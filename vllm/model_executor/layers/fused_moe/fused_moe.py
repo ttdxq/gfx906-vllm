@@ -823,7 +823,14 @@ def get_config_file_name(
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = ("" if not block_shape or not all(block_shape) else
                             f",block_shape={block_shape}").replace(" ", "")
-    gfx906_names = [ "Instinct_MI50", "Instinct_MI60", "Radeon_Pro_VII", "Radeon_VII", "Vega_20" ]
+    gfx906_names = [
+        "Instinct_MI50",
+        "Instinct_MI60",
+        "AMD_Radeon_Graphics",
+        "Radeon_Pro_VII",
+        "Radeon_VII",
+        "Vega_20",
+    ]
     if any(s in device_name for s in gfx906_names):
         device_name = "AMD_GFX906"
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
@@ -887,12 +894,11 @@ def get_moe_configs(
 
     # If no optimized configuration is available, we will use the default
     # configuration
-    logger.warning(
-        (
-            "Using default MoE config. Performance might be sub-optimal! "
-            "Config file not found at %s"
-        ),
-        config_file_paths,
+    logger.warning_once(
+        "Using default MoE config. Performance might be sub-optimal! "
+        "Config file not found at %s",
+        ", ".join(config_file_paths),
+        scope="local",
     )
     return None
 
@@ -931,8 +937,8 @@ def get_moe_wna16_block_config(
         # set default block_size 128, and increase them when num_blocks
         # is too large.
         block_size_n = 128
-        block_size_k = 128
-        if block_size_k <= group_size:
+        block_size_k = min(128, size_k)
+        if block_size_k <= group_size and group_size <= size_k:
             block_size_k = group_size
 
         num_n_blocks = size_k // block_size_k

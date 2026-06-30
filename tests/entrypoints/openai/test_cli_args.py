@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from argparse import Namespace
 
 import pytest
 
+import vllm.entrypoints.openai.api_server as api_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.serving_models import LoRAModulePath
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -107,6 +109,38 @@ def test_invalid_json_field(serve_parser):
                 '{"name": "module4"}',  # Missing required 'path' field
             ]
         )
+
+
+def test_api_server_main_copies_model_tag(monkeypatch):
+    captured = {}
+
+    def fake_parse_args(self, args=None, namespace=None):
+        return Namespace(
+            model_tag="/root/model/Qwen3.5-4B-UD-Q4_K_XL.gguf",
+            model="Qwen/Qwen3-0.6B",
+        )
+
+    def fake_validate_parsed_serve_args(args):
+        captured["model"] = args.model
+
+    def fake_run_server(args):
+        captured["run_server_model"] = args.model
+
+    monkeypatch.setattr(api_server, "cli_env_setup", lambda: None)
+    monkeypatch.setattr(api_server, "make_arg_parser", lambda parser: parser)
+    monkeypatch.setattr(api_server.FlexibleArgumentParser, "parse_args", fake_parse_args)
+    monkeypatch.setattr(
+        api_server,
+        "validate_parsed_serve_args",
+        fake_validate_parsed_serve_args,
+    )
+    monkeypatch.setattr(api_server, "run_server", fake_run_server)
+    monkeypatch.setattr(api_server.uvloop, "run", lambda coro: coro)
+
+    api_server.main()
+
+    assert captured["model"] == "/root/model/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+    assert captured["run_server_model"] == "/root/model/Qwen3.5-4B-UD-Q4_K_XL.gguf"
 
 
 def test_empty_values(serve_parser):

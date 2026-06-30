@@ -11,12 +11,63 @@ import warnings
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .utils import check_shared_mem, input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
+
+
+def _chunk_local_cumsum_eager(
+    g: torch.Tensor,
+    chunk_size: int,
+    reverse: bool,
+    cu_seqlens: torch.Tensor | None,
+    head_first: bool,
+    output_dtype: torch.dtype | None,
+) -> torch.Tensor:
+    output = torch.empty_like(g, dtype=output_dtype or g.dtype)
+
+    if head_first:
+        working = g.movedim(2, 1)
+        target = output.movedim(2, 1)
+    else:
+        working = g
+        target = output
+
+    if cu_seqlens is None:
+        seq_ranges = [(b, 0, working.shape[1]) for b in range(working.shape[0])]
+    else:
+        seq_ranges = [
+            (0, int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item()))
+            for i in range(len(cu_seqlens) - 1)
+        ]
+
+    for batch_idx, seq_start, seq_end in seq_ranges:
+        for chunk_start in range(seq_start, seq_end, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_end)
+            chunk = working[batch_idx, chunk_start:chunk_end].to(target.dtype)
+            if reverse:
+                chunk = torch.flip(chunk, dims=[0])
+                chunk = torch.cumsum(chunk, dim=0)
+                chunk = torch.flip(chunk, dims=[0])
+            else:
+                chunk = torch.cumsum(chunk, dim=0)
+            target[batch_idx, chunk_start:chunk_end] = chunk
+
+    return output
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -252,6 +303,16 @@ def chunk_local_cumsum(
     output_dtype: torch.dtype | None = torch.float,
     **kwargs,
 ) -> torch.Tensor:
+    if _is_gfx906_rocm():
+        return _chunk_local_cumsum_eager(
+            g=g,
+            chunk_size=chunk_size,
+            reverse=reverse,
+            cu_seqlens=cu_seqlens,
+            head_first=head_first,
+            output_dtype=output_dtype,
+        )
+
     if not head_first and g.shape[1] < g.shape[2]:
         warnings.warn(
             f"Input tensor shape suggests potential format mismatch: seq_len ({g.shape[1]}) < num_heads ({g.shape[2]}). "

@@ -298,11 +298,11 @@ class RuntimeDiagnostics:
                 {
                     "anthropic >= 0.71.0",
                     "protobuf >= 5.29.6",
-                    "model-hosting-container-standards >= 0.1.13",
+                    "model-hosting-container-standards >= 0.1.14",
                 },
             ),
             ("requirements/rocm.txt", {"setuptools>=77.0.3,<81.0.0"}),
-            ("requirements/test.txt", {"protobuf >= 5.29.6"}),
+            ("requirements/test/cuda.txt", {"protobuf=="}),
         ]
 
         for file_path, required_content in req_files:

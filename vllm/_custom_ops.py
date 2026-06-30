@@ -465,7 +465,7 @@ def awq_gemm(
     if envs.VLLM_USE_TRITON_AWQ:
         from vllm.model_executor.layers.quantization.awq_triton import awq_gemm_triton
 
-        return awq_gemm_triton(input, qweight, qzeros, scales, split_k_iters)
+        return awq_gemm_triton(input, qweight, scales, qzeros, split_k_iters)
     return torch.ops._C.awq_gemm(input, qweight, qzeros, scales, split_k_iters)
 
 
@@ -513,8 +513,10 @@ if hasattr(torch.ops._C, "gptq_gemm"):
 def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
     torch.ops._C.gptq_shuffle(q_weight, q_perm, bit)
 
+
 def gptq_shuffle_awq_qweight(q_weight: torch.Tensor, bit: int) -> None:
     torch.ops._C.gptq_shuffle_awq_qweight(q_weight, bit)
+
 
 # marlin_24
 def gptq_marlin_24_gemm(

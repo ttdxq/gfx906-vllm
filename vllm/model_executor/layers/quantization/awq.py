@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Union
 import torch
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 
+from vllm import envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
@@ -21,6 +22,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.transformers_utils.config import get_safetensors_params_metadata
 
 if TYPE_CHECKING:
@@ -28,6 +31,22 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+
+def _use_gfx906_awq_triton() -> bool:
+    return (
+        current_platform.is_rocm()
+        and on_gfx906()
+        and not envs.VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ
+    )
+
+
+def _use_gfx906_mobydick_awq() -> bool:
+    return (
+        current_platform.is_rocm()
+        and on_gfx906()
+        and envs.VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ
+    )
 
 
 class AWQConfig(QuantizationConfig):
@@ -68,7 +87,7 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
-        return [torch.half]
+        return [torch.half, torch.float32]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -103,13 +122,65 @@ class AWQConfig(QuantizationConfig):
                 skip_with_substr=True,
             ):
                 return UnquantizedLinearMethod()
+            if _use_gfx906_awq_triton():
+                logger.warning_once(
+                    "[gfx906] Falling back to Triton AWQ kernels instead of "
+                    "exllama/GPTQ-compatible AWQ path."
+                )
+                return AWQLinearMethod(self)
+            if _use_gfx906_mobydick_awq():
+                logger.warning_once(
+                    "[gfx906] Using opt-in mobydick AWQ path via GPTQ-compatible "
+                    "kernel flow instead of the default Triton AWQ path."
+                )
+                return AWQLinearMethod(self)
             logger.warning_once(
                 "[vllm-gfx906] You are using AWQ with exllama kernel, "
-                "this is differ from the offical vLLM.")
+                "this is differ from the offical vLLM."
+            )
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             # Lazy import to avoid circular import.
+            if _use_gfx906_mobydick_awq():
+                from .awq_marlin import AWQMarlinConfig
+                from .moe_wna16 import MoeWNA16Config
+                from .utils.marlin_utils import check_moe_marlin_supports_layer
+
+                if on_gfx906() or not check_moe_marlin_supports_layer(
+                    layer, self.group_size
+                ):
+                    logger.warning_once(
+                        f"Layer '{prefix}' is not supported by AWQMoeMarlin or "
+                        "GFX906 mobydick AWQ path is selected. Falling back to "
+                        "Moe WNA16 kernels."
+                    )
+                    config = {
+                        "quant_method": "awq",
+                        "bits": self.weight_bits,
+                        "group_size": self.group_size,
+                        "zero_point": self.zero_point,
+                        "lm_head": False,
+                        "modules_to_not_convert": self.modules_to_not_convert,
+                    }
+                    return MoeWNA16Config.from_config(config).get_quant_method(
+                        layer, prefix
+                    )
+
+                marlin_compatible_config_dict = {
+                    "quant_method": "awq",
+                    "bits": self.weight_bits,
+                    "group_size": self.group_size,
+                    "zero_point": self.zero_point,
+                    "lm_head": False,
+                    "modules_to_not_convert": self.modules_to_not_convert,
+                }
+                awq_marlin_config = AWQMarlinConfig.from_config(
+                    marlin_compatible_config_dict
+                )
+                return awq_marlin_config.get_quant_method(layer, prefix)
+
             from .moe_wna16 import MoeWNA16Config
+
             config = {
                 "quant_method": "awq",
                 "bits": self.weight_bits,
@@ -120,9 +191,9 @@ class AWQConfig(QuantizationConfig):
             }
             logger.warning_once(
                 "[vllm-gfx906] You are using modified MoeWNA16 kernel, "
-                "this is differ from the offical vLLM.")
-            return MoeWNA16Config.from_config(config).get_quant_method(
-                layer, prefix)
+                "this is differ from the offical vLLM."
+            )
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
         return None
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
@@ -225,7 +296,8 @@ class AWQLinearMethod(LinearMethodBase):
             ),
             input_dim=0,
             output_dim=1,
-            weight_loader=weight_loader)
+            weight_loader=weight_loader,
+        )
 
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("qzeros", qzeros)
@@ -236,6 +308,9 @@ class AWQLinearMethod(LinearMethodBase):
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
+        if _use_gfx906_awq_triton():
+            return
+
         bits = self.quant_config.weight_bits
         empty = torch.empty(0, device=layer.qzeros.device)
 
@@ -244,23 +319,59 @@ class AWQLinearMethod(LinearMethodBase):
         ops.gptq_shuffle(layer.qzeros, empty, bits)
 
         ops.gptq_shuffle_awq_qweight(layer.qweight, bits)
-        layer.qweight.data = layer.qweight.reshape((layer.qweight.shape[0] // 8,
-                                                    layer.qweight.shape[1] * 8))
+        layer.qweight.data = layer.qweight.reshape(
+            (layer.qweight.shape[0] // 8, layer.qweight.shape[1] * 8)
+        )
         replace_parameter(layer, "qweight", layer.qweight.data)
 
+    def apply(
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if _use_gfx906_awq_triton():
+            from vllm.model_executor.layers.quantization.awq_triton import (
+                awq_dequantize_triton,
+                awq_gemm_triton,
+            )
 
-    def apply(self,
-              layer: torch.nn.Module,
-              x: torch.Tensor,
-              bias: torch.Tensor | None = None) -> torch.Tensor:
-        out_shape = x.shape[:-1] + (layer.qweight.shape[-1], )
+            qweight = layer.qweight
+            scales = layer.scales
+            qzeros = layer.qzeros
+            pack_factor = self.quant_config.pack_factor
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+            reshaped_x = x.reshape(-1, x.shape[-1])
+
+            if x.shape[:-1].numel() >= 256:
+                output = awq_dequantize_triton(qweight, scales, qzeros)
+                output = torch.matmul(reshaped_x, output)
+            else:
+                output = awq_gemm_triton(
+                    reshaped_x, qweight, scales, qzeros, pack_factor
+                )
+            if bias is not None:
+                output.add_(bias)
+            return output.reshape(out_shape)
+
+        out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+        orig_dtype = x.dtype
+        scales = layer.scales
+        if x.dtype == torch.float32:
+            x = x.to(torch.float16)
+            if scales.dtype == torch.float32:
+                scales = scales.to(torch.float16)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         output = ops.gptq_gemm(
-            reshaped_x, layer.qweight, layer.qzeros, layer.scales,
+            reshaped_x,
+            layer.qweight,
+            layer.qzeros,
+            scales,
             torch.empty(0, device=layer.qweight.device),
-            True, True, self.quant_config.weight_bits
+            True,
+            True,
+            self.quant_config.weight_bits,
         )
+        if output.dtype != orig_dtype:
+            output = output.to(orig_dtype)
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)

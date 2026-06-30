@@ -61,4 +61,4 @@ class QutlassNvFP4LinearMethod(CompressedTensorsLinearTransformMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        raise NotImplementedError()
+        return super().apply(layer, x, bias)

@@ -85,6 +85,13 @@ def test_multi_modal_uuids_length_mismatch_raises(monkeypatch):
         )
 
 
+def test_mm_cache_hooks_are_safe_when_renderer_has_no_cache(monkeypatch):
+    input_processor = _mock_input_processor(monkeypatch)
+
+    assert input_processor.stat_mm_cache() is None
+    input_processor.clear_mm_cache()
+
+
 def test_multi_modal_uuids_missing_modality_raises(monkeypatch):
     input_processor = _mock_input_processor(monkeypatch)
 

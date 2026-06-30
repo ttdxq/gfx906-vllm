@@ -5,7 +5,7 @@ import gc
 import itertools
 import time
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from functools import reduce
@@ -40,6 +40,7 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+from vllm.distributed.weight_transfer.base import SparseWeightPatch
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -890,20 +891,23 @@ class GPUModelRunner(
             req_state.num_computed_tokens = num_computed_tokens
 
             if not is_last_rank:
-                # When using PP, the scheduler sends the sampled tokens back,
-                # because there's no direct communication between the first-
-                # stage worker and the last-stage worker.
-                new_token_ids = req_data.new_token_ids[i]
-                # Add the sampled token(s) from the previous step (if any).
-                # This doesn't include "unverified" tokens like spec tokens.
-                num_new_tokens = (
-                    num_computed_tokens + len(new_token_ids) - req_state.num_tokens
-                )
-                if num_new_tokens == 1:
-                    # Avoid slicing list in most common case.
-                    req_state.output_token_ids.append(new_token_ids[-1])
-                elif num_new_tokens > 0:
-                    req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
+                if not req_data.new_token_ids:
+                    new_token_ids: list[int] = []
+                else:
+                    # When using PP, the scheduler sends the sampled tokens back,
+                    # because there's no direct communication between the first-
+                    # stage worker and the last-stage worker.
+                    new_token_ids = req_data.new_token_ids[i]
+                    # Add the sampled token(s) from the previous step (if any).
+                    # This doesn't include "unverified" tokens like spec tokens.
+                    num_new_tokens = (
+                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                    )
+                    if num_new_tokens == 1:
+                        # Avoid slicing list in most common case.
+                        req_state.output_token_ids.append(new_token_ids[-1])
+                    elif num_new_tokens > 0:
+                        req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
@@ -951,14 +955,25 @@ class GPUModelRunner(
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
             if not is_last_rank:
-                # Add new_token_ids to token_ids_cpu.
-                start_token_index = num_computed_tokens
-                end_token_index = num_computed_tokens + len(new_token_ids)
-                self.input_batch.token_ids_cpu[
-                    req_index, start_token_index:end_token_index
-                ] = new_token_ids
-                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
-                self.input_batch.num_tokens[req_index] = end_token_index
+                start_token_index = self.input_batch.num_tokens_no_spec[req_index]
+                end_token_index = max(
+                    start_token_index,
+                    num_computed_tokens + len(new_token_ids),
+                )
+                if end_token_index > start_token_index:
+                    if new_token_ids:
+                        num_new_tokens = end_token_index - start_token_index
+                        tokens_to_append = new_token_ids[-num_new_tokens:]
+                        self.input_batch.token_ids_cpu[
+                            req_index, start_token_index:end_token_index
+                        ] = tokens_to_append
+                    self.input_batch.is_token_ids[
+                        req_index, start_token_index:end_token_index
+                    ] = True
+                    self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+                self.input_batch.num_tokens[req_index] = self.input_batch.num_tokens_no_spec[
+                    req_index
+                ]
 
             # Add spec_token_ids to token_ids_cpu.
             spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
@@ -2263,10 +2278,50 @@ class GPUModelRunner(
         return mm_embeds, is_mm_embed
 
     def get_model(self) -> nn.Module:
-        # get raw model out of the cudagraph wrapper.
+        if not hasattr(self, "model"):
+            raise ValueError("Cannot get model before model has been initialized")
         if isinstance(self.model, (CUDAGraphWrapper, UBatchWrapper)):
             return self.model.unwrap()
         return self.model
+
+    def apply_sparse_weight_patches(
+        self, patches: Iterable[SparseWeightPatch]
+    ) -> None:
+        model = self.get_model()
+        for patch in patches:
+            param = model.get_parameter(patch.name)
+            if not param.data.is_contiguous():
+                raise NotImplementedError(
+                    "Sparse weight updates currently require contiguous params: "
+                    f"{patch.name}"
+                )
+
+            if patch.indices.dtype != torch.int32:
+                raise ValueError(
+                    "Sparse weight updates currently require int32 indices: "
+                    f"{patch.name}"
+                )
+            if patch.indices.ndim != 1 or patch.values.ndim != 1:
+                raise ValueError(
+                    f"Sparse weight patches must be 1D flattened updates: {patch.name}"
+                )
+            if patch.indices.numel() != patch.values.numel():
+                raise ValueError(
+                    "`indices` and `values` must have matching lengths for "
+                    f"{patch.name}"
+                )
+            if patch.values.dtype != param.dtype:
+                raise ValueError(
+                    f"Sparse values dtype {patch.values.dtype} does not match "
+                    f"parameter dtype {param.dtype} for {patch.name}"
+                )
+
+            flat_param = param.data.view(-1)
+            flat_param.index_copy_(
+                0,
+                patch.indices.to(device=flat_param.device, dtype=torch.long),
+                patch.values.to(device=flat_param.device),
+            )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
@@ -2548,23 +2603,58 @@ class GPUModelRunner(
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
-            # Update output token ids with tokens sampled in last step
-            # if async scheduling and required by current sampling params.
-            self.input_batch.update_async_output_token_ids()
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
 
+        draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            None,  # draft_probs
+            draft_probs,
             logits,
             sampling_metadata,
         )
-        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
         return sampler_output
+
+    def _get_spec_decode_draft_probs(
+        self, spec_decode_metadata: SpecDecodeMetadata
+    ) -> torch.Tensor | None:
+        if (
+            getattr(self, "_draft_probs", None) is None
+            or getattr(self, "_draft_prob_req_ids", None) is None
+        ):
+            return None
+
+        draft_prob_req_ids = self._draft_prob_req_ids
+        draft_probs = self._draft_probs
+        assert draft_prob_req_ids is not None
+        assert draft_probs is not None
+
+        row_by_req_id = {req_id: idx for idx, req_id in enumerate(draft_prob_req_ids)}
+        draft_prob_rows: list[torch.Tensor] = []
+        for req_id, num_draft in zip(
+            self.input_batch.req_ids, spec_decode_metadata.num_draft_tokens
+        ):
+            if num_draft == 0:
+                continue
+            row_idx = row_by_req_id.get(req_id)
+            if row_idx is None:
+                logger.warning(
+                    "Missing draft probabilities for request %s during "
+                    "spec decode; falling back to rejection sampler without "
+                    "draft_probs.",
+                    req_id,
+                )
+                return None
+            draft_prob_rows.append(draft_probs[row_idx, :num_draft])
+
+        if not draft_prob_rows:
+            return None
+
+        return torch.cat(draft_prob_rows, dim=0).contiguous()
 
     def _bookkeeping_sync(
         self,
@@ -2744,6 +2834,25 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    @staticmethod
+    def _is_uniform_decode(
+        max_num_scheduled_tokens: int,
+        uniform_decode_query_len: int,
+        num_tokens: int,
+        num_reqs: int,
+        force_uniform_decode: bool | None = None,
+    ) -> bool:
+        """Check if it's a decode batch with the same amount of scheduled
+        tokens across all requests."""
+        return (
+            (
+                (max_num_scheduled_tokens == uniform_decode_query_len)
+                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+            )
+            if force_uniform_decode is None
+            else force_uniform_decode
+        )
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -2761,13 +2870,12 @@ class GPUModelRunner(
         CUDAGraphMode, BatchDescriptor, UBatchSlices | None, torch.Tensor | None
     ]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
-        uniform_decode = (
-            (
-                (max_num_scheduled_tokens == self.uniform_decode_query_len)
-                and (num_tokens_padded == max_num_scheduled_tokens * num_reqs)
-            )
-            if force_uniform_decode is None
-            else force_uniform_decode
+        uniform_decode = self._is_uniform_decode(
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            uniform_decode_query_len=self.uniform_decode_query_len,
+            num_tokens=num_tokens_padded,
+            num_reqs=num_reqs,
+            force_uniform_decode=force_uniform_decode,
         )
 
         has_lora = (
@@ -3082,6 +3190,8 @@ class GPUModelRunner(
         self.kv_connector_output = None
 
         if self.execute_model_state is None:
+            if self.use_async_scheduling and not get_pp_group().is_last_rank:
+                self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
                 return None  # type: ignore[return-value]
@@ -3462,6 +3572,9 @@ class GPUModelRunner(
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
+        self.vllm_config.model_config = self.model_config
+        self.vllm_config.load_config = self.load_config
+
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
         Args:
@@ -3642,9 +3755,8 @@ class GPUModelRunner(
         return None
 
     def reload_weights(self) -> None:
-        assert getattr(self, "model", None) is not None, (
-            "Cannot reload weights before model is loaded."
-        )
+        if getattr(self, "model", None) is None:
+            raise ValueError("Cannot reload weights before model is loaded.")
         model_loader = get_model_loader(self.load_config)
         logger.info("Reloading weights inplace...")
         model_loader.load_weights(self.get_model(), model_config=self.model_config)

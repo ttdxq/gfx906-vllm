@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import re
 from collections.abc import Generator
 
 import gguf
@@ -84,14 +85,18 @@ class GGUFModelLoader(BaseModelLoader):
         https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
         """
         config = model_config.hf_config
+        vllm_arch = model_config.architecture
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
         # Gemma3Config, this returns config.text_config. For text-only
         # models, this returns config itself.
         text_config = config.get_text_config()
         model_type = config.model_type
+        detected_mm = detect_gguf_multimodal(model_config.model)
         is_multimodal = (
-            hasattr(config, "vision_config") and config.vision_config is not None
+            hasattr(config, "vision_config")
+            and config.vision_config is not None
+            and detected_mm is not None
         )
         gguf_to_hf_name_map = {}
         # hack: ggufs have a different name than transformers
@@ -101,6 +106,10 @@ class GGUFModelLoader(BaseModelLoader):
             # Gemma3 models use "gemma3_text" in HuggingFace but
             # "gemma3" in GGUF architecture naming
             model_type = "gemma3"
+        if model_type in ("qwen3_5", "qwen3_5_text"):
+            model_type = "qwen35"
+        if model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            model_type = "qwen35moe"
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
@@ -157,9 +166,12 @@ class GGUFModelLoader(BaseModelLoader):
         auto_cls = (
             AutoModelForImageTextToText if is_multimodal else AutoModelForCausalLM
         )
+        dummy_config = config
+        if not is_multimodal and config.model_type in ("qwen3_5", "qwen3_5_moe"):
+            dummy_config = text_config
         with torch.device("meta"):
             dummy_model = auto_cls.from_config(
-                config, trust_remote_code=model_config.trust_remote_code
+                dummy_config, trust_remote_code=model_config.trust_remote_code
             )
 
         state_dict = dummy_model.state_dict()
@@ -224,9 +236,17 @@ class GGUFModelLoader(BaseModelLoader):
                 gguf_name = text_name_map.get_name(base_name)
 
             if gguf_name is None:
+                if model_type == "qwen35":
+                    if m := re.fullmatch(
+                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.dt_bias", hf_name
+                    ):
+                        return f"blk.{m['bid']}.ssm_dt.bias"
                 return None
 
-            return gguf_name + "." + suffix
+            if suffix:
+                return gguf_name + "." + suffix
+            else:
+                return gguf_name
 
         # Build mapping and track unmapped parameters
         unmapped_params = []
@@ -235,6 +255,12 @@ class GGUFModelLoader(BaseModelLoader):
 
             # Track mapping success
             if gguf_name_with_suffix is not None:
+                if model_type == "qwen35" and vllm_arch in (
+                    "Qwen3_5ForCausalLM",
+                    "Qwen3_5ForConditionalGeneration",
+                ):
+                    if hf_name.startswith(("model.", "lm_head.")):
+                        hf_name = f"language_model.{hf_name}"
                 gguf_to_hf_name_map[gguf_name_with_suffix] = hf_name
                 logger.debug("Mapped GGUF %s → HF %s", gguf_name_with_suffix, hf_name)
             elif hf_name not in gguf_to_hf_name_map.values():
@@ -259,7 +285,7 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = get_gguf_weight_type_map(
             model_name_or_path, gguf_to_hf_name_map
         )
-        is_multimodal = hasattr(model_config.hf_config, "vision_config")
+        is_multimodal = detect_gguf_multimodal(model_name_or_path) is not None
         if is_multimodal:
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
@@ -290,7 +316,7 @@ class GGUFModelLoader(BaseModelLoader):
             Tuples of (parameter_name, tensor) for all model weights
         """
         hf_config = model_config.hf_config
-        is_multimodal = hasattr(hf_config, "vision_config")
+        is_multimodal = detect_gguf_multimodal(model_name_or_path) is not None
 
         if is_multimodal:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
@@ -319,8 +345,12 @@ class GGUFModelLoader(BaseModelLoader):
         local_model_path = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know if tie word embeddings after mapping weights
-        if "lm_head.weight" in get_gguf_extra_tensor_names(
+        extra_tensor_names = get_gguf_extra_tensor_names(
             local_model_path, gguf_weights_map
+        )
+        if (
+            "lm_head.weight" in extra_tensor_names
+            or "language_model.lm_head.weight" in extra_tensor_names
         ):
             model_config.hf_config.update({"tie_word_embeddings": True})
 

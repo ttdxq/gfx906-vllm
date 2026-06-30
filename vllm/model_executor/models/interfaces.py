@@ -298,7 +298,7 @@ class SupportsMultiModal(Protocol):
                     lambda mod: StageMissingLayer("language_model", mod),
                     targets=targets,
                 )
-                if mm_config.mm_encoder_only
+                if mm_config is not None and mm_config.mm_encoder_only
                 else nullcontext()
             ):
                 yield

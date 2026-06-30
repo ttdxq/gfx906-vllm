@@ -124,6 +124,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
+    VLLM_ROCM_USE_GFX906_TRITON_PRIORITY: bool = False
+    VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ: bool = False
+    VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1005,6 +1008,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_CUSTOM_PAGED_ATTN": lambda: (
         os.getenv("VLLM_ROCM_CUSTOM_PAGED_ATTN", "True").lower() in ("true", "1")
     ),
+    # Opt-in override for gfx906 to prefer Triton attention backends first.
+    # Disabled by default to preserve the more conservative gfx906 behavior.
+    "VLLM_ROCM_USE_GFX906_TRITON_PRIORITY": lambda: (
+        os.getenv("VLLM_ROCM_USE_GFX906_TRITON_PRIORITY", "False").lower()
+        in ("true", "1")
+    ),
+    # Opt-in override for gfx906 AWQ to use the mobydick-style
+    # GPTQ-compatible AWQ path instead of the default Triton AWQ path.
+    # Disabled by default to preserve current gfx906 behavior.
+    "VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ": lambda: (
+        os.getenv("VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ", "False").lower()
+        in ("true", "1")
+    ),
+    # Opt into the Triton causal_conv1d_update kernel on gfx906. The default
+    # keeps the conservative torch fallback for compatibility.
+    "VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE": lambda: (
+        os.getenv("VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE", "False").lower()
+        in ("true", "1")
+    ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4 or NONE
     # Recommended for large models to get allreduce
@@ -1529,6 +1551,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+    ),
+    # If set to 1, use Python spinloop extension to poll in a more efficient
+    # way when using the mp backend.
+    "VLLM_USE_SPINLOOP_EXT": lambda: bool(
+        int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream

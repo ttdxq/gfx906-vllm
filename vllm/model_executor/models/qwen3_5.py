@@ -25,6 +25,7 @@
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
 import os
+import os
 import typing
 from collections.abc import Callable, Iterable
 from inspect import signature
@@ -48,6 +49,7 @@ from vllm.model_executor.layers.layernorm import (
 )
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -64,6 +66,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -113,6 +116,18 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _append_qwen35_load_debug(message: str) -> None:
+    debug_file = os.environ.get("VLLM_QWEN35_LOAD_DEBUG_FILE")
+    if not debug_file:
+        return
+    logger.warning(message)
+    try:
+        with open(debug_file, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+    except Exception:
+        pass
+
+
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
@@ -131,6 +146,7 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         cache_config=None,
         quant_config: QuantizationConfig | None = None,
         speculative_config=None,
+        split_projections: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -141,36 +157,89 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             speculative_config=speculative_config,
             prefix=prefix,
         )
-        del self.in_proj_qkvz
-        del self.in_proj_ba
-        self.in_proj_qkv = ColumnParallelLinear(
-            self.hidden_size,
-            self.key_dim * 2 + self.value_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_qkv",
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            return raw.lower() in {"1", "true", "yes", "on"}
+
+        self.split_projections = split_projections
+        self.expand_qk_heads_for_gdn = _env_bool(
+            "VLLM_QWEN35_EXPAND_QK", True
         )
-        self.in_proj_z = ColumnParallelLinear(
-            self.hidden_size,
-            self.value_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_z",
+        self.use_recurrent_prefill_for_gdn = _env_bool(
+            "VLLM_QWEN35_REC_PREFILL", True
         )
-        self.in_proj_b = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_v_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_b",
+        self.use_local_recurrent_decode_for_gdn = _env_bool(
+            "VLLM_QWEN35_LOCAL_REC_DECODE", False
         )
-        self.in_proj_a = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_v_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_a",
+        self.use_qk_l2norm_in_kernel_for_gdn = _env_bool(
+            "VLLM_QWEN35_QK_L2NORM", True
         )
+        if prefix.endswith("layers.0.linear_attn"):
+            logger.warning(
+                "[qwen3.5 init] prefix=%s split_projections=%s", prefix, self.split_projections
+            )
+            debug_file = os.getenv("VLLM_QWEN35_INIT_DEBUG_FILE")
+            if debug_file:
+                try:
+                    with open(debug_file, "a", encoding="utf-8") as f:
+                        f.write(
+                            f"prefix={prefix} split_projections={self.split_projections} modules={list(self._modules.keys())}\n"
+                        )
+                except Exception:
+                    pass
+        if self.split_projections:
+            self.in_proj_qkvz.output_sizes = [
+                self.key_dim,
+                self.key_dim,
+                self.value_dim,
+                self.value_dim,
+            ]
+            self.in_proj_ba.output_sizes = [self.num_v_heads, self.num_v_heads]
+        else:
+            self.in_proj_qkvz.output_sizes = [
+                self.key_dim,
+                self.key_dim,
+                self.value_dim,
+                self.value_dim,
+            ]
+            self.in_proj_ba.output_sizes = [self.num_v_heads, self.num_v_heads]
+
+    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+        capability = current_platform.get_device_capability()
+        if (
+            current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        ):
+            return (torch.float32, torch.float32)
+        return super().get_state_dtype()
+
+    def _expand_qk_heads_for_gdn(
+        self,
+        query: torch.Tensor | None,
+        key: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if query is None or key is None:
+            return query, key
+
+        head_ratio = self.num_v_heads // self.num_k_heads
+        if head_ratio <= 1:
+            return query.contiguous(), key.contiguous()
+
+        if (
+            self.split_projections
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "gguf"
+        ):
+            query = query.repeat(1, 1, head_ratio, 1)
+            key = key.repeat(1, 1, head_ratio, 1)
+        else:
+            query = query.repeat_interleave(head_ratio, dim=2)
+            key = key.repeat_interleave(head_ratio, dim=2)
+        return query.contiguous(), key.contiguous()
 
     def _maybe_log_debug_stats(self, **tensors: torch.Tensor) -> None:
         if os.getenv("VLLM_QWEN35_GGUF_DEBUG", "0") != "1":
@@ -178,10 +247,11 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         target_prefix = os.getenv(
             "VLLM_QWEN35_GGUF_DEBUG_LAYER", "model.layers.0.linear_attn"
         )
-        if self.prefix != target_prefix or getattr(self, "_gguf_debug_logged", False):
+        prefix_matches = self.prefix == target_prefix or self.prefix.endswith(
+            ".layers.0.linear_attn"
+        )
+        if not prefix_matches:
             return
-
-        self._gguf_debug_logged = True
 
         def summarize(name: str, tensor: torch.Tensor) -> str:
             tensor_f32 = tensor.detach().float()
@@ -201,15 +271,56 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             *[summarize(name, tensor) for name, tensor in tensors.items()],
         ]
         logger.warning("\n".join(lines))
+        debug_file = os.getenv("VLLM_QWEN35_GGUF_DEBUG_FILE")
+        if debug_file:
+            try:
+                with open(debug_file, "a", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+            except Exception:
+                pass
 
     def fix_query_key_value_ordering(
         self,
         mixed_qkvz: torch.Tensor,
         mixed_ba: torch.Tensor,
     ):
-        raise NotImplementedError(
-            "Qwen3.5 Series dont need to fix query key value ordering"
+        new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
+            self.num_k_heads // self.tp_size,
+            (
+                self.head_k_dim
+                + self.head_k_dim
+                + (self.num_v_heads // self.num_k_heads) * self.head_v_dim
+                + (self.num_v_heads // self.num_k_heads) * self.head_v_dim
+            ),
         )
+        new_tensor_shape_ba = mixed_ba.size()[:-1] + (
+            self.num_k_heads // self.tp_size,
+            2 * self.num_v_heads // self.num_k_heads,
+        )
+
+        mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
+        mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
+
+        split_arg_list_qkvz = [
+            self.head_k_dim,
+            self.head_k_dim,
+            (self.num_v_heads // self.num_k_heads) * self.head_v_dim,
+            (self.num_v_heads // self.num_k_heads) * self.head_v_dim,
+        ]
+        split_arg_list_ba = [
+            self.num_v_heads // self.num_k_heads,
+            self.num_v_heads // self.num_k_heads,
+        ]
+
+        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
+        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=2)
+
+        value = value.reshape(value.size(0), -1, self.head_v_dim)
+        z = z.reshape(z.size(0), -1, self.head_v_dim)
+        b = b.reshape(b.size(0), self.num_v_heads // self.tp_size)
+        a = a.reshape(a.size(0), self.num_v_heads // self.tp_size)
+
+        return query, key, value, z, b, a
 
     def forward(
         self,
@@ -218,20 +329,35 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
     ):
         num_tokens = hidden_states.size(0)
 
-        mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-        z, _ = self.in_proj_z(hidden_states)
-        b, _ = self.in_proj_b(hidden_states)
-        a, _ = self.in_proj_a(hidden_states)
+        if self.split_projections:
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
 
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-        q, k, v = mixed_qkv.split(
-            [
-                self.key_dim // self.tp_size,
-                self.key_dim // self.tp_size,
-                self.value_dim // self.tp_size,
-            ],
-            dim=-1,
-        )
+            q_size = self.key_dim // self.tp_size
+            k_size = self.key_dim // self.tp_size
+            v_size = self.value_dim // self.tp_size
+            q, k, v, z = torch.split(
+                projected_states_qkvz,
+                [q_size, k_size, v_size, v_size],
+                dim=-1,
+            )
+
+            mixed_qkv = torch.cat((q, k, v), dim=-1)
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b, a = projected_states_ba.chunk(2, dim=-1)
+            b = b.contiguous()
+            a = a.contiguous()
+        else:
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            q, k, v, z, b, a = self.fix_query_key_value_ordering(
+                projected_states_qkvz, projected_states_ba
+            )
+            q, k, v = map(
+                lambda x: rearrange(x, "l p d -> l (p d)"),
+                (q, k, v),
+            )
+            mixed_qkv = torch.cat((q, k, v), dim=-1)
         self._maybe_log_debug_stats(
             hidden_states=hidden_states,
             mixed_qkv=mixed_qkv,
@@ -251,24 +377,30 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             device=hidden_states.device,
         )
 
+        call_b_first = os.getenv("VLLM_QWEN35_CALL_ORDER", "ba").lower() != "ab"
         torch.ops.vllm.gdn_attention_core(
             mixed_qkv,
-            b,
-            a,
+            b if call_b_first else a,
+            a if call_b_first else b,
             core_attn_out,
             self.prefix,
         )
+        self._maybe_log_debug_stats(core_attn_out=core_attn_out)
 
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
+        self._maybe_log_debug_stats(post_norm=core_attn_out)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def _use_gfx906_chunk_decode_path(self) -> bool:
-        return False
+        raw = os.getenv("VLLM_QWEN35_CHUNK_DECODE")
+        if raw is None:
+            return False
+        return raw.lower() in {"1", "true", "yes", "on"}
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -290,14 +422,24 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.layer_idx = extract_layer_index(prefix)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen3_5GatedDeltaNet(
-                config,
-                model_config=model_config,
-                cache_config=cache_config,
-                quant_config=quant_config,
-                speculative_config=speculative_config,
-                prefix=f"{prefix}.linear_attn",
-            )
+            if vllm_config.model_config.quantization == "gguf":
+                self.linear_attn = Qwen3_5GatedDeltaNet(
+                    config,
+                    model_config=model_config,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    speculative_config=speculative_config,
+                    split_projections=True,
+                    prefix=f"{prefix}.linear_attn",
+                )
+            else:
+                self.linear_attn = GatedDeltaNetAttention(
+                    config=config,
+                    vllm_config=vllm_config,
+                    prefix=f"{prefix}.linear_attn",
+                    gqa_interleaved_layout=False,
+                    create_in_proj_qkvz=vllm_config.lora_config is None,
+                )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
                 config,
@@ -375,6 +517,7 @@ class Qwen3_5Model(Qwen3NextModel):
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.config = config
+        self.enable_lora = vllm_config.lora_config is not None
         self.quant_config = vllm_config.quant_config
 
         self.vocab_size = config.vocab_size
@@ -444,6 +587,88 @@ class Qwen3_5Model(Qwen3NextModel):
         ]
 
         params_dict = dict(self.named_parameters())
+
+        first_linear_attn = None
+        for module_name, module in self.named_modules():
+            if module_name.endswith("layers.0.linear_attn"):
+                first_linear_attn = module
+                break
+
+        if first_linear_attn is not None:
+            _append_qwen35_load_debug(
+                "RUNTIME "
+                f"linear_attn_type={type(first_linear_attn).__name__} "
+                f"has_in_proj_b={hasattr(first_linear_attn, 'in_proj_b')} "
+                f"has_in_proj_a={hasattr(first_linear_attn, 'in_proj_a')} "
+                f"has_in_proj_ba={hasattr(first_linear_attn, 'in_proj_ba')} "
+                f"split_attr={getattr(first_linear_attn, 'split_projections', None)}"
+            )
+
+        force_split = bool(
+            getattr(first_linear_attn, "split_projections", False)
+            if first_linear_attn is not None
+            else False
+        )
+
+        has_split_qkv = bool(
+            first_linear_attn is not None
+            and hasattr(first_linear_attn, "in_proj_qkv")
+        )
+        has_split_ba = bool(
+            first_linear_attn is not None
+            and hasattr(first_linear_attn, "in_proj_b")
+            and hasattr(first_linear_attn, "in_proj_a")
+        )
+        has_fused_ba = bool(
+            first_linear_attn is not None
+            and hasattr(first_linear_attn, "in_proj_ba")
+            and first_linear_attn.in_proj_ba is not None
+        )
+        force_split_ba = os.getenv("VLLM_QWEN35_FORCE_BA_SPLIT", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if force_split_ba:
+            has_split_ba = True
+            has_fused_ba = False
+        use_split_gdn_proj = has_split_qkv
+
+        _append_qwen35_load_debug(
+            f"MODE force_split={force_split} has_split_qkv={has_split_qkv} has_split_ba={has_split_ba} has_fused_ba={has_fused_ba}"
+        )
+
+        if has_fused_ba and not has_split_ba:
+            reverse_ba = os.getenv("VLLM_QWEN35_REVERSE_BA_SHARDS", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if reverse_ba:
+                stacked_params_mapping.extend(
+                    [
+                        ("in_proj_ba", "in_proj_a", 0),
+                        ("in_proj_ba", "in_proj_b", 1),
+                    ]
+                )
+            else:
+                stacked_params_mapping.extend(
+                    [
+                        ("in_proj_ba", "in_proj_b", 0),
+                        ("in_proj_ba", "in_proj_a", 1),
+                    ]
+                )
+
+        if not has_split_qkv:
+            stacked_params_mapping.extend(
+                [
+                    ("in_proj_qkvz", "in_proj_qkv", (0, 1, 2)),
+                    ("in_proj_qkvz", "in_proj_z", 3),
+                ]
+            )
+
         modules_dict = dict(self.named_modules())
         loaded_params: set[str] = set()
         # Track partition sizes for merged parameters to calculate correct offsets
@@ -513,6 +738,7 @@ class Qwen3_5Model(Qwen3NextModel):
                     start_idx = tp_rank * local_shard
                     shard = loaded_weight.narrow(output_dim, split_offset, shard_size)
                     shard = shard.narrow(output_dim, start_idx, local_shard)
+                    shard = shard.to(device=param.device)
                     param.shard_id.append(sid)
                     param.shard_id_map[sid] = len(param.data_container)
                     param.data_container.append(shard)
@@ -562,6 +788,7 @@ class Qwen3_5Model(Qwen3NextModel):
                 local_shard = loaded_weight.size(output_dim) // tp_size
                 start_idx = tp_rank * local_shard
                 shard = loaded_weight.narrow(output_dim, start_idx, local_shard)
+                shard = shard.to(device=param.device)
                 param.shard_id.append(shard_id)
                 param.shard_id_map[shard_id] = len(param.data_container)
                 param.data_container.append(shard)
@@ -582,8 +809,6 @@ class Qwen3_5Model(Qwen3NextModel):
 
                 if name.endswith("A_log"):
                     loaded_weight = torch.log(-loaded_weight)
-            elif name.endswith("A_log"):
-                loaded_weight = torch.log(-loaded_weight)
 
             # Remapping the name of FP8 kv-scale.
             if name.endswith("scale"):
@@ -614,6 +839,17 @@ class Qwen3_5Model(Qwen3NextModel):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                if "linear_attn.in_proj" in name and any(
+                    token in name
+                    for token in ("in_proj_qkv", "in_proj_z", "in_proj_ba", "in_proj_b", "in_proj_a")
+                ):
+                    _append_qwen35_load_debug(
+                        "STACKED "
+                        f"name={name} shard_id={shard_id} "
+                        f"is_gguf_weight={getattr(param, 'is_gguf_weight', False)} "
+                        f"is_gguf_weight_type={getattr(param, 'is_gguf_weight_type', False)} "
+                        f"loaded_shape={tuple(loaded_weight.shape) if hasattr(loaded_weight, 'shape') else 'NA'}"
+                    )
                 if isinstance(shard_id, tuple):
                     if getattr(param, "is_gguf_weight", False) or getattr(
                         param, "is_gguf_weight_type", False
@@ -792,11 +1028,24 @@ class Qwen3_5Model(Qwen3NextModel):
                         logger.warning_once(
                             f"Parameter {name} not found in params_dict, skip loading"
                         )
+                        if "linear_attn.in_proj" in name:
+                            _append_qwen35_load_debug(f"MISSING name={name}")
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    if "linear_attn.in_proj" in name and any(
+                        token in name
+                        for token in ("in_proj_qkv", "in_proj_z", "in_proj_ba", "in_proj_b", "in_proj_a")
+                    ):
+                        _append_qwen35_load_debug(
+                            "DIRECT "
+                            f"name={name} "
+                            f"is_gguf_weight={getattr(param, 'is_gguf_weight', False)} "
+                            f"is_gguf_weight_type={getattr(param, 'is_gguf_weight_type', False)} "
+                            f"loaded_shape={tuple(loaded_weight.shape) if hasattr(loaded_weight, 'shape') else 'NA'}"
+                        )
                     try:
                         weight_loader(param, loaded_weight)
                     except AssertionError as exc:
@@ -883,6 +1132,16 @@ class Qwen3_5ForCausalLMBase(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        capability = current_platform.get_device_capability()
+        if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "gguf"
+            and current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        ):
+            hidden_states = hidden_states.float()
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1061,11 +1320,20 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+        conv_dtype, temporal_dtype = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
+        capability = current_platform.get_device_capability()
+        if (
+            current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        ):
+            return (torch.float32, torch.float32)
+        return (conv_dtype, temporal_dtype)
 
     @classmethod
     def get_mamba_state_shape_from_config(

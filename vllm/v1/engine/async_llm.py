@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.platforms import current_platform
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -49,6 +50,10 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
+
+
+def _use_v1_async_multiprocessing() -> bool:
+    return not current_platform.is_rocm()
 
 
 class AsyncLLM(EngineClient):
@@ -131,14 +136,23 @@ class AsyncLLM(EngineClient):
             self.output_processor.tracer = tracer
 
         # EngineCore (starts the engine in background process).
-        self.engine_core = EngineCoreClient.make_async_mp_client(
-            vllm_config=vllm_config,
-            executor_class=executor_class,
-            log_stats=self.log_stats,
-            client_addresses=client_addresses,
-            client_count=client_count,
-            client_index=client_index,
-        )
+        if _use_v1_async_multiprocessing():
+            self.engine_core = EngineCoreClient.make_async_mp_client(
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=self.log_stats,
+                client_addresses=client_addresses,
+                client_count=client_count,
+                client_index=client_index,
+            )
+        else:
+            self.engine_core = EngineCoreClient.make_client(
+                multiprocess_mode=False,
+                asyncio_mode=True,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=self.log_stats,
+            )
 
         # Loggers.
         self.logger_manager: StatLoggerManager | None = None
@@ -542,6 +556,8 @@ class AsyncLLM(EngineClient):
                             iteration_stats=iteration_stats,
                             mm_cache_stats=input_processor.stat_mm_cache(),
                         )
+
+                    await asyncio.sleep(0)
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)

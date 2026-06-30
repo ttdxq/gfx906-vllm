@@ -250,8 +250,7 @@ def add_kv_sharing_layers_to_kv_cache_groups(
     """
     Sets up KV cache sharing by reusing the allocated KV caches in `kv_caches`
     for layers that do not allocate its own KV cache, based on the mapping in
-    `shared_kv_cache_layers`. Adds these layers to the corresponding KV cache
-    group, which is needed to ensure that attention metadata is assigned later.
+    `shared_kv_cache_layers`.
 
     Args:
         shared_kv_cache_layers: Layer pairings for cross-layer KV sharing.
@@ -260,6 +259,8 @@ def add_kv_sharing_layers_to_kv_cache_groups(
             from the KV cache of `shared_kv_cache_layers[layer_name]`.
         kv_cache_groups: The KV cache groups of the model.
     """
+    if not shared_kv_cache_layers: return
+
     layer_to_kv_cache_group: dict[str, KVCacheGroupSpec] = {}
     for kv_cache_group in kv_cache_groups:
         for layer_name in kv_cache_group.layer_names:
@@ -313,15 +314,19 @@ def bind_kv_cache(
             # TODO - analyze where runner_kv_caches is used and the right
             # way to ensure it properly reflects multiple attention layers
             # in the same decoder block.
-            if current_platform.is_cuda_alike() or current_platform.is_xpu():
-                # We know that the GPU runner is not impacted by this
+            if (
+                current_platform.is_cuda_alike()
+                or current_platform.is_xpu()
+                or current_platform.is_cpu()
+            ):
+                # We know that the GPU / CPU runner is not impacted by this
                 # case. Some test code depends on runner_kv_caches, but
                 # not in a way that's impacted by ignoring this.
                 pass
             else:
                 raise NotImplementedError
-        layer_name = layer_names[0]
-        runner_kv_caches.append(kv_caches[layer_name])
+        for layer_name in layer_names:
+            runner_kv_caches.append(kv_caches[layer_name])
 
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():

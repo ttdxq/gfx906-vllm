@@ -9,6 +9,7 @@ from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
 from vllm.model_executor.model_loader.weight_utils import download_gguf
+from vllm.transformers_utils.gguf_utils import maybe_patch_hf_config_from_gguf
 
 
 class TestGGUFDownload:
@@ -149,6 +150,71 @@ class TestGGUFModelLoader:
         assert result == "/downloaded/model.gguf"
         mock_hf_download.assert_called_once_with(
             repo_id="unsloth/Qwen3-0.6B-GGUF", filename="model.gguf"
+        )
+
+    def test_qwen3_5_text_gguf_config_uses_registered_wrapper_arch(self):
+        hf_config = MagicMock()
+        hf_config.model_type = "qwen3_5_text"
+        hf_config.architectures = ["Qwen3_5ForCausalLM"]
+        hf_config.rope_parameters = {"rope_type": "default"}
+
+        patched_config = maybe_patch_hf_config_from_gguf(
+            "/tmp/qwen3.5.gguf",
+            hf_config,
+        )
+
+        assert patched_config.architectures == ["Qwen3_5ForConditionalGeneration"]
+
+    def test_qwen3_5_text_gguf_config_normalizes_rope_theta(self):
+        hf_config = MagicMock()
+        hf_config.model_type = "qwen3_5_text"
+        hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
+        hf_config.rope_parameters = {
+            "rope_type": "default",
+            "theta": 10000000.0,
+        }
+
+        patched_config = maybe_patch_hf_config_from_gguf(
+            "/tmp/qwen3.5.gguf",
+            hf_config,
+        )
+
+        assert patched_config.rope_parameters["rope_theta"] == 10000000.0
+        assert "theta" not in patched_config.rope_parameters
+
+    @patch("vllm.model_executor.model_loader.gguf_loader.detect_gguf_multimodal")
+    @patch("vllm.model_executor.model_loader.gguf_loader.AutoModelForCausalLM")
+    def test_qwen3_5_gguf_map_keeps_language_model_prefix_for_all_qwen35_arches(
+        self,
+        mock_auto_model,
+        mock_detect_multimodal,
+    ):
+        mock_detect_multimodal.return_value = None
+        mock_hf_model = MagicMock()
+        mock_hf_model.state_dict.return_value = {
+            "model.layers.0.linear_attn.in_proj_qkv.weight": MagicMock(),
+        }
+        mock_auto_model.from_config.return_value = mock_hf_model
+
+        hf_config = MagicMock()
+        hf_config.model_type = "qwen3_5_text"
+        hf_config.num_hidden_layers = 1
+        hf_config.vision_config = None
+        hf_config.get_text_config.return_value = hf_config
+
+        model_config = MagicMock()
+        model_config.hf_config = hf_config
+        model_config.architecture = "Qwen3_5ForConditionalGeneration"
+        model_config.trust_remote_code = False
+        model_config.model = "/tmp/qwen3.5.gguf"
+
+        load_config = LoadConfig(load_format="gguf")
+        loader = GGUFModelLoader(load_config)
+
+        weights_map = loader._get_gguf_weights_map(model_config)
+
+        assert weights_map["blk.0.attn_qkv.weight"] == (
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight"
         )
 
     @patch("vllm.config.model.get_hf_image_processor_config", return_value=None)

@@ -7,9 +7,196 @@
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.attention.backends.utils import PAD_SLOT_ID
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+
+def _causal_conv1d_gfx906_fallback(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor | None,
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    activation: str | None,
+    pad_slot_id: int,
+) -> torch.Tensor:
+    original_x_dtype = x.dtype
+    x = x.to(conv_states.dtype)
+    out = torch.empty_like(x)
+    dim, width = weight.shape
+    cache_state_len = conv_states.shape[-1]
+    state_len = width - 1
+    weight_conv = weight.to(x.dtype).unsqueeze(1).contiguous()
+    if bias is not None:
+        bias = bias.to(x.dtype)
+    zero_state = torch.zeros((dim, state_len), dtype=x.dtype, device=x.device)
+
+    if query_start_loc is None:
+        unsqueeze = False
+        if x.dim() == 2:
+            x = x.unsqueeze(-1)
+            out = out.unsqueeze(-1)
+            unsqueeze = True
+        batch = x.shape[0]
+        for seq_idx in range(batch):
+            cache_idx = (
+                seq_idx if cache_indices is None else int(cache_indices[seq_idx].item())
+            )
+            if cache_idx == pad_slot_id:
+                continue
+            use_initial_state = has_initial_state is None or bool(
+                has_initial_state[seq_idx].item()
+            )
+            prev_state = (
+                conv_states[cache_idx][:, -state_len:]
+                if state_len > 0 and use_initial_state
+                else zero_state
+            )
+            seq_x = x[seq_idx]
+            full_x = torch.cat((prev_state, seq_x), dim=1).unsqueeze(0)
+            seq_out = F.conv1d(full_x, weight_conv, bias=bias, groups=dim).squeeze(0)
+            if activation in ["silu", "swish"]:
+                seq_out = F.silu(seq_out)
+            out[seq_idx].copy_(seq_out)
+
+            if cache_state_len > 0:
+                updated_state = full_x.squeeze(0)[:, -cache_state_len:]
+                if updated_state.shape[1] < cache_state_len:
+                    padded_state = torch.zeros(
+                        (dim, cache_state_len),
+                        dtype=updated_state.dtype,
+                        device=updated_state.device,
+                    )
+                    padded_state[:, -updated_state.shape[1] :] = updated_state
+                    updated_state = padded_state
+                conv_states[cache_idx].copy_(updated_state)
+
+        if unsqueeze:
+            out = out.squeeze(-1)
+        return out.to(original_x_dtype)
+
+    for seq_idx in range(query_start_loc.size(0) - 1):
+        start = int(query_start_loc[seq_idx].item())
+        end = int(query_start_loc[seq_idx + 1].item())
+        if end <= start:
+            continue
+
+        cache_idx = (
+            seq_idx if cache_indices is None else int(cache_indices[seq_idx].item())
+        )
+        if cache_idx == pad_slot_id:
+            continue
+
+        use_initial_state = has_initial_state is None or bool(
+            has_initial_state[seq_idx].item()
+        )
+        prev_state = (
+            conv_states[cache_idx][:, -state_len:]
+            if state_len > 0 and use_initial_state
+            else zero_state
+        )
+        channels_first = x.dim() == 2 and x.shape[0] == dim
+        seq_x = x[:, start:end] if channels_first else x[start:end].transpose(0, 1)
+        full_x = torch.cat((prev_state, seq_x), dim=1).unsqueeze(0)
+        seq_out = F.conv1d(full_x, weight_conv, bias=bias, groups=dim).squeeze(0)
+        if activation in ["silu", "swish"]:
+            seq_out = F.silu(seq_out)
+        if channels_first:
+            out[:, start:end] = seq_out
+        else:
+            out[start:end] = seq_out.transpose(0, 1)
+
+        if cache_state_len > 0:
+            updated_state = full_x.squeeze(0)[:, -cache_state_len:]
+            if updated_state.shape[1] < cache_state_len:
+                padded_state = torch.zeros(
+                    (dim, cache_state_len),
+                    dtype=updated_state.dtype,
+                    device=updated_state.device,
+                )
+                padded_state[:, -updated_state.shape[1] :] = updated_state
+                updated_state = padded_state
+            conv_states[cache_idx].copy_(updated_state)
+
+    return out.to(original_x_dtype)
+
+
+def _causal_conv1d_gfx906_decode_update_fallback(
+    x: torch.Tensor,
+    conv_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_state_indices: torch.Tensor | None,
+    activation: str | None,
+    pad_slot_id: int,
+) -> torch.Tensor:
+    original_x_dtype = x.dtype
+    x = x.to(conv_states.dtype)
+    unsqueeze = x.dim() == 2
+    if unsqueeze:
+        x = x.unsqueeze(-1)
+
+    batch, dim, seqlen = x.shape
+    _, width = weight.shape
+    cache_state_len = conv_states.shape[-1]
+    conv_state_len = width - 1
+
+    if conv_state_indices is None:
+        raw_indices = torch.arange(batch, dtype=torch.long, device=x.device)
+    else:
+        raw_indices = conv_state_indices.to(dtype=torch.long)
+
+    if pad_slot_id is None:
+        valid_mask = torch.ones(batch, dtype=torch.bool, device=x.device)
+    else:
+        valid_mask = raw_indices != pad_slot_id
+    safe_indices = raw_indices.clamp(0, conv_states.shape[0] - 1)
+
+    prev_state = conv_states.index_select(0, safe_indices)
+    if conv_state_len > 0:
+        prev_state = prev_state[:, :, -conv_state_len:]
+        full_x = torch.cat((prev_state, x), dim=-1)
+    else:
+        full_x = x
+
+    weight = weight.to(dtype=x.dtype)
+    if bias is None:
+        out = torch.zeros_like(x)
+    else:
+        out = bias.to(dtype=x.dtype).view(1, dim, 1).expand(batch, dim, seqlen).clone()
+    for idx in range(width):
+        out = out + full_x[:, :, idx : idx + seqlen] * weight[:, idx].view(1, dim, 1)
+
+    if activation in ["silu", "swish"]:
+        out = F.silu(out)
+    out = torch.where(valid_mask.view(batch, 1, 1), out, torch.zeros_like(out))
+
+    if cache_state_len > 0:
+        updated_state = full_x[:, :, -cache_state_len:]
+        if updated_state.shape[-1] < cache_state_len:
+            updated_state = F.pad(
+                updated_state,
+                (cache_state_len - updated_state.shape[-1], 0),
+            )
+        for seq_idx in range(batch):
+            state_idx = safe_indices[seq_idx : seq_idx + 1]
+            current_state = conv_states.index_select(0, state_idx)
+            source_state = torch.where(
+                valid_mask[seq_idx].view(1, 1, 1),
+                updated_state[seq_idx : seq_idx + 1],
+                current_state,
+            )
+            conv_states.index_copy_(0, state_idx, source_state)
+
+    if unsqueeze:
+        out = out.squeeze(-1)
+    return out.to(original_x_dtype)
 
 
 @triton.jit()
@@ -536,6 +723,25 @@ def causal_conv1d_fn(
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
+
+    capability = current_platform.get_device_capability()
+    if (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    ):
+        return _causal_conv1d_gfx906_fallback(
+            x=x,
+            weight=weight,
+            bias=bias,
+            conv_states=conv_states,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+        )
 
     args = None
     # Store original dtype to cast back at the end
@@ -1126,6 +1332,34 @@ def causal_conv1d_update(
         activation = "silu" if activation is True else None
     elif activation is not None:
         assert activation in ["silu", "swish"]
+
+    use_gfx906_fallback = (
+        current_platform.is_rocm()
+        and current_platform.get_device_capability() == (9, 0)
+        and not envs.VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE
+    )
+    if use_gfx906_fallback:
+        if query_start_loc is None and num_accepted_tokens is None:
+            return _causal_conv1d_gfx906_decode_update_fallback(
+                x=x,
+                conv_states=conv_state,
+                weight=weight,
+                bias=bias,
+                conv_state_indices=conv_state_indices,
+                activation=activation,
+                pad_slot_id=pad_slot_id,
+            )
+        return _causal_conv1d_gfx906_fallback(
+            x=x,
+            weight=weight,
+            bias=bias,
+            conv_states=conv_state,
+            query_start_loc=query_start_loc,
+            cache_indices=conv_state_indices,
+            has_initial_state=None,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+        )
 
     original_x_dtype = x.dtype
     x = x.to(conv_state.dtype)

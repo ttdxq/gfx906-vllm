@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.platforms import current_platform
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -39,6 +40,14 @@ from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
+
+
+def _maybe_disable_v1_multiprocessing(enabled: bool) -> bool:
+    if enabled and current_platform.is_rocm():
+        logger.warning_once("Disabling V1 multiprocessing on ROCm for compatibility.")
+        return False
+    return enabled
+
 
 _R = TypeVar("_R", default=Any)
 
@@ -158,7 +167,9 @@ class LLMEngine:
             log_stats=(not disable_log_stats),
             usage_context=usage_context,
             stat_loggers=stat_loggers,
-            multiprocess_mode=envs.VLLM_ENABLE_V1_MULTIPROCESSING,
+            multiprocess_mode=_maybe_disable_v1_multiprocessing(
+                envs.VLLM_ENABLE_V1_MULTIPROCESSING
+            ),
         )
 
     @classmethod
@@ -186,7 +197,7 @@ class LLMEngine:
             log_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
-            multiprocess_mode=enable_multiprocessing,
+            multiprocess_mode=_maybe_disable_v1_multiprocessing(enable_multiprocessing),
         )
 
     def get_num_unfinished_requests(self) -> int:

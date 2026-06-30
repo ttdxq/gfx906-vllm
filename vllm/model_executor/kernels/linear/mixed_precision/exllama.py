@@ -10,6 +10,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
@@ -31,6 +32,9 @@ class ExllamaLinearKernel(MPLinearKernel):
                 False,
                 "Exllama is only supported on CUDA and ROCm",
             )
+
+        if current_platform.is_rocm() and on_gfx906():
+            return False, "Exllama is disabled on ROCm gfx906"
 
         if c.has_g_idx and c.partition_weight_shape[0] != c.full_weight_shape[0]:
             return (

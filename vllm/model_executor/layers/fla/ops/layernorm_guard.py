@@ -20,10 +20,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
 from .utils import input_guard
+
+
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
 
 
 def rms_norm_ref(
@@ -313,6 +324,16 @@ def layernorm_fn(
 def rmsnorm_fn(
     x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True
 ):
+    if _is_gfx906_rocm():
+        return rms_norm_ref(
+            x,
+            weight,
+            bias,
+            z=z,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+        )
     return LayerNormFn.apply(
         x, weight, bias, z, eps, group_size, norm_before_gate, True
     )

@@ -2,14 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 
 from vllm.config import ModelConfig
+from vllm.inputs import EmbedsPrompt
 from vllm.inputs import zip_enc_dec_prompts
 from vllm.inputs.parse import parse_raw_prompts
 from vllm.inputs.preprocess import InputPreprocessor
+from vllm.renderers.hf import HfRenderer
 from vllm.tokenizers import init_tokenizer_from_config
 
 pytestmark = pytest.mark.cpu_test
+
+
+class _DummyRendererModelConfig:
+    max_model_len = 16
+    encoder_config = None
+    enable_prompt_embeds = True
+
+
+class _DummyRendererConfig:
+    model_config = _DummyRendererModelConfig()
 
 STRING_INPUTS = [
     "",
@@ -116,3 +129,19 @@ def test_preprocessor_always_mm_code_path(model_id, prompt):
 
     processed_inputs = input_preprocessor.preprocess(prompt)
     assert sep_token_id in processed_inputs["prompt_token_ids"]
+
+
+def test_renderer_process_embeds_preserves_token_mask():
+    renderer = HfRenderer(_DummyRendererConfig(), tokenizer=None)
+
+    processed = renderer._process_embeds(
+        EmbedsPrompt(
+            prompt_embeds=torch.ones((1, 2, 3), dtype=torch.float32),
+            prompt_token_ids=[11, 22],
+            prompt_is_token_ids=[True, False],
+        )
+    )
+
+    assert processed["prompt_embeds"].shape == (2, 3)
+    assert processed["prompt_token_ids"] == [11, 22]
+    assert processed["is_token_ids"] == [True, False]

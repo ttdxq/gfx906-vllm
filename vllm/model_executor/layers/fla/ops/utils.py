@@ -135,12 +135,17 @@ def _check_platform() -> Literal["nvidia", "amd", "intel", "musa"]:
     return mapping.get(device, device)
 
 
-# For AMD GPUs, the triton backend is 'hip', while for Nvidia GPUs, the triton backend is 'cuda'.
-# However, the torch backend is 'cuda' for both Nvidia and AMD GPUs.
-# Therefore, we need to check the triton backend to determine the actual GPU vendor.
-device = "cuda" if current_platform.is_cuda_alike() else get_available_device()
+if current_platform.is_rocm():
+    device = "cuda"
+    device_platform = "amd"
+elif current_platform.is_cuda():
+    device = "cuda"
+    device_platform = "nvidia"
+else:
+    device = get_available_device()
+    device_platform = _check_platform()
+
 device_torch_lib = getattr(torch, device, None)
-device_platform = _check_platform()
 
 is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"

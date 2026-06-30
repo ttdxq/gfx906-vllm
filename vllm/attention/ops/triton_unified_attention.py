@@ -53,10 +53,7 @@ def find_seq_idx(
     return left - 1
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_stages=1, num_warps=2)],
-    key=[]
-)
+@triton.autotune(configs=[triton.Config({}, num_stages=1, num_warps=2)], key=[])
 @triton.jit
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -356,10 +353,7 @@ def kernel_unified_attention_2d(
     )
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_stages=1, num_warps=2)],
-    key=[]
-)
+@triton.autotune(configs=[triton.Config({}, num_stages=1, num_warps=2)], key=[])
 @triton.jit
 def kernel_unified_attention_3d(
     segm_output_ptr,
@@ -740,6 +734,210 @@ def reduce_segments(
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
+
+
+def _unified_attention_eager(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    seqused_k,
+    block_table,
+    softmax_scale,
+    k_descale=None,
+    v_descale=None,
+    causal=True,
+    window_size=None,
+    softcap=0.0,
+    alibi_slopes=None,
+    qq_bias=None,
+    sinks=None,
+):
+    if alibi_slopes is not None or qq_bias is not None or sinks is not None:
+        raise NotImplementedError(
+            "gfx906 eager fallback does not support alibi, qq_bias, or sinks."
+        )
+
+    if q.numel() == 0:
+        return
+
+    block_size = k.shape[1]
+    num_query_heads = q.shape[1]
+    num_kv_heads = k.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    num_seqs = len(seqused_k)
+
+    if isinstance(window_size, (tuple, list)):
+        window_size = window_size[0]
+    if window_size is None or window_size < 0:
+        window_size = 0
+
+    def _gather_seq_kv(seq_idx: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        num_blocks = (seq_len + block_size - 1) // block_size
+        seq_block_ids = block_table[seq_idx, :num_blocks].to(dtype=torch.long)
+        seq_k = (
+            k.index_select(0, seq_block_ids)
+            .contiguous()
+            .reshape(-1, num_kv_heads, q.shape[2])[:seq_len]
+        )
+        seq_v = (
+            v.index_select(0, seq_block_ids)
+            .contiguous()
+            .reshape(-1, num_kv_heads, q.shape[2])[:seq_len]
+        )
+
+        if k_descale is not None:
+            seq_k = seq_k.float() * k_descale[seq_idx].view(1, num_kv_heads, 1)
+        if v_descale is not None:
+            seq_v = seq_v.float() * v_descale[seq_idx].view(1, num_kv_heads, 1)
+        return seq_k.to(dtype=q.dtype), seq_v.to(dtype=q.dtype)
+
+    for seq_idx in range(num_seqs):
+        q_start = int(cu_seqlens_q[seq_idx].item())
+        q_end = int(cu_seqlens_q[seq_idx + 1].item())
+        q_len = q_end - q_start
+        if q_len <= 0:
+            continue
+
+        seq_len = int(seqused_k[seq_idx].item())
+        if seq_len <= 0:
+            continue
+
+        seq_q = q[q_start:q_end]
+        seq_k, seq_v = _gather_seq_kv(seq_idx, seq_len)
+
+        q_t = (seq_q.transpose(0, 1) * softmax_scale).contiguous()
+        k_t = seq_k.transpose(0, 1).contiguous()
+        v_t = seq_v.transpose(0, 1).contiguous()
+
+        if num_queries_per_kv > 1:
+            k_t = k_t.repeat_interleave(num_queries_per_kv, dim=0)
+            v_t = v_t.repeat_interleave(num_queries_per_kv, dim=0)
+
+        attn_mask = None
+        if causal or window_size > 0:
+            q_positions = (seq_len - q_len) + torch.arange(q_len, device=q.device)
+            kv_positions = torch.arange(seq_len, device=q.device)
+            allowed = torch.ones((q_len, seq_len), dtype=torch.bool, device=q.device)
+            if causal:
+                allowed &= kv_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
+            if window_size > 0:
+                allowed &= kv_positions.unsqueeze(0) >= (
+                    q_positions.unsqueeze(1) - window_size + 1
+                )
+
+            attn_mask = torch.full(
+                (q_len, seq_len),
+                float("-inf"),
+                dtype=q_t.dtype,
+                device=q.device,
+            )
+            attn_mask.masked_fill_(allowed, 0)
+            attn_mask = attn_mask.unsqueeze(0)
+
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1))
+        if softcap > 0:
+            scores = softcap * torch.tanh(scores / softcap)
+        if attn_mask is not None:
+            scores = scores + attn_mask
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q_t.dtype)
+        out_t = torch.matmul(probs, v_t)
+
+        out[q_start:q_end].copy_(out_t.transpose(0, 1))
+
+
+def _unified_attention_decode_eager(
+    q,
+    k,
+    v,
+    out,
+    seqused_k,
+    block_table,
+    max_seqlen_k,
+    softmax_scale,
+    k_descale=None,
+    v_descale=None,
+    causal=True,
+    window_size=None,
+    softcap=0.0,
+):
+    block_size = k.shape[1]
+    num_query_heads = q.shape[1]
+    num_kv_heads = k.shape[2]
+    head_size = q.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    num_seqs = q.shape[0]
+
+    if isinstance(window_size, (tuple, list)):
+        window_size = window_size[0]
+    if window_size is None or window_size < 0:
+        window_size = 0
+
+    max_blocks = (max_seqlen_k + block_size - 1) // block_size
+    seq_block_ids = block_table[:num_seqs, :max_blocks].to(dtype=torch.long)
+    flat_block_ids = seq_block_ids.reshape(-1)
+    seq_k = (
+        k.index_select(0, flat_block_ids)
+        .reshape(num_seqs, max_blocks * block_size, num_kv_heads, head_size)
+        .contiguous()[:, :max_seqlen_k]
+    )
+    seq_v = (
+        v.index_select(0, flat_block_ids)
+        .reshape(num_seqs, max_blocks * block_size, num_kv_heads, head_size)
+        .contiguous()[:, :max_seqlen_k]
+    )
+
+    use_k_descale = k_descale is not None and k.element_size() == 1
+    use_v_descale = v_descale is not None and v.element_size() == 1
+    if use_k_descale:
+        k_descale = k_descale.reshape(num_seqs, num_kv_heads)
+        seq_k = seq_k.float() * k_descale.view(num_seqs, 1, num_kv_heads, 1)
+    if use_v_descale:
+        v_descale = v_descale.reshape(num_seqs, num_kv_heads)
+        seq_v = seq_v.float() * v_descale.view(num_seqs, 1, num_kv_heads, 1)
+    seq_k = seq_k.to(dtype=q.dtype)
+    seq_v = seq_v.to(dtype=q.dtype)
+
+    q_t = (q * softmax_scale).reshape(
+        num_seqs, num_kv_heads, num_queries_per_kv, head_size
+    )
+    k_t = seq_k.permute(0, 2, 3, 1)
+    scores = torch.matmul(q_t, k_t)
+    if softcap > 0:
+        scores = softcap * torch.tanh(scores / softcap)
+
+    kv_positions = torch.arange(max_seqlen_k, device=q.device)
+    q_positions = seqused_k[:num_seqs].to(dtype=torch.long) - 1
+    allowed = kv_positions.view(1, 1, 1, max_seqlen_k) < seqused_k[:num_seqs].view(
+        num_seqs, 1, 1, 1
+    )
+    if causal:
+        allowed = allowed & (
+            kv_positions.view(1, 1, 1, max_seqlen_k)
+            <= q_positions.view(num_seqs, 1, 1, 1)
+        )
+    if window_size > 0:
+        allowed = allowed & (
+            kv_positions.view(1, 1, 1, max_seqlen_k)
+            >= (q_positions.view(num_seqs, 1, 1, 1) - window_size + 1)
+        )
+    scores = scores.masked_fill(~allowed, float("-inf"))
+
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    out_t = torch.matmul(probs, seq_v.permute(0, 2, 1, 3))
+    out_t = out_t.reshape(num_seqs, num_query_heads, head_size)
+    out[:num_seqs].copy_(out_t)
+
+
 def unified_attention(
     q,
     k,
@@ -763,6 +961,49 @@ def unified_attention(
     # Optional tensor for sinks
     sinks=None,
 ):
+    # gfx906 eager fallback for unsupported Triton kernels
+    if _is_gfx906_rocm():
+        if (
+            max_seqlen_q == 1
+            and alibi_slopes is None
+            and qq_bias is None
+            and sinks is None
+            and q_descale is None
+        ):
+            return _unified_attention_decode_eager(
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                seqused_k=seqused_k,
+                block_table=block_table,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap if softcap is not None else 0.0,
+            )
+        return _unified_attention_eager(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            block_table=block_table,
+            softmax_scale=softmax_scale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap if softcap is not None else 0.0,
+            alibi_slopes=alibi_slopes,
+            qq_bias=qq_bias,
+            sinks=sinks,
+        )
+
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
@@ -811,12 +1052,11 @@ def unified_attention(
     def _prev_power_of_two(x: int) -> int:
         if x <= 1:
             return 1
-        return 1 << ((x.bit_length() - 1))
+        return 1 << (x.bit_length() - 1)
 
     preferred_prefill = min(_next_power_of_two(block_size), 256)
     preferred_prefill = max(preferred_prefill, min_tile_size)
-    preferred_decode = max(min_tile_size,
-                           16 if q.element_size() >= 2 else 32)
+    preferred_decode = max(min_tile_size, 16 if q.element_size() >= 2 else 32)
     preferred_decode = min(preferred_decode, preferred_prefill)
 
     max_tile_shared = None
@@ -831,8 +1071,9 @@ def unified_attention(
             # Fallback to the architectural minimum when runtime does not report.
             shared_mem_limit = 64 * 1024
         if shared_mem_limit and shared_mem_limit > 0:
-            head_bytes = max(2 * head_size_padded *
-                             max(k.element_size(), v.element_size(), 1), 1)
+            head_bytes = max(
+                2 * head_size_padded * max(k.element_size(), v.element_size(), 1), 1
+            )
             softmax_bytes = max(BLOCK_M * 4, 1)
             max_tile_per_head = shared_mem_limit // head_bytes
             max_tile_softmax = shared_mem_limit // softmax_bytes
@@ -863,7 +1104,9 @@ def unified_attention(
             while tile > max_tile_shared and tile > abs_min_tile_size:
                 tile //= 2
         if shared_mem_limit and shared_mem_limit > 0:
-            while tile > abs_min_tile_size and _estimate_shared(tile) > shared_mem_limit:
+            while (
+                tile > abs_min_tile_size and _estimate_shared(tile) > shared_mem_limit
+            ):
                 tile //= 2
         return max(tile, abs_min_tile_size)
 

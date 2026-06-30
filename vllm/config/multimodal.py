@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Mapping
-from typing import Any, Literal, TypeAlias
+from pathlib import Path
+from typing import Any, Literal, TypeAlias, TypedDict, final
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 from pydantic.dataclasses import dataclass
@@ -45,9 +46,24 @@ class AudioDummyOptions(BaseDummyOptions):
 
 MMEncoderTPMode = Literal["weights", "data"]
 MMCacheType = Literal["shm", "lru"]
+MMTensorIPC = Literal["direct_rpc", "torch_shm"]
 DummyOptions: TypeAlias = (
     BaseDummyOptions | VideoDummyOptions | ImageDummyOptions | AudioDummyOptions
 )
+
+
+@final
+class MultiModalDummyOptionsBuiltins(TypedDict, total=False):
+    """Type annotations for modality types predefined by vLLM."""
+
+    image: ImageDummyOptions
+    """Options for dummy images."""
+
+    video: VideoDummyOptions
+    """Options for dummy videos."""
+
+    audio: AudioDummyOptions
+    """Options for dummy audios."""
 
 
 @config
@@ -125,6 +141,22 @@ class MultiModalConfig:
     """Optional override for the multi-modal encoder attention backend when
     using vision transformers. Accepts any value from
     `vllm.attention.backends.registry.AttentionBackendEnum` (e.g. `FLASH_ATTN`)."""
+    mm_encoder_attn_dtype: Literal["fp8"] | None = None
+    """Optional dtype override for ViT encoder attention. Set to `"fp8"` to
+    enable FP8 quantization via the FlashInfer cuDNN backend. When set to
+    `"fp8"` without a scale file, dynamic scaling is used automatically."""
+    mm_encoder_fp8_scale_path: str | None = None
+    """Path to a JSON file containing per-layer FP8 Q/K/V scales for ViT
+    encoder attention. When provided (with `mm_encoder_attn_dtype="fp8"`),
+    static scaling is used. When omitted, dynamic scaling is used."""
+    mm_encoder_fp8_scale_save_path: str | None = None
+    """When set with dynamic FP8 scaling (`mm_encoder_attn_dtype="fp8"` and no
+    `mm_encoder_fp8_scale_path`), saves the calibrated scales to this file
+    after the amax history buffer is full."""
+    mm_encoder_fp8_scale_save_margin: float = Field(default=1.5, gt=0.0)
+    """Safety margin multiplied onto scales when auto-saving. A value > 1 leaves
+    headroom so that inputs with larger activations than the calibration set do
+    not overflow FP8 range. Default 1.5."""
     mm_encoder_only: bool = False
     """If `True`, the language model component is skipped and only the
     multi-modal encoder is initialized and used. This is useful for
@@ -144,6 +176,24 @@ class MultiModalConfig:
     Value sits in range [0;1) and determines fraction of media tokens
     from each video to be pruned.
     """
+    language_model_only: bool = False
+    """If True, disables all multimodal inputs by setting all modality limits to
+    0. Equivalent to setting `--limit-mm-per-prompt` to 0 for every modality."""
+    mm_tensor_ipc: MMTensorIPC = "direct_rpc"
+    """IPC (inter-process communication) method for multimodal tensors.
+    - "direct_rpc": Use msgspec serialization via RPC
+    - "torch_shm": Use torch.multiprocessing shared memory for zero-copy IPC
+    Defaults to "direct_rpc"."""
+    mm_ipc_gpu_memory_gb: float = Field(default=0, ge=0)
+    """Amount of GPU memory (in GiB) sequestered on the engine's device for
+    GPU-side multimodal work in the API-server (frontend) process, such as
+    hardware video decoding.
+
+    This budget is carved out of the engine's KV-cache memory so the headroom
+    physically exists, and frontend GPU decode paths acquire from a blocking
+    byte-counting semaphore of this size before allocating on the device.
+
+    Set to `0` (default) to disable frontend GPU multimodal memory gating."""
 
     @field_validator("limit_per_prompt", mode="before")
     @classmethod
@@ -194,6 +244,34 @@ class MultiModalConfig:
                 "'mm_shm_cache_max_object_size_mb' should only be set when "
                 "'mm_processor_cache_type' is 'shm'."
             )
+        if self.mm_encoder_attn_dtype != "fp8" and (
+            self.mm_encoder_fp8_scale_path is not None
+            or self.mm_encoder_fp8_scale_save_path is not None
+        ):
+            raise ValueError(
+                "'mm_encoder_fp8_scale_path' and "
+                "'mm_encoder_fp8_scale_save_path' require "
+                "'mm_encoder_attn_dtype' to be 'fp8'."
+            )
+        if (
+            self.mm_encoder_fp8_scale_path is not None
+            and self.mm_encoder_fp8_scale_save_path is not None
+        ):
+            raise ValueError(
+                "'mm_encoder_fp8_scale_save_path' cannot be used with "
+                "'mm_encoder_fp8_scale_path' (saving requires dynamic scaling)."
+            )
+        if self.mm_encoder_fp8_scale_path is not None:
+            scale_path = Path(self.mm_encoder_fp8_scale_path)
+            if not scale_path.is_file():
+                raise FileNotFoundError(f"FP8 scale file not found: {scale_path}")
+        if self.mm_encoder_fp8_scale_save_path is not None:
+            save_parent = Path(self.mm_encoder_fp8_scale_save_path).parent
+            if not save_parent.is_dir():
+                raise FileNotFoundError(
+                    f"Parent directory for FP8 scale save path not found: "
+                    f"{save_parent}"
+                )
         return self
 
     def compute_hash(self) -> str:
@@ -211,7 +289,10 @@ class MultiModalConfig:
         factors: list[Any] = [
             self.mm_encoder_attn_backend.name
             if self.mm_encoder_attn_backend is not None
-            else None
+            else None,
+            self.mm_encoder_tp_mode,
+            self.mm_encoder_attn_dtype,
+            self.mm_encoder_fp8_scale_path,
         ]
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -221,6 +302,9 @@ class MultiModalConfig:
         Get the maximum number of input items allowed per prompt
         for the given modality (backward compatible).
         """
+        if self.language_model_only:
+            return 0
+
         limit_data = self.limit_per_prompt.get(modality)
 
         if limit_data is None:

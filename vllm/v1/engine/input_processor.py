@@ -6,8 +6,12 @@ from collections.abc import Mapping
 from typing import Any, Literal, cast
 
 from vllm.config import VllmConfig
-from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs
-from vllm.inputs.parse import split_enc_dec_inputs
+from vllm.inputs import (
+    EngineInput,
+    PromptType,
+    SingletonInput,
+    split_enc_dec_input,
+)
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -17,6 +21,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
 from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.multimodal.utils import argsort_mm_positions
+from vllm.renderers import renderer_from_config
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import MistralTokenizer, TokenizerLike
@@ -53,11 +58,12 @@ class InputProcessor:
         self.mm_registry = mm_registry
         self.mm_processor_cache = processor_cache_from_config(vllm_config, mm_registry)
 
+        renderer = renderer_from_config(vllm_config, tokenizer=tokenizer)
+
         self.input_preprocessor = InputPreprocessor(
-            self.model_config,
-            tokenizer,
-            mm_registry,
-            mm_processor_cache=self.mm_processor_cache,
+            vllm_config,
+            renderer=renderer,
+            mm_registry=mm_registry,
         )
 
     @property
@@ -66,7 +72,7 @@ class InputProcessor:
 
     @tokenizer.setter
     def tokenizer(self, tokenizer: TokenizerLike | None) -> None:
-        self.input_preprocessor.tokenizer = tokenizer
+        self.input_preprocessor.renderer.tokenizer = tokenizer
 
     def _validate_logprobs(
         self,
@@ -181,7 +187,7 @@ class InputProcessor:
         self._validate_sampling_params(params)
         self._validate_supported_sampling_params(params)
 
-    def _validate_multi_modal_uuids(self, prompt: PromptType) -> None:
+    def _validate_multi_modal_uuids(self, prompt: PromptType | EngineInput) -> None:
         """
         Validate that user-provided multi_modal_uuids align with
         multi_modal_data in the incoming request prompt(s).
@@ -347,7 +353,7 @@ class InputProcessor:
     def _maybe_build_mm_uuids(
         self,
         request_id: str,
-        prompt: PromptType,
+        prompt: PromptType | EngineInput,
     ) -> MultiModalUUIDDict | None:
         """Build per-item multimodal hash overrides when enabled. In this case,
         multimodal data items are identified by their request id, modality and
@@ -385,7 +391,7 @@ class InputProcessor:
     def process_inputs(
         self,
         request_id: str,
-        prompt: PromptType,
+        prompt: PromptType | EngineInput,
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
@@ -438,7 +444,7 @@ class InputProcessor:
         # 1. Tokenize text prompt, with LoRA request if one exists.
         # 2. For multimodal models with a merged preprocessor, preprocess
         #   multimodal data and expand prompt token ids accordingly.
-        processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
+        processed_inputs: EngineInput = self.input_preprocessor.preprocess(
             prompt,
             tokenization_kwargs=tokenization_kwargs,
             mm_uuids=mm_uuids,
@@ -451,9 +457,9 @@ class InputProcessor:
             processed_inputs=processed_inputs,
         )
 
-        eos_token_id = self.input_preprocessor.get_eos_token_id()
+        eos_token_id = self.input_preprocessor.renderer.get_eos_token_id()
 
-        encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
+        encoder_inputs, decoder_inputs = split_enc_dec_input(processed_inputs)
         self._validate_model_inputs(encoder_inputs, decoder_inputs)
 
         # Mypy can be conservative for TypedDict unions; normalize access.
@@ -524,7 +530,7 @@ class InputProcessor:
         )
 
     def _validate_model_inputs(
-        self, encoder_inputs: SingletonInputs | None, decoder_inputs: SingletonInputs
+        self, encoder_inputs: SingletonInput | None, decoder_inputs: SingletonInput
     ):
         if encoder_inputs is not None:
             self._validate_model_input(encoder_inputs, prompt_type="encoder")
@@ -533,7 +539,7 @@ class InputProcessor:
 
     def _validate_model_input(
         self,
-        prompt_inputs: SingletonInputs,
+        prompt_inputs: SingletonInput,
         *,
         prompt_type: Literal["encoder", "decoder"],
     ):

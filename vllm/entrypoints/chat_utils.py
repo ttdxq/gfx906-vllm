@@ -51,6 +51,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalDataDict, MultiModalU
 from vllm.multimodal.utils import MEDIA_CONNECTOR_REGISTRY, MediaConnector
 from vllm.tokenizers import MistralTokenizer, TokenizerLike
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
+from vllm.transformers_utils.utils import check_gguf_file
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils import random_uuid
 from vllm.utils.func_utils import supports_kw
@@ -1681,6 +1682,10 @@ def _resolve_chat_template_kwargs(
 
 _cached_resolve_chat_template_kwargs = lru_cache(_resolve_chat_template_kwargs)
 
+_EMPTY_CLOSED_THINK_SUFFIX = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+_QWEN3_5_MODEL_TYPE = "qwen3_5_text"
+_QWEN3_5_ARCHITECTURE = "Qwen3_5ForCausalLM"
+
 
 @lru_cache
 def _get_hf_base_chat_template_params() -> frozenset[str]:
@@ -1731,6 +1736,33 @@ def resolve_chat_template_kwargs(
     return {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
 
 
+def _is_qwen3_5_model(model_config: ModelConfig) -> bool:
+    model_type = getattr(model_config.hf_config, "model_type", None)
+    architectures = getattr(model_config.hf_config, "architectures", None)
+    return model_type == _QWEN3_5_MODEL_TYPE or (
+        isinstance(architectures, list)
+        and _QWEN3_5_ARCHITECTURE in architectures
+    )
+
+
+def _normalize_qwen3_5_thinking_off_prompt(
+    rendered: str,
+    *,
+    model_config: ModelConfig,
+    enable_thinking: object,
+) -> str:
+    if enable_thinking is not False:
+        return rendered
+
+    if not _is_qwen3_5_model(model_config):
+        return rendered
+
+    if not rendered.endswith(_EMPTY_CLOSED_THINK_SUFFIX):
+        return rendered
+
+    return rendered.removesuffix(_EMPTY_CLOSED_THINK_SUFFIX) + "<|im_start|>assistant\n"
+
+
 def apply_hf_chat_template(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     conversation: list[ConversationMessage],
@@ -1768,15 +1800,11 @@ def apply_hf_chat_template(
             tokenize=False,
             **resolved_kwargs,
         )
-        if (
-            model_config.hf_config.model_type.startswith("qwen3_5")
-            and model_config.quantization == "gguf"
-        ):
-            for suffix in ("<think>\n\n</think>\n\n", "<think>\n"):
-                if rendered.endswith(f"<|im_start|>assistant\n{suffix}"):
-                    rendered = rendered[: -len(suffix)]
-                    break
-        return rendered
+        return _normalize_qwen3_5_thinking_off_prompt(
+            rendered,
+            model_config=model_config,
+            enable_thinking=resolved_kwargs.get("enable_thinking"),
+        )
 
     # External library exceptions can sometimes occur despite the framework's
     # internal exception management capabilities.

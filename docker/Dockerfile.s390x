@@ -226,7 +226,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=numba-builder,source=/tmp/llvmlite/dist,target=/tmp/llvmlite-wheels/ \
     --mount=type=bind,from=numba-builder,source=/tmp/numba/dist,target=/tmp/numba-wheels/ \
     --mount=type=bind,from=outlines-core-builder,source=/tmp/outlines-core/dist,target=/tmp/outlines-core/dist/ \
-     sed -i '/^torch/d' requirements/build.txt && \
+     sed -i '/^torch/d' requirements/build/cpu.txt && \
      ARROW_WHL_FILE=$(ls /tmp/arrow-wheels/pyarrow-*.whl) && \
      VISION_WHL_FILE=$(ls /tmp/vision-wheels/*.whl) && \
      HF_XET_WHL_FILE=$(ls /tmp/hf-xet-wheels/*.whl) && \
@@ -241,7 +241,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         $NUMBA_WHL_FILE \
         $OUTLINES_CORE_WHL_FILE \
         --index-strategy unsafe-best-match \
-        -r requirements/build.txt \
+        -r requirements/build/cpu.txt \
         -r requirements/cpu.txt
 
 

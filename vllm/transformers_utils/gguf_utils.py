@@ -165,6 +165,20 @@ def maybe_patch_hf_config_from_gguf(
             )
             hf_config = new_hf_config
 
+    if (
+        mmproj_path is None
+        and getattr(hf_config, "model_type", "") in ("qwen3_5", "qwen3_5_text")
+        and getattr(hf_config, "architectures", None) == ["Qwen3_5ForCausalLM"]
+    ):
+        hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
+    if getattr(hf_config, "model_type", "") in ("qwen3_5", "qwen3_5_text"):
+        rope_parameters = getattr(hf_config, "rope_parameters", None)
+        if (
+            isinstance(rope_parameters, dict)
+            and "theta" in rope_parameters
+        ):
+            rope_parameters["rope_theta"] = rope_parameters.pop("theta")
+
     return hf_config
 
 

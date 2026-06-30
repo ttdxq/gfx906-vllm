@@ -96,7 +96,12 @@ def get_vit_attn_backend(
 
     selected_backend: AttentionBackendEnum | None = get_env_variable_attn_backend()
     if selected_backend is not None:
-        return selected_backend
+        if selected_backend == AttentionBackendEnum.ROCM_ATTN:
+            logger.info_once(
+                "Ignoring ROCM_ATTN override for ViT attention; using platform-selected ViT backend instead."
+            )
+        else:
+            return selected_backend
 
     return current_platform.get_vit_attn_backend(head_size, dtype)
 

@@ -10,6 +10,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if current_platform.is_cuda():
@@ -82,14 +83,18 @@ def dispatch_rotary_emb_function(
     # otherwise use the naive pytorch embedding implementation
     # is faster when torch compile is enabled.
     if current_platform.is_rocm() and not torch.compiler.is_compiling():
-        if find_spec("flash_attn") is not None:
+        if find_spec("flash_attn") is not None and not on_gfx906():
             from flash_attn.ops.triton.rotary import apply_rotary
 
             return apply_rotary
-        else:
+        if find_spec("flash_attn") is None:
             logger.warning(
                 "flash_attn is not installed. Falling back to PyTorch "
                 "implementation for rotary embeddings."
+            )
+        elif on_gfx906():
+            logger.info_once(
+                "[gfx906] Falling back to PyTorch implementation for rotary embeddings."
             )
     if default is not None:
         return default

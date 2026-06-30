@@ -239,7 +239,8 @@ def default_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
-    return torch.nn.functional.linear(x, weight, bias)
+    linear_input = x if x.dtype == weight.dtype else x.to(weight.dtype)
+    return torch.nn.functional.linear(linear_input, weight, bias)
 
 
 def use_aiter_triton_gemm(n, m, k, dtype):
@@ -285,28 +286,14 @@ def rocm_unquantized_gemm_impl(
         out = ops.LLMM1(weight, x_view, 4)
         return out.view(*x.shape[:-1], weight.shape[0])
 
-    # For all other cases, use triton matmul to avoid hipBLAS errors
-    out = triton_matmul(x, weight)
-    if bias is not None:
-        out = out + bias
-    return out
+    if n <= 16 and not on_gfx9():
+        out = triton_matmul(x_view, weight).view(*x.shape[:-1], weight.shape[0])
+        if bias is not None:
+            out = out + bias
+        return out
 
-    x_view = x.reshape(-1, x.size(-1))
-    n = x_view.shape[0]
-    m = weight.shape[0]
-    k = weight.shape[1]
-
-    # prefer skinny GEMV kernel
-    if m % 4 == 0 and n == 1 and k <= 8192 and k % 8 == 0:
-        out = ops.LLMM1(weight, x_view, 4)
-        return out.view(*x.shape[:-1], weight.shape[0])
-
-    # low batch size, use triton matmul
-    if n <= 16:
-        return triton_matmul(x, weight)
-
-    # otherwise, use native torch
-    return torch.nn.functional.linear(x, weight, bias)
+    linear_input = x if x.dtype == weight.dtype else x.to(weight.dtype)
+    return torch.nn.functional.linear(linear_input, weight, bias)
 
 
 def rocm_unquantized_gemm_fake(

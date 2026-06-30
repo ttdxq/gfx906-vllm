@@ -313,6 +313,15 @@ class GemmaRMSNorm(CustomOp):
         if torch.compiler.is_compiling():
             return self.forward_native(x, residual)
 
+        capability = current_platform.get_device_capability()
+        if (
+            current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        ):
+            return self.forward_native(x, residual)
+
         if not getattr(self, "_is_compiled", False):
             self.forward_static = torch.compile(  # type: ignore
                 self.forward_static
@@ -361,6 +370,13 @@ class RMSNormGated(CustomOp):
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
+        capability = current_platform.get_device_capability()
+        self._use_native_rocm_gfx90 = (
+            current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        )
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -411,6 +427,9 @@ class RMSNormGated(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if torch.compiler.is_compiling() or self._use_native_rocm_gfx90:
+            return self.forward_native(x, z)
+
         from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
 
         return rmsnorm_fn(

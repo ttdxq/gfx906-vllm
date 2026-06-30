@@ -11,6 +11,7 @@ import os
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 BT_LIST = [8, 16, 32, 64, 128]
@@ -106,6 +107,23 @@ def l2norm_fwd(
     BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
     if D > BD:
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
+
+    capability = current_platform.get_device_capability()
+    if (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    ):
+        x_float = x.float()
+        y = x_float * torch.rsqrt(
+            torch.sum(x_float * x_float, dim=-1, keepdim=True) + eps
+        )
+        if output_dtype is not None:
+            y = y.to(output_dtype)
+        else:
+            y = y.to(x.dtype)
+        return y.view(x_shape_og)
 
     if not USE_DEFAULT_FLA_NORM:
         MBLOCK = 32

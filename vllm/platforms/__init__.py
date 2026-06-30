@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
+import os
 import traceback
 from itertools import chain
 from typing import TYPE_CHECKING
@@ -110,6 +111,17 @@ def cuda_platform_plugin() -> str | None:
 def rocm_platform_plugin() -> str | None:
     is_rocm = False
     logger.debug("Checking if ROCm platform is available.")
+
+    visible_devices_set = any(
+        os.environ.get(var)
+        for var in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
+    )
+    if visible_devices_set:
+        logger.debug(
+            "Selecting ROCm platform directly because GPU visibility env vars are set."
+        )
+        return "vllm.platforms.rocm.RocmPlatform"
+
     try:
         import amdsmi
 
@@ -124,6 +136,27 @@ def rocm_platform_plugin() -> str | None:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
         logger.debug("ROCm platform is not available because: %s", str(e))
+
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["/opt/rocm/bin/rocminfo"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and "gfx" in result.stdout:
+                is_rocm = True
+                logger.debug(
+                    "Confirmed ROCm platform is available via rocminfo fallback."
+                )
+        except Exception as fallback_error:
+            logger.debug(
+                "ROCm rocminfo fallback probe failed because: %s",
+                str(fallback_error),
+            )
 
     return "vllm.platforms.rocm.RocmPlatform" if is_rocm else None
 

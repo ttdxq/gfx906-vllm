@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -33,7 +34,9 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule,
+    fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule,
+    fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
@@ -96,6 +99,17 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _append_qwen35_runtime_debug(message: str) -> None:
+    debug_file = os.environ.get("VLLM_QWEN35_RUNTIME_DEBUG_FILE")
+    if not debug_file:
+        return
+    try:
+        with open(debug_file, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+    except Exception:
+        pass
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
@@ -442,6 +456,37 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         return query, key, value, z, b, a
 
+    def create_qkvz_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> ColumnParallelLinear:
+        return ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=key_dim * 2 + value_dim * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def create_ba_proj(
+        self,
+        hidden_size: int,
+        num_v_heads: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> ColumnParallelLinear:
+        return ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=num_v_heads * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
             return None, None, None
@@ -474,6 +519,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             query = query.repeat_interleave(head_ratio, dim=2)
             key = key.repeat_interleave(head_ratio, dim=2)
         return query.contiguous(), key.contiguous()
+
+    def _use_gfx906_chunk_decode_path(self) -> bool:
+        return True
 
     def forward(
         self,
@@ -638,10 +686,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
             mixed_qkv_non_spec
         )
-        query_spec, key_spec = self._expand_qk_heads_for_gdn(query_spec, key_spec)
-        query_non_spec, key_non_spec = self._expand_qk_heads_for_gdn(
-            query_non_spec, key_non_spec
-        )
+        if getattr(self, "expand_qk_heads_for_gdn", True):
+            query_spec, key_spec = self._expand_qk_heads_for_gdn(
+                query_spec, key_spec
+            )
+            query_non_spec, key_non_spec = self._expand_qk_heads_for_gdn(
+                query_non_spec, key_non_spec
+            )
 
         g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
@@ -663,78 +714,84 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             beta_non_spec = beta
 
         # 2. Recurrent attention
+        use_qk_l2norm_in_kernel = getattr(
+            self, "use_qk_l2norm_in_kernel_for_gdn", True
+        )
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            spec_initial_state = ssm_state.transpose(-1, -2).contiguous()
             core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
                 q=query_spec,
                 k=key_spec,
                 v=value_spec,
                 g=g_spec,
                 beta=beta_spec,
-                initial_state=ssm_state,
+                initial_state=spec_initial_state,
                 inplace_final_state=True,
                 cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
                 ssm_state_indices=spec_state_indices_tensor,
                 num_accepted_tokens=num_accepted_tokens,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
+            ssm_state.copy_(last_recurrent_state.transpose(-1, -2).to(ssm_state.dtype))
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+            initial_state = ssm_state[non_spec_state_indices_tensor].transpose(
+                -1, -2
+            ).contiguous()
             initial_state[~has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-            # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
-            )
-        elif attn_metadata.num_decodes > 0:
+            if getattr(self, "prefix", "") == "language_model.model.layers.0.linear_attn":
+                _append_qwen35_runtime_debug(
+                    "PREFILL q={} k={} v={} g={} beta={} q_stride={} k_stride={} v_stride={} g_stride={} beta_stride={}".format(
+                        tuple(query_non_spec.shape) if query_non_spec is not None else None,
+                        tuple(key_non_spec.shape) if key_non_spec is not None else None,
+                        tuple(value_non_spec.shape) if value_non_spec is not None else None,
+                        tuple(g_non_spec.shape) if g_non_spec is not None else None,
+                        tuple(beta_non_spec.shape) if beta_non_spec is not None else None,
+                        tuple(query_non_spec.stride()) if query_non_spec is not None else None,
+                        tuple(key_non_spec.stride()) if key_non_spec is not None else None,
+                        tuple(value_non_spec.stride()) if value_non_spec is not None else None,
+                        tuple(g_non_spec.stride()) if g_non_spec is not None else None,
+                        tuple(beta_non_spec.stride()) if beta_non_spec is not None else None,
+                    )
+                )
             capability = current_platform.get_device_capability()
-            if (
-                current_platform.is_rocm()
+            use_sigmoid_prefill_for_split_qwen35 = (
+                getattr(self, "split_projections", False)
+                and getattr(self, "use_recurrent_prefill_for_gdn", False)
+                and current_platform.is_rocm()
                 and capability is not None
                 and capability.major == 9
                 and capability.minor == 0
-            ):
-                initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = chunk_gated_delta_rule(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ],
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
+            )
+            if use_sigmoid_prefill_for_split_qwen35:
+                if spec_sequence_masks is not None:
+                    a_non_spec = a.index_select(0, non_spec_token_indx)
+                    b_non_spec = b.index_select(0, non_spec_token_indx)
+                else:
+                    a_non_spec = a
+                    b_non_spec = b
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a_non_spec,
+                        b=b_non_spec,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=initial_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                        ssm_state_indices=None,
+                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    )
                 )
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                    ssm_state.dtype
-                )
-            else:
+            elif getattr(self, "use_recurrent_prefill_for_gdn", False):
                 core_attn_out_non_spec, last_recurrent_state = (
                     fused_recurrent_gated_delta_rule(
                         q=query_non_spec,
@@ -742,15 +799,138 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                         v=value_non_spec,
                         g=g_non_spec,
                         beta=beta_non_spec,
-                        initial_state=ssm_state,
+                        initial_state=initial_state,
                         inplace_final_state=True,
-                        cu_seqlens=non_spec_query_start_loc[
-                            : attn_metadata.num_decodes + 1
-                        ],
-                        ssm_state_indices=non_spec_state_indices_tensor,
-                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                     )
                 )
+            else:
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = chunk_gated_delta_rule(
+                    q=query_non_spec.transpose(1, 2),
+                    k=key_non_spec.transpose(1, 2),
+                    v=value_non_spec.transpose(1, 2),
+                    g=g_non_spec.transpose(1, 2),
+                    beta=beta_non_spec.transpose(1, 2),
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                    head_first=True,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+            # Init cache
+            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.transpose(
+                -1, -2
+            ).to(ssm_state.dtype)
+        elif attn_metadata.num_decodes > 0:
+            if getattr(self, "prefix", "") == "language_model.model.layers.0.linear_attn":
+                _append_qwen35_runtime_debug(
+                    "DECODE q={} k={} v={} g={} beta={} q_stride={} k_stride={} v_stride={} g_stride={} beta_stride={}".format(
+                        tuple(query_non_spec.shape) if query_non_spec is not None else None,
+                        tuple(key_non_spec.shape) if key_non_spec is not None else None,
+                        tuple(value_non_spec.shape) if value_non_spec is not None else None,
+                        tuple(g_non_spec.shape) if g_non_spec is not None else None,
+                        tuple(beta_non_spec.shape) if beta_non_spec is not None else None,
+                        tuple(query_non_spec.stride()) if query_non_spec is not None else None,
+                        tuple(key_non_spec.stride()) if key_non_spec is not None else None,
+                        tuple(value_non_spec.stride()) if value_non_spec is not None else None,
+                        tuple(g_non_spec.stride()) if g_non_spec is not None else None,
+                        tuple(beta_non_spec.stride()) if beta_non_spec is not None else None,
+                    )
+                )
+            capability = current_platform.get_device_capability()
+            if (
+                self._use_gfx906_chunk_decode_path()
+                and current_platform.is_rocm()
+                and capability is not None
+                and capability.major == 9
+                and capability.minor == 0
+            ):
+                initial_state = ssm_state[non_spec_state_indices_tensor].transpose(
+                    -1, -2
+                ).contiguous()
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = chunk_gated_delta_rule(
+                    q=query_non_spec.transpose(1, 2),
+                    k=key_non_spec.transpose(1, 2),
+                    v=value_non_spec.transpose(1, 2),
+                    g=g_non_spec.transpose(1, 2),
+                    beta=beta_non_spec.transpose(1, 2),
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc[
+                        : attn_metadata.num_decodes + 1
+                    ],
+                    head_first=True,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.transpose(
+                    -1, -2
+                ).to(ssm_state.dtype)
+            else:
+                force_local_recurrent_decode = (
+                    getattr(self, "use_local_recurrent_decode_for_gdn", False)
+                    or (
+                        current_platform.is_rocm()
+                        and capability is not None
+                        and capability.major == 9
+                        and capability.minor == 0
+                    )
+                )
+                if force_local_recurrent_decode:
+                    core_attn_out_packed = torch.empty(
+                        (
+                            mixed_qkv_non_spec.shape[0],
+                            1,
+                            value_non_spec.shape[2],
+                            value_non_spec.shape[3],
+                        ),
+                        dtype=core_attn_out.dtype,
+                        device=core_attn_out.device,
+                    )
+                    _, last_recurrent_state = (
+                        fused_recurrent_gated_delta_rule_packed_decode(
+                            mixed_qkv=mixed_qkv_non_spec,
+                            a=a,
+                            b=b,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            scale=self.head_k_dim**-0.5,
+                            initial_state=ssm_state,
+                            out=core_attn_out_packed,
+                            ssm_state_indices=non_spec_state_indices_tensor[
+                                : attn_metadata.num_actual_tokens
+                            ],
+                            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                        )
+                    )
+                    core_attn_out_non_spec = core_attn_out_packed.transpose(0, 1)
+                else:
+                    initial_state = ssm_state.transpose(-1, -2).contiguous()
+                    core_attn_out_non_spec, last_recurrent_state = (
+                        fused_recurrent_gated_delta_rule(
+                            q=query_non_spec,
+                            k=key_non_spec,
+                            v=value_non_spec,
+                            g=g_non_spec,
+                            beta=beta_non_spec,
+                            initial_state=initial_state,
+                            inplace_final_state=True,
+                            cu_seqlens=non_spec_query_start_loc[
+                                : attn_metadata.num_decodes + 1
+                            ],
+                            ssm_state_indices=non_spec_state_indices_tensor,
+                            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                        )
+                    )
+                    ssm_state.copy_(
+                        last_recurrent_state.transpose(-1, -2).to(ssm_state.dtype)
+                    )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 

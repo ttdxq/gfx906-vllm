@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import Thread
+from types import SimpleNamespace
 from typing import Any, TypeAlias, TypeVar
 
 import msgspec.msgpack
@@ -77,12 +78,8 @@ class EngineCoreClient(ABC):
         executor_class: type[Executor],
         log_stats: bool,
     ) -> "EngineCoreClient":
-        # TODO: support this for debugging purposes.
         if asyncio_mode and not multiprocess_mode:
-            raise NotImplementedError(
-                "Running EngineCore in asyncio without multiprocessing "
-                "is not currently supported."
-            )
+            return InprocClient(vllm_config, executor_class, log_stats)
 
         if multiprocess_mode and asyncio_mode:
             return EngineCoreClient.make_async_mp_client(
@@ -264,62 +261,126 @@ class InprocClient(EngineCoreClient):
 
     def __init__(self, *args, **kwargs):
         self.engine_core = EngineCore(*args, **kwargs)
+        self.engine_ranks_managed = [0]
+        self.resources = SimpleNamespace(engine_dead=False)
 
     def get_output(self) -> EngineCoreOutputs:
         outputs, _ = self.engine_core.step_fn()
         return outputs and outputs.get(0) or EngineCoreOutputs()
 
+    async def get_output_async(self) -> EngineCoreOutputs:
+        while True:
+            outputs = self.get_output()
+            if (
+                outputs.outputs
+                or outputs.utility_output
+                or outputs.scheduler_stats
+                or outputs.wave_complete is not None
+            ):
+                return outputs
+            await asyncio.sleep(0.01)
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.engine_core.get_supported_tasks()
+
+    async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
+        return self.get_supported_tasks()
 
     def add_request(self, request: EngineCoreRequest) -> None:
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
 
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        self.add_request(request)
+
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
 
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        self.abort_requests(request_ids)
+
     def shutdown(self) -> None:
+        self.resources.engine_dead = True
         self.engine_core.shutdown()
 
     def profile(self, is_start: bool = True) -> None:
         self.engine_core.profile(is_start)
 
+    async def profile_async(self, is_start: bool = True) -> None:
+        self.profile(is_start)
+
     def reset_mm_cache(self) -> None:
         self.engine_core.reset_mm_cache()
+
+    async def reset_mm_cache_async(self) -> None:
+        self.reset_mm_cache()
 
     def reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
         return self.engine_core.reset_prefix_cache(reset_running_requests)
 
+    async def reset_prefix_cache_async(
+        self, reset_running_requests: bool = False
+    ) -> bool:
+        return self.reset_prefix_cache(reset_running_requests)
+
     def sleep(self, level: int = 1) -> None:
         self.engine_core.sleep(level)
+
+    async def sleep_async(self, level: int = 1) -> None:
+        self.sleep(level)
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.engine_core.wake_up(tags)
 
+    async def wake_up_async(self, tags: list[str] | None = None) -> None:
+        self.wake_up(tags)
+
     def is_sleeping(self) -> bool:
         return self.engine_core.is_sleeping()
+
+    async def is_sleeping_async(self) -> bool:
+        return self.is_sleeping()
 
     def execute_dummy_batch(self) -> None:
         self.engine_core.execute_dummy_batch()
 
+    async def execute_dummy_batch_async(self) -> None:
+        self.execute_dummy_batch()
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.engine_core.add_lora(lora_request)
+
+    async def add_lora_async(self, lora_request: LoRARequest) -> bool:
+        return self.add_lora(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
         return self.engine_core.remove_lora(lora_id)
 
+    async def remove_lora_async(self, lora_id: int) -> bool:
+        return self.remove_lora(lora_id)
+
     def list_loras(self) -> set[int]:
         return self.engine_core.list_loras()
 
+    async def list_loras_async(self) -> set[int]:
+        return self.list_loras()
+
     def pin_lora(self, lora_id: int) -> bool:
         return self.engine_core.pin_lora(lora_id)
+
+    async def pin_lora_async(self, lora_id: int) -> bool:
+        return self.pin_lora(lora_id)
 
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
         self.engine_core.save_sharded_state(path, pattern, max_size)
+
+    async def save_sharded_state_async(
+        self, path: str, pattern: str | None = None, max_size: int | None = None
+    ) -> None:
+        self.save_sharded_state(path, pattern, max_size)
 
     def collective_rpc(
         self,
@@ -329,6 +390,15 @@ class InprocClient(EngineCoreClient):
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+
+    async def collective_rpc_async(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        return self.collective_rpc(method, timeout, args, kwargs)
 
     def dp_engines_running(self) -> bool:
         return False

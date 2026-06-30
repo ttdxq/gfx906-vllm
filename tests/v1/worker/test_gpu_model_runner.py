@@ -232,6 +232,90 @@ def test_select_common_block_size_no_valid_option():
         GPUModelRunner.select_common_block_size(48, attn_groups)
 
 
+def test_is_uniform_decode() -> None:
+    # Normal
+    assert GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=16,
+    )
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=2,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=16,
+    )
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=15,
+    )
+    # Spec decoding
+    assert GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=5,
+        uniform_decode_query_len=5,
+        num_tokens=30,
+        num_reqs=6,
+    )
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=5,
+        uniform_decode_query_len=4,
+        num_tokens=30,
+        num_reqs=6,
+    )
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=5,
+        uniform_decode_query_len=5,
+        num_tokens=30,
+        num_reqs=7,
+    )
+    # Force uniform decode
+    assert GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=16,
+        force_uniform_decode=True,
+    )
+    assert GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=2,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=16,
+        force_uniform_decode=True,
+    )
+    assert GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=15,
+        force_uniform_decode=True,
+    )
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=16,
+        force_uniform_decode=False,
+    )
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=2,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=16,
+        force_uniform_decode=False,
+    )
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=15,
+        force_uniform_decode=False,
+    )
+
+
 def test_update_states_new_request(model_runner, dist_init):
     req_id = "req_0"
 
@@ -538,7 +622,7 @@ def test_load_model_weights_inplace(dist_init, model_runner, model_runner_2):
 
 
 def test_reload_weights_before_load_model(model_runner):
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         model_runner.reload_weights()
 
 
@@ -760,6 +844,10 @@ def test_init_kv_cache_with_kv_sharing_valid():
     assert kv_cache_config_after_init.kv_cache_groups[0].layer_names[1] == layer_1
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Attention backend FLASHINFER is only supported on CUDA.",
+)
 def test_hybrid_attention_mamba_tensor_shapes(monkeypatch):
     """
     The GPU model runner creates different views into the

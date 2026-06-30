@@ -10,6 +10,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
@@ -17,6 +18,104 @@ from .op import exp
 from .utils import use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
+
+
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
+
+
+def _chunk_gated_delta_rule_fwd_h_eager(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None,
+    gk: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    chunk_size: int,
+    save_new_value: bool,
+    cu_seqlens: torch.LongTensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    B, T, Hg, K, V = *k.shape, u.shape[-1]
+    H = u.shape[-2]
+    BT = chunk_size
+    head_ratio = H // Hg
+
+    if cu_seqlens is None:
+        N = B
+        seq_ranges = [(b, b, 0, T) for b in range(B)]
+    else:
+        N = len(cu_seqlens) - 1
+        seq_ranges = [
+            (0, i, int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item()))
+            for i in range(N)
+        ]
+
+    NT = sum(
+        (seq_end - seq_start + BT - 1) // BT for _, _, seq_start, seq_end in seq_ranges
+    )
+    h = k.new_empty(B, NT, H, K, V)
+    final_state = (
+        k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+    )
+    v_new = torch.empty_like(u) if save_new_value else None
+
+    chunk_offset = 0
+    for batch_idx, seq_idx, seq_start, seq_end in seq_ranges:
+        for head_idx in range(H):
+            key_head_idx = head_idx // head_ratio
+            if initial_state is None:
+                state = torch.zeros((K, V), device=k.device, dtype=torch.float32)
+            else:
+                state = initial_state[seq_idx, head_idx].float().clone()
+
+            local_chunk_offset = chunk_offset
+            for chunk_start in range(seq_start, seq_end, BT):
+                chunk_end = min(chunk_start + BT, seq_end)
+                chunk_len = chunk_end - chunk_start
+
+                h[batch_idx, local_chunk_offset, head_idx] = state.to(h.dtype)
+
+                w_chunk = w[batch_idx, chunk_start:chunk_end, head_idx].float()
+                u_chunk = u[batch_idx, chunk_start:chunk_end, head_idx].float()
+
+                residual = u_chunk - torch.matmul(w_chunk, state)
+
+                if g is not None:
+                    g_chunk = g[batch_idx, chunk_start:chunk_end, head_idx].float()
+                    g_last = torch.exp(g_chunk[-1])
+                    residual = residual * torch.exp(
+                        (g_chunk[-1] - g_chunk).unsqueeze(-1)
+                    )
+                    state = state * g_last
+
+                if gk is not None:
+                    gk_last = torch.exp(
+                        gk[batch_idx, chunk_end - 1, head_idx].float()
+                    ).unsqueeze(-1)
+                    state = state * gk_last
+
+                if save_new_value and v_new is not None:
+                    v_new[batch_idx, chunk_start:chunk_end, head_idx] = residual.to(
+                        v_new.dtype
+                    )
+
+                k_chunk = k[batch_idx, chunk_start:chunk_end, key_head_idx].float()
+                state = state + torch.matmul(k_chunk.transpose(0, 1), residual)
+                local_chunk_offset += 1
+
+            if final_state is not None:
+                final_state[seq_idx, head_idx] = state
+
+        chunk_offset += (seq_end - seq_start + BT - 1) // BT
+
+    return h, v_new, final_state
 
 
 @triton.heuristics(
@@ -311,6 +410,20 @@ def chunk_gated_delta_rule_fwd_h(
             prepare_chunk_offsets(cu_seqlens, BT),
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
+
+    if _is_gfx906_rocm():
+        return _chunk_gated_delta_rule_fwd_h_eager(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=gk,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            chunk_size=chunk_size,
+            save_new_value=save_new_value,
+            cu_seqlens=cu_seqlens,
+        )
 
     h = k.new_empty(B, NT, H, K, V)
     final_state = (

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import importlib.metadata
 import os
 import struct
 from functools import cache
@@ -9,12 +10,19 @@ from os import PathLike
 from pathlib import Path
 from typing import Any
 
+import gguf
 from gguf import GGMLQuantizationType
 
 import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+if not hasattr(gguf, "__version__"):
+    try:
+        gguf.__version__ = importlib.metadata.version("gguf")
+    except importlib.metadata.PackageNotFoundError:
+        gguf.__version__ = "0.0.0"
 
 
 def is_s3(model_or_path: str) -> bool:

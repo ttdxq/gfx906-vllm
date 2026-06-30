@@ -12,6 +12,7 @@ import os
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
@@ -23,6 +24,53 @@ ALLOWED_TRIL_PRECISIONS = ["ieee", "tf32"] if is_amd else ["ieee", "tf32", "tf32
 assert FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS, (
     f"FLA_TRIL_PRECISION must be one of {ALLOWED_TRIL_PRECISIONS}, but got {FLA_TRIL_PRECISION}"
 )
+
+
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
+
+
+def _solve_tril_eager(
+    A: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    B, T, H, BT = A.shape
+    Ai = torch.zeros_like(A, dtype=output_dtype)
+
+    if cu_seqlens is None:
+        seq_ranges = [(b, 0, T) for b in range(B)]
+    else:
+        seq_ranges = [
+            (0, int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item()))
+            for i in range(len(cu_seqlens) - 1)
+        ]
+
+    for batch_idx, seq_start, seq_end in seq_ranges:
+        for chunk_start in range(seq_start, seq_end, BT):
+            chunk_end = min(chunk_start + BT, seq_end)
+            chunk_len = chunk_end - chunk_start
+            eye = torch.eye(chunk_len, device=A.device, dtype=torch.float32)
+
+            for head_idx in range(H):
+                block = A[
+                    batch_idx, chunk_start:chunk_end, head_idx, :chunk_len
+                ].float()
+                inverse = torch.linalg.solve_triangular(
+                    eye + block,
+                    eye,
+                    upper=False,
+                    unitriangular=False,
+                ).to(output_dtype)
+                Ai[batch_idx, chunk_start:chunk_end, head_idx, :chunk_len] = inverse
+
+    return Ai
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -533,6 +581,9 @@ def solve_tril(
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+
+    if _is_gfx906_rocm():
+        return _solve_tril_eager(A=A, cu_seqlens=cu_seqlens, output_dtype=output_dtype)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)
     if BT == 16:
