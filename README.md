@@ -130,13 +130,9 @@ export VLLM_WORKER_MULTIPROC_METHOD=fork
 export VLLM_COMPILATION_MODE=0
 
 vllm serve /root/model/Qwen3.5-27B-Q6_K.gguf \
-  --tokenizer /root/model/Qwen3.5-27B-UD-Q6_K_XL-repo \
-  --tokenizer-mode auto \
-  --trust-remote-code \
   --port 8001 \
   --tensor-parallel-size 1 \
-  --kv-cache-memory-bytes 268435456 \
-  --max-model-len 256 \
+  --max-model-len 096 \
   --reasoning-parser qwen3_5 \
   --compilation-config '{"mode":3,"backend":"eager","cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":128}' \
   --limit-mm-per-prompt '{"image": 0, "video": 0}'
