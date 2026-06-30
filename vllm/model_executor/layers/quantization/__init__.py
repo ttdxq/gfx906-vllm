@@ -98,12 +98,13 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
+    from vllm.platforms import current_platform
+
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 
     from .auto_round import AutoRoundConfig
     from .awq import AWQConfig
-    from .awq_marlin import AWQMarlinConfig
     from .bitblas import BitBLASConfig
     from .bitsandbytes import BitsAndBytesConfig
     from .compressed_tensors.compressed_tensors import (
@@ -131,6 +132,34 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .rtn import RTNConfig
     from .torchao import TorchAOConfig
     from .tpu_int8 import Int8TpuConfig
+
+    if current_platform.is_cuda():
+        from .awq_marlin import AWQMarlinConfig
+    else:
+
+        class AWQMarlinConfig(QuantizationConfig):
+            @classmethod
+            def get_name(cls) -> QuantizationMethods:
+                return "awq_marlin"
+
+            @classmethod
+            def get_supported_act_dtypes(cls):
+                return []
+
+            @classmethod
+            def get_min_capability(cls) -> int:
+                return 0
+
+            @staticmethod
+            def get_config_filenames() -> list[str]:
+                return []
+
+            @classmethod
+            def from_config(cls, config: dict):
+                raise RuntimeError("awq_marlin is unavailable on non-CUDA platforms")
+
+            def get_quant_method(self, layer, prefix):
+                return None
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "awq": AWQConfig,

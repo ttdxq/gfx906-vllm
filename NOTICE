@@ -13,5 +13,6 @@ Licensed under the Apache License, Version 2.0
 相关项目：
 - ROCm移植版本: https://github.com/Said-Akbar/vllm-rocm
 - 原gfx906分支: https://github.com/nalanzeyu/vllm-gfx906
+- gfx906社区适配分支: https://github.com/ai-infos/vllm-gfx906-mobydick
 
 本项目由社区维护，与UC Berkeley或vLLM官方项目无关联。

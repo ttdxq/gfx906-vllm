@@ -10,7 +10,10 @@
 import warnings
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
+
+from vllm.platforms import current_platform
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
@@ -20,6 +23,175 @@ from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
+
+
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
+
+
+def _torch_chunk_gated_delta_rule_ref(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 64,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    initial_dtype = query.dtype
+    if use_qk_l2norm_in_kernel:
+        query = l2norm_fwd(query)
+        key = l2norm_fwd(key)
+
+    if query.shape[2] != value.shape[2]:
+        num_qk_heads = query.shape[2]
+        num_v_heads = value.shape[2]
+        if num_qk_heads == 0 or num_v_heads % num_qk_heads != 0:
+            raise ValueError(
+                f"Invalid GDN head mapping: H={num_qk_heads}, HV={num_v_heads}"
+            )
+        head_ratio = num_v_heads // num_qk_heads
+        query = query.repeat_interleave(head_ratio, dim=2)
+        key = key.repeat_interleave(head_ratio, dim=2)
+
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
+    ]
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    total_sequence_length = sequence_length + pad_size
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    query, key, value, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, k_beta, v_beta)
+    ]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=0,
+    )
+
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    last_recurrent_state = (
+        torch.zeros(
+            batch_size,
+            num_heads,
+            k_head_dim,
+            v_head_dim,
+            device=value.device,
+            dtype=value.dtype,
+        )
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    core_attn_out = torch.zeros_like(value)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=1,
+    )
+
+    for i in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(
+                -1, -2
+            )
+            @ v_new
+        )
+
+    if not output_final_state:
+        last_recurrent_state = None
+    core_attn_out = core_attn_out.reshape(
+        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+    )
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state
+
+
+def _chunk_gated_delta_rule_gfx906_eager(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    cu_seqlens: torch.LongTensor | None,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if cu_seqlens is None:
+        return _torch_chunk_gated_delta_rule_ref(
+            query=q,
+            key=k,
+            value=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+
+    output = torch.empty_like(v)
+    final_state = None if not output_final_state else initial_state.clone()
+    num_seqs = cu_seqlens.numel() - 1
+    for seq_idx in range(num_seqs):
+        start = int(cu_seqlens[seq_idx].item())
+        end = int(cu_seqlens[seq_idx + 1].item())
+        if end <= start:
+            continue
+        seq_init = (
+            None if initial_state is None else initial_state[seq_idx : seq_idx + 1]
+        )
+        seq_out, seq_state = _torch_chunk_gated_delta_rule_ref(
+            query=q[:, start:end],
+            key=k[:, start:end],
+            value=v[:, start:end],
+            g=g[:, start:end],
+            beta=beta[:, start:end],
+            initial_state=seq_init,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        output[:, start:end] = seq_out
+        if output_final_state and final_state is not None and seq_state is not None:
+            final_state[seq_idx] = seq_state[0].to(final_state.dtype)
+    return output, final_state
 
 
 def chunk_gated_delta_rule_fwd(
@@ -194,11 +366,6 @@ def chunk_gated_delta_rule(
     )
 
     if head_first:
-        raise DeprecationWarning(
-            "head_first is deprecated and will be removed in a future version. "
-            "Please use head_first=False for now instead.",
-            stacklevel=2,
-        )
         q, k, v, beta, g = map(
             lambda x: rearrange(x, "b h t ... -> b t h ..."), (q, k, v, beta, g)
         )
@@ -223,6 +390,18 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if _is_gfx906_rocm():
+        return _chunk_gated_delta_rule_gfx906_eager(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,

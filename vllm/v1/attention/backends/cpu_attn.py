@@ -38,23 +38,27 @@ class CPUAttentionBackend(AttentionBackend):
 
     @classmethod
     def get_supported_dtypes(cls) -> list[torch.dtype]:
-        return [torch.float16, torch.bfloat16, torch.float32]
+        return cls.supported_dtypes
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [32, 64, 96, 128, 160, 192, 224, 256]
+        return [32, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512]
 
     @staticmethod
     def get_name() -> str:
         return "CPU_ATTN"
 
     @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
-        """CPU attention supports decoder and encoder-only attention."""
         return attn_type in (
             AttentionType.DECODER,
             AttentionType.ENCODER,
             AttentionType.ENCODER_ONLY,
+            AttentionType.ENCODER_DECODER,
         )
 
     @staticmethod

@@ -5,6 +5,7 @@
 import numpy as np
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .base import RotaryEmbeddingBase
@@ -248,6 +249,13 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         self.mrope_interleaved = mrope_interleaved
         if self.mrope_section:
             assert sum(self.mrope_section) == rotary_dim // 2
+        capability = current_platform.get_device_capability()
+        self._use_native_rocm_gfx90 = (
+            current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        )
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
         if self.scaling_factor is None:
@@ -321,6 +329,9 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert positions.ndim == 1 or positions.ndim == 2
         assert key is not None
+
+        if torch.compiler.is_compiling() or self._use_native_rocm_gfx90:
+            return self.forward_native(positions, query, key, offsets)
 
         self._match_cos_sin_cache_dtype(query)
         num_tokens = positions.shape[-1]

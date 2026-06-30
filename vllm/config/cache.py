@@ -4,10 +4,10 @@
 from dataclasses import field
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, SkipValidation, field_validator
+from pydantic import Field, SkipValidation, field_validator, model_validator
 from pydantic.dataclasses import dataclass
 
-from vllm.config.utils import config
+from .utils import config
 from vllm.logger import init_logger
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import get_cpu_memory
@@ -22,16 +22,25 @@ logger = init_logger(__name__)
 BlockSize = Literal[1, 8, 16, 32, 64, 128, 256]
 CacheDType = Literal[
     "auto",
+    "float16",
     "bfloat16",
     "fp8",
     "fp8_e4m3",
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "turboquant_k8v4",
+    "turboquant_4bit_nc",
+    "turboquant_k3v4_nc",
+    "turboquant_3bit_nc",
+    "int4_per_token_head",
+    "int8_per_token_head",
+    "fp8_per_token_head",
+    "nvfp4",
 ]
-MambaDType = Literal["auto", "float32", "float16"]
+MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
-PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor"]
+PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -47,6 +56,20 @@ class CacheConfig:
     This config has no static default. If left unspecified by the user, it will
     be set in `Platform.check_and_update_config()` based on the current
     platform."""
+    user_specified_block_size: bool = field(default=False, init=False)
+    user_specified_mamba_block_size: bool = field(default=False, init=False)
+    hash_block_size: int | None = Field(default=None, gt=0)
+    """Block size (in tokens) used for computing Request's block_hashes.
+
+    This can be set to a finer granularity than the physical KV cache block
+    sizes (e.g. 8) as long as every KV cache group's `block_size` is divisible
+    by it. This enables prefix-caching keys to be computed at the finest common
+    granularity and then merged for larger physical block sizes.
+
+    This config has no static default. If left unspecified, vLLM will choose a
+    default based on the resolved KV cache groups (typically the smallest KV
+    cache block size when there are multiple groups).
+    """
     gpu_memory_utilization: float = Field(default=0.9, gt=0, le=1)
     """The fraction of GPU memory to be used for the model executor, which can
     range from 0 to 1. For example, a value of 0.5 would imply 50% GPU memory
@@ -96,6 +119,9 @@ class CacheConfig:
     checkpoint if available. Otherwise, the scales will default to 1.0."""
     cpu_kvcache_space_bytes: int | None = None
     """(CPU backend only) CPU key-value cache space."""
+    kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
+    """Layer patterns to skip KV cache quantization. Accepts layer indices
+    (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
@@ -126,6 +152,12 @@ class CacheConfig:
     """The number of blocks to allocate for GPU memory."""
     num_cpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for CPU memory."""
+    kv_cache_size_tokens: int | None = field(default=None, init=False)
+    """Per-DP-engine KV cache capacity in tokens (group-aware). Uses
+    group-aware capacity since num_gpu_blocks * block_size can be wrong
+    for hybrid models where requests occupy multiple KV cache groups."""
+    kv_cache_max_concurrency: float | None = field(default=None, init=False)
+    """Per-DP-engine maximum concurrency at max_model_len tokens."""
 
     kv_sharing_fast_prefill: bool = False
     """This feature is work in progress and no prefill optimization takes place
@@ -179,9 +211,15 @@ class CacheConfig:
             "prefix_caching_hash_algo",
             "cpu_kvcache_space_bytes",
             "mamba_page_size_padded",
+            "hash_block_size",
+            "user_specified_block_size",
+            "user_specified_mamba_block_size",
+            "_block_size_resolved",
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",
+            "kv_cache_size_tokens",
+            "kv_cache_max_concurrency",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
         }
@@ -195,6 +233,36 @@ class CacheConfig:
         # convert cache_config to dict(key: str, value: str) for prometheus
         # metrics info
         return {key: str(value) for key, value in self.__dict__.items()}
+
+    _block_size_resolved: bool = field(default=False, init=False)
+
+    @model_validator(mode="after")
+    def _apply_block_size_default(self) -> "CacheConfig":
+        if self._block_size_resolved:
+            return self
+        self._block_size_resolved = True
+        # NOTE(gfx906): block_size is intentionally left as None when the user
+        # does not specify it. The None sentinel is relied on by
+        # Platform.check_and_update_config() (vllm/platforms/rocm.py) to pick a
+        # platform-specific late default (64 for ROCm AITER unified attention,
+        # 16 otherwise). Do not eagerly default it to 16 here.
+        if self.block_size is not None:
+            self.user_specified_block_size = True
+        if self.mamba_block_size is not None:
+            self.user_specified_mamba_block_size = True
+        return self
+
+    @field_validator("calculate_kv_scales", mode="after")
+    @classmethod
+    def _warn_deprecated_calculate_kv_scales(cls, calculate_kv_scales: bool) -> bool:
+        if calculate_kv_scales:
+            logger.warning(
+                "The `--calculate-kv-scales` option is deprecated and will "
+                "be removed in v0.19. The scales will be loaded from the "
+                "model checkpoint if available, otherwise they default to "
+                "1.0."
+            )
+        return calculate_kv_scales
 
     @field_validator("cache_dtype", mode="after")
     @classmethod

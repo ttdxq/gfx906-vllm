@@ -1876,7 +1876,7 @@ async def run_server_worker(
         sock.close()
 
 
-if __name__ == "__main__":
+def main() -> None:
     # NOTE(simon):
     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
     # entrypoints.
@@ -1886,6 +1886,12 @@ if __name__ == "__main__":
     )
     parser = make_arg_parser(parser)
     args = parser.parse_args()
+    if hasattr(args, "model_tag") and args.model_tag is not None:
+        args.model = args.model_tag
     validate_parsed_serve_args(args)
 
     uvloop.run(run_server(args))
+
+
+if __name__ == "__main__":
+    main()

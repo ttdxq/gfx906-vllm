@@ -7,6 +7,58 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
+
+
+def _reshape_and_cache_flash_eager(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    fp8_kv_cache = kv_cache_dtype.startswith("fp8")
+    if key.shape[0] != slot_mapping.shape[0]:
+        key = key[: slot_mapping.shape[0]]
+        value = value[: slot_mapping.shape[0]]
+
+    valid_mask = slot_mapping >= 0
+    valid_slots = slot_mapping.clamp_min(0).to(torch.long)
+    src_key = key
+    src_value = value
+
+    if fp8_kv_cache:
+        src_key = (src_key / k_scale).to(key_cache.dtype)
+        src_value = (src_value / v_scale).to(value_cache.dtype)
+
+    block_size = key_cache.shape[1]
+    block_idx = torch.div(valid_slots, block_size, rounding_mode="floor")
+    block_offset = valid_slots.remainder(block_size)
+    cached_key = key_cache[block_idx, block_offset]
+    cached_value = value_cache[block_idx, block_offset]
+    valid_mask = valid_mask.view(valid_mask.shape[0], 1, 1)
+    key_cache[block_idx, block_offset] = torch.where(
+        valid_mask,
+        src_key.to(key_cache.dtype),
+        cached_key,
+    )
+    value_cache[block_idx, block_offset] = torch.where(
+        valid_mask,
+        src_value.to(value_cache.dtype),
+        cached_value,
+    )
+
+
 @triton.jit
 def reshape_and_cache_kernel_flash(
     key_ptr,  # [num_tokens, num_heads, head_size]
@@ -140,6 +192,19 @@ def triton_reshape_and_cache_flash(
         "{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
         "fp8e5m2, uint8, bfloat16, float16, float32, fp8e4m3fnuz."
     )
+
+    if _is_gfx906_rocm():
+        _reshape_and_cache_flash_eager(
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return
 
     # heuristics instead of autotuning
     TILE_SIZE = min(2048, triton.next_power_of_2(n))

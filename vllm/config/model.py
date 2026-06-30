@@ -5,6 +5,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import InitVar, field
 from importlib.util import find_spec
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 import torch
@@ -23,32 +24,24 @@ except ImportError:
 
 import vllm.envs as envs
 from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.config.multimodal import MMCacheType, MMEncoderTPMode, MultiModalConfig
+from vllm.config.multimodal import (
+    MMCacheType,
+    MMEncoderTPMode,
+    MMTensorIPC,
+    MultiModalConfig,
+)
 from vllm.config.pooler import PoolerConfig
 from vllm.config.scheduler import RunnerType
 from vllm.config.utils import config, getattr_iter
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.transformers_utils.config import (
-    ConfigFormat,
-    get_config,
-    get_hf_image_processor_config,
-    get_hf_text_config,
-    get_pooling_config,
-    get_sentence_transformer_tokenizer_config,
-    is_encoder_decoder,
-    try_get_dense_modules,
-    try_get_generation_config,
-    try_get_safetensors_metadata,
-    try_get_tokenizer_config,
-    uses_mrope,
-    uses_xdrope_dim,
-)
 from vllm.transformers_utils.gguf_utils import (
+    detect_gguf_multimodal,
     maybe_patch_hf_config_from_gguf,
 )
 from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from vllm.transformers_utils.utils import (
+    check_gguf_file,
     is_gguf,
     is_remote_gguf,
     maybe_model_redirect,
@@ -79,6 +72,62 @@ else:
     LogitsProcessor = Any
 
 logger = init_logger(__name__)
+
+ConfigFormat = Any
+
+
+def _tu_config():
+    from vllm.transformers_utils import config as tu_config
+
+    return tu_config
+
+
+def get_config(*args, **kwargs):
+    return _tu_config().get_config(*args, **kwargs)
+
+
+def get_hf_image_processor_config(*args, **kwargs):
+    return _tu_config().get_hf_image_processor_config(*args, **kwargs)
+
+
+def get_hf_text_config(*args, **kwargs):
+    return _tu_config().get_hf_text_config(*args, **kwargs)
+
+
+def get_pooling_config(*args, **kwargs):
+    return _tu_config().get_pooling_config(*args, **kwargs)
+
+
+def get_sentence_transformer_tokenizer_config(*args, **kwargs):
+    return _tu_config().get_sentence_transformer_tokenizer_config(*args, **kwargs)
+
+
+def is_encoder_decoder(*args, **kwargs):
+    return _tu_config().is_encoder_decoder(*args, **kwargs)
+
+
+def try_get_dense_modules(*args, **kwargs):
+    return _tu_config().try_get_dense_modules(*args, **kwargs)
+
+
+def try_get_generation_config(*args, **kwargs):
+    return _tu_config().try_get_generation_config(*args, **kwargs)
+
+
+def try_get_safetensors_metadata(*args, **kwargs):
+    return _tu_config().try_get_safetensors_metadata(*args, **kwargs)
+
+
+def try_get_tokenizer_config(*args, **kwargs):
+    return _tu_config().try_get_tokenizer_config(*args, **kwargs)
+
+
+def uses_mrope(*args, **kwargs):
+    return _tu_config().uses_mrope(*args, **kwargs)
+
+
+def uses_xdrope_dim(*args, **kwargs):
+    return _tu_config().uses_xdrope_dim(*args, **kwargs)
 
 RunnerOption = Literal["auto", RunnerType]
 ConvertType = Literal["none", "embed", "classify", "reward"]
@@ -305,6 +354,15 @@ class ModelConfig:
     definitions"""
     io_processor_plugin: str | None = None
     """IOProcessor plugin name to load at model startup"""
+    renderer_num_workers: int = 1
+    """Number of worker threads in the renderer thread pool. The pool is
+    consumed by the async renderer path (e.g. the OpenAI-compatible API server
+    started by `vllm serve`) to parallelize tokenization, chat template
+    rendering, and multimodal preprocessing across concurrent requests.
+
+    The offline `LLM` entrypoint uses the synchronous renderer path and
+    processes prompts (including multimodal preprocessing) serially, so this
+    setting has no effect there."""
 
     # Pooler config
     pooler_config: PoolerConfig | None = None
@@ -327,6 +385,14 @@ class ModelConfig:
     interleave_mm_strings: InitVar[bool | None] = None
     skip_mm_profiling: InitVar[bool | None] = None
     video_pruning_rate: InitVar[float | None] = None
+    language_model_only: InitVar[bool] = False
+    mm_encoder_only: InitVar[bool | None] = None
+    mm_encoder_attn_dtype: InitVar[str | None] = None
+    mm_encoder_fp8_scale_path: InitVar[str | None] = None
+    mm_encoder_fp8_scale_save_path: InitVar[str | None] = None
+    mm_encoder_fp8_scale_save_margin: InitVar[float | None] = None
+    mm_tensor_ipc: InitVar[MMTensorIPC | None] = None
+    mm_ipc_gpu_memory_gb: InitVar[float | None] = None
 
     def compute_hash(self) -> str:
         """
@@ -375,11 +441,18 @@ class ModelConfig:
             "mm_encoder_tp_mode",
             "interleave_mm_strings",
             "skip_mm_profiling",
+            "mm_ipc_gpu_memory_gb",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
+        # For some models (e.g. Qwen3-VL), whether the MM code path is enabled
+        # affects the language model computation graph, so include it in hash.
+        if self.multimodal_config:
+            factors["language_model_only"] = (
+                self.multimodal_config.language_model_only
+            )
         return hash_factors(factors)
 
     def _update_nested(
@@ -427,6 +500,33 @@ class ModelConfig:
                 # It's a dict-valued parameter - set it directly
                 setattr(config, key, value)
 
+    def _maybe_use_local_gguf_companion_tokenizer(self) -> None:
+        if not check_gguf_file(self.model):
+            return
+
+        model_path = Path(self.model)
+        if not model_path.is_file():
+            return
+
+        if self.tokenizer is not None and self.tokenizer != self.model:
+            return
+
+        direct_repo = model_path.with_name(model_path.stem + "-repo")
+        if direct_repo.is_dir():
+            self.tokenizer = str(direct_repo)
+            logger.info("Using local GGUF companion tokenizer: %s", self.tokenizer)
+            return
+
+        model_prefix = model_path.stem.split("-Q", 1)[0]
+        candidates = sorted(
+            p
+            for p in model_path.parent.iterdir()
+            if p.is_dir() and p.name.endswith("-repo") and p.name.startswith(model_prefix)
+        )
+        if len(candidates) == 1:
+            self.tokenizer = str(candidates[0])
+            logger.info("Using local GGUF companion tokenizer: %s", self.tokenizer)
+
     def __post_init__(
         self,
         # Multimodal config init vars
@@ -442,6 +542,14 @@ class ModelConfig:
         interleave_mm_strings: bool | None,
         skip_mm_profiling: bool | None,
         video_pruning_rate: float | None,
+        language_model_only: bool,
+        mm_encoder_only: bool | None,
+        mm_encoder_attn_dtype: str | None,
+        mm_encoder_fp8_scale_path: str | None,
+        mm_encoder_fp8_scale_save_path: str | None,
+        mm_encoder_fp8_scale_save_margin: float | None,
+        mm_tensor_ipc: MMTensorIPC | None,
+        mm_ipc_gpu_memory_gb: float | None,
     ) -> None:
         # Keep set served_model_name before maybe_model_redirect(self.model)
         self.served_model_name = get_served_model_name(
@@ -451,6 +559,7 @@ class ModelConfig:
         # The tokenizer is consistent with the model by default.
         if self.tokenizer is None:
             self.tokenizer = self.model
+        self._maybe_use_local_gguf_companion_tokenizer()
         if self.tokenizer_revision is None:
             self.tokenizer_revision = self.revision
         self.tokenizer = maybe_model_redirect(self.tokenizer)
@@ -512,6 +621,17 @@ class ModelConfig:
             self.model,
             hf_config,
         )
+
+        if (
+            check_gguf_file(self.model)
+            and detect_gguf_multimodal(self.model) is None
+            and getattr(hf_config, "model_type", "")
+            in ("qwen3_5", "qwen3_5_text", "qwen35")
+            and hasattr(hf_config, "text_config")
+        ):
+            hf_config = hf_config.get_text_config()
+            if not getattr(hf_config, "architectures", None):
+                hf_config.architectures = ["Qwen3_5ForCausalLM"]
 
         self.hf_config = hf_config
         if dict_overrides:
@@ -670,8 +790,12 @@ class ModelConfig:
 
         self.original_max_model_len = self.max_model_len
         self.max_model_len = self.get_and_verify_max_len(self.max_model_len)
+        is_text_only_gguf = check_gguf_file(self.model) and getattr(
+            self.hf_config, "model_type", ""
+        ).endswith("_text")
+
         # Init multimodal config if needed
-        if self._model_info.supports_multimodal:
+        if self._model_info.supports_multimodal and not is_text_only_gguf:
             if (
                 mm_encoder_tp_mode == "data"
                 and not self._model_info.supports_multimodal_encoder_tp_data
@@ -695,6 +819,14 @@ class ModelConfig:
                 interleave_mm_strings=interleave_mm_strings,
                 skip_mm_profiling=skip_mm_profiling,
                 video_pruning_rate=video_pruning_rate,
+                language_model_only=language_model_only,
+                mm_encoder_only=mm_encoder_only,
+                mm_encoder_attn_dtype=mm_encoder_attn_dtype,
+                mm_encoder_fp8_scale_path=mm_encoder_fp8_scale_path,
+                mm_encoder_fp8_scale_save_path=mm_encoder_fp8_scale_save_path,
+                mm_encoder_fp8_scale_save_margin=mm_encoder_fp8_scale_save_margin,
+                mm_tensor_ipc=mm_tensor_ipc,
+                mm_ipc_gpu_memory_gb=mm_ipc_gpu_memory_gb,
             )
 
             mm_config_kwargs = {
@@ -703,8 +835,21 @@ class ModelConfig:
 
             self.multimodal_config = MultiModalConfig(**mm_config_kwargs)
 
+            if (
+                self.renderer_num_workers > 1
+                and self.multimodal_config.mm_processor_cache_gb > 0
+            ):
+                raise ValueError(
+                    "Cannot use --renderer-num-workers > 1 with the "
+                    "multimodal processor cache enabled. The cache is "
+                    "not thread-safe and does not support concurrent "
+                    "renderer workers. Please set "
+                    "--renderer-num-workers 1 (the default), or "
+                    "disable the cache with --mm-processor-cache-gb 0."
+                )
+
         # Multimodal GGUF models must use original repo for mm processing
-        if is_gguf(self.tokenizer) and self.is_multimodal_model:
+        if is_gguf(self.tokenizer) and self.multimodal_config is not None:
             raise ValueError(
                 "Loading a multimodal GGUF model needs to use original "
                 "tokenizer. Please specify the unquantized hf model's "
@@ -1192,6 +1337,17 @@ class ModelConfig:
                 f"({parallel_config.decode_context_parallel_size})."
             )
 
+        if (
+            self.multimodal_config is not None
+            and self.multimodal_config.mm_tensor_ipc == "torch_shm"
+            and parallel_config.world_size_across_dp > 1
+        ):
+            raise ValueError(
+                "mm_tensor_ipc='torch_shm' is not supported with "
+                "data_parallel_size > 1 or tensor_parallel_size > 1 "
+                "or pipeline_parallel_size > 1."
+            )
+
     def get_sliding_window(self) -> int | None:
         """Get the sliding window size from the HF text config if present."""
         return getattr(self.hf_text_config, "sliding_window", None)
@@ -1587,6 +1743,33 @@ class ModelConfig:
                 "model creator. If this is not intended, please relaunch "
                 "vLLM instance with `--generation-config vllm`."
             )
+
+        if check_gguf_file(self.model) and getattr(self.hf_config, "model_type", "") in (
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen35",
+        ):
+            diff_sampling_param.setdefault("repetition_penalty", 1.2)
+            eos_ids: list[int] = []
+            generation_eos = config.get("eos_token_id")
+            if isinstance(generation_eos, int):
+                eos_ids.append(generation_eos)
+            elif isinstance(generation_eos, list):
+                eos_ids.extend(eos for eos in generation_eos if isinstance(eos, int))
+
+            text_eos = getattr(self.hf_text_config, "eos_token_id", None)
+            if isinstance(text_eos, int):
+                eos_ids.append(text_eos)
+            elif isinstance(text_eos, list):
+                eos_ids.extend(eos for eos in text_eos if isinstance(eos, int))
+
+            if eos_ids:
+                stop_ids = list(diff_sampling_param.get("stop_token_ids", []))
+                for eos_id in eos_ids:
+                    if eos_id not in stop_ids:
+                        stop_ids.append(eos_id)
+                diff_sampling_param["stop_token_ids"] = stop_ids
+
         return diff_sampling_param
 
     @property
@@ -1714,7 +1897,7 @@ class ModelConfig:
             )
             return self.dtype
 
-        if head_dtype not in current_platform.supported_dtypes():
+        if head_dtype not in current_platform.supported_dtypes:
             logger.warning_once(
                 "The current platform does not support [%s] head dtype, "
                 "fallback to model dtype [%s].",
@@ -2017,7 +2200,7 @@ def _resolve_auto_dtype(
 
     supported_dtypes = [
         dtype
-        for dtype in current_platform.supported_dtypes()
+        for dtype in current_platform.supported_dtypes
         if _is_valid_dtype(model_type, dtype)
     ]
 
@@ -2113,7 +2296,7 @@ def _get_head_dtype(
     elif isinstance(head_dtype, torch.dtype):
         return head_dtype
     elif head_dtype is None:
-        if torch.float32 not in current_platform.supported_dtypes():
+        if torch.float32 not in current_platform.supported_dtypes:
             return dtype
         if runner_type == "pooling":
             return torch.float32

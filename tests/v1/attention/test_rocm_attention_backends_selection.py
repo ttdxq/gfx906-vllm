@@ -338,3 +338,20 @@ def test_sparse_not_supported(mock_vllm_config):
             has_sink=False,
             use_sparse=True,
         )
+
+
+def test_get_gcn_arch_prefers_rocminfo_before_amdsmi(monkeypatch: pytest.MonkeyPatch):
+    from vllm.platforms import rocm
+
+    state = {"amdsmi_calls": 0}
+
+    monkeypatch.setattr(rocm, "_query_gcn_arch_from_rocminfo", lambda: "gfx906")
+
+    def fail_if_called() -> str:
+        state["amdsmi_calls"] += 1
+        raise RuntimeError("amdsmi path should not be used when rocminfo succeeds")
+
+    monkeypatch.setattr(rocm, "_query_gcn_arch_from_amdsmi", fail_if_called)
+
+    assert rocm._get_gcn_arch() == "gfx906"
+    assert state["amdsmi_calls"] == 0

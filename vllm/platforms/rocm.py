@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import subprocess
 from datetime import timedelta
 from functools import cache, lru_cache, wraps
 from typing import TYPE_CHECKING
@@ -26,14 +27,20 @@ logger = init_logger(__name__)
 
 try:
     from amdsmi import (
+        AmdSmiMemoryType,
         AmdSmiException,
         amdsmi_get_gpu_asic_info,
+        amdsmi_get_gpu_device_uuid,
+        amdsmi_get_gpu_memory_total,
+        amdsmi_get_gpu_memory_usage,
         amdsmi_get_processor_handles,
         amdsmi_init,
         amdsmi_shut_down,
         amdsmi_topo_get_link_type,
     )
+    _AMDSMI_AVAILABLE = True
 except ImportError as e:
+    _AMDSMI_AVAILABLE = False
     logger.warning(
         "Failed to import from amdsmi with %r. "
         "AMD GPU monitoring will be unavailable. "
@@ -78,6 +85,13 @@ _ROCM_DEVICE_ID_NAME_MAP: dict[str, str] = {
     "0x744c": "AMD_Radeon_RX7900XTX",
 }
 
+# Known amdsmi target_graphics_version quirks.
+# Some ROCm versions may return non-standard names like
+# "gfx9006" instead of the canonical "gfx906".
+_AMDSMI_GFX_NORMALIZATION: dict[str, str] = {
+    "gfx9006": "gfx906",
+}
+
 
 def _sync_hip_cuda_env_vars():
     """Ensure HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES are consistent.
@@ -102,6 +116,21 @@ def _sync_hip_cuda_env_vars():
 # Sync at import time - catches misconfigurations from process start.
 _sync_hip_cuda_env_vars()
 
+
+def _set_rocm_nccl_workarounds():
+    """Reduce ROCm NCCL watchdog/monitoring interference during graph capture.
+
+    Keep these as setdefault so advanced users can still override them
+    explicitly from their environment.
+    """
+    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+    os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")
+
+
+_set_rocm_nccl_workarounds()
+
 # AMDSMI utils
 # Note that NVML is not affected by `{CUDA/HIP_VISIBLE_DEVICES}`,
 # all the related functions work on real physical device ids.
@@ -111,6 +140,8 @@ _sync_hip_cuda_env_vars()
 def with_amdsmi_context(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        if not _AMDSMI_AVAILABLE:
+            return fn(*args, **kwargs)
         amdsmi_init()
         try:
             return fn(*args, **kwargs)
@@ -131,7 +162,15 @@ def _query_gcn_arch_from_amdsmi() -> str:
         target_gfx = asic_info.get("target_graphics_version", "")
         # FIX: Validate amdsmi return value
         if target_gfx and target_gfx not in ["gfx0", "", None]:
-            return target_gfx
+            normalized_gfx = _AMDSMI_GFX_NORMALIZATION.get(target_gfx, target_gfx)
+            if normalized_gfx != target_gfx:
+                logger.warning_once(
+                    "amdsmi returned non-standard GCN arch '%s'; "
+                    "normalizing to '%s'.",
+                    target_gfx,
+                    normalized_gfx,
+                )
+            return normalized_gfx
         # If amdsmi returns invalid value, fall through to torch.cuda
         logger.debug(
             f"amdsmi returned invalid arch '{target_gfx}', falling back to torch.cuda"
@@ -140,20 +179,58 @@ def _query_gcn_arch_from_amdsmi() -> str:
     raise RuntimeError("amdsmi did not return valid GCN arch")
 
 
+@with_amdsmi_context
+def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
+    if not _AMDSMI_AVAILABLE:
+        raise RuntimeError("AMDSMI is unavailable")
+    handles = amdsmi_get_processor_handles()
+    handle = handles[physical_device_id]
+    return amdsmi_get_gpu_memory_total(handle, AmdSmiMemoryType.VRAM)
+
+
+def _query_gcn_arch_from_rocminfo() -> str:
+    try:
+        result = subprocess.run(
+            [
+                "rocminfo",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        raise RuntimeError("rocminfo did not return valid GCN arch") from e
+
+    matches = re.findall(r"\bgfx\d+[a-z]?\b", result.stdout)
+    for arch in matches:
+        if arch != "gfx0":
+            return arch
+
+    raise RuntimeError("rocminfo did not return valid GCN arch")
+
+
 def _get_gcn_arch() -> str:
     """
-    Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
+    Get GCN arch via rocminfo first, then amdsmi, then torch.cuda.
     Called once at module level; result stored in _GCN_ARCH.
     """
+    try:
+        arch = _query_gcn_arch_from_rocminfo()
+        logger.info("Resolved GCN arch from rocminfo: %s", arch)
+        return arch
+    except Exception as e:
+        logger.debug("Failed to get GCN arch via rocminfo: %s", e)
+
     try:
         return _query_gcn_arch_from_amdsmi()
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
         logger.warning_once(
-            "Failed to get GCN arch via amdsmi, falling back to torch.cuda. "
+            "Failed to get GCN arch via rocminfo and amdsmi, falling back to torch.cuda. "
             "This will initialize CUDA and may cause "
             "issues if CUDA_VISIBLE_DEVICES is not set yet."
         )
+
     # Ultimate fallback: use torch.cuda (will initialize CUDA)
     arch = torch.cuda.get_device_properties("cuda").gcnArchName
 
@@ -178,16 +255,36 @@ def _get_gcn_arch() -> str:
     return arch
 
 
-# Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers
-# can still set CUDA_VISIBLE_DEVICES after import.
-# These are plain Python bools — fully torch.compile/Dynamo safe.
-_GCN_ARCH = _get_gcn_arch()
+# Prefer an explicit env override first; otherwise initialize lazily to avoid
+# blocking import-time startup on problematic ROCm setups.
+_GCN_ARCH = os.environ.get("VLLM_GCN_ARCH", "")
 
-_ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
-_ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])
-_ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx906", "gfx90a", "gfx942", "gfx950"])
-_ON_GFX942 = "gfx942" in _GCN_ARCH
-_ON_GFX950 = "gfx950" in _GCN_ARCH
+
+def _refresh_gcn_flags() -> None:
+    global _ON_GFX1X, _ON_MI3XX, _ON_GFX9, _ON_GFX942, _ON_GFX950
+    _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
+    _ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])
+    _ON_GFX9 = any(
+        arch in _GCN_ARCH for arch in ["gfx906", "gfx90a", "gfx942", "gfx950"]
+    )
+    _ON_GFX942 = "gfx942" in _GCN_ARCH
+    _ON_GFX950 = "gfx950" in _GCN_ARCH
+
+
+def _ensure_gcn_arch_initialized() -> None:
+    global _GCN_ARCH
+    if _GCN_ARCH:
+        return
+    _GCN_ARCH = _get_gcn_arch()
+    _refresh_gcn_flags()
+
+
+_ON_GFX1X = False
+_ON_MI3XX = False
+_ON_GFX9 = False
+_ON_GFX942 = False
+_ON_GFX950 = False
+_refresh_gcn_flags()
 
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
@@ -262,28 +359,47 @@ def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
 
 
 def on_gfx1x() -> bool:
+    _ensure_gcn_arch_initialized()
     return _ON_GFX1X
 
 
 def on_mi3xx() -> bool:
+    _ensure_gcn_arch_initialized()
     return _ON_MI3XX
 
 
 def on_gfx9() -> bool:
+    _ensure_gcn_arch_initialized()
     return _ON_GFX9
 
 
 def on_gfx942() -> bool:
+    _ensure_gcn_arch_initialized()
     return _ON_GFX942
 
 
 def on_gfx950() -> bool:
+    _ensure_gcn_arch_initialized()
     return _ON_GFX950
 
 
 def on_gfx906() -> bool:
     """检测当前GPU是否为gfx906架构"""
+    _ensure_gcn_arch_initialized()
     return "gfx906" in _GCN_ARCH
+
+
+def _rocm_supported_dtypes() -> list[torch.dtype]:
+    """ROCm supported dtypes; shared so the ``supported_dtypes`` property
+    (instance) and ``check_if_supports_dtype`` (classmethod) agree.
+
+    gfx906 lacks native bfloat16, so returns fp16/fp32 there; other GFX9
+    (gfx90a+) also include bfloat16.
+    """
+    _ensure_gcn_arch_initialized()
+    if "gfx906" in _GCN_ARCH:
+        return [torch.float16, torch.float32]
+    return [torch.float16, torch.bfloat16, torch.float32]
 
 
 @cache
@@ -298,6 +414,7 @@ def use_rocm_custom_paged_attention(
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
 ) -> bool:
+    _ensure_gcn_arch_initialized()
     # custom paged attn always supported on V0. On V1, requires sliding window
     # disabled due to observed numerical discrepancy.
     if _ON_GFX9:
@@ -336,6 +453,7 @@ def use_rocm_custom_paged_attention(
 
 @cache
 def flash_attn_triton_available() -> bool:
+    _ensure_gcn_arch_initialized()
     if not on_gfx1x():
         return False
     try:
@@ -367,11 +485,19 @@ def _get_backend_priorities(
 
     if use_mla:
         if rocm_aiter_ops.is_mla_enabled():
-            return [
+            backends = [
                 AttentionBackendEnum.ROCM_AITER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.ROCM_AITER_TRITON_MLA,
             ]
+            if envs.VLLM_ROCM_USE_GFX906_TRITON_PRIORITY and on_gfx906():
+                logger.info_once(
+                    "VLLM_ROCM_USE_GFX906_TRITON_PRIORITY enabled: preferring "
+                    "TRITON_MLA first on gfx906."
+                )
+                backends.remove(AttentionBackendEnum.TRITON_MLA)
+                backends.insert(0, AttentionBackendEnum.TRITON_MLA)
+            return backends
         else:
             return [
                 AttentionBackendEnum.TRITON_MLA,
@@ -399,6 +525,15 @@ def _get_backend_priorities(
 
     # Default: Triton Unified Attention
     backends.append(AttentionBackendEnum.TRITON_ATTN)
+
+    if envs.VLLM_ROCM_USE_GFX906_TRITON_PRIORITY and on_gfx906():
+        logger.info_once(
+            "VLLM_ROCM_USE_GFX906_TRITON_PRIORITY enabled: preferring "
+            "TRITON_ATTN first on gfx906."
+        )
+        backends.remove(AttentionBackendEnum.TRITON_ATTN)
+        backends.insert(0, AttentionBackendEnum.TRITON_ATTN)
+
     return backends
 
 
@@ -416,35 +551,23 @@ class RocmPlatform(Platform):
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
         "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
     ]
-
-    @property
-    def supported_quantization(self) -> list[str]:
-        """返回支持的量化方法列表
-
-        gfx9系列(including gfx906)的warp size为64，
-        不支持bitsandbytes(需要warp size 32)。
-        """
-        base_quantization = [
-            "awq",
-            "awq_marlin",  # will be overwritten with awq
-            "gptq",
-            "gptq_marlin",  # will be overwritten with gptq
-            "fp8",
-            "compressed-tensors",
-            "fbgemm_fp8",
-            "gguf",
-            "quark",
-            "ptpc_fp8",
-            "mxfp4",
-            "petit_nvfp4",
-            "torchao",
-        ]
-
-        # gfx9系列不支持bitsandbytes
-        if not _ON_GFX9:  # _ON_GFX9现在包含gfx906
-            base_quantization.append("bitsandbytes")
-
-        return base_quantization
+    supported_quantization: list[str] = [
+        "awq",
+        "awq_marlin",  # will be overwritten with awq
+        "gptq",
+        "gptq_marlin",  # will be overwritten with gptq
+        "fp8",
+        "compressed-tensors",
+        "fbgemm_fp8",
+        "gguf",
+        "quark",
+        "ptpc_fp8",
+        "mxfp4",
+        "petit_nvfp4",
+        "torchao",
+    ]
+    if not _ON_GFX9:
+        supported_quantization.append("bitsandbytes")
 
     @classmethod
     def import_kernels(cls) -> None:
@@ -672,17 +795,17 @@ class RocmPlatform(Platform):
         logger.info_once("Using Torch SDPA backend for ViT model.")
         return ViTAttentionBackendEnum.TORCH_SDPA
 
-    @classmethod
-    def supported_dtypes(cls) -> list[torch.dtype]:
-        """返回该平台支持的数据类型列表
+    @property
+    def supported_dtypes(self) -> list[torch.dtype]:
+        """Supported dtypes for the current ROCm device.
 
         gfx906硬件不支持bfloat16，因此只返回float16和float32。
         其他GFX9架构(gfx90a+)支持bfloat16。
+
+        Property (not classmethod) to match the Platform base contract;
+        access as ``current_platform.supported_dtypes`` without parentheses.
         """
-        if "gfx906" in _GCN_ARCH:
-            return [torch.float16, torch.float32]
-        # 其他架构支持bfloat16
-        return [torch.float16, torch.bfloat16, torch.float32]
+        return _rocm_supported_dtypes()
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
@@ -694,6 +817,7 @@ class RocmPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=8)
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+        _ensure_gcn_arch_initialized()
         cap = _capability_from_gcn_arch(_GCN_ARCH)
         if cap is not None:
             return DeviceCapability(major=cap[0], minor=cap[1])
@@ -730,6 +854,8 @@ class RocmPlatform(Platform):
     @with_amdsmi_context
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
+        if not _AMDSMI_AVAILABLE:
+            return torch.cuda.get_device_name(device_id)
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
         handle = amdsmi_get_processor_handles()[physical_device_id]
         asic_info = amdsmi_get_gpu_asic_info(handle)
@@ -739,7 +865,38 @@ class RocmPlatform(Platform):
         return asic_info["market_name"]
 
     @classmethod
+    @with_amdsmi_context
+    def get_device_uuid(cls, device_id: int = 0) -> str:
+        if not _AMDSMI_AVAILABLE:
+            return ""
+        physical_device_id = cls.device_id_to_physical_device_id(device_id)
+
+        try:
+            handles = amdsmi_get_processor_handles()
+            handle = handles[physical_device_id]
+        except (AmdSmiException, IndexError) as error:
+            logger.error("amdsmi device query failed", exc_info=error)
+            return ""
+
+        try:
+            return amdsmi_get_gpu_device_uuid(handle)
+        except AmdSmiException as error:
+            logger.error("amdsmi device uuid query failed", exc_info=error)
+            return ""
+
+    @classmethod
+    @with_amdsmi_context
     def get_device_total_memory(cls, device_id: int = 0) -> int:
+        if not _AMDSMI_AVAILABLE:
+            device_props = torch.cuda.get_device_properties(device_id)
+            return device_props.total_memory
+        physical_device_id = cls.device_id_to_physical_device_id(device_id)
+        handles = amdsmi_get_processor_handles()
+        if physical_device_id < len(handles):
+            return amdsmi_get_gpu_memory_total(
+                handles[physical_device_id], AmdSmiMemoryType.VRAM
+            )
+
         device_props = torch.cuda.get_device_properties(device_id)
         return device_props.total_memory
 
@@ -854,6 +1011,7 @@ class RocmPlatform(Platform):
 
     @classmethod
     def verify_quantization(cls, quant: str) -> None:
+        _ensure_gcn_arch_initialized()
         super().verify_quantization(quant)
 
         # gfx906不支持bitsandbytes检查
@@ -879,6 +1037,26 @@ class RocmPlatform(Platform):
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
+        device_obj = (
+            torch.device(device) if device is not None else torch.device("cuda:0")
+        )
+        physical_device_id = cls.device_id_to_physical_device_id(device_obj.index or 0)
+
+        try:
+            amdsmi_init()
+            handles = amdsmi_get_processor_handles()
+            if physical_device_id < len(handles):
+                return amdsmi_get_gpu_memory_usage(
+                    handles[physical_device_id], AmdSmiMemoryType.VRAM
+                )
+        except Exception:
+            pass
+        finally:
+            try:
+                amdsmi_shut_down()
+            except Exception:
+                pass
+
         torch.cuda.reset_peak_memory_stats(device)
         free_mem, total_mem = torch.cuda.mem_get_info(device)
         return total_mem - free_mem
@@ -891,15 +1069,18 @@ class RocmPlatform(Platform):
 
     @classmethod
     def supports_mx(cls) -> bool:
+        _ensure_gcn_arch_initialized()
         return any(gfx in _GCN_ARCH for gfx in ["gfx95"])
 
     @classmethod
     def supports_fp8(cls) -> bool:
+        _ensure_gcn_arch_initialized()
         return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95", "gfx12"])
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:
         # only device 0 is checked, this assumes MI300 platforms are homogeneous
+        _ensure_gcn_arch_initialized()
         return "gfx94" in _GCN_ARCH
 
     @classmethod
@@ -912,6 +1093,7 @@ class RocmPlatform(Platform):
     @classmethod
     def use_custom_allreduce(cls) -> bool:
         # We only enable custom allreduce for MI300 series
+        _ensure_gcn_arch_initialized()
         return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
 
     @classmethod
@@ -920,6 +1102,7 @@ class RocmPlatform(Platform):
 
     @classmethod
     def is_navi(cls) -> bool:
+        _ensure_gcn_arch_initialized()
         return "gfx1" in _GCN_ARCH
 
     @classmethod
@@ -963,8 +1146,18 @@ class RocmPlatform(Platform):
 
     @classmethod
     def check_if_supports_dtype(cls, dtype: torch.dtype):
-        # 新增：首先检查supported_dtypes
-        supported = cls.supported_dtypes()
+        if on_gfx906() and dtype == torch.bfloat16:
+            gpu_name = cls.get_device_name()
+            raise ValueError(
+                f"Dtype {dtype} is not supported on {gpu_name} (gfx906). "
+                "gfx906 does not natively support bfloat16, and some model "
+                "configs default to bfloat16. Please launch with "
+                "--dtype=half or --dtype=float16 to avoid float32 fallback "
+                "and ROCm instability on gfx906."
+            )
+
+        # Classmethod cannot read a @property off `cls`; use the shared helper.
+        supported = _rocm_supported_dtypes()
         if dtype not in supported:
             gpu_name = cls.get_device_name()
             raise ValueError(
@@ -1004,6 +1197,11 @@ class RocmPlatform(Platform):
     @classmethod
     def num_compute_units(cls, device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).multi_processor_count
+
+    @classmethod
+    def is_pin_memory_available(cls) -> bool:
+        _ensure_gcn_arch_initialized()
+        return "gfx906" not in _GCN_ARCH
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:

@@ -12,6 +12,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
@@ -20,6 +21,73 @@ from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
+
+
+def _chunk_fwd_o_eager(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    h: torch.Tensor,
+    g: torch.Tensor | None,
+    scale: float,
+    cu_seqlens: torch.LongTensor | None,
+    chunk_size: int,
+) -> torch.Tensor:
+    B, T, Hg, _, _ = *q.shape, v.shape[-1]
+    H = v.shape[-2]
+    BT = chunk_size
+    head_ratio = H // Hg
+    o = torch.empty_like(v)
+
+    if cu_seqlens is None:
+        seq_ranges = [(b, b, 0, T) for b in range(B)]
+    else:
+        seq_ranges = [
+            (0, i, int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item()))
+            for i in range(len(cu_seqlens) - 1)
+        ]
+
+    chunk_offset = 0
+    for batch_idx, seq_idx, seq_start, seq_end in seq_ranges:
+        local_chunk_offset = chunk_offset
+        for chunk_start in range(seq_start, seq_end, BT):
+            chunk_end = min(chunk_start + BT, seq_end)
+            chunk_len = chunk_end - chunk_start
+
+            for head_idx in range(H):
+                key_head_idx = head_idx // head_ratio
+                q_chunk = q[batch_idx, chunk_start:chunk_end, key_head_idx].float()
+                k_chunk = k[batch_idx, chunk_start:chunk_end, key_head_idx].float()
+                v_chunk = v[batch_idx, chunk_start:chunk_end, head_idx].float()
+                h_chunk = h[batch_idx, local_chunk_offset, head_idx].float()
+
+                out_chunk = torch.matmul(q_chunk, h_chunk)
+                attn = torch.matmul(q_chunk, k_chunk.transpose(0, 1))
+
+                if g is not None:
+                    g_chunk = g[batch_idx, chunk_start:chunk_end, head_idx].float()
+                    out_chunk = out_chunk * torch.exp(g_chunk).unsqueeze(-1)
+                    attn = attn * torch.exp(g_chunk.unsqueeze(1) - g_chunk.unsqueeze(0))
+
+                attn = torch.tril(attn, diagonal=0)
+                out_chunk = (out_chunk + torch.matmul(attn, v_chunk)) * scale
+                o[batch_idx, chunk_start:chunk_end, head_idx] = out_chunk.to(o.dtype)
+
+            local_chunk_offset += 1
+
+        chunk_offset += (seq_end - seq_start + BT - 1) // BT
+
+    return o
 
 
 @triton.heuristics(
@@ -157,6 +225,18 @@ def chunk_fwd_o(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
+
+    if _is_gfx906_rocm():
+        return _chunk_fwd_o_eager(
+            q=q,
+            k=k,
+            v=v,
+            h=h,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=BT,
+        )
 
     o = torch.empty_like(v)
 

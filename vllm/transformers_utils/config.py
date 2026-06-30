@@ -62,6 +62,11 @@ MISTRAL_CONFIG_NAME = "params.json"
 logger = init_logger(__name__)
 
 
+def _trace_qwen35_config_import(marker: str) -> None:
+    if os.environ.get("VLLM_QWEN35_IMPORT_TRACE") == "1":
+        print(f"[qwen35-config-import] {marker}", flush=True)
+
+
 class LazyConfigDict(dict):
     def __getitem__(self, key):
         if isinstance(value := super().__getitem__(key), type):
@@ -95,6 +100,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     ultravox="UltravoxConfig",
     step3_vl="Step3VLConfig",
     step3_text="Step3TextConfig",
+    qwen3_5="Qwen3_5Config",
+    qwen3_5_moe="Qwen3_5MoeConfig",
     qwen3_next="Qwen3NextConfig",
     lfm2_moe="Lfm2MoeConfig",
 )
@@ -108,6 +115,8 @@ _AUTO_CONFIG_KWARGS_OVERRIDES: dict[str, dict[str, Any]] = {
     "Llama_Nemotron_Nano_VL": {"attn_implementation": "eager"},
     "NVLM_D": {"has_no_defaults_at_init": True},
 }
+
+_trace_qwen35_config_import("after-top-level-defs")
 
 
 class HFConfigParser(ConfigParserBase):
@@ -225,6 +234,9 @@ class MistralConfigParser(ConfigParserBase):
             config.sliding_window = next(filter(None, sliding_window), None)
 
         return config_dict, config
+
+
+_trace_qwen35_config_import("after-config-parsers")
 
 
 _CONFIG_FORMAT_TO_CONFIG_PARSER: dict[str, type[ConfigParserBase]] = {
@@ -473,17 +485,19 @@ def maybe_override_with_speculators(
     Returns:
         Tuple of (resolved_model, resolved_tokenizer, speculative_config)
     """
-    if check_gguf_file(model):
+    config_source = kwargs.pop("hf_config_path", None)
+
+    if check_gguf_file(model) and config_source is None:
         kwargs["gguf_file"] = Path(model).name
         gguf_model_repo = Path(model).parent
-    elif is_remote_gguf(model):
+    elif is_remote_gguf(model) and config_source is None:
         repo_id, _ = split_remote_gguf(model)
         gguf_model_repo = Path(repo_id)
     else:
         gguf_model_repo = None
     kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
     config_dict, _ = PretrainedConfig.get_config_dict(
-        model if gguf_model_repo is None else gguf_model_repo,
+        config_source if config_source is not None else (model if gguf_model_repo is None else gguf_model_repo),
         revision=revision,
         trust_remote_code=trust_remote_code,
         token=_get_hf_token(),
@@ -510,6 +524,9 @@ def maybe_override_with_speculators(
     model = tokenizer = verifier_model
 
     return model, tokenizer, speculative_config
+
+
+_trace_qwen35_config_import("after-speculator-helpers")
 
 
 def get_config(
@@ -738,6 +755,9 @@ def get_pooling_config(model: str, revision: str | None = "main") -> dict | None
         return {"pooling_type": pooling_type_name, "normalize": normalize}
 
     return None
+
+
+_trace_qwen35_config_import("after-pooling-helpers")
 
 
 def get_pooling_config_name(pooling_name: str) -> str | None:
@@ -1087,3 +1107,6 @@ def _maybe_retrieve_max_pos_from_hf(model, revision, **kwargs) -> int:
         )
 
     return max_position_embeddings
+
+
+_trace_qwen35_config_import("module-import-complete")

@@ -57,6 +57,9 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
 
+_DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
+_GFX906_FALLBACK_GPU_MEMORY_UTILIZATION = 0.98
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 
@@ -229,7 +232,7 @@ class Worker(WorkerBase):
             torch.cuda.empty_cache()
 
             # take current memory snapshot
-            self.init_snapshot = MemorySnapshot()
+            self.init_snapshot = MemorySnapshot(device=self.device)
             self.requested_memory = (
                 self.init_snapshot.total_memory
                 * self.cache_config.gpu_memory_utilization
@@ -341,6 +344,40 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.requested_memory - profile_result.non_kv_cache_memory
         )
+
+        if (
+            self.available_kv_cache_memory_bytes <= 0
+            and self.cache_config.kv_cache_memory_bytes is None
+            and current_platform.is_rocm()
+            and abs(
+                self.cache_config.gpu_memory_utilization
+                - _DEFAULT_GPU_MEMORY_UTILIZATION
+            )
+            < 1e-6
+        ):
+            from vllm.platforms.rocm import on_gfx906
+
+            if on_gfx906():
+                fallback_requested_memory = (
+                    self.init_snapshot.total_memory
+                    * _GFX906_FALLBACK_GPU_MEMORY_UTILIZATION
+                )
+                if self.init_snapshot.free_memory >= fallback_requested_memory:
+                    self.cache_config.gpu_memory_utilization = (
+                        _GFX906_FALLBACK_GPU_MEMORY_UTILIZATION
+                    )
+                    self.requested_memory = fallback_requested_memory
+                    self.available_kv_cache_memory_bytes = (
+                        self.requested_memory - profile_result.non_kv_cache_memory
+                    )
+                    logger.warning_once(
+                        "gfx906 detected and default gpu_memory_utilization=0.9 "
+                        "left no KV cache memory after profiling; "
+                        "automatically raising it to 0.98. Override with "
+                        "--gpu-memory-utilization or --kv-cache-memory-bytes "
+                        "if needed.",
+                        scope="local",
+                    )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(

@@ -185,6 +185,10 @@ class Qwen3_5Config(PretrainedConfig):
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
+
+        kwargs.setdefault("bos_token_id", self.text_config.bos_token_id)
+        kwargs.setdefault("eos_token_id", self.text_config.eos_token_id)
+
         super().__init__(**kwargs)
         # Set after super().__init__() to avoid v4 PretrainedConfig overwrite
         self.tie_word_embeddings = tie_word_embeddings

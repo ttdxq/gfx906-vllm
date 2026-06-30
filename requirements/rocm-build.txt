@@ -4,9 +4,9 @@
 # DOWNGRADED for gfx906 compatibility
 # ROCm 7.0+ dropped gfx906 support, using ROCm 6.3 instead
 --extra-index-url https://download.pytorch.org/whl/rocm6.3
-torch==2.9.0
-torchvision==0.24.0
-torchaudio==2.9.0
+torch==2.9.0+rocm6.3
+torchvision==0.24.0+rocm6.3
+torchaudio==2.9.0+rocm6.3
 
 # DOWNGRADED for gfx906 compatibility
 # Triton 3.6+ may have removed gfx906 support

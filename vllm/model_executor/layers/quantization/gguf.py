@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Any, Optional
@@ -12,6 +13,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.platforms.rocm import on_gfx906
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
@@ -185,6 +187,11 @@ def _fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
+    if os.getenv("VLLM_GGUF_FORCE_DEQUANT_MATMUL", "0") == "1":
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+        shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
+        weight = ops.ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+        return x @ weight.T
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
@@ -405,6 +412,72 @@ except AttributeError as error:
     raise error
 
 
+def _dequantize_gguf_weight(
+    qweight: torch.Tensor,
+    qweight_type: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    if qweight_type in UNQUANTIZED_TYPES:
+        return qweight.to(dtype=out_dtype).contiguous()
+    if qweight_type in DEQUANT_TYPES:
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+        shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
+        return ops.ggml_dequantize(qweight, qweight_type, *shape, out_dtype).contiguous()
+
+    qweight_type = WeightType(qweight_type)
+    raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
+
+
+def _is_gfx906_qwen35_linear_attn_fallback(layer: torch.nn.Module) -> bool:
+    if not on_gfx906():
+        return False
+    prefix = getattr(layer, "prefix", "")
+    if ".linear_attn." not in prefix:
+        return False
+    return prefix.endswith((
+        ".linear_attn.in_proj_qkvz",
+        ".linear_attn.in_proj_qkv",
+        ".linear_attn.in_proj_z",
+        ".linear_attn.in_proj_ba",
+        ".linear_attn.in_proj_b",
+        ".linear_attn.in_proj_a",
+    ))
+
+
+def _ordered_gguf_shard_ids(shard_id: list[int | str]) -> list[int | str]:
+    if all(isinstance(idx, int) for idx in shard_id):
+        return sorted(shard_id)
+    if {"q", "k", "v"}.issubset(set(shard_id)):
+        return ["q", "k", "v"]
+    return list(shard_id)
+
+
+def _materialize_dense_gguf_weight(
+    layer: torch.nn.Module,
+    out_dtype: torch.dtype,
+) -> torch.nn.Parameter:
+    shard_id = layer.qweight.shard_id
+    if shard_id:
+        qweight = layer.qweight
+        parts = []
+        for idx in _ordered_gguf_shard_ids(shard_id):
+            qweight_type = layer.qweight_type.shard_weight_type[idx]
+            if hasattr(qweight, "shard_offset_map"):
+                start, end, offset = qweight.shard_offset_map[idx]
+                shard = qweight[start:end, :offset].contiguous()
+            else:
+                shard = qweight.data_container[qweight.shard_id_map[idx]].contiguous()
+            parts.append(_dequantize_gguf_weight(shard, qweight_type, out_dtype))
+        weight = torch.cat(parts, dim=0).contiguous()
+    else:
+        weight = _dequantize_gguf_weight(
+            layer.qweight,
+            layer.qweight_type.weight_type,
+            out_dtype,
+        )
+    return Parameter(weight, requires_grad=False)
+
+
 class GGUFLinearMethod(LinearMethodBase):
     """Linear method for GGUF.
 
@@ -468,6 +541,15 @@ class GGUFLinearMethod(LinearMethodBase):
             raise ValueError(
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
             )
+        if _is_gfx906_qwen35_linear_attn_fallback(layer):
+            layer.register_parameter(
+                "weight",
+                _materialize_dense_gguf_weight(layer, self.params_dtype),
+            )
+            layer.register_parameter("qweight", None)
+            layer.register_parameter("qweight_type", None)
+            layer.use_dense_gguf_fallback = True
+            return
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
@@ -477,7 +559,22 @@ class GGUFLinearMethod(LinearMethodBase):
         qweight = layer.qweight
         shard_id_map = qweight.shard_id_map
         shard_id = qweight.shard_id
-        if len(data_container := qweight.data_container) > 1:
+        data_container = qweight.data_container
+        if len(data_container) == 1:
+            data = data_container[0].to(device=qweight.device).contiguous()
+            qweight.data_container.clear()
+            padded_param = Parameter(data, requires_grad=False)
+            set_weight_attrs(padded_param, vars(qweight))
+            set_weight_attrs(
+                padded_param,
+                {
+                    "shard_offset_map": {
+                        shard_id[0]: (0, data.size(0), data.size(1))
+                    }
+                },
+            )
+            layer.register_parameter("qweight", padded_param)
+        elif len(data_container) > 1:
             dtype = {data.dtype for data in data_container}
             assert len(dtype) == 1, ValueError(
                 f"Data container has mixed dtypes: {dtype}"
@@ -512,20 +609,32 @@ class GGUFLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "use_dense_gguf_fallback", False):
+            weight = layer.weight.to(dtype=x.dtype)
+            out = x @ weight.T
+            if bias is not None:
+                out.add_(bias.to(dtype=out.dtype))
+            return out
+
         shard_id = layer.qweight.shard_id
 
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            if all(isinstance(idx, int) for idx in shard_id):
+                shard_id = sorted(shard_id)
+            elif {"q", "k", "v"}.issubset(set(shard_id)):
+                shard_id = ["q", "k", "v"]
             qweight = layer.qweight
             result = []
             for idx in shard_id:
-                start, end, offset = layer.qweight.shard_offset_map[idx]
                 qweight_type = layer.qweight_type.shard_weight_type[idx]
+                if hasattr(layer.qweight, "shard_offset_map"):
+                    start, end, offset = layer.qweight.shard_offset_map[idx]
+                    shard = qweight[start:end, :offset].contiguous()
+                else:
+                    shard = qweight.data_container[qweight.shard_id_map[idx]].contiguous()
                 result.append(
-                    fused_mul_mat_gguf(
-                        x, qweight[start:end, :offset].contiguous(), qweight_type
-                    )
+                    fused_mul_mat_gguf(x, shard, qweight_type)
                 )
             out = torch.cat(result, axis=1)
         else:

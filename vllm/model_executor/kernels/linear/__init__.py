@@ -24,17 +24,11 @@ from vllm.model_executor.kernels.linear.mixed_precision import (
     MPLinearKernel,
     MPLinearLayerConfig,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.allspark import (
-    AllSparkLinearKernel,
-)
 from vllm.model_executor.kernels.linear.mixed_precision.conch import (
     ConchLinearKernel,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.cpu import (
     CPUWNA16LinearKernel,
-)
-from vllm.model_executor.kernels.linear.mixed_precision.cutlass import (
-    CutlassW4A8LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.dynamic_4bit import (
     Dynamic4bitLinearKernel,
@@ -42,16 +36,7 @@ from vllm.model_executor.kernels.linear.mixed_precision.dynamic_4bit import (
 from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
     ExllamaLinearKernel,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.machete import (
-    MacheteLinearKernel,
-)
-from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
-    MarlinLinearKernel,
-)
-from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
-    XPUwNa16LinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm import (
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
     Int8ScaledMMLinearKernel,
@@ -59,78 +44,188 @@ from vllm.model_executor.kernels.linear.scaled_mm import (
     ScaledMMLinearKernel,
     ScaledMMLinearLayerConfig,
 )
-from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
-    AiterInt8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
-    CPUInt8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
-    CutlassFP8ScaledMMLinearKernel,
-    CutlassInt8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
-    FlashInferFP8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
-    ChannelWiseTorchFP8ScaledMMLinearKernel,
-    PerTensorTorchFP8ScaledMMLinearKernel,
-    RowWiseTorchFP8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
-    ROCmFP8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.triton import (
-    TritonInt8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
-    XPUFP8ScaledMMLinearKernel,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import PlatformEnum, current_platform
 
 logger = init_logger(__name__)
 
+try:
+    from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
+        CPUInt8ScaledMMLinearKernel,
+    )
+except ImportError:
+    CPUInt8ScaledMMLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
+        ChannelWiseTorchFP8ScaledMMLinearKernel,
+        PerTensorTorchFP8ScaledMMLinearKernel,
+        RowWiseTorchFP8ScaledMMLinearKernel,
+    )
+except ImportError:
+    ChannelWiseTorchFP8ScaledMMLinearKernel = None
+    PerTensorTorchFP8ScaledMMLinearKernel = None
+    RowWiseTorchFP8ScaledMMLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
+        ROCmFP8ScaledMMLinearKernel,
+    )
+except ImportError:
+    ROCmFP8ScaledMMLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+        TritonInt8ScaledMMLinearKernel,
+    )
+except ImportError:
+    TritonInt8ScaledMMLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
+        AiterInt8ScaledMMLinearKernel,
+    )
+except ImportError:
+    AiterInt8ScaledMMLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+        CutlassFP8ScaledMMLinearKernel,
+        CutlassInt8ScaledMMLinearKernel,
+    )
+except ImportError:
+    CutlassFP8ScaledMMLinearKernel = None
+    CutlassInt8ScaledMMLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+        FlashInferFP8ScaledMMLinearKernel,
+    )
+except ImportError:
+    FlashInferFP8ScaledMMLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
+        XPUFP8ScaledMMLinearKernel,
+    )
+except ImportError:
+    XPUFP8ScaledMMLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.mixed_precision.allspark import (
+        AllSparkLinearKernel,
+    )
+except ImportError:
+    AllSparkLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.mixed_precision.cutlass import (
+        CutlassW4A8LinearKernel,
+    )
+except ImportError:
+    CutlassW4A8LinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.mixed_precision.machete import (
+        MacheteLinearKernel,
+    )
+except ImportError:
+    MacheteLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
+        MarlinLinearKernel,
+    )
+except ImportError:
+    MarlinLinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
+        XPUwNa16LinearKernel,
+    )
+except ImportError:
+    XPUwNa16LinearKernel = None
+
+try:
+    from vllm.model_executor.kernels.linear.mixed_precision.torch_wna16 import (
+        TorchWNA16LinearKernel,
+    )
+except ImportError:
+    TorchWNA16LinearKernel = None
+
 # in priority/performance order (when available)
 _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]] = {
-    PlatformEnum.CPU: [CPUInt8ScaledMMLinearKernel],
-    PlatformEnum.CUDA: [
-        CutlassInt8ScaledMMLinearKernel,
-        TritonInt8ScaledMMLinearKernel,
-    ],
-    PlatformEnum.ROCM: [AiterInt8ScaledMMLinearKernel, TritonInt8ScaledMMLinearKernel],
+    PlatformEnum.CPU: [],
+    PlatformEnum.CUDA: [],
+    PlatformEnum.ROCM: [],
 }
+
+if CPUInt8ScaledMMLinearKernel is not None:
+    _POSSIBLE_INT8_KERNELS[PlatformEnum.CPU].append(CPUInt8ScaledMMLinearKernel)
+if TritonInt8ScaledMMLinearKernel is not None:
+    _POSSIBLE_INT8_KERNELS[PlatformEnum.CUDA].append(TritonInt8ScaledMMLinearKernel)
+    _POSSIBLE_INT8_KERNELS[PlatformEnum.ROCM].append(TritonInt8ScaledMMLinearKernel)
+
+if CutlassInt8ScaledMMLinearKernel is not None:
+    _POSSIBLE_INT8_KERNELS[PlatformEnum.CUDA].insert(0, CutlassInt8ScaledMMLinearKernel)
+if AiterInt8ScaledMMLinearKernel is not None:
+    _POSSIBLE_INT8_KERNELS[PlatformEnum.ROCM].insert(0, AiterInt8ScaledMMLinearKernel)
 
 # in priority/performance order (when available)
 _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
-    PlatformEnum.CUDA: [
-        FlashInferFP8ScaledMMLinearKernel,
-        CutlassFP8ScaledMMLinearKernel,
-        PerTensorTorchFP8ScaledMMLinearKernel,
-        ChannelWiseTorchFP8ScaledMMLinearKernel,
-    ],
-    PlatformEnum.ROCM: [
-        ROCmFP8ScaledMMLinearKernel,
-        PerTensorTorchFP8ScaledMMLinearKernel,
-        RowWiseTorchFP8ScaledMMLinearKernel,
-        ChannelWiseTorchFP8ScaledMMLinearKernel,
-    ],
-    PlatformEnum.CPU: [
-        PerTensorTorchFP8ScaledMMLinearKernel,
-        ChannelWiseTorchFP8ScaledMMLinearKernel,
-    ],
-    PlatformEnum.XPU: [
-        XPUFP8ScaledMMLinearKernel,
-    ],
+    PlatformEnum.CUDA: [],
+    PlatformEnum.ROCM: [],
+    PlatformEnum.CPU: [],
+    PlatformEnum.XPU: [],
 }
+
+if PerTensorTorchFP8ScaledMMLinearKernel is not None:
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.CUDA].append(
+        PerTensorTorchFP8ScaledMMLinearKernel
+    )
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.ROCM].append(
+        PerTensorTorchFP8ScaledMMLinearKernel
+    )
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.CPU].append(
+        PerTensorTorchFP8ScaledMMLinearKernel
+    )
+if ChannelWiseTorchFP8ScaledMMLinearKernel is not None:
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.CUDA].append(
+        ChannelWiseTorchFP8ScaledMMLinearKernel
+    )
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.ROCM].append(
+        ChannelWiseTorchFP8ScaledMMLinearKernel
+    )
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.CPU].append(
+        ChannelWiseTorchFP8ScaledMMLinearKernel
+    )
+if ROCmFP8ScaledMMLinearKernel is not None:
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.ROCM].insert(0, ROCmFP8ScaledMMLinearKernel)
+if RowWiseTorchFP8ScaledMMLinearKernel is not None:
+    insert_at = (
+        1
+        if ROCmFP8ScaledMMLinearKernel is not None
+        else len(_POSSIBLE_FP8_KERNELS[PlatformEnum.ROCM])
+    )
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.ROCM].insert(
+        insert_at, RowWiseTorchFP8ScaledMMLinearKernel
+    )
+
+if FlashInferFP8ScaledMMLinearKernel is not None:
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.CUDA].insert(
+        0, FlashInferFP8ScaledMMLinearKernel
+    )
+if CutlassFP8ScaledMMLinearKernel is not None:
+    cuda_fp8_index = 1 if FlashInferFP8ScaledMMLinearKernel is not None else 0
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.CUDA].insert(
+        cuda_fp8_index, CutlassFP8ScaledMMLinearKernel
+    )
+if XPUFP8ScaledMMLinearKernel is not None:
+    _POSSIBLE_FP8_KERNELS[PlatformEnum.XPU].append(XPUFP8ScaledMMLinearKernel)
 
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
-        CutlassW4A8LinearKernel,
-        MacheteLinearKernel,
-        AllSparkLinearKernel,
-        MarlinLinearKernel,
         ConchLinearKernel,
         ExllamaLinearKernel,
     ],
@@ -138,14 +233,38 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         ConchLinearKernel,
         ExllamaLinearKernel,
     ],
-    PlatformEnum.XPU: [
-        XPUwNa16LinearKernel,
-    ],
+    PlatformEnum.XPU: [],
     PlatformEnum.CPU: [
         Dynamic4bitLinearKernel,
         CPUWNA16LinearKernel,
     ],
 }
+
+if CutlassW4A8LinearKernel is not None:
+    _POSSIBLE_KERNELS[PlatformEnum.CUDA].insert(0, CutlassW4A8LinearKernel)
+if MacheteLinearKernel is not None:
+    _POSSIBLE_KERNELS[PlatformEnum.CUDA].insert(
+        1 if CutlassW4A8LinearKernel is not None else 0, MacheteLinearKernel
+    )
+if AllSparkLinearKernel is not None:
+    cuda_index = (
+        2
+        if MacheteLinearKernel is not None and CutlassW4A8LinearKernel is not None
+        else (
+            1
+            if (MacheteLinearKernel is not None or CutlassW4A8LinearKernel is not None)
+            else 0
+        )
+    )
+    _POSSIBLE_KERNELS[PlatformEnum.CUDA].insert(cuda_index, AllSparkLinearKernel)
+if MarlinLinearKernel is not None:
+    _POSSIBLE_KERNELS[PlatformEnum.CUDA].insert(
+        len(_POSSIBLE_KERNELS[PlatformEnum.CUDA]) - 2, MarlinLinearKernel
+    )
+if XPUwNa16LinearKernel is not None:
+    _POSSIBLE_KERNELS[PlatformEnum.XPU].append(XPUwNa16LinearKernel)
+if TorchWNA16LinearKernel is not None:
+    _POSSIBLE_KERNELS[PlatformEnum.ROCM].append(TorchWNA16LinearKernel)
 
 _KernelT = TypeVar("_KernelT", bound=ScaledMMLinearKernel)
 _KernelConfigT = TypeVar("_KernelConfigT", bound=ScaledMMLinearLayerConfig)
@@ -373,11 +492,7 @@ __all__ = [
     "FP8ScaledMMLinearLayerConfig",
     "Int8ScaledMMLinearLayerConfig",
     "ScaledMMLinearLayerConfig",
-    "AiterInt8ScaledMMLinearKernel",
     "CPUInt8ScaledMMLinearKernel",
-    "CutlassFP8ScaledMMLinearKernel",
-    "CutlassInt8ScaledMMLinearKernel",
-    "FlashInferFP8ScaledMMLinearKernel",
     "ChannelWiseTorchFP8ScaledMMLinearKernel",
     "PerTensorTorchFP8ScaledMMLinearKernel",
     "RowWiseTorchFP8ScaledMMLinearKernel",
@@ -385,13 +500,31 @@ __all__ = [
     "TritonInt8ScaledMMLinearKernel",
     "MPLinearKernel",
     "MPLinearLayerConfig",
-    "AllSparkLinearKernel",
     "ConchLinearKernel",
     "CPUWNA16LinearKernel",
-    "CutlassW4A8LinearKernel",
     "Dynamic4bitLinearKernel",
     "ExllamaLinearKernel",
-    "MacheteLinearKernel",
-    "MarlinLinearKernel",
-    "XPUwNa16LinearKernel",
 ]
+
+if AllSparkLinearKernel is not None:
+    __all__.append("AllSparkLinearKernel")
+if AiterInt8ScaledMMLinearKernel is not None:
+    __all__.append("AiterInt8ScaledMMLinearKernel")
+if CutlassW4A8LinearKernel is not None:
+    __all__.append("CutlassW4A8LinearKernel")
+if CutlassFP8ScaledMMLinearKernel is not None:
+    __all__.append("CutlassFP8ScaledMMLinearKernel")
+if CutlassInt8ScaledMMLinearKernel is not None:
+    __all__.append("CutlassInt8ScaledMMLinearKernel")
+if FlashInferFP8ScaledMMLinearKernel is not None:
+    __all__.append("FlashInferFP8ScaledMMLinearKernel")
+if MacheteLinearKernel is not None:
+    __all__.append("MacheteLinearKernel")
+if MarlinLinearKernel is not None:
+    __all__.append("MarlinLinearKernel")
+if XPUFP8ScaledMMLinearKernel is not None:
+    __all__.append("XPUFP8ScaledMMLinearKernel")
+if XPUwNa16LinearKernel is not None:
+    __all__.append("XPUwNa16LinearKernel")
+if TorchWNA16LinearKernel is not None:
+    __all__.append("TorchWNA16LinearKernel")

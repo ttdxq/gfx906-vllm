@@ -1,16 +1,25 @@
 [build-system]
-# Should be mirrored in requirements/build.txt
+# Should be mirrored in requirements/build/cuda.txt
 requires = [
     "cmake>=3.26.1",
     "ninja",
     "packaging>=24.2",
     "setuptools>=77.0.3,<81.0.0",
     "setuptools-scm>=8.0",
-    "torch == 2.9.0",
+    "setuptools-rust>=1.9.0",
+    "torch == 2.9.0+rocm6.3",
     "wheel",
     "jinja2",
 ]
 build-backend = "setuptools.build_meta"
+
+[[tool.uv.index]]
+name = "pytorch-rocm63"
+url = "https://download.pytorch.org/whl/rocm6.3"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-rocm63" }
 
 [project]
 name = "vllm"
@@ -302,4 +311,5 @@ windo = "windo"
 [tool.typos.type.vimscript.extend-words]
 
 [tool.uv]
+torch-backend = "rocm6.3"
 no-build-isolation-package = ["torch"]

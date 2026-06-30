@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 import pickle
+import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -27,12 +29,29 @@ from zmq import (  # type: ignore
 import vllm.envs as envs
 from vllm.distributed.utils import StatelessProcessGroup, sched_yield
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.network_utils import (
     get_ip,
     get_open_port,
+    get_open_zmq_inproc_path,
     get_open_zmq_ipc_path,
     is_valid_ipv6_address,
 )
+
+logger = init_logger(__name__)
+
+
+SPINLOOP_EXT_ENABLED = False
+if envs.VLLM_USE_SPINLOOP_EXT:
+    try:
+        from vllm.spinloop import spinloop
+
+        SPINLOOP_EXT_ENABLED = True
+    except ImportError:
+        logger.warning(
+            "spinloop extension could not be loaded, disabling VLLM_USE_SPINLOOP_EXT!"
+        )
+SPINLOOP_TIMEOUT_SECONDS = 0.1
 
 if TYPE_CHECKING:
     from _typeshed import SizedBuffer
@@ -42,11 +61,16 @@ VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
 from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
 
 
+_memory_fence_lock = threading.Lock()
+
+
+def memory_fence():
+    with _memory_fence_lock:
+        pass
+
+
 def to_bytes_big(value: int, size: int) -> bytes:
     return value.to_bytes(size, byteorder="big")
-
-
-logger = init_logger(__name__)
 
 
 def long_wait_time_msg(threshold: int) -> str:
@@ -413,9 +437,16 @@ class MessageQueue:
         n_warning = 1
         while True:
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
-                read_count = sum(metadata_buffer[1:])
-                written_flag = metadata_buffer[0]
-                if written_flag and read_count != self.buffer.n_reader:
+                def check():
+                    memory_fence()
+                    read_count = sum(metadata_buffer[1:])
+                    written_flag = metadata_buffer[0]
+                    return not (written_flag and read_count != self.buffer.n_reader)
+
+                if SPINLOOP_EXT_ENABLED and not check():
+                    spinloop(metadata_buffer, check, timeout=SPINLOOP_TIMEOUT_SECONDS)
+
+                if not check():
                     # this block is written and not read by all readers
                     # for writers, `self.current_idx` is the next block to write
                     # if this block is not ready to write,
@@ -455,8 +486,10 @@ class MessageQueue:
                 for i in range(1, self.buffer.n_reader + 1):
                     # set read flag to 0, meaning it is not read yet
                     metadata_buffer[i] = 0
+                memory_fence()
                 # mark the block as written
                 metadata_buffer[0] = 1
+                memory_fence()
                 self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
                 break
 
@@ -472,9 +505,20 @@ class MessageQueue:
         n_warning = 1
         while True:
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
-                read_flag = metadata_buffer[self.local_reader_rank + 1]
-                written_flag = metadata_buffer[0]
-                if not written_flag or read_flag:
+                def check():
+                    memory_fence()
+                    read_flag = metadata_buffer[self.local_reader_rank + 1]
+                    written_flag = metadata_buffer[0]
+                    return not (not written_flag or read_flag)
+
+                if SPINLOOP_EXT_ENABLED and not check():
+                    spinloop(
+                        metadata_buffer[0 : self.local_reader_rank + 1],
+                        check,
+                        timeout=SPINLOOP_TIMEOUT_SECONDS,
+                    )
+
+                if not check():
                     # this block is either
                     # (1) not written
                     # (2) already read by this reader
@@ -512,6 +556,7 @@ class MessageQueue:
                 # caller has read from the buffer
                 # set the read flag
                 metadata_buffer[self.local_reader_rank + 1] = 1
+                memory_fence()
                 self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
 
                 self._read_spin_timer.record_activity()

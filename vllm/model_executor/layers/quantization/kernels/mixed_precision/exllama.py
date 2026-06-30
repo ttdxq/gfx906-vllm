@@ -9,13 +9,19 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     pack_quantized_values_into_int32,
 )
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
+from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 
 class ExllamaLinearKernel(MPLinearKernel):
-    SUPPORTED_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128, scalar_types.uint4]
+    SUPPORTED_QUANT_TYPES = [
+        scalar_types.uint4b8,
+        scalar_types.uint8b128,
+        scalar_types.uint4,
+    ]
     # In theory supports `scalar_types.uint2b2, scalar_types.uint3b4` too but
     # currently untested so not added to the list
 
@@ -25,6 +31,9 @@ class ExllamaLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        if current_platform.is_rocm() and on_gfx906():
+            return False, "Exllama is disabled on ROCm gfx906"
+
         if c.has_g_idx and c.partition_weight_shape[0] != c.full_weight_shape[0]:
             return (
                 False,
@@ -67,9 +76,11 @@ class ExllamaLinearKernel(MPLinearKernel):
         device = getattr(layer, self.w_q_name).device
 
         if c.zero_points:
+
             def transform_w_zp(x):
                 permute_param_layout_(x, input_dim=0, output_dim=1)
                 return x.data.contiguous()
+
             self._transform_param(layer, self.w_zp_name, transform_w_zp)
         else:
             # For Exllama, we need to set a zero-point tensor if there is not one
@@ -79,17 +90,19 @@ class ExllamaLinearKernel(MPLinearKernel):
             out_features = c.partition_weight_shape[1]
             # gfx906: We will pass use_v2_format=True to gptq_gemm,
             # no need to subtract 1 here
-            zeros = torch.full((groups, out_features),
-                                c.weight_type.bias,
-                                dtype=torch.int32,
-                                device=device)
-            zeros = pack_quantized_values_into_int32(zeros,
-                                                     c.weight_type,
-                                                     packed_dim=1)
-            setattr(layer, self.w_zp_name,
-                    torch.nn.Parameter(zeros, requires_grad=False))
+            zeros = torch.full(
+                (groups, out_features),
+                c.weight_type.bias,
+                dtype=torch.int32,
+                device=device,
+            )
+            zeros = pack_quantized_values_into_int32(zeros, c.weight_type, packed_dim=1)
+            setattr(
+                layer, self.w_zp_name, torch.nn.Parameter(zeros, requires_grad=False)
+            )
 
         if c.has_g_idx:
+
             def transform_w_g_idx(x):
                 # Exllama wants the permutation array instead of the group
                 # indices
@@ -142,8 +155,9 @@ class ExllamaLinearKernel(MPLinearKernel):
         assert w_zp is not None, "Zero points are required by Exllama"
         assert w_g_idx is not None, "Group index is required by Exllama"
 
-        output = ops.gptq_gemm(x_2d, w_q, w_zp, w_s, w_g_idx, True,
-                               use_v2_format, c.weight_type.size_bits)
+        output = ops.gptq_gemm(
+            x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format, c.weight_type.size_bits
+        )
 
         if bias is not None:
             output.add_(bias)

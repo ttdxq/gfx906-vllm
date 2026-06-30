@@ -3,6 +3,7 @@
 import logging
 import os
 from dataclasses import MISSING, Field, asdict, dataclass, field
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +23,7 @@ from vllm.config.vllm import (
     OPTIMIZATION_LEVEL_TO_CONFIG,
     OptimizationLevel,
 )
+from vllm.model_executor.models.config import Qwen3_5ForCausalLMConfig
 from vllm.model_executor.layers.pooler import PoolingType
 from vllm.platforms import current_platform
 
@@ -36,6 +38,22 @@ def test_compile_config_repr_succeeds():
     val = repr(config)
     assert "VllmConfig" in val
     assert "inductor_passes" in val
+
+
+def test_qwen3_5_gguf_uses_qwen3_5_reasoning_parser():
+    structured_outputs_config = SimpleNamespace(reasoning_parser="")
+    model_config = SimpleNamespace(
+        quantization="gguf",
+        hf_config=SimpleNamespace(model_type="qwen3_5_text"),
+    )
+    vllm_config = SimpleNamespace(
+        structured_outputs_config=structured_outputs_config,
+        model_config=model_config,
+    )
+
+    Qwen3_5ForCausalLMConfig.verify_and_update_config(vllm_config)
+
+    assert structured_outputs_config.reasoning_parser == "qwen3_5"
 
 
 @dataclass

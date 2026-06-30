@@ -13,6 +13,7 @@
 - **原始项目**: [vLLM](https://github.com/vllm-project/vllm) by UC Berkeley Sky Computing Lab
 - **许可证**: Apache License 2.0
 - **本项目**: 包含针对AMD gfx906 GPU的优化和修复
+- **衍生与参考来源**: 本分支在遵循 Apache-2.0 的前提下，吸收并参考了社区已有的 ROCm/gfx906 适配工作，相关归属见 [NOTICE](NOTICE)
 
 详见 [NOTICE](NOTICE) 文件了解完整的归属声明。
 
@@ -22,22 +23,16 @@
 
 ## 最新更新
 
-### ✅ 2026年3月更新
+### ✅ 2026年6月更新
 
-- **修复 HIPBLAS 兼容性问题** - 解决了 ROCm/gfx906 上的 `HIPBLAS_STATUS_INTERNAL_ERROR` 错误
-- **更新至最新的 vLLM V1 引擎** - 性能提升和新功能支持
-- **测试 Qwen3.5-0.8B** - 成功运行 Qwen/Qwen3.5-0.8B（非多模态版本）
-- **通用 Triton GEMM** - 使用 Triton 矩阵乘法替代 hipBLAS 回退，提高稳定性
-- **MoE + GPTQ 修复尝试** - 尝试修复 Qwen/Qwen3.5-35B-A3B-GPTQ-Int4，但该模型仍无法正常运行
-- **新增失败样例确认** - 实测 `cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit` 在 ROCm 6.4 + gfx906 上仍无法稳定推理，可能表现为整串 `!` 输出或 `EngineCore` 崩溃
-- **新增 Qwen3.5 GGUF 实验性支持** - 补齐了 Qwen3.5 GGUF 在 gfx906/ROCm 6.3 下的部分加载、推理与 reasoning 处理链路
-- **新增 Qwen3.5 reasoning 处理修复** - 针对 Qwen3.5 GGUF 自动接入专用 reasoning parser，并修正 chat prompt 与 thinking scaffold 的处理逻辑
-- **Qwen3.5-0.8B-GGUF 已明显改善** - 实测 `unsloth/Qwen3.5-0.8B-GGUF` 的 `Qwen3.5-0.8B-UD-Q6_K_XL.gguf` 已可返回正确简单问答结果（如 `1+1=2`）
-- **Qwen3.5-27B-GGUF 仍属实验性质** - 实测 `unsloth/Qwen3.5-27B-GGUF` 的 `Qwen3.5-27B-UD-Q6_K_XL.gguf`：
-  - 简单问答已可走到正确答案路径（如 `1+1=2`）
-  - `/v1/models`、服务启动、基础 chat/completions 链路均已打通
-  - 但复杂推理问题在 gfx906 GPU 路径下仍可能出现题目复述、thinking 文本异常或推理质量不稳定
-- **当前结论** - Qwen3.5 GGUF 支持仍在持续完善中，27B 级别模型暂不建议视为稳定可用
+- **Qwen3.5 GGUF reasoning parser** - 新增并自动接入 `qwen3_5` reasoning parser，避免误用其他模型的 parser。
+- **Qwen3.5 GGUF thinking scaffold 修复** - 修正 chat prompt 中 `<think>` / `</think>` 处理，兼容 Qwen3.5 默认输出行为。
+- **Qwen3.5 GGUF dense fallback 修复** - 修复 GGUF dense 权重路径在 gfx906 上的兼容问题，避免错误反量化路径影响推理。
+- **Qwen3.5 GDN projection 合并优化** - 将 Gated DeltaNet 的多组 linear 合并，减少 GGUF 路径上的额外算子开销。
+- **Qwen3.5 GGUF piecewise compile 支持** - 补齐 layernorm、mRoPE、KV cache reshape 等 gfx906 capture-safe fallback，支持 `PIECEWISE` CUDA/HIP Graph 路径。
+- **Qwen3.5 GGUF FULL decode graph 支持** - 补齐 causal conv1d、fused recurrent、sigmoid gating、unified attention 等 decode fallback，已验证 `FULL_AND_PIECEWISE` 可完成 FULL decode graph capture。
+- **当前推荐配置** - Qwen3.5 GGUF 在 gfx906 上建议使用 `--reasoning-parser qwen3_5`，并优先使用 `FULL_AND_PIECEWISE` + `max_cudagraph_capture_size=128`。
+- **当前限制** - 默认 capture size 512 仍可能因显存压力 OOM；27B 级 GGUF 仍属实验支持，复杂长输出质量需继续测试。
 
 ### 支持的模型
 
@@ -114,15 +109,50 @@ VLLM_USE_MODELSCOPE=true vllm serve Qwen/Qwen3.5-0.8B \
   --port 8000 \
   --tensor-parallel-size 1 \
   --max-model-len 8192 \
-  --limit-mm-per-prompt '{"image": 0, "video": 0}' \
-  --enforce-eager
+  --reasoning-parser qwen3_5 \
+  --limit-mm-per-prompt '{"image": 0, "video": 0}'
 
 # 指定 GPU 内存使用率
 vllm serve Qwen/Qwen3.5-0.8B \
   --port 8000 \
   --max-model-len 8192 \
-  --gpu-memory-utilization 0.85
+  --gpu-memory-utilization 0.85 \
+  --reasoning-parser qwen3_5
 ```
+
+### Qwen3.5-27B GGUF（gfx906 实验状态）
+
+对于 `Qwen3.5-27B` 级别的 GGUF，当前仓库仍以**原生 vLLM 路径排障**为主。现阶段建议仅将其视为实验性支持：
+
+```bash
+export HIP_VISIBLE_DEVICES=0
+export GPU_MAX_HW_QUEUES=1
+export HSA_ENABLE_SDMA=0
+export VLLM_WORKER_MULTIPROC_METHOD=fork
+export VLLM_COMPILATION_MODE=0
+
+vllm serve /root/model/Qwen3.5-27B-Q6_K.gguf \
+  --tokenizer /root/model/Qwen3.5-27B-UD-Q6_K_XL-repo \
+  --tokenizer-mode auto \
+  --trust-remote-code \
+  --port 8001 \
+  --tensor-parallel-size 1 \
+  --kv-cache-memory-bytes 268435456 \
+  --max-model-len 256 \
+  --reasoning-parser qwen3_5 \
+  --compilation-config '{"mode":3,"backend":"eager","cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":128}' \
+  --limit-mm-per-prompt '{"image": 0, "video": 0}'
+```
+
+**当前观察：**
+
+- ✅ 服务启动与基础 OpenAI 接口链路可打通
+- ✅ 简单问答、数字题、部分短回答已明显改善
+- ✅ `FULL_AND_PIECEWISE` + `max_cudagraph_capture_size=128` 已可完成 FULL decode graph capture
+- ✅ reasoning 内容会进入 OpenAI 响应的 `reasoning` / `reasoning_content` 字段，普通 `content` 可能为空
+- ⚠️ 默认 capture size 512 仍可能因显存压力 OOM
+- ⚠️ 复杂长回答质量仍需继续测试
+- ⚠️ 目前仅建议作为实验性验证，不建议视为稳定生产支持
 
 ### 测试 API
 
@@ -187,6 +217,14 @@ print(response.choices[0].message.content)
 - ⚠️ **MoE 量化模型** - 速度显著较慢，不推荐
 - ⚠️ **非量化模型** - 略慢，但可用
 
+gfx906 上 AWQ 默认继续使用当前较保守的 Triton 路径。如需试验 `vllm-gfx906-mobydick` 风格的 GPTQ-compatible AWQ 路径，可显式设置：
+
+```bash
+export VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ=1
+```
+
+该开关默认关闭，仅建议在排查 Triton AWQ 兼容性或对比两条 AWQ 路径行为时使用。
+
 详细信息请参阅 [Issue #29](https://github.com/nlzy/vllm-gfx906/issues/29)。
 
 ## 已知限制
@@ -199,12 +237,13 @@ print(response.choices[0].message.content)
    - Triton kernel 在处理特定分块大小时会出现内存访问错误
    - aiter 后端在复杂 MoE 路由场景下不稳定
    - 建议使用非量化 MoE 模型或较小的 MoE + GPTQ 模型
+6. **Qwen3.5 GGUF on gfx906** - 当前 27B 级 GGUF 在原生 vLLM 路径下仍可能出现复杂提示上的题目复述、thinking 文本异常或语义漂移，暂不建议视为稳定支持
 
 ## 性能优化建议
 
 1. **减小 `max-model-len`** - 对于小模型可以节省内存
 2. **使用 `--gpu-memory-utilization`** - 显式管理内存使用
-3. **启用 `--enforce-eager`** - 如果遇到 CUDA 图问题
+3. **优先使用 `FULL_AND_PIECEWISE`** - Qwen3.5 GGUF 推荐配合 `max_cudagraph_capture_size=128`
 4. **重启前清理进程** - 使用 `pkill -9 -f "vllm serve"` 杀死现有进程
 
 ## 故障排除
@@ -232,6 +271,7 @@ print(response.choices[0].message.content)
 - **原始 vLLM**: [UC Berkeley Sky Computing Lab](https://sky.cs.berkeley.edu)
 - **ROCm 移植**: [Said-Akbar/vllm-rocm](https://github.com/Said-Akbar/vllm-rocm)
 - **gfx906 分支**: [nalanzeyu/vllm-gfx906](https://github.com/nalanzeyu/vllm-gfx906)
+- **gfx906 社区适配分支**: [ai-infos/vllm-gfx906-mobydick](https://github.com/ai-infos/vllm-gfx906-mobydick)
 - **Triton for gfx906**: [nlzy/triton-gfx906](https://github.com/nlzy/triton-gfx906)
 
 ## 许可证

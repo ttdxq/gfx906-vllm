@@ -8,6 +8,8 @@ from pydantic import field_validator
 from vllm.config.utils import config
 from vllm.attention.backends.registry import AttentionBackendEnum
 
+IndexerKVDType = Literal["bf16", "fp8", "mxfp4", "nvfp4"]
+
 
 @config
 class AttentionConfig:
@@ -46,6 +48,42 @@ class AttentionConfig:
     use_prefill_query_quantization: bool = False
     """If set, quantize query for attention in prefill."""
 
+    tq_max_kv_splits_for_cuda_graph: int = 32
+    """TurboQuant max NUM_KV_SPLITS for cuda graph decode.
+    Fixes the split count so grid dimensions are constant across captures,
+    and buffers can be pre-allocated to avoid inflating the memory estimate."""
+
+    use_fp4_indexer_cache: bool = False
+    """If set, use fp4 indexer cache for dsv32 family model (not support yet)"""
+
+    indexer_kv_dtype: IndexerKVDType = "bf16"
+    """Data type for the sparse-attention indexer K cache. Quantized formats
+    (fp8, mxfp4, nvfp4) require indexer kernel support in the backend."""
+
+    use_non_causal: bool = False
+    """Whether to use non-causal (bidirectional) attention."""
+
+    flex_attn_block_m: int | None = None
+    """Triton kernel BLOCK_M tile size for flex attention.
+    Must be a power of 2 >= 16. If None and VLLM_BATCH_INVARIANT=1,
+    defaults to 16."""
+
+    flex_attn_block_n: int | None = None
+    """Triton kernel BLOCK_N tile size for flex attention.
+    Must be a power of 2 >= 16. If None and VLLM_BATCH_INVARIANT=1,
+    defaults to 16."""
+
+    flex_attn_q_block_size: int | None = None
+    """Logical Q block size for the flex attention block mask.
+    Must be a power of 2 and divisible by flex_attn_block_m.
+    If None, uses the default (16 on PyTorch >= 2.9, 128 otherwise)."""
+
+    flex_attn_kv_block_size: int | None = None
+    """Logical KV block size for the flex attention block mask.
+    Must be a power of 2 and divisible by flex_attn_block_n.
+    If None, uses the default (kv_cache_block_size on PyTorch >= 2.9,
+    128 otherwise)."""
+
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs
@@ -56,7 +94,7 @@ class AttentionConfig:
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
-        ignored_factors: list[str] = []
+        ignored_factors: set[str] = set()
         factors = get_hash_factors(self, ignored_factors)
         return hash_factors(factors)
 

@@ -11,9 +11,73 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
+
+
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
+
+
+def _recompute_w_u_fwd_eager(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    A: torch.Tensor,
+    cu_seqlens: torch.LongTensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B, T, Hg, K, V = *k.shape, v.shape[-1]
+    H = v.shape[-2]
+    BT = A.shape[-1]
+    head_ratio = H // Hg
+
+    u = torch.empty_like(v)
+    w = k.new_empty(B, T, H, K)
+
+    if cu_seqlens is None:
+        seq_ranges = [(b, 0, T) for b in range(B)]
+    else:
+        seq_ranges = [
+            (0, int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item()))
+            for i in range(len(cu_seqlens) - 1)
+        ]
+
+    for batch_idx, seq_start, seq_end in seq_ranges:
+        for chunk_start in range(seq_start, seq_end, BT):
+            chunk_end = min(chunk_start + BT, seq_end)
+            chunk_len = chunk_end - chunk_start
+
+            for head_idx in range(H):
+                key_head_idx = head_idx // head_ratio
+                beta_chunk = beta[batch_idx, chunk_start:chunk_end, head_idx].float()
+                g_chunk = torch.exp(
+                    g_cumsum[batch_idx, chunk_start:chunk_end, head_idx].float()
+                )
+                a_block = A[
+                    batch_idx, chunk_start:chunk_end, head_idx, :chunk_len
+                ].float()
+
+                v_chunk = v[batch_idx, chunk_start:chunk_end, head_idx].float()
+                u_chunk = torch.matmul(a_block, v_chunk * beta_chunk.unsqueeze(-1))
+                u[batch_idx, chunk_start:chunk_end, head_idx] = u_chunk.to(u.dtype)
+
+                k_chunk = k[batch_idx, chunk_start:chunk_end, key_head_idx].float()
+                w_chunk = torch.matmul(
+                    a_block,
+                    k_chunk * beta_chunk.unsqueeze(-1) * g_chunk.unsqueeze(-1),
+                )
+                w[batch_idx, chunk_start:chunk_end, head_idx] = w_chunk.to(w.dtype)
+
+    return w, u
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -134,6 +198,17 @@ def recompute_w_u_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
+
+    if _is_gfx906_rocm():
+        return _recompute_w_u_fwd_eager(
+            k=k,
+            v=v,
+            beta=beta,
+            g_cumsum=g_cumsum,
+            A=A,
+            cu_seqlens=cu_seqlens,
+        )
+
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
