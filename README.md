@@ -25,8 +25,6 @@
 
 ### ✅ 2026年6月更新
 
-- **Qwen3.5 GGUF reasoning parser** - 新增并自动接入 `qwen3_5` reasoning parser，避免误用其他模型的 parser。
-- **Qwen3.5 GGUF thinking scaffold 修复** - 修正 chat prompt 中 `<think>` / `</think>` 处理，兼容 Qwen3.5 默认输出行为。
 - **Qwen3.5 GGUF dense fallback 修复** - 修复 GGUF dense 权重路径在 gfx906 上的兼容问题，避免错误反量化路径影响推理。
 - **Qwen3.5 GDN projection 合并优化** - 将 Gated DeltaNet 的多组 linear 合并，减少 GGUF 路径上的额外算子开销。
 - **Qwen3.5 GGUF piecewise compile 支持** - 补齐 layernorm、mRoPE、KV cache reshape 等 gfx906 capture-safe fallback，支持 `PIECEWISE` CUDA/HIP Graph 路径。
