@@ -22,6 +22,7 @@ from vllm.config.utils import get_field
 from vllm.config.vllm import (
     OPTIMIZATION_LEVEL_TO_CONFIG,
     OptimizationLevel,
+    needs_qwen35_gguf_piecewise_cudagraph,
 )
 from vllm.model_executor.models.config import Qwen3_5ForCausalLMConfig
 from vllm.model_executor.layers.pooler import PoolingType
@@ -54,6 +55,90 @@ def test_qwen3_5_gguf_uses_qwen3_5_reasoning_parser():
     Qwen3_5ForCausalLMConfig.verify_and_update_config(vllm_config)
 
     assert structured_outputs_config.reasoning_parser == "qwen3_5"
+
+
+def test_qwen3_5_gguf_on_gfx906_needs_piecewise_cudagraph(monkeypatch):
+    class MockPlatform:
+
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def get_device_capability():
+            return SimpleNamespace(major=9, minor=0)
+
+    monkeypatch.setattr("vllm.platforms.current_platform", MockPlatform)
+
+    qwen35_gguf = SimpleNamespace(
+        quantization="gguf",
+        hf_text_config=SimpleNamespace(model_type="qwen3_5_text"),
+    )
+    qwen35_dense = SimpleNamespace(
+        quantization=None,
+        hf_text_config=SimpleNamespace(model_type="qwen3_5_text"),
+    )
+    other_gguf = SimpleNamespace(
+        quantization="gguf",
+        hf_text_config=SimpleNamespace(model_type="llama"),
+    )
+
+    assert needs_qwen35_gguf_piecewise_cudagraph(qwen35_gguf)
+    assert not needs_qwen35_gguf_piecewise_cudagraph(qwen35_dense)
+    assert not needs_qwen35_gguf_piecewise_cudagraph(other_gguf)
+
+
+def test_local_gguf_companion_config_uses_tokenizer_repo(tmp_path):
+    model_path = tmp_path / "Qwen3.5-27B-Q6_K.gguf"
+    model_path.write_bytes(b"GGUF")
+    tokenizer_path = tmp_path / "Qwen3.5-27B-UD-Q6_K_XL-repo"
+    tokenizer_path.mkdir()
+    (tokenizer_path / "config.json").write_text("{}", encoding="utf-8")
+
+    model_config = object.__new__(ModelConfig)
+    model_config.model = str(model_path)
+    model_config.tokenizer = str(tokenizer_path)
+    model_config.hf_config_path = None
+
+    model_config._maybe_use_local_gguf_companion_config()
+
+    assert model_config.hf_config_path == str(tokenizer_path)
+
+
+def test_local_gguf_companion_config_keeps_explicit_hf_config_path(tmp_path):
+    model_path = tmp_path / "Qwen3.5-27B-Q6_K.gguf"
+    model_path.write_bytes(b"GGUF")
+    tokenizer_path = tmp_path / "Qwen3.5-27B-UD-Q6_K_XL-repo"
+    tokenizer_path.mkdir()
+    (tokenizer_path / "config.json").write_text("{}", encoding="utf-8")
+
+    model_config = object.__new__(ModelConfig)
+    model_config.model = str(model_path)
+    model_config.tokenizer = str(tokenizer_path)
+    model_config.hf_config_path = "/tmp/explicit-config"
+
+    model_config._maybe_use_local_gguf_companion_config()
+
+    assert model_config.hf_config_path == "/tmp/explicit-config"
+
+
+def test_qwen35_gguf_metadata_tokenizer_is_used(monkeypatch, tmp_path):
+    model_path = tmp_path / "Qwen3.6-27B-UD-Q4_K_XL.gguf"
+    model_path.write_bytes(b"GGUF")
+    tokenizer_path = tmp_path / "tokenizer-cache"
+
+    monkeypatch.setattr(
+        "vllm.config.model.qwen35_gguf_tokenizer_path",
+        lambda model: str(tokenizer_path),
+    )
+
+    model_config = object.__new__(ModelConfig)
+    model_config.model = str(model_path)
+    model_config.tokenizer = str(model_path)
+
+    model_config._maybe_use_qwen35_gguf_tokenizer()
+
+    assert model_config.tokenizer == str(tokenizer_path)
 
 
 @dataclass

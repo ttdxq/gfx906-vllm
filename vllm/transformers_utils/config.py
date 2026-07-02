@@ -34,6 +34,7 @@ from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.transformers_utils.gguf_utils import qwen35_gguf_config_dict
 
 from .config_parser_base import ConfigParserBase
 from .repo_utils import (
@@ -129,13 +130,26 @@ class HFConfigParser(ConfigParserBase):
         **kwargs,
     ) -> tuple[dict, PretrainedConfig]:
         kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
-        config_dict, _ = PretrainedConfig.get_config_dict(
-            model,
-            revision=revision,
-            code_revision=code_revision,
-            token=_get_hf_token(),
-            **kwargs,
-        )
+        try:
+            config_dict, _ = PretrainedConfig.get_config_dict(
+                model,
+                revision=revision,
+                code_revision=code_revision,
+                token=_get_hf_token(),
+                **kwargs,
+            )
+        except ValueError as e:
+            if _is_unsupported_transformers_gguf_arch_error(e):
+                gguf_file = kwargs.get("gguf_file")
+                gguf_path = (
+                    Path(model) / gguf_file
+                    if gguf_file is not None
+                    else Path(model)
+                )
+                if config_dict := qwen35_gguf_config_dict(str(gguf_path)):
+                    config = _CONFIG_REGISTRY["qwen3_5"].from_dict(config_dict)
+                    return config_dict, _maybe_remap_hf_config_attrs(config)
+            raise
         # Use custom model class if it's in our registry
         model_type = config_dict.get("model_type")
         if model_type is None:
@@ -461,6 +475,13 @@ def _maybe_remap_hf_config_attrs(config: PretrainedConfig) -> PretrainedConfig:
     return config
 
 
+def _is_unsupported_transformers_gguf_arch_error(exc: ValueError) -> bool:
+    return (
+        "GGUF model with architecture" in str(exc)
+        and "is not supported yet" in str(exc)
+    )
+
+
 def maybe_override_with_speculators(
     model: str,
     tokenizer: str | None,
@@ -496,13 +517,28 @@ def maybe_override_with_speculators(
     else:
         gguf_model_repo = None
     kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
-    config_dict, _ = PretrainedConfig.get_config_dict(
-        config_source if config_source is not None else (model if gguf_model_repo is None else gguf_model_repo),
-        revision=revision,
-        trust_remote_code=trust_remote_code,
-        token=_get_hf_token(),
-        **kwargs,
-    )
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            config_source if config_source is not None else (model if gguf_model_repo is None else gguf_model_repo),
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+            token=_get_hf_token(),
+            **kwargs,
+        )
+    except ValueError as e:
+        if (
+            gguf_model_repo is not None
+            and config_source is None
+            and _is_unsupported_transformers_gguf_arch_error(e)
+        ):
+            logger.debug(
+                "Skipping speculators auto-detection for GGUF model %s because "
+                "Transformers cannot parse its GGUF architecture: %s",
+                model,
+                e,
+            )
+            return model, tokenizer, vllm_speculative_config
+        raise
     speculators_config = config_dict.get("speculators_config")
 
     if speculators_config is None:

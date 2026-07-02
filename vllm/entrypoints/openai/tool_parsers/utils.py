@@ -145,6 +145,171 @@ def _extract_tool_info(
         raise TypeError(f"Unsupported tool type: {type(tool)}")
 
 
+def _is_function_tool(tool: Tool | ChatCompletionToolsParam) -> bool:
+    return isinstance(tool, (FunctionTool, ChatCompletionToolsParam))
+
+
+def find_tool_properties(
+    tools: list[Tool | ChatCompletionToolsParam] | None,
+    tool_name: str,
+) -> dict[str, Any]:
+    """Find a tool by name and return its properties dict, or {}."""
+    if not tools:
+        return {}
+    for tool in tools:
+        if not _is_function_tool(tool):
+            continue
+        name, params = _extract_tool_info(tool)
+        if name == tool_name:
+            return (params or {}).get("properties", {})
+    return {}
+
+
+def find_tool_name(
+    tools: list[Tool | ChatCompletionToolsParam] | None,
+    tool_name: str,
+) -> bool:
+    """Return whether a function tool with *tool_name* exists."""
+    if not tools:
+        return False
+    for tool in tools:
+        if not _is_function_tool(tool):
+            continue
+        name, _ = _extract_tool_info(tool)
+        if name == tool_name:
+            return True
+    return False
+
+
+def extract_types_from_schema(schema: Any) -> list[str]:
+    """Extract possible JSON Schema type strings."""
+    if schema is None or not isinstance(schema, dict):
+        return ["string"]
+
+    types: set[str] = set()
+    type_value = schema.get("type")
+    if isinstance(type_value, str):
+        types.add(type_value)
+    elif isinstance(type_value, list):
+        types.update(t for t in type_value if isinstance(t, str))
+
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        for value in enum_values:
+            if value is None:
+                types.add("null")
+            elif isinstance(value, bool):
+                types.add("boolean")
+            elif isinstance(value, int):
+                types.add("integer")
+            elif isinstance(value, float):
+                types.add("number")
+            elif isinstance(value, str):
+                types.add("string")
+            elif isinstance(value, list):
+                types.add("array")
+            elif isinstance(value, dict):
+                types.add("object")
+
+    for choice_field in ("anyOf", "oneOf", "allOf"):
+        choices = schema.get(choice_field)
+        if isinstance(choices, list):
+            for choice in choices:
+                types.update(extract_types_from_schema(choice))
+
+    return list(types) if types else ["string"]
+
+
+_TYPE_ALIASES: dict[str, str] = {
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "enum": "string",
+    "int": "integer",
+    "int32": "integer",
+    "int64": "integer",
+    "uint": "integer",
+    "uint32": "integer",
+    "uint64": "integer",
+    "long": "integer",
+    "short": "integer",
+    "unsigned": "integer",
+    "float": "number",
+    "float32": "number",
+    "float64": "number",
+    "double": "number",
+    "bool": "boolean",
+    "dict": "object",
+    "arr": "array",
+    "list": "array",
+    "sequence": "array",
+}
+
+
+def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
+    """Best-effort coercion of a raw string value to a JSON Schema type."""
+    if isinstance(schema_type, str):
+        schema_type = [schema_type]
+
+    normalized_types = {
+        _TYPE_ALIASES.get(key, key)
+        for t in schema_type
+        for key in [t.strip().lower()]
+    }
+    type_priority = [
+        "null",
+        "integer",
+        "number",
+        "boolean",
+        "object",
+        "array",
+        "string",
+    ]
+
+    for candidate_type in type_priority:
+        if candidate_type not in normalized_types:
+            continue
+        if candidate_type == "null":
+            if value.lower() == "null":
+                return None
+            continue
+        if candidate_type == "string":
+            return value
+        if candidate_type == "integer":
+            try:
+                if value.strip().isdigit() or (
+                    value.strip().startswith("-") and value.strip()[1:].isdigit()
+                ):
+                    return int(value)
+            except ValueError:
+                pass
+            continue
+        if candidate_type == "number":
+            try:
+                return float(value)
+            except ValueError:
+                continue
+        if candidate_type == "boolean":
+            lowered = value.lower()
+            if lowered == "true":
+                return True
+            if lowered == "false":
+                return False
+            continue
+        if candidate_type in ("object", "array"):
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if candidate_type == "object" and isinstance(parsed, dict):
+                return parsed
+            if candidate_type == "array" and isinstance(parsed, list):
+                return parsed
+
+    return value
+
+
 def _get_tool_schema_from_tool(tool: Tool | ChatCompletionToolsParam) -> dict:
     name, params = _extract_tool_info(tool)
     params = params if params else {"type": "object", "properties": {}}

@@ -52,8 +52,10 @@ def test_qwen3_5_split_gdn_calls_core_with_b_then_a(monkeypatch):
     b = torch.full((3, 2), 11.0)
     a = torch.full((3, 2), 22.0)
 
-    module.in_proj_qkvz = _FakeLinear(torch.cat((mixed_qkv, z), dim=-1))
-    module.in_proj_ba = _FakeLinear(torch.cat((b, a), dim=-1))
+    module.in_proj_qkv = _FakeLinear(mixed_qkv)
+    module.in_proj_z = _FakeLinear(z)
+    module.in_proj_b = _FakeLinear(b)
+    module.in_proj_a = _FakeLinear(a)
 
     captured: dict[str, torch.Tensor] = {}
 

@@ -181,7 +181,7 @@ typedef struct {
     uint8_t qs[QK4_NL/2];
 } block_iq4_nl;
 
-#define QR4_XS 8
+#define QR4_XS 2
 #define QI4_XS (QK_K / (4*QR4_XS))
 typedef struct {
     half d;

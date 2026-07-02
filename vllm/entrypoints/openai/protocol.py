@@ -345,6 +345,13 @@ class ResponsesRequest(OpenAIBaseModel):
         default=None,
         description=("Additional kwargs to pass to the HF processor."),
     )
+    chat_template_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Additional keyword args to pass to the template renderer. "
+            "Will be accessible by the chat template."
+        ),
+    )
     priority: int = Field(
         default=0,
         description=(

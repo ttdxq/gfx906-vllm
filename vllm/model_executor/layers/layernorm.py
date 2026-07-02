@@ -305,6 +305,32 @@ class GemmaRMSNorm(CustomOp):
         """PyTorch-native implementation equivalent to forward()."""
         return self.forward_static(self.weight.data, self.variance_epsilon, x, residual)
 
+    @staticmethod
+    def _use_gfx906_kernel(x: torch.Tensor, weight: torch.Tensor,
+                           residual: torch.Tensor | None) -> bool:
+        if not current_platform.is_rocm() or not x.is_cuda:
+            return False
+        try:
+            from vllm.platforms.rocm import on_gfx906
+        except ImportError:
+            return False
+        if not on_gfx906():
+            return False
+        if x.dtype not in (torch.float16, torch.float32):
+            return False
+        if weight.dtype != x.dtype or weight.device != x.device:
+            return False
+        if x.ndim < 2 or x.shape[-1] != weight.numel():
+            return False
+        if residual is None:
+            return True
+        return (
+            residual.is_cuda
+            and residual.device == x.device
+            and residual.shape == x.shape
+            and residual.dtype in (x.dtype, torch.float32)
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -313,14 +339,21 @@ class GemmaRMSNorm(CustomOp):
         if torch.compiler.is_compiling():
             return self.forward_native(x, residual)
 
-        capability = current_platform.get_device_capability()
-        if (
-            current_platform.is_rocm()
-            and capability is not None
-            and capability.major == 9
-            and capability.minor == 0
-        ):
-            return self.forward_native(x, residual)
+        if self._use_gfx906_kernel(x, self.weight.data, residual):
+            from vllm import _custom_ops as ops
+
+            if residual is None:
+                return ops.gemma_rms_norm_gfx906(
+                    x,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
+            return ops.gemma_fused_add_rms_norm_gfx906(
+                x,
+                residual,
+                self.weight.data,
+                self.variance_epsilon,
+            )
 
         if not getattr(self, "_is_compiled", False):
             self.forward_static = torch.compile(  # type: ignore
@@ -427,6 +460,30 @@ class RMSNormGated(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if (
+            self._use_native_rocm_gfx90
+            and z is not None
+            and self.group_size is None
+            and x.dim() == 2
+            and z.dim() == 2
+            and x.is_cuda
+            and z.is_cuda
+            and x.dtype == z.dtype == self.weight.dtype
+        ):
+            from vllm import _custom_ops as ops
+
+            if x.stride(-1) != 1:
+                x = x.contiguous()
+            if z.stride(-1) != 1:
+                z = z.contiguous()
+            return ops.rms_norm_gated_gfx906(
+                x,
+                self.weight,
+                z,
+                self.eps,
+                self.norm_before_gate,
+            )
+
         if torch.compiler.is_compiling() or self._use_native_rocm_gfx90:
             return self.forward_native(x, z)
 

@@ -91,6 +91,17 @@ void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
                         torch::Tensor& weight, double epsilon);
 
+torch::Tensor rms_norm_gated_gfx906(torch::Tensor input, torch::Tensor weight,
+                                    torch::Tensor gate, double epsilon,
+                                    bool norm_before_gate);
+
+torch::Tensor gemma_rms_norm_gfx906(torch::Tensor input, torch::Tensor weight,
+                                    double epsilon);
+
+std::vector<torch::Tensor> gemma_fused_add_rms_norm_gfx906(
+    torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+    double epsilon);
+
 void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
                         int64_t num_heads_k, int64_t num_heads_v,
                         int64_t head_dim, double eps, torch::Tensor& q_weight,
@@ -196,6 +207,10 @@ torch::Tensor ggml_dequantize(torch::Tensor W, int64_t type, int64_t m,
 torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W, torch::Tensor X,
                                   int64_t type, int64_t row);
 
+torch::Tensor ggml_mul_mat_vec_a8_sharded(std::vector<torch::Tensor> W,
+                                          torch::Tensor X,
+                                          std::vector<int64_t> types);
+
 torch::Tensor ggml_mul_mat_a8(torch::Tensor W, torch::Tensor X, int64_t type,
                               int64_t row);
 
@@ -210,6 +225,37 @@ torch::Tensor ggml_moe_a8_vec(torch::Tensor X, torch::Tensor W,
                               int64_t type, int64_t row, int64_t tokens);
 
 int64_t ggml_moe_get_block_size(int64_t type);
+
+torch::Tensor causal_conv1d_gfx906_decode_update(
+    torch::Tensor x, torch::Tensor conv_state, torch::Tensor weight,
+    std::optional<torch::Tensor> bias,
+    std::optional<torch::Tensor> conv_state_indices, int64_t pad_slot_id,
+    bool silu_activation);
+
+torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_decode(
+    torch::Tensor A_log, torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor state,
+    double beta, double threshold, double scale,
+    bool use_qk_l2norm_in_kernel);
+
+torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_indexed_decode(
+    torch::Tensor A_log, torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor state,
+    torch::Tensor state_indices, double beta, double threshold, double scale,
+    bool use_qk_l2norm_in_kernel);
+
+torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state(
+    torch::Tensor A_log, torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor state,
+    torch::Tensor state_indices, double beta, double threshold, double scale,
+    bool use_qk_l2norm_in_kernel);
+
+torch::Tensor fused_recurrent_gated_delta_rule_gfx906_packed_decode(
+    torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b,
+    torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state,
+    torch::Tensor out, torch::Tensor state_indices, double scale,
+    bool use_qk_l2norm_in_kernel, bool use_tiled_qk_head_mapping,
+    bool use_transposed_state);
 
 #ifndef USE_ROCM
 

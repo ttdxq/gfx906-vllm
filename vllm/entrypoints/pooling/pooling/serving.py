@@ -5,7 +5,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncGenerator, Sequence
-from typing import Final, cast
+from typing import Any, Final, cast
 
 import jinja2
 from fastapi import Request
@@ -58,12 +58,14 @@ class OpenAIServingPooling(OpenAIServing):
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
         trust_request_chat_template: bool = False,
+        default_chat_template_kwargs: dict[str, Any] | None = None,
         log_error_stack: bool = False,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
             models=models,
             request_logger=request_logger,
+            default_chat_template_kwargs=default_chat_template_kwargs,
             log_error_stack=log_error_stack,
         )
 
@@ -151,6 +153,7 @@ class OpenAIServingPooling(OpenAIServing):
                     # so there is no need to append extra tokens to the input
                     add_generation_prompt=False,
                     continue_final_message=False,
+                    chat_template_kwargs=request.chat_template_kwargs,
                     add_special_tokens=request.add_special_tokens,
                 )
             elif isinstance(request, PoolingCompletionRequest):

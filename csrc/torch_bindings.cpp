@@ -162,6 +162,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "float epsilon) -> ()");
   ops.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
 
+  ops.def(
+      "rms_norm_gated_gfx906(Tensor input, Tensor weight, Tensor gate, "
+      "float epsilon, bool norm_before_gate) -> Tensor");
+  ops.impl("rms_norm_gated_gfx906", torch::kCUDA, &rms_norm_gated_gfx906);
+
+  ops.def(
+      "gemma_rms_norm_gfx906(Tensor input, Tensor weight, float epsilon) -> "
+      "Tensor");
+  ops.impl("gemma_rms_norm_gfx906", torch::kCUDA, &gemma_rms_norm_gfx906);
+
+  ops.def(
+      "gemma_fused_add_rms_norm_gfx906(Tensor input, Tensor residual, Tensor "
+      "weight, float epsilon) -> Tensor[]");
+  ops.impl("gemma_fused_add_rms_norm_gfx906", torch::kCUDA,
+           &gemma_fused_add_rms_norm_gfx906);
+
   // Function for fused QK Norm and RoPE
   ops.def(
       "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
@@ -356,6 +372,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> Tensor");
   ops.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
 
+  ops.def(
+      "ggml_mul_mat_vec_a8_sharded(Tensor[] W, Tensor X, int[] types) "
+      "-> Tensor");
+  ops.impl("ggml_mul_mat_vec_a8_sharded", torch::kCUDA,
+           &ggml_mul_mat_vec_a8_sharded);
+
   // mmq kernel for GGML.
   ops.def(
       "ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
@@ -376,6 +398,48 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
 
   ops.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
+
+  ops.def(
+      "causal_conv1d_gfx906_decode_update("
+      "Tensor x, Tensor conv_state, Tensor weight, Tensor? bias, "
+      "Tensor? conv_state_indices, int pad_slot_id, bool silu_activation) "
+      "-> Tensor");
+  ops.impl("causal_conv1d_gfx906_decode_update", torch::kCUDA,
+           &causal_conv1d_gfx906_decode_update);
+
+  ops.def(
+      "fused_sigmoid_gating_delta_rule_gfx906_decode("
+      "Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, Tensor q, Tensor k, "
+      "Tensor v, Tensor state, float beta, float threshold, float scale, "
+      "bool use_qk_l2norm_in_kernel) -> Tensor");
+  ops.impl("fused_sigmoid_gating_delta_rule_gfx906_decode", torch::kCUDA,
+           &fused_sigmoid_gating_delta_rule_gfx906_decode);
+
+  ops.def(
+      "fused_sigmoid_gating_delta_rule_gfx906_indexed_decode("
+      "Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, Tensor q, Tensor k, "
+      "Tensor v, Tensor state, Tensor state_indices, float beta, "
+      "float threshold, float scale, bool use_qk_l2norm_in_kernel) -> Tensor");
+  ops.impl("fused_sigmoid_gating_delta_rule_gfx906_indexed_decode", torch::kCUDA,
+           &fused_sigmoid_gating_delta_rule_gfx906_indexed_decode);
+
+  ops.def(
+      "fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state("
+      "Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, Tensor q, Tensor k, "
+      "Tensor v, Tensor state, Tensor state_indices, float beta, "
+      "float threshold, float scale, bool use_qk_l2norm_in_kernel) -> Tensor");
+  ops.impl("fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state",
+           torch::kCUDA,
+           &fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state);
+
+  ops.def(
+      "fused_recurrent_gated_delta_rule_gfx906_packed_decode("
+      "Tensor mixed_qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, "
+      "Tensor state, Tensor out, Tensor state_indices, float scale, "
+      "bool use_qk_l2norm_in_kernel, bool use_tiled_qk_head_mapping, "
+      "bool use_transposed_state) -> Tensor");
+  ops.impl("fused_recurrent_gated_delta_rule_gfx906_packed_decode", torch::kCUDA,
+           &fused_recurrent_gated_delta_rule_gfx906_packed_decode);
 
 #ifndef USE_ROCM
   // CUTLASS nvfp4 block scaled GEMM

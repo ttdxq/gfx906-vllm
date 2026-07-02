@@ -241,6 +241,26 @@ class GGUFModelLoader(BaseModelLoader):
                         r"model\.layers\.(?P<bid>\d+)\.linear_attn\.dt_bias", hf_name
                     ):
                         return f"blk.{m['bid']}.ssm_dt.bias"
+                    if m := re.fullmatch(
+                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.in_proj_qkv",
+                        base_name,
+                    ):
+                        return f"blk.{m['bid']}.attn_qkv.{suffix}"
+                    if m := re.fullmatch(
+                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.in_proj_z",
+                        base_name,
+                    ):
+                        return f"blk.{m['bid']}.attn_gate.{suffix}"
+                    if m := re.fullmatch(
+                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.in_proj_b",
+                        base_name,
+                    ):
+                        return f"blk.{m['bid']}.ssm_beta.{suffix}"
+                    if m := re.fullmatch(
+                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.in_proj_a",
+                        base_name,
+                    ):
+                        return f"blk.{m['bid']}.ssm_alpha.{suffix}"
                 return None
 
             if suffix:
@@ -266,6 +286,30 @@ class GGUFModelLoader(BaseModelLoader):
             elif hf_name not in gguf_to_hf_name_map.values():
                 # Parameter not in manual overrides either
                 unmapped_params.append(hf_name)
+
+        if model_type == "qwen35" and vllm_arch in (
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+        ):
+            for idx in range(text_num_layers):
+                if text_config.layer_types[idx] != "linear_attention":
+                    continue
+                gguf_to_hf_name_map[f"blk.{idx}.attn_qkv.weight"] = (
+                    "language_model."
+                    f"model.layers.{idx}.linear_attn.in_proj_qkv.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_gate.weight"] = (
+                    "language_model."
+                    f"model.layers.{idx}.linear_attn.in_proj_z.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_beta.weight"] = (
+                    "language_model."
+                    f"model.layers.{idx}.linear_attn.in_proj_b.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_alpha.weight"] = (
+                    "language_model."
+                    f"model.layers.{idx}.linear_attn.in_proj_a.weight"
+                )
 
         # All parameters must be mapped: both vision/projector and backbone
         if unmapped_params:

@@ -13,7 +13,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.platforms.rocm import on_gfx906
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
@@ -233,6 +232,142 @@ except AttributeError as error:
     raise error
 
 
+def _mmvq_safe_batch(qweight: torch.Tensor, qweight_type: int) -> int:
+    if qweight_type in IMATRIX_QUANT_TYPES:
+        return 8 if qweight.shape[0] > 5120 else 16
+    return 2 if qweight.shape[0] > 5120 else 6
+
+
+def _can_share_mmvq_activation(
+    x: torch.Tensor,
+    qweights: list[torch.Tensor],
+    qweight_types: list[int],
+) -> bool:
+    if x.shape[0] == 0:
+        return False
+    for qweight, qweight_type in zip(qweights, qweight_types):
+        if qweight_type not in MMVQ_QUANT_TYPES:
+            return False
+        if x.shape[0] > _mmvq_safe_batch(qweight, qweight_type):
+            return False
+    return True
+
+
+def _shared_mmvq_max_batch(
+    qweights: list[torch.Tensor],
+    qweight_types: list[int],
+) -> int:
+    max_batch = torch.iinfo(torch.int32).max
+    for qweight, qweight_type in zip(qweights, qweight_types):
+        if qweight_type not in MMVQ_QUANT_TYPES:
+            return 0
+        max_batch = min(max_batch, _mmvq_safe_batch(qweight, qweight_type))
+    return max_batch
+
+
+def _get_full_mmvq_shard_weight(
+    layer: torch.nn.Module,
+    qweight_types: list[int],
+) -> tuple[torch.Tensor, int] | None:
+    qweight = layer.qweight
+    shard_id = getattr(qweight, "shard_id", [])
+    shard_offset_map = getattr(qweight, "shard_offset_map", None)
+    if not shard_id or not shard_offset_map:
+        return None
+    if len(set(qweight_types)) != 1:
+        return None
+
+    qweight_type = qweight_types[0]
+    if qweight_type not in MMVQ_QUANT_TYPES:
+        return None
+
+    expected_start = 0
+    packed_width = qweight.shape[1]
+    for idx in _ordered_gguf_shard_ids(shard_id):
+        start, end, offset = shard_offset_map[idx]
+        if start != expected_start or offset != packed_width:
+            return None
+        expected_start = end
+
+    if expected_start != qweight.shape[0]:
+        return None
+    return qweight, qweight_type
+
+
+def _collect_gguf_linear_shards(
+    layer: torch.nn.Module,
+) -> tuple[list[torch.Tensor], list[int]] | None:
+    cached = getattr(layer, "_gguf_collected_shards", None)
+    if cached is not None:
+        return cached
+
+    if not hasattr(layer, "qweight") or not hasattr(layer, "qweight_type"):
+        return None
+    if getattr(layer, "use_dense_gguf_fallback", False):
+        return None
+    if not _has_loaded_gguf_weight(layer):
+        return None
+
+    shard_id = getattr(layer.qweight, "shard_id", [])
+    if shard_id:
+        if all(isinstance(idx, int) for idx in shard_id):
+            shard_id = sorted(shard_id)
+        elif {"q", "k", "v"}.issubset(set(shard_id)):
+            shard_id = ["q", "k", "v"]
+        qweight = layer.qweight
+        qweights = []
+        qweight_types = []
+        for idx in shard_id:
+            qweight_type = layer.qweight_type.shard_weight_type[idx]
+            if hasattr(layer.qweight, "shard_offset_map"):
+                start, end, offset = layer.qweight.shard_offset_map[idx]
+                shard = getattr(layer, "_gguf_shard_cache", {}).get(idx)
+                if shard is None:
+                    shard = qweight[start:end, :offset]
+                    if not shard.is_contiguous():
+                        shard = shard.contiguous()
+            else:
+                shard = qweight.data_container[qweight.shard_id_map[idx]].contiguous()
+            qweights.append(shard)
+            qweight_types.append(qweight_type)
+        return qweights, qweight_types
+
+    return [layer.qweight], [layer.qweight_type.weight_type]
+
+
+def _fused_mul_mat_gguf_sharded_mmvq(
+    x: torch.Tensor,
+    qweights: list[torch.Tensor],
+    qweight_types: list[int],
+) -> torch.Tensor:
+    return ops.ggml_mul_mat_vec_a8_sharded(qweights, x, qweight_types)
+
+
+def _fused_mul_mat_gguf_sharded_mmvq_fake(
+    x: torch.Tensor,
+    qweights: list[torch.Tensor],
+    qweight_types: list[int],
+) -> torch.Tensor:
+    return torch.empty(
+        x.shape[0],
+        sum(qweight.shape[0] for qweight in qweights),
+        dtype=x.dtype,
+        device=x.device,
+    )
+
+
+try:
+    direct_register_custom_op(
+        op_name="_fused_mul_mat_gguf_sharded_mmvq",
+        op_func=_fused_mul_mat_gguf_sharded_mmvq,
+        fake_impl=_fused_mul_mat_gguf_sharded_mmvq_fake,
+    )
+    fused_mul_mat_gguf_sharded_mmvq = torch.ops.vllm._fused_mul_mat_gguf_sharded_mmvq
+
+except AttributeError as error:
+    raise error
+
+
 def _fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -422,26 +557,16 @@ def _dequantize_gguf_weight(
     if qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-        return ops.ggml_dequantize(qweight, qweight_type, *shape, out_dtype).contiguous()
+        return ops.ggml_dequantize(
+            qweight, qweight_type, *shape, out_dtype
+        ).contiguous()
 
     qweight_type = WeightType(qweight_type)
     raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
 
 
 def _is_gfx906_qwen35_linear_attn_fallback(layer: torch.nn.Module) -> bool:
-    if not on_gfx906():
-        return False
-    prefix = getattr(layer, "prefix", "")
-    if ".linear_attn." not in prefix:
-        return False
-    return prefix.endswith((
-        ".linear_attn.in_proj_qkvz",
-        ".linear_attn.in_proj_qkv",
-        ".linear_attn.in_proj_z",
-        ".linear_attn.in_proj_ba",
-        ".linear_attn.in_proj_b",
-        ".linear_attn.in_proj_a",
-    ))
+    return False
 
 
 def _ordered_gguf_shard_ids(shard_id: list[int | str]) -> list[int | str]:
@@ -476,6 +601,13 @@ def _materialize_dense_gguf_weight(
             out_dtype,
         )
     return Parameter(weight, requires_grad=False)
+
+
+def _has_loaded_gguf_weight(layer: torch.nn.Module) -> bool:
+    qweight = layer.qweight
+    if getattr(qweight, "shard_id", None):
+        return True
+    return not isinstance(qweight, UninitializedParameter)
 
 
 class GGUFLinearMethod(LinearMethodBase):
@@ -541,7 +673,9 @@ class GGUFLinearMethod(LinearMethodBase):
             raise ValueError(
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
             )
-        if _is_gfx906_qwen35_linear_attn_fallback(layer):
+        if _is_gfx906_qwen35_linear_attn_fallback(layer) and _has_loaded_gguf_weight(
+            layer
+        ):
             layer.register_parameter(
                 "weight",
                 _materialize_dense_gguf_weight(layer, self.params_dtype),
@@ -553,6 +687,8 @@ class GGUFLinearMethod(LinearMethodBase):
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
+        self._cache_gguf_shards(layer)
+        self._cache_gguf_shard_metadata(layer)
 
     def _create_padded_weight_param(self, layer: torch.nn.Module):
         """Create padded weight parameter for GGUF MergedLinear layer."""
@@ -567,11 +703,7 @@ class GGUFLinearMethod(LinearMethodBase):
             set_weight_attrs(padded_param, vars(qweight))
             set_weight_attrs(
                 padded_param,
-                {
-                    "shard_offset_map": {
-                        shard_id[0]: (0, data.size(0), data.size(1))
-                    }
-                },
+                {"shard_offset_map": {shard_id[0]: (0, data.size(0), data.size(1))}},
             )
             layer.register_parameter("qweight", padded_param)
         elif len(data_container) > 1:
@@ -603,6 +735,40 @@ class GGUFLinearMethod(LinearMethodBase):
             set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
             layer.register_parameter("qweight", padded_param)
 
+    def _cache_gguf_shards(self, layer: torch.nn.Module):
+        qweight = layer.qweight
+        shard_offset_map = getattr(qweight, "shard_offset_map", None)
+        if not shard_offset_map:
+            return
+
+        cache = {}
+        for idx, (start, end, offset) in shard_offset_map.items():
+            shard = qweight[start:end, :offset]
+            if not shard.is_contiguous():
+                shard = shard.contiguous()
+            cache[idx] = shard
+        layer._gguf_shard_cache = cache
+
+    def _cache_gguf_shard_metadata(self, layer: torch.nn.Module):
+        if not getattr(layer.qweight, "shard_id", []):
+            return
+        collected = _collect_gguf_linear_shards(layer)
+        if collected is None:
+            return
+        qweights, qweight_types = collected
+        layer._gguf_collected_shards = collected
+        layer._gguf_sharded_mmvq_max_batch = _shared_mmvq_max_batch(
+            qweights, qweight_types
+        )
+        full_mmvq = _get_full_mmvq_shard_weight(layer, qweight_types)
+        if full_mmvq is not None:
+            qweight, qweight_type = full_mmvq
+            layer._gguf_full_shard_mmvq = (
+                qweight,
+                qweight_type,
+                _mmvq_safe_batch(qweight, qweight_type),
+            )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -616,27 +782,33 @@ class GGUFLinearMethod(LinearMethodBase):
                 out.add_(bias.to(dtype=out.dtype))
             return out
 
-        shard_id = layer.qweight.shard_id
+        shard_id = getattr(layer.qweight, "shard_id", [])
 
         if shard_id:
-            # dequantize shard weights respectively
-            if all(isinstance(idx, int) for idx in shard_id):
-                shard_id = sorted(shard_id)
-            elif {"q", "k", "v"}.issubset(set(shard_id)):
-                shard_id = ["q", "k", "v"]
-            qweight = layer.qweight
-            result = []
-            for idx in shard_id:
-                qweight_type = layer.qweight_type.shard_weight_type[idx]
-                if hasattr(layer.qweight, "shard_offset_map"):
-                    start, end, offset = layer.qweight.shard_offset_map[idx]
-                    shard = qweight[start:end, :offset].contiguous()
+            collected = _collect_gguf_linear_shards(layer)
+            assert collected is not None
+            qweights, qweight_types = collected
+            mmvq_max_batch = getattr(layer, "_gguf_sharded_mmvq_max_batch", None)
+            can_share_mmvq = (
+                x.shape[0] > 0
+                and mmvq_max_batch is not None
+                and x.shape[0] <= mmvq_max_batch
+            )
+            if mmvq_max_batch is None:
+                can_share_mmvq = _can_share_mmvq_activation(x, qweights, qweight_types)
+            if can_share_mmvq:
+                full_mmvq = getattr(layer, "_gguf_full_shard_mmvq", None)
+                if full_mmvq is not None and x.shape[0] <= full_mmvq[2]:
+                    qweight, qweight_type, _ = full_mmvq
+                    out = fused_mul_mat_gguf(x, qweight, qweight_type)
                 else:
-                    shard = qweight.data_container[qweight.shard_id_map[idx]].contiguous()
-                result.append(
+                    out = fused_mul_mat_gguf_sharded_mmvq(x, qweights, qweight_types)
+            else:
+                result = [
                     fused_mul_mat_gguf(x, shard, qweight_type)
-                )
-            out = torch.cat(result, axis=1)
+                    for shard, qweight_type in zip(qweights, qweight_types)
+                ]
+                out = torch.cat(result, axis=1)
         else:
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type

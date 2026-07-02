@@ -198,7 +198,8 @@ class TestGGUFModelLoader:
 
         hf_config = MagicMock()
         hf_config.model_type = "qwen3_5_text"
-        hf_config.num_hidden_layers = 1
+        hf_config.num_hidden_layers = 2
+        hf_config.layer_types = ["linear_attention", "full_attention"]
         hf_config.vision_config = None
         hf_config.get_text_config.return_value = hf_config
 
@@ -216,6 +217,56 @@ class TestGGUFModelLoader:
         assert weights_map["blk.0.attn_qkv.weight"] == (
             "language_model.model.layers.0.linear_attn.in_proj_qkv.weight"
         )
+        assert "blk.1.attn_qkv.weight" not in weights_map
+
+    @patch("vllm.model_executor.model_loader.gguf_loader.detect_gguf_multimodal")
+    @patch("vllm.model_executor.model_loader.gguf_loader.AutoModelForCausalLM")
+    def test_qwen3_5_gguf_map_handles_split_gdn_projections(
+        self,
+        mock_auto_model,
+        mock_detect_multimodal,
+    ):
+        mock_detect_multimodal.return_value = None
+        mock_hf_model = MagicMock()
+        mock_hf_model.state_dict.return_value = {
+            "model.layers.0.linear_attn.in_proj_qkv.weight": MagicMock(),
+            "model.layers.0.linear_attn.in_proj_z.weight": MagicMock(),
+            "model.layers.0.linear_attn.in_proj_b.weight": MagicMock(),
+            "model.layers.0.linear_attn.in_proj_a.weight": MagicMock(),
+        }
+        mock_auto_model.from_config.return_value = mock_hf_model
+
+        hf_config = MagicMock()
+        hf_config.model_type = "qwen3_5_text"
+        hf_config.num_hidden_layers = 2
+        hf_config.layer_types = ["linear_attention", "full_attention"]
+        hf_config.vision_config = None
+        hf_config.get_text_config.return_value = hf_config
+
+        model_config = MagicMock()
+        model_config.hf_config = hf_config
+        model_config.architecture = "Qwen3_5ForCausalLM"
+        model_config.trust_remote_code = False
+        model_config.model = "/tmp/qwen3.6.gguf"
+
+        load_config = LoadConfig(load_format="gguf")
+        loader = GGUFModelLoader(load_config)
+
+        weights_map = loader._get_gguf_weights_map(model_config)
+
+        assert weights_map["blk.0.attn_qkv.weight"] == (
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight"
+        )
+        assert weights_map["blk.0.attn_gate.weight"] == (
+            "language_model.model.layers.0.linear_attn.in_proj_z.weight"
+        )
+        assert weights_map["blk.0.ssm_beta.weight"] == (
+            "language_model.model.layers.0.linear_attn.in_proj_b.weight"
+        )
+        assert weights_map["blk.0.ssm_alpha.weight"] == (
+            "language_model.model.layers.0.linear_attn.in_proj_a.weight"
+        )
+        assert "blk.1.attn_qkv.weight" not in weights_map
 
     @patch("vllm.config.model.get_hf_image_processor_config", return_value=None)
     @patch("vllm.transformers_utils.config.file_or_path_exists", return_value=True)

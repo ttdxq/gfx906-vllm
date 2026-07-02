@@ -625,12 +625,14 @@ class OpenAIServingEmbedding(EmbeddingMixin):
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
         trust_request_chat_template: bool = False,
+        default_chat_template_kwargs: dict[str, Any] | None = None,
         log_error_stack: bool = False,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
             models=models,
             request_logger=request_logger,
+            default_chat_template_kwargs=default_chat_template_kwargs,
             log_error_stack=log_error_stack,
         )
 

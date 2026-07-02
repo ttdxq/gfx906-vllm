@@ -10,6 +10,7 @@
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -477,8 +478,29 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    use_tiled_qk_head_mapping: bool = False,
+    use_transposed_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if _is_gfx906_rocm():
+        try:
+            output = ops.fused_recurrent_gated_delta_rule_gfx906_packed_decode(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                state=initial_state,
+                out=out,
+                state_indices=ssm_state_indices,
+                scale=scale,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                use_tiled_qk_head_mapping=use_tiled_qk_head_mapping,
+                use_transposed_state=use_transposed_state,
+            )
+            return output, initial_state
+        except (AttributeError, RuntimeError):
+            pass
+
         B = mixed_qkv.shape[0]
         HV, V, K = initial_state.shape[-3:]
         qkv_dim = mixed_qkv.shape[1]
@@ -497,6 +519,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             raise ValueError(
                 f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
             )
+        if use_transposed_state and K != V:
+            raise ValueError(
+                "Packed decode with transposed cache state requires K == V "
+                f"(got K={K}, V={V})."
+            )
 
         state_indices = ssm_state_indices.to(dtype=torch.long)
         valid_mask = state_indices >= 0
@@ -506,7 +533,10 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         final_state = initial_state
 
         for head_idx in range(HV):
-            q_head_idx = head_idx // head_ratio
+            if use_tiled_qk_head_mapping:
+                q_head_idx = head_idx % H
+            else:
+                q_head_idx = head_idx // head_ratio
             q_offset = q_head_idx * K
             k_offset = H * K + q_head_idx * K
             v_offset = 2 * H * K + head_idx * V
@@ -528,11 +558,20 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             state_view = final_state[:, head_idx]
             state_head = state_view.index_select(0, safe_indices).float()
             state_head = state_head * torch.exp(g_val).view(B, 1, 1)
-            v_residual = v_t - torch.sum(state_head * k_t[:, None, :], dim=2)
-            v_residual = v_residual * beta_val.view(B, 1)
-            state_head = state_head + v_residual[:, :, None] * k_t[:, None, :]
-
-            head_out = torch.sum(state_head * q_t[:, None, :], dim=2).to(output.dtype)
+            if use_transposed_state:
+                v_residual = v_t - torch.sum(state_head * k_t[:, :, None], dim=1)
+                v_residual = v_residual * beta_val.view(B, 1)
+                state_head = state_head + k_t[:, :, None] * v_residual[:, None, :]
+                head_out = torch.sum(state_head * q_t[:, :, None], dim=1).to(
+                    output.dtype
+                )
+            else:
+                v_residual = v_t - torch.sum(state_head * k_t[:, None, :], dim=2)
+                v_residual = v_residual * beta_val.view(B, 1)
+                state_head = state_head + v_residual[:, :, None] * k_t[:, None, :]
+                head_out = torch.sum(state_head * q_t[:, None, :], dim=2).to(
+                    output.dtype
+                )
             output[:, 0, head_idx] = torch.where(
                 valid_mask.view(B, 1), head_out, torch.zeros_like(head_out)
             )

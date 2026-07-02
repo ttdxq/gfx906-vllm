@@ -62,6 +62,10 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 logger = init_logger(__name__)
 
 
+def _gdn_runtime_debug_enabled() -> bool:
+    return bool(os.environ.get("VLLM_QWEN35_RUNTIME_DEBUG_FILE"))
+
+
 def _append_gdn_runtime_debug(message: str) -> None:
     debug_file = os.environ.get("VLLM_QWEN35_RUNTIME_DEBUG_FILE")
     if not debug_file:
@@ -626,17 +630,18 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 f"qtype_shards={getattr(qtype, 'shard_weight_type', None)}"
             )
 
-        _append_gdn_runtime_debug(
-            "PROJMETA "
-            + " | ".join(
-                [
-                    f"prefix={self.prefix}",
-                    summarize_proj("in_proj_qkv", getattr(self, "in_proj_qkv", None)),
-                    summarize_proj("in_proj_z", getattr(self, "in_proj_z", None)),
-                    summarize_proj("in_proj_ba", getattr(self, "in_proj_ba", None)),
-                ]
+        if _gdn_runtime_debug_enabled():
+            _append_gdn_runtime_debug(
+                "PROJMETA "
+                + " | ".join(
+                    [
+                        f"prefix={self.prefix}",
+                        summarize_proj("in_proj_qkv", getattr(self, "in_proj_qkv", None)),
+                        summarize_proj("in_proj_z", getattr(self, "in_proj_z", None)),
+                        summarize_proj("in_proj_ba", getattr(self, "in_proj_ba", None)),
+                    ]
+                )
             )
-        )
 
     def _forward_core(self, mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor, core_attn_out: torch.Tensor):
         self._log_projection_debug_once()
@@ -651,16 +656,16 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
-        _append_gdn_runtime_debug(
-            "COREMETA "
-            f"prefix={self.prefix} packed={self.enable_packed_recurrent_decode} "
-            f"spec_is_none={attn_metadata.spec_sequence_masks is None} "
-            f"num_prefills={attn_metadata.num_prefills} num_decodes={attn_metadata.num_decodes}"
-        )
+        if _gdn_runtime_debug_enabled():
+            _append_gdn_runtime_debug(
+                "COREMETA "
+                f"prefix={self.prefix} packed={self.enable_packed_recurrent_decode} "
+                f"spec_is_none={attn_metadata.spec_sequence_masks is None} "
+                f"num_prefills={attn_metadata.num_prefills} num_decodes={attn_metadata.num_decodes}"
+            )
 
         if (
             self.enable_packed_recurrent_decode
-            and not _is_gfx906_rocm()
             and attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
@@ -751,7 +756,13 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
-        if attn_metadata.num_prefills > 0 or attn_metadata.num_decodes > 0:
+        g_non_spec: torch.Tensor | None = None
+        beta_non_spec: torch.Tensor | None = None
+
+        def ensure_non_spec_gating() -> None:
+            nonlocal g_non_spec, beta_non_spec
+            if g_non_spec is not None:
+                return
             g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
             if spec_sequence_masks is not None:
                 g_non_spec = g.index_select(1, non_spec_token_indx)
@@ -759,9 +770,6 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             else:
                 g_non_spec = g
                 beta_non_spec = beta
-        else:
-            g_non_spec = None
-            beta_non_spec = None
 
         if spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = fused_sigmoid_gating_delta_rule_update(
@@ -793,11 +801,12 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
                 if has_initial_state is not None:
                     initial_state[~has_initial_state, ...] = 0
-                _append_gdn_runtime_debug(
-                    "PREFILL "
-                    f"q={tuple(query_non_spec.shape)} k={tuple(key_non_spec.shape)} "
-                    f"v={tuple(value_non_spec.shape)} a={tuple(a_non_spec.shape)} b={tuple(b_non_spec.shape)}"
-                )
+                if _gdn_runtime_debug_enabled():
+                    _append_gdn_runtime_debug(
+                        "PREFILL "
+                        f"q={tuple(query_non_spec.shape)} k={tuple(key_non_spec.shape)} "
+                        f"v={tuple(value_non_spec.shape)} a={tuple(a_non_spec.shape)} b={tuple(b_non_spec.shape)}"
+                    )
                 core_attn_out_non_spec, last_recurrent_state = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
                     a=a_non_spec,
@@ -816,14 +825,18 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     -1, -2
                 ).to(ssm_state.dtype)
             else:
+                ensure_non_spec_gating()
+                assert g_non_spec is not None
+                assert beta_non_spec is not None
                 initial_state = ssm_state.contiguous()
                 if has_initial_state is not None:
                     initial_state[non_spec_state_indices_tensor[~has_initial_state], ...] = 0
-                _append_gdn_runtime_debug(
-                    "PREFILL "
-                    f"q={tuple(query_non_spec.shape)} k={tuple(key_non_spec.shape)} "
-                    f"v={tuple(value_non_spec.shape)} g={tuple(g_non_spec.shape)} beta={tuple(beta_non_spec.shape)}"
-                )
+                if _gdn_runtime_debug_enabled():
+                    _append_gdn_runtime_debug(
+                        "PREFILL "
+                        f"q={tuple(query_non_spec.shape)} k={tuple(key_non_spec.shape)} "
+                        f"v={tuple(value_non_spec.shape)} g={tuple(g_non_spec.shape)} beta={tuple(beta_non_spec.shape)}"
+                    )
                 core_attn_out_non_spec, last_recurrent_state = self.chunk_gated_delta_rule(
                     q=query_non_spec.transpose(1, 2),
                     k=key_non_spec.transpose(1, 2),
@@ -839,7 +852,6 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 ssm_state.copy_(last_recurrent_state.to(ssm_state.dtype))
         elif attn_metadata.num_decodes > 0:
             if _is_gfx906_rocm():
-                initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
                 core_attn_out_non_spec, last_recurrent_state = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
                     a=a,
@@ -848,15 +860,12 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    initial_state=initial_state,
+                    initial_state=ssm_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
-                    ssm_state_indices=None,
+                    ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                 )
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.transpose(
-                    -1, -2
-                ).to(ssm_state.dtype)
             else:
                 core_attn_out_non_spec, last_recurrent_state = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -922,11 +931,12 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         )
 
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
-        _append_gdn_runtime_debug(
-            "DECODE_PACKED "
-            f"mixed_qkv={tuple(mixed_qkv_non_spec.shape)} a={tuple(a.shape)} b={tuple(b.shape)} "
-            f"out={tuple(out_buf.shape)}"
-        )
+        if _gdn_runtime_debug_enabled():
+            _append_gdn_runtime_debug(
+                "DECODE_PACKED "
+                f"mixed_qkv={tuple(mixed_qkv_non_spec.shape)} a={tuple(a.shape)} b={tuple(b.shape)} "
+                f"out={tuple(out_buf.shape)}"
+            )
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
