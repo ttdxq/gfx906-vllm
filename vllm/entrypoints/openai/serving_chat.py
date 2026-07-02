@@ -6,7 +6,7 @@ import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
-from typing import Final
+from typing import Any, Final
 
 import jinja2
 import partial_json_parser
@@ -87,6 +87,7 @@ class OpenAIServingChat(OpenAIServing):
         chat_template_content_format: ChatTemplateContentFormatOption,
         trust_request_chat_template: bool = False,
         return_tokens_as_token_ids: bool = False,
+        default_chat_template_kwargs: dict[str, Any] | None = None,
         reasoning_parser: str = "",
         enable_auto_tools: bool = False,
         exclude_tools_when_tool_choice_none: bool = False,
@@ -101,6 +102,7 @@ class OpenAIServingChat(OpenAIServing):
             models=models,
             request_logger=request_logger,
             return_tokens_as_token_ids=return_tokens_as_token_ids,
+            default_chat_template_kwargs=default_chat_template_kwargs,
             log_error_stack=log_error_stack,
         )
 
@@ -587,7 +589,10 @@ class OpenAIServingChat(OpenAIServing):
             if self.reasoning_parser:
                 reasoning_parser = self.reasoning_parser(
                     tokenizer,
-                    chat_template_kwargs=request.chat_template_kwargs,  # type: ignore
+                    chat_template_kwargs=self._get_effective_chat_template_kwargs(
+                        request.chat_template_kwargs,
+                        request,
+                    ),  # type: ignore
                 )
         except RuntimeError as e:
             logger.exception("Error in reasoning parser creation.")
@@ -595,6 +600,35 @@ class OpenAIServingChat(OpenAIServing):
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
             return
+
+        def is_reasoning_end_streaming(
+            parser,
+            current_token_ids: list[int],
+            delta_token_ids: list[int],
+        ) -> bool:
+            if getattr(parser, "engine_based_streaming", False):
+                return parser.has_engine_confirmed_reasoning_end()
+            return parser.is_reasoning_end_streaming(
+                current_token_ids,
+                delta_token_ids,
+            )
+
+        def merge_delta_message(
+            base: DeltaMessage | None,
+            extra: DeltaMessage | None,
+        ) -> DeltaMessage | None:
+            if extra is None:
+                return base
+            if base is None:
+                return extra
+            if extra.content:
+                base.content = (base.content or "") + extra.content
+            if extra.reasoning:
+                base.reasoning = (base.reasoning or "") + extra.reasoning
+            if extra.tool_calls:
+                base.tool_calls.extend(extra.tool_calls)
+            return base
+
         # Prepare the tool parser if it's needed
         try:
             if tool_choice_auto and self.tool_parser:
@@ -843,8 +877,11 @@ class OpenAIServingChat(OpenAIServing):
                             # i.e {"enable_thinking": False},
                             # set reasoning status to end.
                             # Only keep 'content', remove 'reasoning'.
-                            if reasoning_parser.is_reasoning_end(
-                                as_list(output.token_ids)
+                            output_token_ids = as_list(output.token_ids)
+                            if is_reasoning_end_streaming(
+                                reasoning_parser,
+                                current_token_ids,
+                                output_token_ids,
                             ) or (
                                 res.prompt_token_ids
                                 and reasoning_parser.is_reasoning_end(
@@ -914,7 +951,11 @@ class OpenAIServingChat(OpenAIServing):
                                     output_token_ids,
                                 )
                             )
-                            if reasoning_parser.is_reasoning_end(output_token_ids):
+                            if is_reasoning_end_streaming(
+                                reasoning_parser,
+                                current_token_ids,
+                                output_token_ids,
+                            ):
                                 reasoning_end_arr[i] = True
                                 if delta_message and delta_message.content:
                                     current_text = delta_message.content
@@ -985,7 +1026,11 @@ class OpenAIServingChat(OpenAIServing):
                             # set reasoning status to end.
                             # Remove the text and token ids related
                             # to 'reasoning'.
-                            if reasoning_parser.is_reasoning_end(output_token_ids):
+                            if is_reasoning_end_streaming(
+                                reasoning_parser,
+                                current_token_ids,
+                                output_token_ids,
+                            ):
                                 reasoning_end_arr[i] = True
                                 current_token_ids = (
                                     reasoning_parser.extract_content_ids(
@@ -1047,6 +1092,14 @@ class OpenAIServingChat(OpenAIServing):
                             current_token_ids,
                             output.token_ids,
                         )
+                        if (
+                            output.finish_reason is not None
+                            and getattr(reasoning_parser, "engine_based_streaming", False)
+                        ):
+                            delta_message = merge_delta_message(
+                                delta_message,
+                                reasoning_parser.finish_streaming(),
+                            )
                     # handle streaming just a content delta
                     else:
                         delta_message = DeltaMessage(content=delta_text)
@@ -1388,7 +1441,10 @@ class OpenAIServingChat(OpenAIServing):
                 try:
                     reasoning_parser = self.reasoning_parser(
                         tokenizer,
-                        chat_template_kwargs=request.chat_template_kwargs,  # type: ignore
+                        chat_template_kwargs=self._get_effective_chat_template_kwargs(
+                            request.chat_template_kwargs,
+                            request,
+                        ),  # type: ignore
                     )
                 except RuntimeError as e:
                     logger.exception("Error in reasoning parser creation.")

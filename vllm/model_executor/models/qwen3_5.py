@@ -25,7 +25,6 @@
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
 import os
-import os
 import typing
 from collections.abc import Callable, Iterable
 from inspect import signature
@@ -47,7 +46,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -128,6 +130,24 @@ def _append_qwen35_load_debug(message: str) -> None:
         pass
 
 
+def _is_qwen35_gguf_projection_aux_param(name: str) -> bool:
+    if ".linear_attn.in_proj_" not in name:
+        return False
+    if not name.endswith((".qweight", ".qweight_type")):
+        return False
+    return any(
+        f".{proj}." in name
+        for proj in (
+            "in_proj_qkvz",
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_ba",
+            "in_proj_b",
+            "in_proj_a",
+        )
+    )
+
+
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
@@ -167,8 +187,16 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         self.expand_qk_heads_for_gdn = _env_bool(
             "VLLM_QWEN35_EXPAND_QK", True
         )
+        capability = current_platform.get_device_capability()
+        default_recurrent_prefill = not (
+            self.split_projections
+            and current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        )
         self.use_recurrent_prefill_for_gdn = _env_bool(
-            "VLLM_QWEN35_REC_PREFILL", True
+            "VLLM_QWEN35_REC_PREFILL", default_recurrent_prefill
         )
         self.use_local_recurrent_decode_for_gdn = _env_bool(
             "VLLM_QWEN35_LOCAL_REC_DECODE", False
@@ -176,27 +204,38 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         self.use_qk_l2norm_in_kernel_for_gdn = _env_bool(
             "VLLM_QWEN35_QK_L2NORM", True
         )
-        if prefix.endswith("layers.0.linear_attn"):
-            logger.warning(
-                "[qwen3.5 init] prefix=%s split_projections=%s", prefix, self.split_projections
-            )
-            debug_file = os.getenv("VLLM_QWEN35_INIT_DEBUG_FILE")
-            if debug_file:
-                try:
-                    with open(debug_file, "a", encoding="utf-8") as f:
-                        f.write(
-                            f"prefix={prefix} split_projections={self.split_projections} modules={list(self._modules.keys())}\n"
-                        )
-                except Exception:
-                    pass
+        self.use_transposed_state_for_packed_decode = self.split_projections
         if self.split_projections:
-            self.in_proj_qkvz.output_sizes = [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-                self.value_dim,
-            ]
-            self.in_proj_ba.output_sizes = [self.num_v_heads, self.num_v_heads]
+            del self.in_proj_qkvz
+            del self.in_proj_ba
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_qkv",
+            )
+            self.in_proj_z = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.value_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_z",
+            )
+            self.in_proj_b = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.num_v_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_b",
+            )
+            self.in_proj_a = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.num_v_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_a",
+            )
         else:
             self.in_proj_qkvz.output_sizes = [
                 self.key_dim,
@@ -229,17 +268,31 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         if head_ratio <= 1:
             return query.contiguous(), key.contiguous()
 
-        if (
-            self.split_projections
-            and self.quant_config is not None
-            and self.quant_config.get_name() == "gguf"
-        ):
+        tiled_qk_expand = os.getenv(
+            "VLLM_QWEN35_TILED_QK_EXPAND",
+            "1" if self.split_projections else "0",
+        )
+        if tiled_qk_expand.lower() in {"1", "true", "yes", "on"}:
             query = query.repeat(1, 1, head_ratio, 1)
             key = key.repeat(1, 1, head_ratio, 1)
         else:
             query = query.repeat_interleave(head_ratio, dim=2)
             key = key.repeat_interleave(head_ratio, dim=2)
         return query.contiguous(), key.contiguous()
+
+    def _use_gfx906_packed_decode_path(self) -> bool:
+        raw = os.getenv(
+            "VLLM_QWEN35_PACKED_DECODE",
+            "1" if self.split_projections else "0",
+        )
+        return raw.lower() in {"1", "true", "yes", "on"}
+
+    def _use_tiled_qk_head_mapping_for_packed_decode(self) -> bool:
+        raw = os.getenv(
+            "VLLM_QWEN35_PACKED_DECODE_TILED_QK",
+            "1" if self.split_projections else "0",
+        )
+        return raw.lower() in {"1", "true", "yes", "on"}
 
     def _maybe_log_debug_stats(self, **tensors: torch.Tensor) -> None:
         if os.getenv("VLLM_QWEN35_GGUF_DEBUG", "0") != "1":
@@ -330,21 +383,22 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         num_tokens = hidden_states.size(0)
 
         if self.split_projections:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_qkv, _ = self.in_proj_qkv(hidden_states)
+            z, _ = self.in_proj_z(hidden_states)
+            b, _ = self.in_proj_b(hidden_states)
+            a, _ = self.in_proj_a(hidden_states)
 
             q_size = self.key_dim // self.tp_size
             k_size = self.key_dim // self.tp_size
             v_size = self.value_dim // self.tp_size
-            q, k, v, z = torch.split(
-                projected_states_qkvz,
-                [q_size, k_size, v_size, v_size],
+            q, k, v = torch.split(
+                projected_states_qkv,
+                [q_size, k_size, v_size],
                 dim=-1,
             )
 
-            mixed_qkv = torch.cat((q, k, v), dim=-1)
+            mixed_qkv = projected_states_qkv
             z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b, a = projected_states_ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
         else:
@@ -398,9 +452,16 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
 
     def _use_gfx906_chunk_decode_path(self) -> bool:
         raw = os.getenv("VLLM_QWEN35_CHUNK_DECODE")
-        if raw is None:
-            return False
-        return raw.lower() in {"1", "true", "yes", "on"}
+        if raw is not None:
+            return raw.lower() in {"1", "true", "yes", "on"}
+        capability = current_platform.get_device_capability()
+        return (
+            self.split_projections
+            and current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        )
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -639,7 +700,7 @@ class Qwen3_5Model(Qwen3NextModel):
             f"MODE force_split={force_split} has_split_qkv={has_split_qkv} has_split_ba={has_split_ba} has_fused_ba={has_fused_ba}"
         )
 
-        if has_fused_ba and not has_split_ba:
+        if has_fused_ba and not has_split_ba and not force_split:
             reverse_ba = os.getenv("VLLM_QWEN35_REVERSE_BA_SHARDS", "0").lower() in {
                 "1",
                 "true",
@@ -661,7 +722,7 @@ class Qwen3_5Model(Qwen3NextModel):
                     ]
                 )
 
-        if not has_split_qkv:
+        if not has_split_qkv and not force_split:
             stacked_params_mapping.extend(
                 [
                     ("in_proj_qkvz", "in_proj_qkv", (0, 1, 2)),
@@ -821,7 +882,7 @@ class Qwen3_5Model(Qwen3NextModel):
                     is_fused_expert = True
                     expert_params_mapping = fused_expert_params_mapping
 
-                if weight_name not in name:
+                if f".{weight_name}." not in name:
                     continue
 
                 if "mlp.experts" in name:
@@ -1025,11 +1086,12 @@ class Qwen3_5Model(Qwen3NextModel):
                     if is_pp_missing_parameter(name, self):
                         continue
                     if name not in params_dict:
+                        if _is_qwen35_gguf_projection_aux_param(name):
+                            _append_qwen35_load_debug(f"MISSING name={name}")
+                            continue
                         logger.warning_once(
                             f"Parameter {name} not found in params_dict, skip loading"
                         )
-                        if "linear_attn.in_proj" in name:
-                            _append_qwen35_load_debug(f"MISSING name={name}")
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(
@@ -1046,6 +1108,32 @@ class Qwen3_5Model(Qwen3NextModel):
                             f"is_gguf_weight_type={getattr(param, 'is_gguf_weight_type', False)} "
                             f"loaded_shape={tuple(loaded_weight.shape) if hasattr(loaded_weight, 'shape') else 'NA'}"
                         )
+                    if getattr(param, "is_gguf_weight", False) or getattr(
+                        param, "is_gguf_weight_type", False
+                    ):
+                        if getattr(param, "is_gguf_weight_type", False):
+                            param.weight_type = loaded_weight.item()
+                        else:
+                            output_dim = getattr(param, "output_dim", 0)
+                            tp_size = get_tensor_model_parallel_world_size()
+                            tp_rank = get_tensor_model_parallel_rank()
+                            local_shard = loaded_weight.size(output_dim) // tp_size
+                            start_idx = tp_rank * local_shard
+                            loaded_weight = loaded_weight.narrow(
+                                output_dim, start_idx, local_shard
+                            )
+                            loaded_weight = loaded_weight.to(device=param.device)
+                            loaded_param = torch.nn.Parameter(
+                                loaded_weight.contiguous(), requires_grad=False
+                            )
+                            for attr_name, attr_value in vars(param).items():
+                                setattr(loaded_param, attr_name, attr_value)
+                            module_name, _, param_leaf = name.rpartition(".")
+                            module = modules_dict[module_name]
+                            module.register_parameter(param_leaf, loaded_param)
+                            params_dict[name] = loaded_param
+                        loaded_params.add(name)
+                        continue
                     try:
                         weight_loader(param, loaded_weight)
                     except AssertionError as exc:

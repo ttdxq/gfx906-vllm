@@ -204,6 +204,140 @@ torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W,  // quant weight
   return Y;
 }
 
+torch::Tensor ggml_quantize_row_q8_1(torch::Tensor X) {
+  int col = X.sizes()[1];
+  int vecs = X.sizes()[0];
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(torch::kInt32).device(X.device());
+  at::Tensor quant_X = torch::empty({vecs, padded / 32 * 9}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_quantize_row_q8_1", [&] {
+    quantize_row_q8_1_cuda<scalar_t>(
+        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
+  });
+  return quant_X;
+}
+
+template <typename scalar_t>
+static void ggml_mul_mat_vec_q8_dispatch(
+    const void* W, const void* quant_X, scalar_t* dst, int col, int row,
+    int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
+  switch (type) {
+    case 2:
+      mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 3:
+      mul_mat_vec_q4_1_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 6:
+      mul_mat_vec_q5_0_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 7:
+      mul_mat_vec_q5_1_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 8:
+      mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 10:
+      mul_mat_vec_q2_K_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 11:
+      mul_mat_vec_q3_K_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 12:
+      mul_mat_vec_q4_K_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 13:
+      mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 14:
+      mul_mat_vec_q6_K_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 16:
+      mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 17:
+      mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 18:
+      mul_mat_vec_iq3_xxs_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 19:
+      mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 20:
+      mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 21:
+      mul_mat_vec_iq3_s_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 22:
+      mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 23:
+      mul_mat_vec_iq4_xs_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+    case 29:
+      mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
+          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      break;
+  }
+}
+
+torch::Tensor ggml_mul_mat_vec_a8_sharded(std::vector<torch::Tensor> W,
+                                          torch::Tensor X,
+                                          std::vector<int64_t> types) {
+  TORCH_CHECK(!W.empty(), "W must have at least one shard");
+  TORCH_CHECK(W.size() == types.size(),
+              "W and types must have the same number of elements");
+  int col = X.sizes()[1];
+  int vecs = X.sizes()[0];
+  int64_t total_rows = 0;
+  for (const auto& shard : W) {
+    total_rows += shard.sizes()[0];
+  }
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(X.device());
+  at::Tensor Y = torch::empty({vecs, total_rows}, options);
+  at::Tensor quant_X = ggml_quantize_row_q8_1(X);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8_sharded",
+                               [&] {
+    int64_t row_offset = 0;
+    for (size_t i = 0; i < W.size(); ++i) {
+      const auto& shard = W[i];
+      const int row = shard.sizes()[0];
+      scalar_t* dst = (scalar_t*)Y.data_ptr() + row_offset;
+      ggml_mul_mat_vec_q8_dispatch<scalar_t>(
+          (void*)shard.data_ptr(), (void*)quant_X.data_ptr(), dst, col, row,
+          vecs, types[i], stream, total_rows);
+      row_offset += row;
+    }
+  });
+  return Y;
+}
+
 torch::Tensor ggml_mul_mat_a8(torch::Tensor W,  // quant weight
                               torch::Tensor X,  // input
                               int64_t type, int64_t row) {

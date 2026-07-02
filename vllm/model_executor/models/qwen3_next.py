@@ -37,6 +37,7 @@ from vllm.model_executor.layers.fla.ops import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule,
     fused_sigmoid_gating_delta_rule_update,
+    fused_sigmoid_gating_delta_rule_update_kv_cache_gfx906,
 )
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
@@ -490,21 +491,35 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
             return None, None, None
+        seq_len = mixed_qkv.shape[0]
+        q_dim = self.key_dim // self.tp_size
+        k_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
         query, key, value = torch.split(
             mixed_qkv,
             [
-                self.key_dim // self.tp_size,
-                self.key_dim // self.tp_size,
-                self.value_dim // self.tp_size,
+                q_dim,
+                k_dim,
+                v_dim,
             ],
             dim=-1,
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
+
+        fused = torch.cat(
+            [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0
         )
-        value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
-        return query.contiguous(), key.contiguous(), value.contiguous()
+
+        q_numel = seq_len * q_dim
+        k_numel = seq_len * k_dim
+        v_numel = seq_len * v_dim
+        query = fused[:q_numel].view(1, seq_len, -1, self.head_k_dim)
+        key = fused[q_numel : q_numel + k_numel].view(
+            1, seq_len, -1, self.head_k_dim
+        )
+        value = fused[q_numel + k_numel : q_numel + k_numel + v_numel].view(
+            1, seq_len, -1, self.head_v_dim
+        )
+        return query, key, value
 
     def _expand_qk_heads_for_gdn(
         self,
@@ -522,6 +537,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
     def _use_gfx906_chunk_decode_path(self) -> bool:
         return True
+
+    def _use_gfx906_packed_decode_path(self) -> bool:
+        return False
+
+    def _use_tiled_qk_head_mapping_for_packed_decode(self) -> bool:
+        return False
 
     def forward(
         self,
@@ -580,6 +601,62 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
+    def _forward_core_decode_packed_gfx906(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> None:
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
+        assert non_spec_state_indices_tensor is not None
+
+        forward_context = get_forward_context()
+        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+        conv_state = self_kv_cache[0].transpose(-1, -2)
+        ssm_state = self_kv_cache[1]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        mixed_qkv = causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
+            validate_data=True,
+        )
+
+        out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            scale=self.head_k_dim**-0.5,
+            initial_state=ssm_state,
+            out=out_buf,
+            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
+            use_qk_l2norm_in_kernel=getattr(
+                self, "use_qk_l2norm_in_kernel_for_gdn", True
+            ),
+            use_tiled_qk_head_mapping=(
+                self._use_tiled_qk_head_mapping_for_packed_decode()
+            ),
+            use_transposed_state=getattr(
+                self, "use_transposed_state_for_packed_decode", False
+            ),
+        )
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -600,6 +677,25 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        capability = current_platform.get_device_capability()
+        if (
+            self._use_gfx906_packed_decode_path()
+            and attn_metadata.spec_sequence_masks is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes > 0
+            and current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        ):
+            self._forward_core_decode_packed_gfx906(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
+            return
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
@@ -694,24 +790,32 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 query_non_spec, key_non_spec
             )
 
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        g: torch.Tensor | None = None
+        beta: torch.Tensor | None = None
+        g_spec: torch.Tensor | None = None
+        beta_spec: torch.Tensor | None = None
+        g_non_spec: torch.Tensor | None = None
+        beta_non_spec: torch.Tensor | None = None
 
-        if spec_sequence_masks is not None:
-            if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                g_spec = g
-                beta_spec = beta
-                g_non_spec = None
-                beta_non_spec = None
+        def ensure_gating() -> None:
+            nonlocal g, beta, g_spec, beta_spec, g_non_spec, beta_non_spec
+            if g is not None:
+                return
+            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+            if spec_sequence_masks is not None:
+                if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                    g_spec = g
+                    beta_spec = beta
+                    g_non_spec = None
+                    beta_non_spec = None
+                else:
+                    g_spec = g.index_select(1, spec_token_indx)
+                    beta_spec = beta.index_select(1, spec_token_indx)
+                    g_non_spec = g.index_select(1, non_spec_token_indx)
+                    beta_non_spec = beta.index_select(1, non_spec_token_indx)
             else:
-                g_spec = g.index_select(1, spec_token_indx)
-                beta_spec = beta.index_select(1, spec_token_indx)
-                g_non_spec = g.index_select(1, non_spec_token_indx)
-                beta_non_spec = beta.index_select(1, non_spec_token_indx)
-        else:
-            g_spec = None
-            beta_spec = None
-            g_non_spec = g
-            beta_non_spec = beta
+                g_non_spec = g
+                beta_non_spec = beta
 
         # 2. Recurrent attention
         use_qk_l2norm_in_kernel = getattr(
@@ -720,6 +824,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            ensure_gating()
+            assert g_spec is not None
+            assert beta_spec is not None
             spec_initial_state = ssm_state.transpose(-1, -2).contiguous()
             core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
                 q=query_spec,
@@ -768,6 +875,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 and capability.major == 9
                 and capability.minor == 0
             )
+            prefill_state_is_cache_layout = False
             if use_sigmoid_prefill_for_split_qwen35:
                 if spec_sequence_masks is not None:
                     a_non_spec = a.index_select(0, non_spec_token_indx)
@@ -792,6 +900,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     )
                 )
             elif getattr(self, "use_recurrent_prefill_for_gdn", False):
+                ensure_gating()
+                assert g_non_spec is not None
+                assert beta_non_spec is not None
                 core_attn_out_non_spec, last_recurrent_state = (
                     fused_recurrent_gated_delta_rule(
                         q=query_non_spec,
@@ -806,25 +917,33 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     )
                 )
             else:
+                ensure_gating()
+                assert g_non_spec is not None
+                assert beta_non_spec is not None
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
                 ) = chunk_gated_delta_rule(
-                    q=query_non_spec.transpose(1, 2),
-                    k=key_non_spec.transpose(1, 2),
-                    v=value_non_spec.transpose(1, 2),
-                    g=g_non_spec.transpose(1, 2),
-                    beta=beta_non_spec.transpose(1, 2),
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
                     initial_state=initial_state,
                     output_final_state=True,
                     cu_seqlens=non_spec_query_start_loc,
-                    head_first=True,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
+                prefill_state_is_cache_layout = True
             # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.transpose(
-                -1, -2
-            ).to(ssm_state.dtype)
+            if prefill_state_is_cache_layout:
+                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
+            else:
+                ssm_state[non_spec_state_indices_tensor] = (
+                    last_recurrent_state.transpose(-1, -2).to(ssm_state.dtype)
+                )
         elif attn_metadata.num_decodes > 0:
             if getattr(self, "prefix", "") == "language_model.model.layers.0.linear_attn":
                 _append_qwen35_runtime_debug(
@@ -849,29 +968,24 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 and capability.major == 9
                 and capability.minor == 0
             ):
-                initial_state = ssm_state[non_spec_state_indices_tensor].transpose(
-                    -1, -2
-                ).contiguous()
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
-                ) = chunk_gated_delta_rule(
-                    q=query_non_spec.transpose(1, 2),
-                    k=key_non_spec.transpose(1, 2),
-                    v=value_non_spec.transpose(1, 2),
-                    g=g_non_spec.transpose(1, 2),
-                    beta=beta_non_spec.transpose(1, 2),
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ],
-                    head_first=True,
-                    use_qk_l2norm_in_kernel=True,
+                ) = fused_sigmoid_gating_delta_rule_update_kv_cache_gfx906(
+                    A_log=self.A_log,
+                    a=a,
+                    b=b,
+                    dt_bias=self.dt_bias,
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    beta=1.0,
+                    threshold=20.0,
+                    scale=self.head_k_dim**-0.5,
+                    initial_state=ssm_state,
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.transpose(
-                    -1, -2
-                ).to(ssm_state.dtype)
             else:
                 force_local_recurrent_decode = (
                     getattr(self, "use_local_recurrent_decode_for_gdn", False)
@@ -911,6 +1025,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     )
                     core_attn_out_non_spec = core_attn_out_packed.transpose(0, 1)
                 else:
+                    ensure_gating()
+                    assert g_non_spec is not None
+                    assert beta_non_spec is not None
                     initial_state = ssm_state.transpose(-1, -2).contiguous()
                     core_attn_out_non_spec, last_recurrent_state = (
                         fused_recurrent_gated_delta_rule(

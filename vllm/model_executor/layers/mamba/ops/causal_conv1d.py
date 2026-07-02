@@ -4,11 +4,11 @@
 # Copyright (c) 2024, Tri Dao.
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+from vllm import _custom_ops as ops
 import vllm.envs as envs
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.platforms import current_platform
@@ -136,6 +136,28 @@ def _causal_conv1d_gfx906_decode_update_fallback(
     activation: str | None,
     pad_slot_id: int,
 ) -> torch.Tensor:
+    use_custom_op = (
+        x.dtype == weight.dtype
+        and conv_states.dtype in (x.dtype, torch.float32)
+        and (bias is None or bias.dtype == x.dtype)
+        and (x.dim() == 2 or (x.dim() == 3 and x.shape[-1] == 1))
+    )
+    if use_custom_op:
+        try:
+            x_for_op = x.squeeze(-1) if x.dim() == 3 else x
+            out = ops.causal_conv1d_gfx906_decode_update(
+                x=x_for_op,
+                conv_state=conv_states,
+                weight=weight,
+                bias=bias,
+                conv_state_indices=conv_state_indices,
+                pad_slot_id=pad_slot_id,
+                silu_activation=activation in ["silu", "swish"],
+            )
+            return out.unsqueeze(-1) if x.dim() == 3 else out
+        except (AttributeError, RuntimeError):
+            pass
+
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
     unsqueeze = x.dim() == 2

@@ -317,7 +317,8 @@ static void moe_vec_iq4_xs_q8_1_cuda(const void* vx, const void* vy,
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-  moe_vec_q<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1>
+  moe_vec_q<scalar_t, QK_K, QI4_XS, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ,
+            vec_dot_iq4_xs_q8_1>
       <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k,
                                               ncols, nrows, token_stride);
 }

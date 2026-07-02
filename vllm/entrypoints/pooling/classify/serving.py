@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from http import HTTPStatus
-from typing import cast
+from typing import Any, cast
 
 import jinja2
 import numpy as np
@@ -90,6 +90,7 @@ class ClassificationMixin(OpenAIServing):
                     ),
                     add_generation_prompt=False,
                     continue_final_message=False,
+                    chat_template_kwargs=chat_request.chat_template_kwargs,
                     add_special_tokens=chat_request.add_special_tokens,
                 )
                 ctx.engine_prompts = engine_prompts
@@ -191,12 +192,14 @@ class ServingClassification(ClassificationMixin):
         chat_template: str | None = None,
         chat_template_content_format: ChatTemplateContentFormatOption = "auto",
         trust_request_chat_template: bool = False,
+        default_chat_template_kwargs: dict[str, Any] | None = None,
         log_error_stack: bool = False,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
             models=models,
             request_logger=request_logger,
+            default_chat_template_kwargs=default_chat_template_kwargs,
             log_error_stack=log_error_stack,
         )
 

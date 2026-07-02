@@ -183,6 +183,32 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+def test_causal_conv1d_update_accepts_float32_state_with_fp16_input():
+    device = "cuda"
+    current_platform.seed_everything(0)
+    batch, dim, width = 2, 128, 4
+    x = torch.randn(batch, dim, 1, device=device, dtype=torch.float16)
+    weight = torch.randn(dim, width, device=device, dtype=torch.float16)
+    conv_state = torch.randn(batch, dim, width - 1, device=device, dtype=torch.float32)
+    conv_state_ref = conv_state.clone()
+    conv_state_indices = torch.arange(batch, dtype=torch.int32, device=device)
+
+    out = causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias=None,
+        activation="silu",
+        conv_state_indices=conv_state_indices,
+    )
+    out_ref = causal_conv1d_update_ref(
+        x, conv_state_ref, weight, bias=None, activation="silu"
+    )
+
+    torch.testing.assert_close(out, out_ref, rtol=3e-3, atol=5e-3)
+    torch.testing.assert_close(conv_state, conv_state_ref, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])

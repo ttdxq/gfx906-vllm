@@ -37,6 +37,8 @@ class ReasoningParser:
     It is used to extract reasoning content from the model output.
     """
 
+    engine_based_streaming: bool = False
+
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         self.model_tokenizer = tokenizer
 
@@ -46,8 +48,19 @@ class ReasoningParser:
         # whereas all tokenizers have .get_vocab()
         return self.model_tokenizer.get_vocab()
 
+    @property
+    def reasoning_start_str(self) -> str | None:
+        return None
+
+    @property
+    def reasoning_end_str(self) -> str | None:
+        return None
+
+    def has_engine_confirmed_reasoning_end(self) -> bool:
+        return False
+
     @abstractmethod
-    def is_reasoning_end(self, input_ids: list[int]) -> bool:
+    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
         Check if the reasoning content ends in the input_ids.
 
@@ -62,6 +75,13 @@ class ReasoningParser:
         bool
             True if the reasoning content ends in the input_ids.
         """
+
+    def is_reasoning_end_streaming(
+        self,
+        input_ids: Sequence[int],
+        delta_ids: Sequence[int],
+    ) -> bool:
+        return self.is_reasoning_end(input_ids)
 
     @abstractmethod
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
@@ -127,6 +147,31 @@ class ReasoningParser:
         Otherwise, None is returned
         """
         return None
+
+    def adjust_request(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        return request
+
+    def adjust_initial_state_from_prompt(
+        self,
+        prompt_token_ids: Sequence[int],
+    ) -> None:
+        return
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        return None
+
+    def get_streaming_fallback_content(
+        self,
+        text: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> str | None:
+        return None
+
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        return 0
 
 
 class ReasoningParserManager:

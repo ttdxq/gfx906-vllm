@@ -1788,25 +1788,30 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
 }
 
 
+#define VDR_IQ4_XS_Q8_1_MMVQ 4
+
 static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 #if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
     const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq;
     const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
 
-    // iqs is 0...7
-    const int ib32 = iqs;
-    const int32_t  * q8 = (const int *)bq8_1[ib32].qs;
-    const uint32_t * q4 = (const uint32_t *)bq4->qs + 4*ib32;
-    const int8_t ls = ((bq4->scales_l[ib32/2] >> 4*(ib32%2)) & 0xf) | (((bq4->scales_h >> 2*ib32) & 3) << 4);
-    const float d = __half2float(bq4->d) * (ls - 32) * __low2float(bq8_1[ib32].ds);
-    int v1, v2;
-    int sumi1 = 0, sumi2 = 0;
+    int sumi = 0;
+#pragma unroll
     for (int j = 0; j < 4; ++j) {
-        get_int_from_table_16(q4[j], values, v1, v2);
-        sumi1 = __dp4a(v1, q8[j+0], sumi1);
-        sumi2 = __dp4a(v2, q8[j+4], sumi2);
+        const uint32_t aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        int v1, v2;
+        get_int_from_table_16(aux_q4, values, v1, v2);
+
+        const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);
+
+        sumi = __dp4a(v1, u0, sumi);
+        sumi = __dp4a(v2, u1, sumi);
     }
-    return d * (sumi1 + sumi2);
+
+    const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    const float d = __half2float(bq4->d) * (ls - 32) * __low2float(bq8_1[iqs/4].ds);
+    return d * sumi;
 #endif
 }

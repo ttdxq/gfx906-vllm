@@ -38,6 +38,7 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_utils import (
     detect_gguf_multimodal,
     maybe_patch_hf_config_from_gguf,
+    qwen35_gguf_tokenizer_path,
 )
 from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from vllm.transformers_utils.utils import (
@@ -527,6 +528,30 @@ class ModelConfig:
             self.tokenizer = str(candidates[0])
             logger.info("Using local GGUF companion tokenizer: %s", self.tokenizer)
 
+    def _maybe_use_local_gguf_companion_config(self) -> None:
+        if self.hf_config_path is not None or not check_gguf_file(self.model):
+            return
+
+        if self.tokenizer is None or self.tokenizer == self.model:
+            return
+
+        tokenizer_path = Path(self.tokenizer)
+        if not tokenizer_path.is_dir():
+            return
+
+        if (tokenizer_path / "config.json").is_file():
+            self.hf_config_path = str(tokenizer_path)
+            logger.info("Using local GGUF companion config: %s", self.hf_config_path)
+
+    def _maybe_use_qwen35_gguf_tokenizer(self) -> None:
+        if self.tokenizer is None or self.tokenizer != self.model:
+            return
+
+        tokenizer_path = qwen35_gguf_tokenizer_path(self.model)
+        if tokenizer_path is not None:
+            self.tokenizer = tokenizer_path
+            logger.info("Using qwen35 GGUF metadata tokenizer: %s", self.tokenizer)
+
     def __post_init__(
         self,
         # Multimodal config init vars
@@ -560,12 +585,14 @@ class ModelConfig:
         if self.tokenizer is None:
             self.tokenizer = self.model
         self._maybe_use_local_gguf_companion_tokenizer()
+        self._maybe_use_qwen35_gguf_tokenizer()
         if self.tokenizer_revision is None:
             self.tokenizer_revision = self.revision
         self.tokenizer = maybe_model_redirect(self.tokenizer)
 
         if isinstance(self.hf_config_path, str):
             self.hf_config_path = maybe_model_redirect(self.hf_config_path)
+        self._maybe_use_local_gguf_companion_config()
 
         if callable(self.hf_overrides):
             hf_overrides_kw = {}

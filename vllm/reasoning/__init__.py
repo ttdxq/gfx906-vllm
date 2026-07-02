@@ -69,12 +69,12 @@ _REASONING_PARSERS_TO_REGISTER = {
         "Olmo3ReasoningParser",
     ),
     "qwen3": (
-        "qwen3_reasoning_parser",
-        "Qwen3ReasoningParser",
+        "qwen3_engine_reasoning_parser",
+        "Qwen3ParserReasoningAdapter",
     ),
     "qwen3_5": (
-        "qwen3_5_reasoning_parser",
-        "Qwen3_5ReasoningParser",
+        "qwen3_engine_reasoning_parser",
+        "Qwen3ParserReasoningAdapter",
     ),
     "seed_oss": (
         "seedoss_reasoning_parser",

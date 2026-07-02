@@ -10,7 +10,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack
 from copy import copy
 from http import HTTPStatus
-from typing import Final
+from typing import Any, Final
 
 import jinja2
 from fastapi import Request
@@ -161,6 +161,7 @@ class OpenAIServingResponses(OpenAIServing):
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
         return_tokens_as_token_ids: bool = False,
+        default_chat_template_kwargs: dict[str, Any] | None = None,
         reasoning_parser: str = "",
         enable_auto_tools: bool = False,
         tool_parser: str | None = None,
@@ -175,6 +176,7 @@ class OpenAIServingResponses(OpenAIServing):
             models=models,
             request_logger=request_logger,
             return_tokens_as_token_ids=return_tokens_as_token_ids,
+            default_chat_template_kwargs=default_chat_template_kwargs,
             log_error_stack=log_error_stack,
         )
 
@@ -416,7 +418,12 @@ class OpenAIServingResponses(OpenAIServing):
                     context = SimpleContext()
 
                 if self.reasoning_parser is not None:
-                    reasoning_parser = self.reasoning_parser(tokenizer)
+                    reasoning_parser = self.reasoning_parser(
+                        tokenizer,
+                        chat_template_kwargs=self._get_effective_chat_template_kwargs(
+                            request.chat_template_kwargs, request
+                        ),
+                    )
                     if sampling_params.structured_outputs is None:
                         sampling_params.structured_outputs = StructuredOutputsParams()
                     struct_out = sampling_params.structured_outputs
@@ -550,6 +557,9 @@ class OpenAIServingResponses(OpenAIServing):
             prev_msg=self.msg_store.get(prev_response.id) if prev_response else None,
             prev_response_output=prev_response.output if prev_response else None,
         )
+        chat_template_kwargs = self._get_effective_chat_template_kwargs(
+            request.chat_template_kwargs, request
+        )
         _, request_prompts, engine_prompts = await self._preprocess_chat(
             request,
             tokenizer,
@@ -558,6 +568,7 @@ class OpenAIServingResponses(OpenAIServing):
             tool_parser=self.tool_parser,
             chat_template=self.chat_template,
             chat_template_content_format=self.chat_template_content_format,
+            chat_template_kwargs=chat_template_kwargs,
         )
         return messages, request_prompts, engine_prompts
 
@@ -807,7 +818,12 @@ class OpenAIServingResponses(OpenAIServing):
     ) -> list[ResponseOutputItem]:
         if self.reasoning_parser:
             try:
-                reasoning_parser = self.reasoning_parser(tokenizer)
+                reasoning_parser = self.reasoning_parser(
+                    tokenizer,
+                    chat_template_kwargs=self._get_effective_chat_template_kwargs(
+                        request.chat_template_kwargs, request
+                    ),
+                )
             except RuntimeError as e:
                 logger.exception("Error in reasoning parser creation.")
                 raise e
@@ -1194,7 +1210,12 @@ class OpenAIServingResponses(OpenAIServing):
         current_item_id = ""
         reasoning_parser = None
         if self.reasoning_parser:
-            reasoning_parser = self.reasoning_parser(tokenizer)
+            reasoning_parser = self.reasoning_parser(
+                tokenizer,
+                chat_template_kwargs=self._get_effective_chat_template_kwargs(
+                    request.chat_template_kwargs, request
+                ),
+            )
         previous_text = ""
         previous_token_ids: list[int] = []
         first_delta_sent = False

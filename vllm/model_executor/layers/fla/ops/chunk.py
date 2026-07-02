@@ -391,7 +391,7 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if _is_gfx906_rocm():
-        return _chunk_gated_delta_rule_gfx906_eager(
+        o, final_state = _chunk_gated_delta_rule_gfx906_eager(
             q=q,
             k=k,
             v=v,
@@ -402,6 +402,9 @@ def chunk_gated_delta_rule(
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
+        if head_first:
+            o = rearrange(o, "b t h ... -> b h t ...")
+        return o, final_state
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,

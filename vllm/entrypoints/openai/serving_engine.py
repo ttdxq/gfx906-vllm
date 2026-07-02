@@ -260,6 +260,7 @@ class OpenAIServing:
         *,
         request_logger: RequestLogger | None,
         return_tokens_as_token_ids: bool = False,
+        default_chat_template_kwargs: dict[str, Any] | None = None,
         log_error_stack: bool = False,
     ):
         super().__init__()
@@ -270,6 +271,7 @@ class OpenAIServing:
 
         self.request_logger = request_logger
         self.return_tokens_as_token_ids = return_tokens_as_token_ids
+        self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self._tokenizer_executor = ThreadPoolExecutor(max_workers=1)
         self._apply_mistral_chat_template_async = make_async(
             apply_mistral_chat_template, executor=self._tokenizer_executor
@@ -282,6 +284,34 @@ class OpenAIServing:
         self.io_processor = self.models.io_processor
         self.model_config = self.models.model_config
         self.max_model_len = self.model_config.max_model_len
+
+    def _get_effective_chat_template_kwargs(
+        self,
+        request_chat_template_kwargs: dict[str, Any] | None,
+        request: Any | None = None,
+    ) -> dict[str, Any] | None:
+        extra_kwargs: dict[str, Any] = {}
+        reasoning_effort = getattr(request, "reasoning_effort", None)
+        if reasoning_effort is None:
+            reasoning = getattr(request, "reasoning", None)
+            reasoning_effort = getattr(reasoning, "effort", None)
+
+        user_kwargs = request_chat_template_kwargs or {}
+        if reasoning_effort is not None and "enable_thinking" not in user_kwargs:
+            extra_kwargs["enable_thinking"] = reasoning_effort != "none"
+
+        if not self.default_chat_template_kwargs:
+            if not extra_kwargs:
+                return request_chat_template_kwargs
+            return {
+                **extra_kwargs,
+                **user_kwargs,
+            }
+        return {
+            **self.default_chat_template_kwargs,
+            **extra_kwargs,
+            **(request_chat_template_kwargs or {}),
+        }
 
     def _get_tool_parser(
         self, tool_parser_name: str | None = None, enable_auto_tools: bool = False
@@ -1117,7 +1147,10 @@ class OpenAIServing:
             tools=tool_dicts,
             documents=documents,
         )
-        _chat_template_kwargs.update(chat_template_kwargs or {})
+        _chat_template_kwargs.update(
+            self._get_effective_chat_template_kwargs(chat_template_kwargs, request)
+            or {}
+        )
 
         request_prompt: str | list[int]
 
@@ -1145,6 +1178,22 @@ class OpenAIServing:
         should_parse_tools = tool_parser is not None and (
             hasattr(request, "tool_choice") and request.tool_choice != "none"
         )
+
+        reasoning_parser = getattr(self, "reasoning_parser", None)
+        if reasoning_parser is not None:
+            if not isinstance(request, ChatCompletionRequest | ResponsesRequest):
+                msg = (
+                    "Reasoning parsing is only supported for Chat Completions "
+                    "API or Responses API requests."
+                )
+                raise NotImplementedError(msg)
+            request = reasoning_parser(
+                tokenizer,
+                chat_template_kwargs=self._get_effective_chat_template_kwargs(
+                    chat_template_kwargs,
+                    request,
+                ),
+            ).adjust_request(request=request)
 
         if should_parse_tools:
             if not isinstance(request, ChatCompletionRequest | ResponsesRequest):

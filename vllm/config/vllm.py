@@ -93,6 +93,36 @@ def enable_fusion(cfg: "VllmConfig") -> bool:
     ) or cfg.compilation_config.is_custom_op_enabled("quant_fp8")
 
 
+def _is_gfx906_qwen35_gguf(model_config: ModelConfig | None) -> bool:
+    if model_config is None or model_config.quantization != "gguf":
+        return False
+
+    hf_config = model_config.hf_text_config
+    if getattr(hf_config, "model_type", None) not in {
+        "qwen3_5",
+        "qwen3_5_text",
+    }:
+        return False
+
+    from vllm.platforms import current_platform
+
+    capability = current_platform.get_device_capability()
+    major = getattr(capability, "major", None)
+    minor = getattr(capability, "minor", None)
+    if isinstance(capability, tuple):
+        major, minor = capability[:2]
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and major == 9
+        and minor == 0
+    )
+
+
+def needs_qwen35_gguf_piecewise_cudagraph(model_config: ModelConfig | None) -> bool:
+    return _is_gfx906_qwen35_gguf(model_config)
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -688,6 +718,14 @@ class VllmConfig:
                         logger.warning_once(
                             "Encoder-decoder models do not support full cudagraphs. "
                             "Overriding cudagraph_mode to PIECEWISE."
+                        )
+                        self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                    elif needs_qwen35_gguf_piecewise_cudagraph(self.model_config):
+                        logger.warning_once(
+                            "Qwen3.5 GGUF on gfx906 updates GatedDeltaNet state "
+                            "through a custom op that is not safe under full "
+                            "decode CUDA graphs. Overriding cudagraph_mode to "
+                            "PIECEWISE."
                         )
                         self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 

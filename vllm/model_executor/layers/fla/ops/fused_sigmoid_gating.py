@@ -9,6 +9,7 @@
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -155,6 +156,31 @@ def _fused_sigmoid_gating_delta_rule_decode_gfx906(
     if b.ndim == 2:
         b = b.unsqueeze(0)
 
+    can_use_custom_op = (
+        A_log.dtype == a.dtype == b.dtype == dt_bias.dtype == q.dtype == k.dtype
+        == v.dtype
+        and initial_state.dtype in (q.dtype, torch.float32)
+    )
+    if can_use_custom_op:
+        try:
+            o = ops.fused_sigmoid_gating_delta_rule_gfx906_decode(
+                A_log=A_log,
+                a=a,
+                b=b,
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                state=initial_state,
+                beta=beta,
+                threshold=threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+            return o, initial_state
+        except (AttributeError, RuntimeError):
+            pass
+
     head_ratio = HV // H
     q_head_idx = torch.arange(HV, device=q.device) // head_ratio
     q_t = q[0].index_select(1, q_head_idx).float()
@@ -183,6 +209,140 @@ def _fused_sigmoid_gating_delta_rule_decode_gfx906(
     o = torch.sum(state * q_t[:, :, None, :], dim=-1).unsqueeze(0).to(q.dtype)
 
     initial_state[:T].copy_(state.to(initial_state.dtype))
+    return o, initial_state
+
+
+def _fused_sigmoid_gating_delta_rule_indexed_decode_gfx906(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: float,
+    threshold: float,
+    scale: float,
+    initial_state: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if a.ndim == 2:
+        a = a.unsqueeze(0)
+    if b.ndim == 2:
+        b = b.unsqueeze(0)
+
+    can_use_custom_op = (
+        A_log.dtype == a.dtype == b.dtype == dt_bias.dtype == q.dtype == k.dtype
+        == v.dtype
+        and initial_state.dtype in (q.dtype, torch.float32)
+        and ssm_state_indices.dtype == torch.int32
+    )
+    if can_use_custom_op:
+        try:
+            o = ops.fused_sigmoid_gating_delta_rule_gfx906_indexed_decode(
+                A_log=A_log,
+                a=a,
+                b=b,
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                state=initial_state,
+                state_indices=ssm_state_indices,
+                beta=beta,
+                threshold=threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+            return o, initial_state
+        except (AttributeError, RuntimeError):
+            pass
+
+    gathered_state = initial_state[ssm_state_indices].contiguous()
+    o, gathered_state = _fused_sigmoid_gating_delta_rule_decode_gfx906(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,
+        threshold=threshold,
+        scale=scale,
+        initial_state=gathered_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    initial_state[ssm_state_indices] = gathered_state.to(initial_state.dtype)
+    return o, initial_state
+
+
+def fused_sigmoid_gating_delta_rule_update_kv_cache_gfx906(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: float,
+    threshold: float,
+    scale: float,
+    initial_state: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if a.ndim == 2:
+        a = a.unsqueeze(0)
+    if b.ndim == 2:
+        b = b.unsqueeze(0)
+
+    can_use_custom_op = (
+        A_log.dtype == a.dtype == b.dtype == dt_bias.dtype == q.dtype == k.dtype
+        == v.dtype
+        and initial_state.dtype in (q.dtype, torch.float32)
+        and ssm_state_indices.dtype == torch.int32
+    )
+    if can_use_custom_op:
+        try:
+            o = ops.fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state(
+                A_log=A_log,
+                a=a,
+                b=b,
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                state=initial_state,
+                state_indices=ssm_state_indices,
+                beta=beta,
+                threshold=threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+            return o, initial_state
+        except (AttributeError, RuntimeError):
+            pass
+
+    gathered_state = initial_state[ssm_state_indices].transpose(-1, -2).contiguous()
+    o, gathered_state = _fused_sigmoid_gating_delta_rule_decode_gfx906(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,
+        threshold=threshold,
+        scale=scale,
+        initial_state=gathered_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    initial_state[ssm_state_indices] = gathered_state.transpose(-1, -2).to(
+        initial_state.dtype
+    )
     return o, initial_state
 
 
@@ -368,11 +528,44 @@ def fused_sigmoid_gating_delta_rule_update(
             and q.shape[0] == 1
             and initial_state is not None
             and inplace_final_state
-            and ssm_state_indices is None
             and num_accepted_tokens is None
-            and q.shape[1] == initial_state.shape[0]
         )
         if decode_gfx906_path:
+            if ssm_state_indices is not None:
+                return _fused_sigmoid_gating_delta_rule_indexed_decode_gfx906(
+                    A_log=A_log,
+                    a=a,
+                    b=b,
+                    dt_bias=dt_bias,
+                    q=q,
+                    k=k,
+                    v=v,
+                    beta=beta,
+                    threshold=threshold,
+                    scale=scale,
+                    initial_state=initial_state,
+                    ssm_state_indices=ssm_state_indices,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+            if q.shape[1] != initial_state.shape[0]:
+                return _fused_sigmoid_gating_delta_rule_update_gfx906_eager(
+                    A_log=A_log,
+                    a=a,
+                    b=b,
+                    dt_bias=dt_bias,
+                    q=q,
+                    k=k,
+                    v=v,
+                    beta=beta,
+                    threshold=threshold,
+                    scale=scale,
+                    initial_state=initial_state,
+                    inplace_final_state=inplace_final_state,
+                    cu_seqlens=cu_seqlens,
+                    ssm_state_indices=ssm_state_indices,
+                    num_accepted_tokens=num_accepted_tokens,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
             return _fused_sigmoid_gating_delta_rule_decode_gfx906(
                 A_log=A_log,
                 a=a,
