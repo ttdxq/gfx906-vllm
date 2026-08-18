@@ -119,6 +119,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
   ops.impl("mul_and_silu", torch::kCUDA, &mul_and_silu);
 
+  ops.def("shared_expert_gate_mul(Tensor! out, Tensor input, Tensor weight) -> ()");
+  ops.impl("shared_expert_gate_mul", torch::kCUDA, &shared_expert_gate_mul);
+
+  ops.def(
+      "shared_expert_gate_add(Tensor! routed_out, Tensor shared_out, Tensor input, "
+      "Tensor weight) -> ()");
+  ops.impl("shared_expert_gate_add", torch::kCUDA, &shared_expert_gate_add);
+
   // Activation function used in GeGLU with `none` approximation.
   ops.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
@@ -365,6 +373,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
       "dtype) -> Tensor");
   ops.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
+  ops.def(
+      "ggml_repack_iq4_xs_to_q8_0(Tensor W, SymInt row, SymInt col) -> Tensor");
+  ops.impl("ggml_repack_iq4_xs_to_q8_0", torch::kCUDA,
+           &ggml_repack_iq4_xs_to_q8_0);
 
   // mmvq kernel for GGML.
   ops.def(
@@ -372,11 +384,89 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> Tensor");
   ops.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
 
+  ops.def("ggml_quantize_row_q8_1(Tensor X) -> Tensor");
+  ops.impl("ggml_quantize_row_q8_1", torch::kCUDA, &ggml_quantize_row_q8_1);
+  ops.def("ggml_quantize_row_q8_1_out(Tensor X, Tensor! quant_X) -> ()");
+  ops.impl("ggml_quantize_row_q8_1_out", torch::kCUDA,
+           &ggml_quantize_row_q8_1_out);
+
+  ops.def("ggml_silu_and_mul_quantize_row_q8_1(Tensor X) -> Tensor");
+  ops.impl("ggml_silu_and_mul_quantize_row_q8_1", torch::kCUDA,
+           &ggml_silu_and_mul_quantize_row_q8_1);
+  ops.def(
+      "ggml_silu_and_mul_quantize_row_q8_1_out(Tensor X, Tensor! quant_X) -> ()");
+  ops.impl("ggml_silu_and_mul_quantize_row_q8_1_out", torch::kCUDA,
+           &ggml_silu_and_mul_quantize_row_q8_1_out);
+
+  ops.def(
+      "ggml_sigmoid_and_mul_quantize_row_q8_1(Tensor X, Tensor gate) -> Tensor");
+  ops.impl("ggml_sigmoid_and_mul_quantize_row_q8_1", torch::kCUDA,
+           &ggml_sigmoid_and_mul_quantize_row_q8_1);
+  ops.def(
+      "ggml_sigmoid_and_mul_quantize_row_q8_1_out(Tensor X, Tensor gate, "
+      "Tensor! quant_X) -> ()");
+  ops.impl("ggml_sigmoid_and_mul_quantize_row_q8_1_out", torch::kCUDA,
+           &ggml_sigmoid_and_mul_quantize_row_q8_1_out);
+
+  ops.def(
+      "ggml_rms_norm_gated_quantize_row_q8_1(Tensor X, Tensor weight, "
+      "Tensor gate, float epsilon, bool norm_before_gate) -> Tensor");
+  ops.impl("ggml_rms_norm_gated_quantize_row_q8_1", torch::kCUDA,
+           &ggml_rms_norm_gated_quantize_row_q8_1);
+  ops.def(
+      "ggml_rms_norm_gated_quantize_row_q8_1_out(Tensor X, Tensor weight, "
+      "Tensor gate, Tensor! quant_X, float epsilon, bool norm_before_gate) -> ()");
+  ops.impl("ggml_rms_norm_gated_quantize_row_q8_1_out", torch::kCUDA,
+           &ggml_rms_norm_gated_quantize_row_q8_1_out);
+
+  ops.def(
+      "ggml_mul_mat_vec_q8(Tensor W, Tensor quant_X, int type, SymInt row, "
+      "SymInt col, ScalarType dtype) -> Tensor");
+  ops.impl("ggml_mul_mat_vec_q8", torch::kCUDA, &ggml_mul_mat_vec_q8);
+  ops.def(
+      "ggml_mul_mat_vec_q8_out(Tensor W, Tensor quant_X, Tensor! Y, int type, "
+      "SymInt row, SymInt col) -> ()");
+  ops.impl("ggml_mul_mat_vec_q8_out", torch::kCUDA, &ggml_mul_mat_vec_q8_out);
+
+  ops.def(
+      "ggml_mul_mat_vec_q8_0_fast(Tensor W, Tensor quant_X, SymInt row, "
+      "SymInt col, ScalarType dtype) -> Tensor");
+  ops.impl("ggml_mul_mat_vec_q8_0_fast", torch::kCUDA,
+           &ggml_mul_mat_vec_q8_0_fast);
+
   ops.def(
       "ggml_mul_mat_vec_a8_sharded(Tensor[] W, Tensor X, int[] types) "
       "-> Tensor");
   ops.impl("ggml_mul_mat_vec_a8_sharded", torch::kCUDA,
            &ggml_mul_mat_vec_a8_sharded);
+
+  ops.def(
+      "ggml_mul_mat_vec_q8_sharded(Tensor[] W, Tensor quant_X, int[] types, "
+      "SymInt col, ScalarType dtype) -> Tensor");
+  ops.impl("ggml_mul_mat_vec_q8_sharded", torch::kCUDA,
+           &ggml_mul_mat_vec_q8_sharded);
+  ops.def(
+      "ggml_mul_mat_vec_q8_sharded_out(Tensor[] W, Tensor quant_X, Tensor! Y, "
+      "int[] types, SymInt col) -> ()");
+  ops.impl("ggml_mul_mat_vec_q8_sharded_out", torch::kCUDA,
+           &ggml_mul_mat_vec_q8_sharded_out);
+
+  ops.def(
+      "ggml_mul_mat_vec_q8_grouped_same_type(Tensor[] W, Tensor quant_X, "
+      "int type, SymInt col, ScalarType dtype) -> Tensor");
+  ops.impl("ggml_mul_mat_vec_q8_grouped_same_type", torch::kCUDA,
+           &ggml_mul_mat_vec_q8_grouped_same_type);
+  ops.def(
+      "ggml_mul_mat_vec_q8_grouped_same_type_out(Tensor[] W, Tensor quant_X, "
+      "Tensor! Y, int type, SymInt col) -> ()");
+  ops.impl("ggml_mul_mat_vec_q8_grouped_same_type_out", torch::kCUDA,
+           &ggml_mul_mat_vec_q8_grouped_same_type_out);
+
+  ops.def(
+      "ggml_mul_mat_vec_q8_qkv3(Tensor W0, Tensor W1, Tensor W2, "
+      "Tensor quant_X, int type01, SymInt col, ScalarType dtype) -> Tensor");
+  ops.impl("ggml_mul_mat_vec_q8_qkv3", torch::kCUDA,
+           &ggml_mul_mat_vec_q8_qkv3);
 
   // mmq kernel for GGML.
   ops.def(
@@ -396,6 +486,41 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor topk_ids, int top_k, "
       "int type, SymInt row, SymInt tokens) -> Tensor");
   ops.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
+  ops.def(
+      "ggml_moe_a8_vec_out(Tensor X, Tensor W, Tensor topk_ids, "
+      "Tensor! output, Tensor! quant_X, int top_k, int type, SymInt row, "
+      "SymInt tokens) -> ()");
+  ops.impl("ggml_moe_a8_vec_out", torch::kCUDA, &ggml_moe_a8_vec_out);
+
+  ops.def(
+      "ggml_moe_q8_vec(Tensor quant_X, Tensor W, "
+      "Tensor topk_ids, int top_k, "
+      "int type, SymInt row, SymInt tokens, SymInt col, ScalarType dtype) "
+      "-> Tensor");
+  ops.impl("ggml_moe_q8_vec", torch::kCUDA, &ggml_moe_q8_vec);
+
+  ops.def(
+      "ggml_moe_q8_vec_weighted_sum(Tensor quant_X, Tensor W, "
+      "Tensor topk_ids, Tensor topk_weights, int top_k, "
+      "int type, SymInt row, SymInt tokens, SymInt col, ScalarType dtype) "
+      "-> Tensor");
+  ops.impl("ggml_moe_q8_vec_weighted_sum", torch::kCUDA,
+           &ggml_moe_q8_vec_weighted_sum);
+  ops.def(
+      "ggml_moe_q8_vec_weighted_sum_out(Tensor quant_X, Tensor W, "
+      "Tensor topk_ids, Tensor topk_weights, Tensor! output, int top_k, "
+      "int type, SymInt row, SymInt tokens, SymInt col) -> ()");
+  ops.impl("ggml_moe_q8_vec_weighted_sum_out", torch::kCUDA,
+           &ggml_moe_q8_vec_weighted_sum_out);
+
+  ops.def(
+      "ggml_moe_a8_vec_silu_q8_weighted_sum_out("
+      "Tensor X, Tensor W1, Tensor W2, Tensor topk_ids, Tensor topk_weights, "
+      "Tensor! w1_output, Tensor! quant_X, Tensor! quant_w1_output, "
+      "Tensor! output, int top_k, int w1_type, int w2_type, SymInt w1_row, "
+      "SymInt w2_row, SymInt tokens) -> ()");
+  ops.impl("ggml_moe_a8_vec_silu_q8_weighted_sum_out", torch::kCUDA,
+           &ggml_moe_a8_vec_silu_q8_weighted_sum_out);
 
   ops.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
@@ -414,6 +539,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool use_qk_l2norm_in_kernel) -> Tensor");
   ops.impl("fused_sigmoid_gating_delta_rule_gfx906_decode", torch::kCUDA,
            &fused_sigmoid_gating_delta_rule_gfx906_decode);
+
+  ops.def(
+      "fused_sigmoid_gating_delta_rule_gfx906_prefill("
+      "Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, Tensor q, Tensor k, "
+      "Tensor v, Tensor state, Tensor cu_seqlens, float beta, "
+      "float threshold, float scale, bool use_qk_l2norm_in_kernel) -> Tensor");
+  ops.impl("fused_sigmoid_gating_delta_rule_gfx906_prefill", torch::kCUDA,
+           &fused_sigmoid_gating_delta_rule_gfx906_prefill);
 
   ops.def(
       "fused_sigmoid_gating_delta_rule_gfx906_indexed_decode("
@@ -440,6 +573,30 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool use_transposed_state) -> Tensor");
   ops.impl("fused_recurrent_gated_delta_rule_gfx906_packed_decode", torch::kCUDA,
            &fused_recurrent_gated_delta_rule_gfx906_packed_decode);
+
+  ops.def(
+      "causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode("
+      "Tensor mixed_qkv, Tensor conv_state, Tensor conv_weight, "
+      "Tensor? conv_bias, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, "
+      "Tensor state, Tensor out, Tensor state_indices, int pad_slot_id, "
+      "float scale, bool silu_activation, bool use_qk_l2norm_in_kernel, "
+      "bool use_tiled_qk_head_mapping, bool use_transposed_state) -> Tensor");
+  ops.impl(
+      "causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode",
+      torch::kCUDA,
+      &causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode);
+
+  ops.def(
+      "causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode("
+      "Tensor mixed_qkv, Tensor conv_state, Tensor conv_weight, "
+      "Tensor? conv_bias, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, "
+      "Tensor state, Tensor out, Tensor state_indices, int pad_slot_id, "
+      "float scale, bool silu_activation, bool use_qk_l2norm_in_kernel, "
+      "bool use_tiled_qk_head_mapping, bool use_transposed_state) -> Tensor");
+  ops.impl(
+      "causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode",
+      torch::kCUDA,
+      &causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode);
 
 #ifndef USE_ROCM
   // CUTLASS nvfp4 block scaled GEMM

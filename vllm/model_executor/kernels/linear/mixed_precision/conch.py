@@ -7,6 +7,8 @@ from typing import Final
 import torch
 
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
+from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
@@ -27,6 +29,9 @@ class ConchLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        if current_platform.is_rocm() and on_gfx906():
+            return False, "Conch Triton kernels do not compile for ROCm gfx906"
+
         if c.weight_type not in _CONCH_SUPPORTED_WEIGHT_TYPES:
             error_msg = (
                 f"Weight type ({c.weight_type}) not supported by "

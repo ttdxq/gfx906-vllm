@@ -31,6 +31,94 @@ __global__ void act_and_mul_kernel(
   }
 }
 
+template <typename scalar_t>
+__global__ void shared_expert_gate_mul_kernel(
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight, const int64_t tokens,
+    const int64_t input_hidden, const int64_t output_hidden,
+    const int64_t input_stride_token, const int64_t input_stride_hidden,
+    const int64_t out_stride_token, const int64_t out_stride_hidden,
+    const int64_t weight_stride_hidden) {
+  extern __shared__ float partial_sums[];
+  const int64_t token_idx = blockIdx.x;
+  if (token_idx >= tokens) {
+    return;
+  }
+
+  float sum = 0.0f;
+  for (int64_t idx = threadIdx.x; idx < input_hidden; idx += blockDim.x) {
+    const float x =
+        static_cast<float>(VLLM_LDG(&input[token_idx * input_stride_token +
+                                           idx * input_stride_hidden]));
+    const float w =
+        static_cast<float>(VLLM_LDG(&weight[idx * weight_stride_hidden]));
+    sum += x * w;
+  }
+  partial_sums[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      partial_sums[threadIdx.x] += partial_sums[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float gate = 1.0f / (1.0f + expf(-partial_sums[0]));
+  for (int64_t idx = threadIdx.x; idx < output_hidden; idx += blockDim.x) {
+    scalar_t* out_ptr =
+        &out[token_idx * out_stride_token + idx * out_stride_hidden];
+    const float value = static_cast<float>(VLLM_LDG(out_ptr));
+    *out_ptr = static_cast<scalar_t>(value * gate);
+  }
+}
+
+template <typename scalar_t>
+__global__ void shared_expert_gate_add_kernel(
+    scalar_t* __restrict__ routed_out, const scalar_t* __restrict__ shared_out,
+    const scalar_t* __restrict__ input, const scalar_t* __restrict__ weight,
+    const int64_t tokens, const int64_t input_hidden,
+    const int64_t output_hidden, const int64_t input_stride_token,
+    const int64_t input_stride_hidden, const int64_t shared_stride_token,
+    const int64_t shared_stride_hidden, const int64_t routed_stride_token,
+    const int64_t routed_stride_hidden, const int64_t weight_stride_hidden) {
+  extern __shared__ float partial_sums[];
+  const int64_t token_idx = blockIdx.x;
+  if (token_idx >= tokens) {
+    return;
+  }
+
+  float sum = 0.0f;
+  for (int64_t idx = threadIdx.x; idx < input_hidden; idx += blockDim.x) {
+    const float x =
+        static_cast<float>(VLLM_LDG(&input[token_idx * input_stride_token +
+                                           idx * input_stride_hidden]));
+    const float w =
+        static_cast<float>(VLLM_LDG(&weight[idx * weight_stride_hidden]));
+    sum += x * w;
+  }
+  partial_sums[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      partial_sums[threadIdx.x] += partial_sums[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float gate = 1.0f / (1.0f + expf(-partial_sums[0]));
+  for (int64_t idx = threadIdx.x; idx < output_hidden; idx += blockDim.x) {
+    scalar_t* routed_ptr =
+        &routed_out[token_idx * routed_stride_token + idx * routed_stride_hidden];
+    const scalar_t* shared_ptr =
+        &shared_out[token_idx * shared_stride_token + idx * shared_stride_hidden];
+    const float routed = static_cast<float>(VLLM_LDG(routed_ptr));
+    const float shared = static_cast<float>(VLLM_LDG(shared_ptr));
+    *routed_ptr = static_cast<scalar_t>(routed + shared * gate);
+  }
+}
+
 template <typename T>
 __device__ __forceinline__ T silu_kernel(const T& x) {
   // x * sigmoid(x)
@@ -106,6 +194,97 @@ void gelu_tanh_and_mul(torch::Tensor& out,    // [..., d]
                        torch::Tensor& input)  // [..., 2 * d]
 {
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel, true);
+}
+
+void shared_expert_gate_mul(torch::Tensor& out,     // [tokens, output_hidden]
+                            torch::Tensor& input,   // [tokens, input_hidden]
+                            torch::Tensor& weight)  // [1, input_hidden]
+{
+  TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
+  TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+  TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+  TORCH_CHECK(out.dim() == 2, "out must have shape [tokens, output_hidden]");
+  TORCH_CHECK(input.dim() == 2, "input must have shape [tokens, input_hidden]");
+  TORCH_CHECK(weight.numel() == input.size(1),
+              "weight must have input_hidden elements");
+  TORCH_CHECK(out.size(0) == input.size(0),
+              "out and input token dimensions must match");
+  TORCH_CHECK(out.scalar_type() == input.scalar_type() &&
+                  input.scalar_type() == weight.scalar_type(),
+              "out, input, and weight dtypes must match");
+
+  const int64_t tokens = input.size(0);
+  if (tokens == 0) {
+    return;
+  }
+
+  const int64_t input_hidden = input.size(1);
+  const int64_t output_hidden = out.size(1);
+  constexpr int threads = 256;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t weight_stride_hidden =
+      weight.dim() == 1 ? weight.stride(0) : weight.stride(weight.dim() - 1);
+
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "shared_expert_gate_mul_kernel", [&] {
+        vllm::shared_expert_gate_mul_kernel<scalar_t>
+            <<<tokens, threads, threads * sizeof(float), stream>>>(
+                out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+                weight.data_ptr<scalar_t>(), tokens, input_hidden, output_hidden,
+                input.stride(0), input.stride(1), out.stride(0), out.stride(1),
+                weight_stride_hidden);
+      });
+}
+
+void shared_expert_gate_add(torch::Tensor& routed_out,  // [tokens, output_hidden]
+                            torch::Tensor& shared_out,  // [tokens, output_hidden]
+                            torch::Tensor& input,       // [tokens, input_hidden]
+                            torch::Tensor& weight)      // [1, input_hidden]
+{
+  TORCH_CHECK(routed_out.is_cuda(), "routed_out must be a CUDA tensor");
+  TORCH_CHECK(shared_out.is_cuda(), "shared_out must be a CUDA tensor");
+  TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+  TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+  TORCH_CHECK(routed_out.dim() == 2,
+              "routed_out must have shape [tokens, output_hidden]");
+  TORCH_CHECK(shared_out.dim() == 2,
+              "shared_out must have shape [tokens, output_hidden]");
+  TORCH_CHECK(input.dim() == 2, "input must have shape [tokens, input_hidden]");
+  TORCH_CHECK(weight.numel() == input.size(1),
+              "weight must have input_hidden elements");
+  TORCH_CHECK(routed_out.sizes() == shared_out.sizes(),
+              "routed_out and shared_out shapes must match");
+  TORCH_CHECK(routed_out.size(0) == input.size(0),
+              "output and input token dimensions must match");
+  TORCH_CHECK(routed_out.scalar_type() == shared_out.scalar_type() &&
+                  shared_out.scalar_type() == input.scalar_type() &&
+                  input.scalar_type() == weight.scalar_type(),
+              "routed_out, shared_out, input, and weight dtypes must match");
+
+  const int64_t tokens = input.size(0);
+  if (tokens == 0) {
+    return;
+  }
+
+  const int64_t input_hidden = input.size(1);
+  const int64_t output_hidden = routed_out.size(1);
+  constexpr int threads = 256;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t weight_stride_hidden =
+      weight.dim() == 1 ? weight.stride(0) : weight.stride(weight.dim() - 1);
+
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "shared_expert_gate_add_kernel", [&] {
+        vllm::shared_expert_gate_add_kernel<scalar_t>
+            <<<tokens, threads, threads * sizeof(float), stream>>>(
+                routed_out.data_ptr<scalar_t>(), shared_out.data_ptr<scalar_t>(),
+                input.data_ptr<scalar_t>(), weight.data_ptr<scalar_t>(), tokens,
+                input_hidden, output_hidden, input.stride(0), input.stride(1),
+                shared_out.stride(0), shared_out.stride(1), routed_out.stride(0),
+                routed_out.stride(1), weight_stride_hidden);
+      });
 }
 
 namespace vllm {

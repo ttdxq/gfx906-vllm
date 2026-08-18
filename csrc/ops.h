@@ -145,6 +145,12 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
+void shared_expert_gate_mul(torch::Tensor& out, torch::Tensor& input,
+                            torch::Tensor& weight);
+
+void shared_expert_gate_add(torch::Tensor& routed_out, torch::Tensor& shared_out,
+                            torch::Tensor& input, torch::Tensor& weight);
+
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
                         torch::Tensor& scale);
 
@@ -203,13 +209,67 @@ torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 torch::Tensor ggml_dequantize(torch::Tensor W, int64_t type, int64_t m,
                               int64_t n,
                               std::optional<at::ScalarType> const& dtype);
+torch::Tensor ggml_repack_iq4_xs_to_q8_0(torch::Tensor W, int64_t row,
+                                         int64_t col);
 
 torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W, torch::Tensor X,
                                   int64_t type, int64_t row);
 
+torch::Tensor ggml_quantize_row_q8_1(torch::Tensor X);
+void ggml_quantize_row_q8_1_out(torch::Tensor X, torch::Tensor quant_X);
+
+torch::Tensor ggml_silu_and_mul_quantize_row_q8_1(torch::Tensor X);
+void ggml_silu_and_mul_quantize_row_q8_1_out(torch::Tensor X,
+                                             torch::Tensor quant_X);
+
+torch::Tensor ggml_sigmoid_and_mul_quantize_row_q8_1(torch::Tensor X,
+                                                     torch::Tensor gate);
+void ggml_sigmoid_and_mul_quantize_row_q8_1_out(torch::Tensor X,
+                                                torch::Tensor gate,
+                                                torch::Tensor quant_X);
+
+torch::Tensor ggml_rms_norm_gated_quantize_row_q8_1(
+    torch::Tensor X, torch::Tensor weight, torch::Tensor gate, double epsilon,
+    bool norm_before_gate);
+void ggml_rms_norm_gated_quantize_row_q8_1_out(
+    torch::Tensor X, torch::Tensor weight, torch::Tensor gate,
+    torch::Tensor quant_X, double epsilon, bool norm_before_gate);
+
+torch::Tensor ggml_mul_mat_vec_q8(torch::Tensor W, torch::Tensor quant_X,
+                                  int64_t type, int64_t row, int64_t col,
+                                  at::ScalarType dtype);
+void ggml_mul_mat_vec_q8_out(torch::Tensor W, torch::Tensor quant_X,
+                             torch::Tensor Y, int64_t type, int64_t row,
+                             int64_t col);
+
+torch::Tensor ggml_mul_mat_vec_q8_0_fast(torch::Tensor W,
+                                         torch::Tensor quant_X, int64_t row,
+                                         int64_t col, at::ScalarType dtype);
+
 torch::Tensor ggml_mul_mat_vec_a8_sharded(std::vector<torch::Tensor> W,
                                           torch::Tensor X,
                                           std::vector<int64_t> types);
+
+torch::Tensor ggml_mul_mat_vec_q8_sharded(std::vector<torch::Tensor> W,
+                                          torch::Tensor quant_X,
+                                          std::vector<int64_t> types,
+                                          int64_t col, at::ScalarType dtype);
+void ggml_mul_mat_vec_q8_sharded_out(std::vector<torch::Tensor> W,
+                                     torch::Tensor quant_X,
+                                     torch::Tensor Y,
+                                     std::vector<int64_t> types, int64_t col);
+
+torch::Tensor ggml_mul_mat_vec_q8_grouped_same_type(
+    std::vector<torch::Tensor> W, torch::Tensor quant_X, int64_t type,
+    int64_t col, at::ScalarType dtype);
+void ggml_mul_mat_vec_q8_grouped_same_type_out(
+    std::vector<torch::Tensor> W, torch::Tensor quant_X, torch::Tensor Y,
+    int64_t type, int64_t col);
+
+torch::Tensor ggml_mul_mat_vec_q8_qkv3(torch::Tensor W0, torch::Tensor W1,
+                                       torch::Tensor W2,
+                                       torch::Tensor quant_X, int64_t type01,
+                                       int64_t col, at::ScalarType dtype);
 
 torch::Tensor ggml_mul_mat_a8(torch::Tensor W, torch::Tensor X, int64_t type,
                               int64_t row);
@@ -223,6 +283,32 @@ torch::Tensor ggml_moe_a8(torch::Tensor X, torch::Tensor W,
 torch::Tensor ggml_moe_a8_vec(torch::Tensor X, torch::Tensor W,
                               torch::Tensor topk_ids, int64_t top_k,
                               int64_t type, int64_t row, int64_t tokens);
+void ggml_moe_a8_vec_out(torch::Tensor X, torch::Tensor W,
+                         torch::Tensor topk_ids, torch::Tensor output,
+                         torch::Tensor quant_X, int64_t top_k, int64_t type,
+                         int64_t row, int64_t tokens);
+
+torch::Tensor ggml_moe_q8_vec(torch::Tensor quant_X, torch::Tensor W,
+                              torch::Tensor topk_ids, int64_t top_k,
+                              int64_t type, int64_t row, int64_t tokens,
+                              int64_t col, at::ScalarType dtype);
+
+torch::Tensor ggml_moe_q8_vec_weighted_sum(
+    torch::Tensor quant_X, torch::Tensor W, torch::Tensor topk_ids,
+    torch::Tensor topk_weights, int64_t top_k, int64_t type, int64_t row,
+    int64_t tokens, int64_t col, at::ScalarType dtype);
+void ggml_moe_q8_vec_weighted_sum_out(
+    torch::Tensor quant_X, torch::Tensor W, torch::Tensor topk_ids,
+    torch::Tensor topk_weights, torch::Tensor output, int64_t top_k,
+    int64_t type, int64_t row, int64_t tokens, int64_t col);
+
+void ggml_moe_a8_vec_silu_q8_weighted_sum_out(
+    torch::Tensor X, torch::Tensor W1, torch::Tensor W2,
+    torch::Tensor topk_ids, torch::Tensor topk_weights,
+    torch::Tensor w1_output, torch::Tensor quant_X,
+    torch::Tensor quant_w1_output, torch::Tensor output, int64_t top_k,
+    int64_t w1_type, int64_t w2_type, int64_t w1_row, int64_t w2_row,
+    int64_t tokens);
 
 int64_t ggml_moe_get_block_size(int64_t type);
 
@@ -236,6 +322,12 @@ torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_decode(
     torch::Tensor A_log, torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor state,
     double beta, double threshold, double scale,
+    bool use_qk_l2norm_in_kernel);
+
+torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_prefill(
+    torch::Tensor A_log, torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor state,
+    torch::Tensor cu_seqlens, double beta, double threshold, double scale,
     bool use_qk_l2norm_in_kernel);
 
 torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_indexed_decode(
@@ -256,6 +348,25 @@ torch::Tensor fused_recurrent_gated_delta_rule_gfx906_packed_decode(
     torch::Tensor out, torch::Tensor state_indices, double scale,
     bool use_qk_l2norm_in_kernel, bool use_tiled_qk_head_mapping,
     bool use_transposed_state);
+
+torch::Tensor causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode(
+    torch::Tensor mixed_qkv, torch::Tensor conv_state,
+    torch::Tensor conv_weight, std::optional<torch::Tensor> conv_bias,
+    torch::Tensor a, torch::Tensor b, torch::Tensor A_log,
+    torch::Tensor dt_bias, torch::Tensor state, torch::Tensor out,
+    torch::Tensor state_indices, int64_t pad_slot_id, double scale,
+    bool silu_activation, bool use_qk_l2norm_in_kernel,
+    bool use_tiled_qk_head_mapping, bool use_transposed_state);
+
+torch::Tensor
+causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode(
+    torch::Tensor mixed_qkv, torch::Tensor conv_state,
+    torch::Tensor conv_weight, std::optional<torch::Tensor> conv_bias,
+    torch::Tensor a, torch::Tensor b, torch::Tensor A_log,
+    torch::Tensor dt_bias, torch::Tensor state, torch::Tensor out,
+    torch::Tensor state_indices, int64_t pad_slot_id, double scale,
+    bool silu_activation, bool use_qk_l2norm_in_kernel,
+    bool use_tiled_qk_head_mapping, bool use_transposed_state);
 
 #ifndef USE_ROCM
 

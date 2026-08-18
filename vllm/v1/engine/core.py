@@ -203,6 +203,11 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+        self._profile_enabled = os.getenv(
+            "VLLM_GFX906_CORE_PROFILE", "0"
+        ).lower() in {"1", "true", "yes", "on"}
+        self._profile_limit = int(os.getenv("VLLM_GFX906_CORE_PROFILE_LIMIT", "64"))
+        self._profile_count = 0
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -339,16 +344,36 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        profile_start = self._profile_mark()
         scheduler_output = self.scheduler.schedule()
+        profile_after_schedule = self._profile_mark()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        profile_after_execute_submit = self._profile_mark()
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        profile_after_grammar = self._profile_mark()
         with self.log_error_detail(scheduler_output):
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        profile_after_wait = self._profile_mark()
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        profile_after_update = self._profile_mark()
+        self._log_step_profile(
+            "direct",
+            scheduler_output,
+            schedule_ms=self._profile_ms(profile_start, profile_after_schedule),
+            execute_submit_ms=self._profile_ms(
+                profile_after_schedule, profile_after_execute_submit
+            ),
+            grammar_ms=self._profile_ms(
+                profile_after_execute_submit, profile_after_grammar
+            ),
+            wait_ms=self._profile_ms(profile_after_grammar, profile_after_wait),
+            update_ms=self._profile_ms(profile_after_wait, profile_after_update),
+            total_ms=self._profile_ms(profile_start, profile_after_update),
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -362,6 +387,62 @@ class EngineCore:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    def _profile_mark(self) -> float:
+        if not self._profile_enabled:
+            return 0.0
+        return time.perf_counter()
+
+    def _profile_ms(self, start: float, end: float) -> float:
+        if not self._profile_enabled:
+            return 0.0
+        return (end - start) * 1000.0
+
+    def _log_step_profile(
+        self,
+        path: str,
+        scheduler_output: SchedulerOutput | None,
+        *,
+        schedule_ms: float = 0.0,
+        execute_submit_ms: float = 0.0,
+        grammar_ms: float = 0.0,
+        sample_submit_ms: float = 0.0,
+        queue_ms: float = 0.0,
+        wait_ms: float = 0.0,
+        update_ms: float = 0.0,
+        total_ms: float = 0.0,
+        returned_empty: bool = False,
+    ) -> None:
+        if not self._profile_enabled:
+            return
+        self._profile_count += 1
+        if self._profile_count > self._profile_limit:
+            return
+        tokens = (
+            scheduler_output.total_num_scheduled_tokens
+            if scheduler_output is not None
+            else 0
+        )
+        reqs = len(scheduler_output.num_scheduled_tokens) if scheduler_output else 0
+        logger.info(
+            "GFX906_CORE_PROFILE step=%d path=%s reqs=%d tokens=%d "
+            "schedule=%.3fms execute_submit=%.3fms grammar=%.3fms "
+            "sample_submit=%.3fms queue=%.3fms wait=%.3fms update=%.3fms "
+            "total=%.3fms empty=%s",
+            self._profile_count,
+            path,
+            reqs,
+            tokens,
+            schedule_ms,
+            execute_submit_ms,
+            grammar_ms,
+            sample_submit_ms,
+            queue_ms,
+            wait_ms,
+            update_ms,
+            total_ms,
+            returned_empty,
+        )
 
     def step_with_batch_queue(
         self,
@@ -381,6 +462,7 @@ class EngineCore:
         """
         batch_queue = self.batch_queue
         assert batch_queue is not None
+        profile_start = self._profile_mark()
 
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
@@ -389,17 +471,28 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        scheduled_for_profile: SchedulerOutput | None = None
+        profile_after_schedule = profile_start
+        profile_after_execute_submit = profile_start
+        profile_after_grammar = profile_start
+        profile_after_sample_submit = profile_start
+        profile_after_queue = profile_start
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            scheduled_for_profile = scheduler_output
+            profile_after_schedule = self._profile_mark()
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
+            profile_after_execute_submit = self._profile_mark()
             if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
+                profile_after_grammar = profile_after_execute_submit
+                profile_after_sample_submit = profile_after_execute_submit
             else:
                 exec_future.add_done_callback(self._log_err_callback(scheduler_output))
 
@@ -409,17 +502,22 @@ class EngineCore:
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
+                    profile_after_grammar = self._profile_mark()
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+                    profile_after_sample_submit = self._profile_mark()
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+                    profile_after_grammar = self._profile_mark()
+                    profile_after_sample_submit = profile_after_grammar
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output))
+                profile_after_queue = self._profile_mark()
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -427,6 +525,27 @@ class EngineCore:
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    self._log_step_profile(
+                        "queue_fill",
+                        scheduled_for_profile,
+                        schedule_ms=self._profile_ms(
+                            profile_start, profile_after_schedule
+                        ),
+                        execute_submit_ms=self._profile_ms(
+                            profile_after_schedule, profile_after_execute_submit
+                        ),
+                        grammar_ms=self._profile_ms(
+                            profile_after_execute_submit, profile_after_grammar
+                        ),
+                        sample_submit_ms=self._profile_ms(
+                            profile_after_grammar, profile_after_sample_submit
+                        ),
+                        queue_ms=self._profile_ms(
+                            profile_after_sample_submit, profile_after_queue
+                        ),
+                        total_ms=self._profile_ms(profile_start, profile_after_queue),
+                        returned_empty=True,
+                    )
                     return None, True
 
         elif not batch_queue:
@@ -436,12 +555,33 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
+        profile_before_pop = self._profile_mark()
         future, scheduler_output = batch_queue.pop()
         with self.log_error_detail(scheduler_output):
             model_output = future.result()
+        profile_after_wait = self._profile_mark()
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        profile_after_update = self._profile_mark()
+        self._log_step_profile(
+            "queue_pop",
+            scheduler_output,
+            schedule_ms=self._profile_ms(profile_start, profile_after_schedule),
+            execute_submit_ms=self._profile_ms(
+                profile_after_schedule, profile_after_execute_submit
+            ),
+            grammar_ms=self._profile_ms(
+                profile_after_execute_submit, profile_after_grammar
+            ),
+            sample_submit_ms=self._profile_ms(
+                profile_after_grammar, profile_after_sample_submit
+            ),
+            queue_ms=self._profile_ms(profile_after_sample_submit, profile_before_pop),
+            wait_ms=self._profile_ms(profile_before_pop, profile_after_wait),
+            update_ms=self._profile_ms(profile_after_wait, profile_after_update),
+            total_ms=self._profile_ms(profile_start, profile_after_update),
         )
 
         # NOTE(nick): We can either handle the deferred tasks here or save

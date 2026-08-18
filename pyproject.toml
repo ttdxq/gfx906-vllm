@@ -7,19 +7,19 @@ requires = [
     "setuptools>=77.0.3,<81.0.0",
     "setuptools-scm>=8.0",
     "setuptools-rust>=1.9.0",
-    "torch == 2.9.0+rocm6.3",
+    "torch == 2.11.0+rocm7.2",
     "wheel",
     "jinja2",
 ]
 build-backend = "setuptools.build_meta"
 
 [[tool.uv.index]]
-name = "pytorch-rocm63"
-url = "https://download.pytorch.org/whl/rocm6.3"
+name = "pytorch-rocm72"
+url = "https://download.pytorch.org/whl/rocm7.2"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-rocm63" }
+torch = { index = "pytorch-rocm72" }
 
 [project]
 name = "vllm"
@@ -311,5 +311,5 @@ windo = "windo"
 [tool.typos.type.vimscript.extend-words]
 
 [tool.uv]
-torch-backend = "rocm6.3"
+torch-backend = "rocm7.2"
 no-build-isolation-package = ["torch"]

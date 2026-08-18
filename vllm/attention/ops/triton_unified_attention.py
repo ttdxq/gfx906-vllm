@@ -7,6 +7,9 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
+from functools import lru_cache
+
 import torch
 
 from vllm.logger import init_logger
@@ -15,6 +18,9 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
+ENABLE_GFX906_TRITON_UNIFIED_ATTN = os.getenv(
+    "VLLM_GFX906_TRITON_UNIFIED_ATTN", "1"
+).lower() in {"1", "true", "yes", "on"}
 
 
 @triton.jit
@@ -734,6 +740,7 @@ def reduce_segments(
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
+@lru_cache(maxsize=1)
 def _is_gfx906_rocm() -> bool:
     capability = current_platform.get_device_capability()
     return (
@@ -962,7 +969,7 @@ def unified_attention(
     sinks=None,
 ):
     # gfx906 eager fallback for unsupported Triton kernels
-    if _is_gfx906_rocm():
+    if _is_gfx906_rocm() and not ENABLE_GFX906_TRITON_UNIFIED_ATTN:
         if (
             max_seqlen_q == 1
             and alibi_slopes is None
@@ -1167,9 +1174,23 @@ def unified_attention(
             USE_FP8=output_scale is not None,
         )
     else:
-        # for initial version, NUM_SEGMENTS = 16 is chosen as a default
-        # value that showed good performance in tests
-        NUM_SEGMENTS = 16
+        # Keep short-context decode at 16 segments, but increase split-KV
+        # parallelism on gfx906 once the KV scan is large enough to amortize
+        # the extra reduction work.
+        decode_segments_override = os.getenv("VLLM_TRITON_ATTN_DECODE_SEGMENTS")
+        if decode_segments_override is not None:
+            NUM_SEGMENTS = int(decode_segments_override)
+        elif _is_gfx906_rocm() and max_seqlen_k >= 16384:
+            NUM_SEGMENTS = 128
+        elif _is_gfx906_rocm() and max_seqlen_k >= 8192:
+            NUM_SEGMENTS = 64
+        elif _is_gfx906_rocm() and max_seqlen_k >= 4096:
+            NUM_SEGMENTS = 32
+        else:
+            NUM_SEGMENTS = 16
+        if NUM_SEGMENTS <= 0:
+            NUM_SEGMENTS = 16
+        NUM_SEGMENTS = triton.next_power_of_2(NUM_SEGMENTS)
 
         segm_output = torch.empty(
             q.shape[0],

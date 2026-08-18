@@ -22,7 +22,10 @@ from vllm.config.utils import get_field
 from vllm.config.vllm import (
     OPTIMIZATION_LEVEL_TO_CONFIG,
     OptimizationLevel,
+    _auto_enable_async_scheduling_for_gfx906_gguf,
+    needs_qwen35_gguf_eager_decode,
     needs_qwen35_gguf_piecewise_cudagraph,
+    prefer_eager_custom_ops_for_qwen35_gguf,
 )
 from vllm.model_executor.models.config import Qwen3_5ForCausalLMConfig
 from vllm.model_executor.layers.pooler import PoolingType
@@ -57,7 +60,7 @@ def test_qwen3_5_gguf_uses_qwen3_5_reasoning_parser():
     assert structured_outputs_config.reasoning_parser == "qwen3_5"
 
 
-def test_qwen3_5_gguf_on_gfx906_needs_piecewise_cudagraph(monkeypatch):
+def test_qwen3_5_gguf_on_gfx906_prefers_eager_decode(monkeypatch):
     class MockPlatform:
 
         @staticmethod
@@ -83,9 +86,106 @@ def test_qwen3_5_gguf_on_gfx906_needs_piecewise_cudagraph(monkeypatch):
         hf_text_config=SimpleNamespace(model_type="llama"),
     )
 
+    monkeypatch.delenv("VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH", raising=False)
+    monkeypatch.delenv("VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH", raising=False)
+
+    assert needs_qwen35_gguf_eager_decode(qwen35_gguf)
     assert needs_qwen35_gguf_piecewise_cudagraph(qwen35_gguf)
+    assert not needs_qwen35_gguf_eager_decode(qwen35_dense)
     assert not needs_qwen35_gguf_piecewise_cudagraph(qwen35_dense)
+    assert not needs_qwen35_gguf_eager_decode(other_gguf)
     assert not needs_qwen35_gguf_piecewise_cudagraph(other_gguf)
+
+    monkeypatch.setenv("VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH", "1")
+    assert not needs_qwen35_gguf_eager_decode(qwen35_gguf)
+    assert needs_qwen35_gguf_piecewise_cudagraph(qwen35_gguf)
+
+    monkeypatch.setenv("VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH", "1")
+    assert not needs_qwen35_gguf_eager_decode(qwen35_gguf)
+    assert not needs_qwen35_gguf_piecewise_cudagraph(qwen35_gguf)
+
+
+def test_gfx906_gguf_auto_async_scheduling(monkeypatch):
+    class MockPlatform:
+
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def get_device_capability():
+            return SimpleNamespace(major=9, minor=0)
+
+    monkeypatch.setattr("vllm.platforms.current_platform", MockPlatform)
+    monkeypatch.delenv("VLLM_GGUF_GFX906_AUTO_ASYNC_SCHEDULING", raising=False)
+
+    gguf_model = SimpleNamespace(quantization="gguf")
+    dense_model = SimpleNamespace(quantization=None)
+
+    assert _auto_enable_async_scheduling_for_gfx906_gguf(gguf_model)
+    assert not _auto_enable_async_scheduling_for_gfx906_gguf(dense_model)
+    assert not _auto_enable_async_scheduling_for_gfx906_gguf(None)
+
+    monkeypatch.setenv("VLLM_GGUF_GFX906_AUTO_ASYNC_SCHEDULING", "0")
+    assert not _auto_enable_async_scheduling_for_gfx906_gguf(gguf_model)
+
+
+def test_qwen3_5_gguf_eager_decode_prefers_custom_ops_all():
+    compilation_config = CompilationConfig(custom_ops=["none", "+rms_norm"])
+
+    prefer_eager_custom_ops_for_qwen35_gguf(compilation_config)
+
+    assert "none" not in compilation_config.custom_ops
+    assert "all" in compilation_config.custom_ops
+    assert "+rms_norm" in compilation_config.custom_ops
+
+
+def test_gguf_gfx906_mmvq_max_batch_default_and_override(monkeypatch):
+    from vllm.model_executor.layers.quantization import gguf
+
+    monkeypatch.delenv("VLLM_GGUF_GFX906_MMVQ_MAX_BATCH", raising=False)
+    monkeypatch.delenv("VLLM_GGUF_GFX906_Q4_MMVQ_MAX_BATCH", raising=False)
+    monkeypatch.delenv("VLLM_GGUF_GFX906_Q6_MMVQ_MAX_BATCH", raising=False)
+    gguf._gguf_gfx906_mmvq_max_batch.cache_clear()
+    gguf._gguf_gfx906_q4_mmvq_max_batch.cache_clear()
+    gguf._gguf_gfx906_q6_mmvq_max_batch.cache_clear()
+    assert gguf._gguf_gfx906_mmvq_max_batch() == 8
+    assert gguf._gguf_gfx906_q4_mmvq_max_batch() == 16
+    assert gguf._gguf_gfx906_q6_mmvq_max_batch() == 16
+
+    monkeypatch.setenv("VLLM_GGUF_GFX906_MMVQ_MAX_BATCH", "4")
+    monkeypatch.setenv("VLLM_GGUF_GFX906_Q4_MMVQ_MAX_BATCH", "12")
+    monkeypatch.setenv("VLLM_GGUF_GFX906_Q6_MMVQ_MAX_BATCH", "10")
+    gguf._gguf_gfx906_mmvq_max_batch.cache_clear()
+    gguf._gguf_gfx906_q4_mmvq_max_batch.cache_clear()
+    gguf._gguf_gfx906_q6_mmvq_max_batch.cache_clear()
+    assert gguf._gguf_gfx906_mmvq_max_batch() == 4
+    assert gguf._gguf_gfx906_q4_mmvq_max_batch() == 12
+    assert gguf._gguf_gfx906_q6_mmvq_max_batch() == 10
+
+
+def test_gguf_gfx906_large_quant_uses_type_specific_mmvq_limits(monkeypatch):
+    import torch
+    from gguf import GGMLQuantizationType as WeightType
+
+    from vllm.model_executor.layers.quantization import gguf
+
+    monkeypatch.delenv("VLLM_GGUF_GFX906_MMVQ_MAX_BATCH", raising=False)
+    monkeypatch.delenv("VLLM_GGUF_GFX906_Q4_MMVQ_MAX_BATCH", raising=False)
+    monkeypatch.delenv("VLLM_GGUF_GFX906_Q6_MMVQ_MAX_BATCH", raising=False)
+    monkeypatch.setattr(gguf.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx906", lambda: True)
+    gguf._gguf_gfx906_small_batch_mmvq_enabled.cache_clear()
+    gguf._gguf_gfx906_mmvq_max_batch.cache_clear()
+    gguf._gguf_gfx906_q4_mmvq_max_batch.cache_clear()
+    gguf._gguf_gfx906_q6_mmvq_max_batch.cache_clear()
+
+    qweight = torch.empty((6000, 1))
+
+    assert gguf._mmvq_safe_batch(qweight, WeightType.Q4_K) == 16
+    assert gguf._mmvq_safe_batch(qweight, WeightType.Q4_0) == 16
+    assert gguf._mmvq_safe_batch(qweight, WeightType.Q5_K) == 8
+    assert gguf._mmvq_safe_batch(qweight, WeightType.Q6_K) == 16
 
 
 def test_local_gguf_companion_config_uses_tokenizer_repo(tmp_path):

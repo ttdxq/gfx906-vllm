@@ -64,14 +64,21 @@ if __name__ == "__main__":
     hipified_sources = []
     for source in args.sources:
         s_abs = os.path.abspath(source)
+        rel_source = os.path.relpath(s_abs, args.project_dir)
+        expected_hipified = os.path.join(args.output_dir, rel_source)
+        expected_hipified = expected_hipified.replace(".cu", ".hip")
+        expected_hipified = expected_hipified.replace("cuda", "hip")
         hipified_s_abs = (
             hipify_result[s_abs].hipified_path
             if (
                 s_abs in hipify_result
                 and hipify_result[s_abs].hipified_path is not None
             )
-            else s_abs
+            else expected_hipified
         )
+        if source.endswith(".cu") and not os.path.exists(hipified_s_abs):
+            os.makedirs(os.path.dirname(hipified_s_abs), exist_ok=True)
+            shutil.copyfile(s_abs, hipified_s_abs)
         hipified_sources.append(hipified_s_abs)
 
     assert len(hipified_sources) == len(args.sources)

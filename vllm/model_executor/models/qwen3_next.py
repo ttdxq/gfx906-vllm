@@ -12,6 +12,7 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
+from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
@@ -33,6 +34,7 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops import (
+    causal_conv1d_recurrent_gated_delta_rule_packed_decode,
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule,
@@ -63,6 +65,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.gguf import (
+    try_gguf_sigmoid_gated_out_proj_mmvq,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -215,7 +220,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
 
         if self.shared_expert is not None:
-            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+            shared_hidden_states, routed_hidden_states = final_hidden_states
+            final_hidden_states = routed_hidden_states.add_(shared_hidden_states)
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -625,6 +631,62 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+        out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        use_combined_decode = os.getenv(
+            "VLLM_QWEN35_COMBINED_PACKED_DECODE", "1"
+        ).lower() in {"1", "true", "yes", "on"}
+        if use_combined_decode:
+            try:
+                if getattr(self, "prefix", "") == "language_model.model.layers.0.linear_attn":
+                    _append_qwen35_runtime_debug(
+                        "DECODE_COMBINED_PACKED mixed_qkv={} a={} b={} out={} indices={} transposed_state={} tiled_qk={}".format(
+                            tuple(mixed_qkv.shape),
+                            tuple(a.shape),
+                            tuple(b.shape),
+                            tuple(out_buf.shape),
+                            tuple(non_spec_state_indices_tensor[:num_actual_tokens].shape),
+                            getattr(
+                                self, "use_transposed_state_for_packed_decode", False
+                            ),
+                            self._use_tiled_qk_head_mapping_for_packed_decode(),
+                        )
+                    )
+                causal_conv1d_recurrent_gated_delta_rule_packed_decode(
+                    mixed_qkv=mixed_qkv,
+                    conv_state=conv_state,
+                    conv_weight=conv_weights,
+                    conv_bias=self.conv1d.bias,
+                    a=a,
+                    b=b,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    scale=self.head_k_dim**-0.5,
+                    initial_state=ssm_state,
+                    out=out_buf,
+                    ssm_state_indices=non_spec_state_indices_tensor[
+                        :num_actual_tokens
+                    ],
+                    pad_slot_id=PAD_SLOT_ID,
+                    silu_activation=self.activation in ["silu", "swish"],
+                    use_qk_l2norm_in_kernel=getattr(
+                        self, "use_qk_l2norm_in_kernel_for_gdn", True
+                    ),
+                    use_tiled_qk_head_mapping=(
+                        self._use_tiled_qk_head_mapping_for_packed_decode()
+                    ),
+                    use_transposed_state=getattr(
+                        self, "use_transposed_state_for_packed_decode", False
+                    ),
+                )
+                return
+            except (AttributeError, RuntimeError) as exc:
+                if getattr(self, "prefix", "") == "language_model.model.layers.0.linear_attn":
+                    _append_qwen35_runtime_debug(
+                        "DECODE_COMBINED_PACKED_FALLBACK {}: {}".format(
+                            type(exc).__name__, exc
+                        )
+                    )
+
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_state,
@@ -635,7 +697,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             validate_data=True,
         )
 
-        out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv,
             a=a,
@@ -1180,6 +1241,14 @@ class Qwen3NextAttention(nn.Module):
         attn_output = self.attn(q, k, v)
 
         if self.attn_output_gate:
+            projected_out = try_gguf_sigmoid_gated_out_proj_mmvq(
+                attn_output,
+                gate,
+                self.o_proj,
+            )
+            if projected_out is not None:
+                output[:] = projected_out
+                return
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 

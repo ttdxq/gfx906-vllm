@@ -1,22 +1,19 @@
 # Common dependencies
 -r common.txt
 
-# DOWNGRADED for gfx906 compatibility
-# ROCm 7.0+ dropped gfx906 support, using ROCm 6.3 instead
---extra-index-url https://download.pytorch.org/whl/rocm6.3
-torch==2.9.0+rocm6.3
-torchvision==0.24.0+rocm6.3
-torchaudio==2.9.0+rocm6.3
+# ROCm 7.2 runtime for gfx906; set ROCBLAS_TENSILE_LIBPATH to a rocBLAS
+# library path that contains gfx906 Tensile files.
+--extra-index-url https://download.pytorch.org/whl/rocm7.2
+torch==2.11.0+rocm7.2
+torchvision==0.26.0+rocm7.2
+torchaudio==2.11.0+rocm7.2
 
-# DOWNGRADED for gfx906 compatibility
-# Triton 3.6+ may have removed gfx906 support
-triton==3.5.0
+triton-rocm==3.6.0
 cmake>=3.26.1,<4
 packaging>=24.2
 setuptools>=77.0.3,<81.0.0
 setuptools-scm>=8
 wheel
 jinja2>=3.1.6
-# DOWNGRADED for ROCm 6.3 compatibility
-amdsmi>=6.3,<6.4
+amdsmi==7.0.2
 timm>=1.0.17

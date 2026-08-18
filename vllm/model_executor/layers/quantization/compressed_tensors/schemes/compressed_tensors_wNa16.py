@@ -69,6 +69,13 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
                 f"Supported num_bits = {WNA16_SUPPORTED_TYPES_MAP.keys()}"
             )
 
+        if not self.symmetric and num_bits not in WNA16_ZP_SUPPORTED_TYPES_MAP:
+            raise ValueError(
+                f"Asymmetric quantization not supported for "
+                f"num_bits = {num_bits}. Supported: "
+                f"{list(WNA16_ZP_SUPPORTED_TYPES_MAP)}"
+            )
+
         self.quant_type = (
             WNA16_ZP_SUPPORTED_TYPES_MAP[num_bits]
             if not self.symmetric
@@ -92,6 +99,12 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.output_partition_sizes = output_partition_sizes
+        layer.params_dtype = params_dtype
+        if not hasattr(layer, "has_bias"):
+            layer.has_bias = False
 
         mp_linear_kernel_config = MPLinearLayerConfig(
             full_weight_shape=(input_size, output_size),
@@ -112,9 +125,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             logger.info("Using %s for CompressedTensorsWNA16", kernel_type.__name__)
             self._kernel_backends_being_used.add(kernel_type.__name__)
 
-        if MarlinLinearKernel is not None and isinstance(
-            kernel_type, MarlinLinearKernel
-        ):
+        if kernel_type is MarlinLinearKernel:
             input_dtype = get_marlin_input_dtype(self.layer_name)
             if input_dtype is not None:
                 mp_linear_kernel_config.act_type = input_dtype

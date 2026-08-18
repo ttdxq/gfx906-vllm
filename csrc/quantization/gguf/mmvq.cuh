@@ -49,10 +49,10 @@ static __global__ void mul_mat_vec_q(const void * __restrict__ vx, const void * 
     } else {
         const int lane = threadIdx.x % warp_size;
         const int warp = threadIdx.x / warp_size;
-        __shared__ float shared_sum[num_warps];
+        __shared__ float shared_sum[GGML_CUDA_MMV_Y][num_warps];
 
         if (lane == 0) {
-            shared_sum[warp] = tmp;
+            shared_sum[threadIdx.y][warp] = tmp;
         }
         __syncthreads();
 
@@ -60,7 +60,7 @@ static __global__ void mul_mat_vec_q(const void * __restrict__ vx, const void * 
             return;
         }
 
-        tmp = lane < num_warps ? shared_sum[lane] : 0.0f;
+        tmp = lane < num_warps ? shared_sum[threadIdx.y][lane] : 0.0f;
 #pragma unroll
         for (int mask = warp_size/2; mask > 0; mask >>= 1) {
             tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
@@ -144,6 +144,76 @@ static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
+template <typename scalar_t>
+static __global__ void mul_mat_vec_q4_K_q8_1_col2560(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    scalar_t * __restrict__ dst, const int nrows, const int nvecs,
+    const int dst_stride) {
+    constexpr int ncols = 2560;
+    constexpr int blocks_per_row = ncols / QK_K;
+    constexpr int q8_blocks_per_vec = ncols / QK8_1;
+    constexpr int blocks_per_warp = VDR_Q4_K_Q8_1_MMVQ * BLOCK_SIZE / QI4_K;
+
+    const int row = blockIdx.x;
+    const int vec = blockIdx.y;
+    if (row >= nrows || vec >= nvecs) {
+        return;
+    }
+
+    const block_q4_K * x = (const block_q4_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    float tmp = 0.0f;
+
+    for (int i = threadIdx.x / (QI4_K / VDR_Q4_K_Q8_1_MMVQ);
+         i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;
+        const int iby = vec * q8_blocks_per_vec + i * (QK_K / QK8_1);
+        const int iqs = VDR_Q4_K_Q8_1_MMVQ *
+            (threadIdx.x % (QI4_K / VDR_Q4_K_Q8_1_MMVQ));
+        tmp += vec_dot_q4_K_q8_1(&x[ibx], &y[iby], iqs);
+    }
+
+    constexpr int warp_size = WARP_SIZE;
+    constexpr int num_warps = BLOCK_SIZE / warp_size;
+#pragma unroll
+    for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+        tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+    }
+
+    if constexpr (num_warps == 1) {
+        if (threadIdx.x == 0) {
+            dst[vec*dst_stride + row] = tmp;
+        }
+    } else {
+        const int lane = threadIdx.x % warp_size;
+        const int warp = threadIdx.x / warp_size;
+        __shared__ float shared_sum[num_warps];
+        if (lane == 0) {
+            shared_sum[warp] = tmp;
+        }
+        __syncthreads();
+        if (warp != 0) {
+            return;
+        }
+        tmp = lane < num_warps ? shared_sum[lane] : 0.0f;
+#pragma unroll
+        for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+            tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+        }
+        if (lane == 0) {
+            dst[vec*dst_stride + row] = tmp;
+        }
+    }
+}
+
+template<typename scalar_t>
+static void mul_mat_vec_q4_K_q8_1_col2560_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    const dim3 block_nums(nrows, nvecs, 1);
+    const dim3 block_dims(BLOCK_SIZE, 1, 1);
+    mul_mat_vec_q4_K_q8_1_col2560<scalar_t>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+}
+
 template<typename scalar_t>
 static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
@@ -153,11 +223,159 @@ static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
+template <typename scalar_t>
+static __global__ void mul_mat_vec_q5_K_q8_1_col2560(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    scalar_t * __restrict__ dst, const int nrows, const int nvecs,
+    const int dst_stride) {
+    constexpr int ncols = 2560;
+    constexpr int blocks_per_row = ncols / QK_K;
+    constexpr int q8_blocks_per_vec = ncols / QK8_1;
+    constexpr int blocks_per_warp = VDR_Q5_K_Q8_1_MMVQ * BLOCK_SIZE / QI5_K;
+
+    const int row = blockIdx.x;
+    const int vec = blockIdx.y;
+    if (row >= nrows || vec >= nvecs) {
+        return;
+    }
+
+    const block_q5_K * x = (const block_q5_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    float tmp = 0.0f;
+
+    for (int i = threadIdx.x / (QI5_K / VDR_Q5_K_Q8_1_MMVQ);
+         i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;
+        const int iby = vec * q8_blocks_per_vec + i * (QK_K / QK8_1);
+        const int iqs = VDR_Q5_K_Q8_1_MMVQ *
+            (threadIdx.x % (QI5_K / VDR_Q5_K_Q8_1_MMVQ));
+        tmp += vec_dot_q5_K_q8_1(&x[ibx], &y[iby], iqs);
+    }
+
+    constexpr int warp_size = WARP_SIZE;
+    constexpr int num_warps = BLOCK_SIZE / warp_size;
+#pragma unroll
+    for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+        tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+    }
+
+    if constexpr (num_warps == 1) {
+        if (threadIdx.x == 0) {
+            dst[vec*dst_stride + row] = tmp;
+        }
+    } else {
+        const int lane = threadIdx.x % warp_size;
+        const int warp = threadIdx.x / warp_size;
+        __shared__ float shared_sum[num_warps];
+        if (lane == 0) {
+            shared_sum[warp] = tmp;
+        }
+        __syncthreads();
+        if (warp != 0) {
+            return;
+        }
+        tmp = lane < num_warps ? shared_sum[lane] : 0.0f;
+#pragma unroll
+        for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+            tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+        }
+        if (lane == 0) {
+            dst[vec*dst_stride + row] = tmp;
+        }
+    }
+}
+
+template<typename scalar_t>
+static void mul_mat_vec_q5_K_q8_1_col2560_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    const dim3 block_nums(nrows, nvecs, 1);
+    const dim3 block_dims(BLOCK_SIZE, 1, 1);
+    mul_mat_vec_q5_K_q8_1_col2560<scalar_t>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+}
+
 template<typename scalar_t>
 static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(block_num_y, nvecs, 1);
     const dim3 block_dims(BLOCK_SIZE, GGML_CUDA_MMV_Y, 1);
+    mul_mat_vec_q<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+}
+
+template <typename scalar_t>
+static __global__ void mul_mat_vec_q6_K_q8_1_col2560(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    scalar_t * __restrict__ dst, const int nrows, const int nvecs,
+    const int dst_stride) {
+    constexpr int ncols = 2560;
+    constexpr int blocks_per_row = ncols / QK_K;
+    constexpr int q8_blocks_per_vec = ncols / QK8_1;
+    constexpr int blocks_per_warp = VDR_Q6_K_Q8_1_MMVQ * BLOCK_SIZE / QI6_K;
+
+    const int row = blockIdx.x;
+    const int vec = blockIdx.y;
+    if (row >= nrows || vec >= nvecs) {
+        return;
+    }
+
+    const block_q6_K * x = (const block_q6_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    float tmp = 0.0f;
+
+    for (int i = threadIdx.x / QI6_K; i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;
+        const int iby = vec * q8_blocks_per_vec + i * (QK_K / QK8_1);
+        const int iqs = threadIdx.x % QI6_K;
+        tmp += vec_dot_q6_K_q8_1(&x[ibx], &y[iby], iqs);
+    }
+
+    constexpr int warp_size = WARP_SIZE;
+    constexpr int num_warps = BLOCK_SIZE / warp_size;
+#pragma unroll
+    for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+        tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+    }
+
+    if constexpr (num_warps == 1) {
+        if (threadIdx.x == 0) {
+            dst[vec * dst_stride + row] = tmp;
+        }
+    } else {
+        const int lane = threadIdx.x % warp_size;
+        const int warp = threadIdx.x / warp_size;
+        __shared__ float shared_sum[num_warps];
+        if (lane == 0) {
+            shared_sum[warp] = tmp;
+        }
+        __syncthreads();
+        if (warp != 0) {
+            return;
+        }
+        tmp = lane < num_warps ? shared_sum[lane] : 0.0f;
+#pragma unroll
+        for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+            tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+        }
+        if (lane == 0) {
+            dst[vec * dst_stride + row] = tmp;
+        }
+    }
+}
+
+template<typename scalar_t>
+static void mul_mat_vec_q6_K_q8_1_col2560_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    const dim3 block_nums(nrows, nvecs, 1);
+    const dim3 block_dims(BLOCK_SIZE, 1, 1);
+    mul_mat_vec_q6_K_q8_1_col2560<scalar_t>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+}
+
+template<typename scalar_t>
+static void mul_mat_vec_q6_K_q8_1_y2_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    constexpr int mmv_y = 2;
+    const int block_num_y = (nrows + mmv_y - 1) / mmv_y;
+    const dim3 block_nums(block_num_y, nvecs, 1);
+    const dim3 block_dims(BLOCK_SIZE, mmv_y, 1);
     mul_mat_vec_q<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }

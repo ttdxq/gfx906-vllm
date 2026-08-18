@@ -1237,7 +1237,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             and use_shared_experts_stream
             and self.shared_experts_stream is not None
             and hidden_states.is_cuda
-            and current_platform.is_cuda()
+            and current_platform.is_cuda_alike()
         ):
             torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
 

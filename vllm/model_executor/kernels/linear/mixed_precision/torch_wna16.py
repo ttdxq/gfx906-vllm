@@ -61,15 +61,22 @@ class TorchWNA16LinearKernel(MPLinearKernel):
             zp = unpack_quantized_values_into_int32(
                 w_zp.data, c.weight_type, packed_dim=0
             )
-            zp = zp.transpose(0, 1).contiguous().to(w_s.dtype)
+            if zp.shape != w_s.shape and zp.transpose(0, 1).shape == w_s.shape:
+                zp = zp.transpose(0, 1).contiguous()
+            zp = zp.to(w_s.dtype)
         else:
             zp = torch.full_like(unpacked, float(c.weight_type.bias))
 
         if c.group_size == -1:
             scales = w_s.data.expand(-1, unpacked.shape[1])
+            if c.zero_points:
+                zp = zp.expand(-1, unpacked.shape[1])
         else:
             scales = w_s.data.repeat_interleave(c.group_size, dim=1)
             scales = scales[:, : unpacked.shape[1]]
+            if c.zero_points:
+                zp = zp.repeat_interleave(c.group_size, dim=1)
+                zp = zp[:, : unpacked.shape[1]]
 
         return (unpacked - zp) * scales
 

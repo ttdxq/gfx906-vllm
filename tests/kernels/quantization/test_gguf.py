@@ -109,6 +109,35 @@ def test_mmvq(hidden_size: int, dtype: torch.dtype, quant_type: GGMLQuantization
         torch.testing.assert_close(output, ref_output, atol=1, rtol=1e-1)
 
 
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_iq4_xs_repack_to_q8_0_mmvq(hidden_size: int, dtype: torch.dtype):
+    if not hasattr(torch.ops._C, "ggml_repack_iq4_xs_to_q8_0"):
+        pytest.skip("IQ4_XS to Q8_0 repack op is not available")
+
+    current_platform.seed_everything(0)
+    quant_type = GGMLQuantizationType.IQ4_XS
+    tensors = get_gguf_sample_tensors(hidden_size, quant_type)
+    x = torch.rand((1, hidden_size), dtype=dtype, device="cuda")
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+
+    for tensor in tensors:
+        qweight = torch.tensor(tensor.data, device="cuda").contiguous()
+        row = qweight.shape[0]
+        col = hidden_size
+        ref_output = ops.ggml_mul_mat_vec_q8(
+            qweight, quant_x, quant_type, row, col, dtype
+        )
+
+        repacked = ops.ggml_repack_iq4_xs_to_q8_0(qweight, row, col)
+        output = ops.ggml_mul_mat_vec_q8(
+            repacked, quant_x, GGMLQuantizationType.Q8_0, row, col, dtype
+        )
+
+        torch.testing.assert_close(output, ref_output, atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)

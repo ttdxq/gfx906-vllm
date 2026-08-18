@@ -111,8 +111,8 @@ def _fwd_kernel(
     block_start_loc = BLOCK_M * start_m
 
     # initialize offsets
-    # [BLOCK_SIZE]; starts at 0
-    offs_bs_n = tl.arange(0, BLOCK_SIZE)
+    # [N]; starts at 0
+    offs_bs_n = tl.arange(0, BLOCK_N)
     # [N]; starts at 0
     offs_n = tl.arange(0, BLOCK_N)
     # [D]; starts at 0
@@ -151,21 +151,27 @@ def _fwd_kernel(
 
     # compute query against context (no causal mask here)
     for start_n in tl.range(
-        0, cur_batch_ctx_len, BLOCK_SIZE, loop_unroll_factor=num_unroll_cache
+        0, cur_batch_ctx_len, BLOCK_N, loop_unroll_factor=num_unroll_cache
     ):
-        start_n = tl.multiple_of(start_n, BLOCK_SIZE)
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        cache_positions = start_n + offs_bs_n
+        cache_block_offsets = cache_positions // BLOCK_SIZE
+        cache_block_slots = cache_positions % BLOCK_SIZE
+        cache_mask = cache_positions < cur_batch_ctx_len
         # -- compute qk ----
         bn = tl.load(
             B_Loc
             + cur_batch * stride_b_loc_b
-            + (start_n // BLOCK_SIZE) * stride_b_loc_s
+            + cache_block_offsets * stride_b_loc_s,
+            mask=cache_mask,
+            other=0,
         ).to(tl.int64)
         # [D,BLOCK_SIZE]
         off_k = (
             bn[None, :] * stride_k_cache_bs
             + cur_kv_head * stride_k_cache_h
             + (offs_d[:, None] // x) * stride_k_cache_d
-            + ((start_n + offs_bs_n[None, :]) % BLOCK_SIZE) * stride_k_cache_bl
+            + cache_block_slots[None, :] * stride_k_cache_bl
             + (offs_d[:, None] % x) * stride_k_cache_x
         )
 
@@ -174,17 +180,17 @@ def _fwd_kernel(
             bn[:, None] * stride_v_cache_bs
             + cur_kv_head * stride_v_cache_h
             + offs_d[None, :] * stride_v_cache_d
-            + offs_bs_n[:, None] * stride_v_cache_bl
+            + cache_block_slots[:, None] * stride_v_cache_bl
         )
 
         if (
-            start_n + BLOCK_SIZE > cur_batch_ctx_len
+            start_n + BLOCK_N > cur_batch_ctx_len
             or BLOCK_DMODEL != BLOCK_DMODEL_PADDED
         ):
             k_load = tl.load(
                 K_cache + off_k,
                 mask=dim_mask[:, None]
-                & ((start_n + offs_bs_n[None, :]) < cur_batch_ctx_len),
+                & (cache_positions[None, :] < cur_batch_ctx_len),
                 other=0.0,
             )  # [D,N]
         else:
@@ -195,10 +201,12 @@ def _fwd_kernel(
         else:
             k = k_load
 
-        qk = tl.zeros([BLOCK_M, BLOCK_SIZE], dtype=tl.float32)  # [M,N]
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)  # [M,N]
         qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
         qk = tl.where(
-            (start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, qk, float("-inf")
+            cache_positions[None, :] < cur_batch_ctx_len,
+            qk,
+            float("-inf"),
         )
         qk *= sm_scale
         if SLIDING_WINDOW > 0:
@@ -229,13 +237,13 @@ def _fwd_kernel(
 
         # update acc
         if (
-            start_n + BLOCK_SIZE > cur_batch_ctx_len
+            start_n + BLOCK_N > cur_batch_ctx_len
             or BLOCK_DMODEL != BLOCK_DMODEL_PADDED
         ):
             v_load = tl.load(
                 V_cache + off_v,
                 mask=dim_mask[None, :]
-                & ((start_n + offs_bs_n[:, None]) < cur_batch_ctx_len),
+                & (cache_positions[:, None] < cur_batch_ctx_len),
                 other=0.0,
             )  # [N,D]
         else:

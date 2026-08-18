@@ -193,6 +193,29 @@ __global__ void moe_sum_kernel(
   }
 }
 
+template <typename scalar_t, typename weight_t, int TOPK>
+__global__ void moe_weighted_sum_kernel(
+    scalar_t* __restrict__ out,          // [..., d]
+    const scalar_t* __restrict__ input,  // [..., topk, d]
+    const weight_t* __restrict__ weights,
+    const int d) {
+  const int64_t token_idx = blockIdx.x;
+  for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+    scalar_t x = 0.0;
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) {
+      const scalar_t value =
+          VLLM_LDG(&input[token_idx * TOPK * d + k * d + idx]);
+      const float weight =
+          static_cast<float>(VLLM_LDG(&weights[token_idx * TOPK + k]));
+      const scalar_t product =
+          static_cast<scalar_t>(static_cast<float>(value) * weight);
+      x += product;
+    }
+    out[token_idx * d + idx] = x;
+  }
+}
+
 template <typename scalar_t>
 __global__ void moe_align_block_size_small_batch_expert_kernel(
     const scalar_t* __restrict__ topk_ids,
@@ -409,8 +432,82 @@ void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
       });
       break;
 
+    case 8:
+      VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
+        vllm::moe::moe_sum_kernel<scalar_t, 8><<<grid, block, 0, stream>>>(
+            output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+            hidden_size);
+      });
+      break;
+
     default:
       at::sum_out(output, input, 1);
       break;
   }
+}
+
+void moe_weighted_sum(torch::Tensor& input,       // [num_tokens, topk, hidden]
+                      torch::Tensor& weights,     // [num_tokens, topk]
+                      torch::Tensor& output) {    // [num_tokens, hidden]
+  TORCH_CHECK(input.dim() == 3, "input must be [num_tokens, topk, hidden]");
+  TORCH_CHECK(weights.dim() == 2, "weights must be [num_tokens, topk]");
+  TORCH_CHECK(output.dim() == 2, "output must be [num_tokens, hidden]");
+  TORCH_CHECK(input.size(0) == output.size(0),
+              "input/output token dimension mismatch");
+  TORCH_CHECK(input.size(2) == output.size(1),
+              "input/output hidden dimension mismatch");
+  TORCH_CHECK(input.size(0) == weights.size(0),
+              "input/weights token dimension mismatch");
+  TORCH_CHECK(input.size(1) == weights.size(1),
+              "input/weights topk dimension mismatch");
+  TORCH_CHECK(input.scalar_type() == output.scalar_type(),
+              "input/output dtype mismatch");
+  TORCH_CHECK(weights.scalar_type() == at::ScalarType::Float ||
+                  weights.scalar_type() == input.scalar_type(),
+              "weights must be float32 or match input dtype");
+
+  const int hidden_size = input.size(-1);
+  const auto num_tokens = output.numel() / hidden_size;
+  const int topk = input.size(1);
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(hidden_size, 1024));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define VLLM_LAUNCH_WEIGHTED_SUM(TOPK_VALUE)                                \
+  VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(),                          \
+                               "moe_weighted_sum_kernel", [&] {             \
+    if (weights.scalar_type() == at::ScalarType::Float) {                    \
+      vllm::moe::moe_weighted_sum_kernel<scalar_t, float, TOPK_VALUE>        \
+          <<<grid, block, 0, stream>>>(                                      \
+              output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),       \
+              weights.data_ptr<float>(), hidden_size);                       \
+    } else {                                                                 \
+      vllm::moe::moe_weighted_sum_kernel<scalar_t, scalar_t, TOPK_VALUE>     \
+          <<<grid, block, 0, stream>>>(                                      \
+              output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),       \
+              weights.data_ptr<scalar_t>(), hidden_size);                    \
+    }                                                                        \
+  })
+
+  switch (topk) {
+    case 2:
+      VLLM_LAUNCH_WEIGHTED_SUM(2);
+      break;
+    case 3:
+      VLLM_LAUNCH_WEIGHTED_SUM(3);
+      break;
+    case 4:
+      VLLM_LAUNCH_WEIGHTED_SUM(4);
+      break;
+    case 8:
+      VLLM_LAUNCH_WEIGHTED_SUM(8);
+      break;
+    default:
+      output.copy_((input * weights.unsqueeze(-1)).sum(1));
+      break;
+  }
+
+#undef VLLM_LAUNCH_WEIGHTED_SUM
 }

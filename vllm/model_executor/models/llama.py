@@ -46,6 +46,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.gguf import (
+    try_gguf_silu_and_mul_down_mmvq,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -106,8 +109,11 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        x, _ = self.gate_up_proj(x)
-        x = self.act_fn(x)
+        gate_up, _ = self.gate_up_proj(x)
+        out = try_gguf_silu_and_mul_down_mmvq(gate_up, self.down_proj)
+        if out is not None:
+            return out
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 

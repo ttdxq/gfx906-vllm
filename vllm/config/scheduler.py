@@ -128,9 +128,11 @@ class SchedulerConfig:
     like full attention and sliding window attention.
     """
 
-    async_scheduling: bool = False
+    async_scheduling: bool | None = None
     """If set to True, perform async scheduling. This helps to avoid gaps in
     GPU utilization, leading to better latency and throughput.
+    If left as None, vLLM may enable it for measured platform/model
+    combinations where it improves single-request latency.
     Async scheduling is currently not supported with some features such as
     speculative decoding and pipeline parallelism.
     """

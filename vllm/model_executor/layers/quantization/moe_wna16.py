@@ -5,8 +5,10 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 
 from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     int4_w4a16_moe_quant_config,
@@ -29,6 +31,9 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
+
+logger = init_logger(__name__)
 
 
 class MoeWNA16Config(QuantizationConfig):
@@ -357,6 +362,101 @@ class MoeWNA16Method(FusedMoEMethodBase):
             block_shape=[0, layer.group_size],
         )
 
+    def _dequantize_expert_weight(
+        self,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        qzeros: torch.Tensor | None,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        bits = self.quant_config.weight_bits
+        if bits == 8:
+            weight = qweight.to(torch.float32)
+        else:
+            low = qweight.bitwise_and(0xF)
+            high = qweight.bitwise_right_shift(4).bitwise_and(0xF)
+            weight = torch.stack((low, high), dim=-1).flatten(-2).to(torch.float32)
+
+        group_size = weight.shape[-1] // scales.shape[-1]
+        scales = scales.repeat_interleave(group_size, dim=-1)
+        scales = scales[..., : weight.shape[-1]].to(torch.float32)
+
+        if qzeros is None:
+            zeros = float(1 << (bits - 1))
+        elif bits == 8:
+            zeros = qzeros.to(torch.float32)
+            zeros = zeros.repeat_interleave(group_size, dim=-1)
+            zeros = zeros[..., : weight.shape[-1]]
+        else:
+            zero_low = qzeros.bitwise_and(0xF)
+            zero_high = qzeros.bitwise_right_shift(4).bitwise_and(0xF)
+            zeros = torch.stack((zero_low, zero_high), dim=-2)
+            zeros = zeros.flatten(-3, -2).to(torch.float32)
+            zeros = zeros.repeat_interleave(group_size, dim=-1)
+            zeros = zeros[: weight.shape[0], : weight.shape[1]]
+
+        return ((weight - zeros) * scales).to(dtype)
+
+    def _apply_gfx906_torch_fallback(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        logger.warning_once(
+            "[gfx906] Falling back to Torch MoE WNA16 path because the Triton "
+            "GPTQ/AWQ fused MoE kernel does not compile for gfx906."
+        )
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "gfx906 Torch MoE WNA16 fallback does not support "
+                "apply_router_weight_on_input."
+            )
+
+        orig_shape = x.shape
+        hidden_size = x.shape[-1]
+        flat_x = x.reshape(-1, hidden_size)
+        flat_topk_weights = topk_weights.reshape(flat_x.shape[0], -1)
+        flat_topk_ids = topk_ids.reshape(flat_x.shape[0], -1)
+        if expert_map is not None:
+            flat_topk_ids = expert_map[flat_topk_ids]
+
+        out = torch.zeros_like(flat_x)
+        qzeros13 = layer.w13_qzeros if self.quant_config.has_zp else None
+        qzeros2 = layer.w2_qzeros if self.quant_config.has_zp else None
+
+        for expert_id in range(layer.w13_qweight.shape[0]):
+            w13 = self._dequantize_expert_weight(
+                layer.w13_qweight[expert_id],
+                layer.w13_scales[expert_id],
+                None if qzeros13 is None else qzeros13[expert_id],
+                flat_x.dtype,
+            )
+            w2 = self._dequantize_expert_weight(
+                layer.w2_qweight[expert_id],
+                layer.w2_scales[expert_id],
+                None if qzeros2 is None else qzeros2[expert_id],
+                flat_x.dtype,
+            )
+
+            expert_weights = (
+                flat_topk_weights * (flat_topk_ids == expert_id)
+            ).sum(dim=-1, keepdim=True)
+            gate_up = F.linear(flat_x, w13)
+            intermediate_size = w2.shape[-1]
+            expert_hidden = gate_up[:, intermediate_size:] * F.silu(
+                gate_up[:, :intermediate_size]
+            )
+            expert_out = F.linear(expert_hidden, w2)
+            expert_out = expert_out * expert_weights
+            expert_out = expert_out.to(out.dtype)
+            out = out + expert_out
+
+        return out.reshape(orig_shape)
+
     def apply(
         self,
         layer: FusedMoE,
@@ -387,6 +487,23 @@ class MoeWNA16Method(FusedMoEMethodBase):
             hidden_states=x,
             router_logits=router_logits,
         )
+
+        if (
+            current_platform.is_rocm()
+            and on_gfx906()
+            and (
+                self.quant_config.weight_bits not in (4, 8)
+                or layer.group_size not in (32, 64, 128)
+            )
+        ):
+            return self._apply_gfx906_torch_fallback(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                apply_router_weight_on_input,
+            )
 
         return fused_experts(
             x,

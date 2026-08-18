@@ -7,6 +7,8 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+from functools import lru_cache
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -14,6 +16,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
+@lru_cache(maxsize=1)
 def _is_gfx906_rocm() -> bool:
     capability = current_platform.get_device_capability()
     return (
@@ -210,6 +213,73 @@ def _fused_sigmoid_gating_delta_rule_decode_gfx906(
 
     initial_state[:T].copy_(state.to(initial_state.dtype))
     return o, initial_state
+
+
+def _fused_sigmoid_gating_delta_rule_prefill_gfx906(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: float,
+    threshold: float,
+    scale: float,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if a.ndim == 2:
+        a = a.unsqueeze(0)
+    if b.ndim == 2:
+        b = b.unsqueeze(0)
+
+    can_use_custom_op = (
+        A_log.dtype == a.dtype == b.dtype == dt_bias.dtype == q.dtype == k.dtype
+        == v.dtype
+        and initial_state.dtype in (q.dtype, torch.float32)
+        and cu_seqlens.dtype in (torch.int32, torch.int64)
+    )
+    if can_use_custom_op:
+        try:
+            o = ops.fused_sigmoid_gating_delta_rule_gfx906_prefill(
+                A_log=A_log,
+                a=a,
+                b=b,
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                state=initial_state,
+                cu_seqlens=cu_seqlens,
+                beta=beta,
+                threshold=threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+            return o, initial_state
+        except (AttributeError, RuntimeError):
+            pass
+
+    return _fused_sigmoid_gating_delta_rule_update_gfx906_eager(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,
+        threshold=threshold,
+        scale=scale,
+        initial_state=initial_state,
+        inplace_final_state=True,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=None,
+        num_accepted_tokens=None,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
 
 
 def _fused_sigmoid_gating_delta_rule_indexed_decode_gfx906(
@@ -548,7 +618,7 @@ def fused_sigmoid_gating_delta_rule_update(
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
             if q.shape[1] != initial_state.shape[0]:
-                return _fused_sigmoid_gating_delta_rule_update_gfx906_eager(
+                return _fused_sigmoid_gating_delta_rule_prefill_gfx906(
                     A_log=A_log,
                     a=a,
                     b=b,
@@ -560,10 +630,7 @@ def fused_sigmoid_gating_delta_rule_update(
                     threshold=threshold,
                     scale=scale,
                     initial_state=initial_state,
-                    inplace_final_state=inplace_final_state,
                     cu_seqlens=cu_seqlens,
-                    ssm_state_indices=ssm_state_indices,
-                    num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
             return _fused_sigmoid_gating_delta_rule_decode_gfx906(

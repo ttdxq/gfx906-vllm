@@ -8,6 +8,10 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+import sys
+from functools import lru_cache
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -16,7 +20,12 @@ from vllm.triton_utils import tl, triton
 
 from .op import exp
 
+ENABLE_QWEN35_RATIO2_FUSED_DECODE = os.getenv(
+    "VLLM_QWEN35_RATIO2_FUSED_DECODE", "1"
+).lower() in {"1", "true", "yes", "on"}
 
+
+@lru_cache(maxsize=1)
 def _is_gfx906_rocm() -> bool:
     capability = current_platform.get_device_capability()
     return (
@@ -498,7 +507,18 @@ def fused_recurrent_gated_delta_rule_packed_decode(
                 use_transposed_state=use_transposed_state,
             )
             return output, initial_state
-        except (AttributeError, RuntimeError):
+        except (AttributeError, RuntimeError) as exc:
+            if os.getenv("VLLM_QWEN35_RATIO2_FUSED_DECODE_DEBUG", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                print(
+                    "QWEN35_RATIO2_FUSED_DECODE_FALLBACK "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
             pass
 
         B = mixed_qkv.shape[0]
@@ -714,6 +734,100 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         num_stages=num_stages,
     )
     return out, initial_state
+
+
+def causal_conv1d_recurrent_gated_delta_rule_packed_decode(
+    mixed_qkv: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    pad_slot_id: int,
+    silu_activation: bool,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_tiled_qk_head_mapping: bool = False,
+    use_transposed_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not _is_gfx906_rocm():
+        raise RuntimeError("combined packed decode is only available on gfx906 ROCm")
+
+    qkv_dim = mixed_qkv.shape[1]
+    kv_heads, value_dim, key_dim = initial_state.shape[-3:]
+    qk_dim = qkv_dim - kv_heads * value_dim
+    heads = qk_dim // (2 * key_dim) if qk_dim > 0 else 0
+    can_use_ratio2_fused_decode = (
+        ENABLE_QWEN35_RATIO2_FUSED_DECODE
+        and mixed_qkv.ndim == 2
+        and conv_state.ndim == 3
+        and conv_weight.ndim == 2
+        and a.ndim == 2
+        and b.ndim == 2
+        and initial_state.ndim == 4
+        and out.ndim == 4
+        and ssm_state_indices.ndim == 1
+        and use_qk_l2norm_in_kernel
+        and key_dim == value_dim == 128
+        and qk_dim > 0
+        and qk_dim % (2 * key_dim) == 0
+        and heads > 0
+        and kv_heads == 2 * heads
+        and conv_state.shape[1] == qkv_dim
+        and conv_weight.shape[0] == qkv_dim
+        and conv_state.dtype == initial_state.dtype
+        and (not use_transposed_state or key_dim == value_dim)
+    )
+    if can_use_ratio2_fused_decode:
+        try:
+            output = ops.causal_conv1d_recurrent_gated_delta_rule_gfx906_ratio2_packed_decode(
+                mixed_qkv=mixed_qkv,
+                conv_state=conv_state,
+                conv_weight=conv_weight,
+                conv_bias=conv_bias,
+                a=a,
+                b=b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                state=initial_state,
+                out=out,
+                state_indices=ssm_state_indices,
+                pad_slot_id=pad_slot_id,
+                scale=scale,
+                silu_activation=silu_activation,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                use_tiled_qk_head_mapping=use_tiled_qk_head_mapping,
+                use_transposed_state=use_transposed_state,
+            )
+            return output, initial_state
+        except (AttributeError, RuntimeError):
+            pass
+
+    output = ops.causal_conv1d_recurrent_gated_delta_rule_gfx906_packed_decode(
+        mixed_qkv=mixed_qkv,
+        conv_state=conv_state,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state=initial_state,
+        out=out,
+        state_indices=ssm_state_indices,
+        pad_slot_id=pad_slot_id,
+        scale=scale,
+        silu_activation=silu_activation,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_tiled_qk_head_mapping=use_tiled_qk_head_mapping,
+        use_transposed_state=use_transposed_state,
+    )
+    return output, initial_state
 
 
 class FusedRecurrentFunction(torch.autograd.Function):

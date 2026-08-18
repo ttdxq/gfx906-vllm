@@ -8,6 +8,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 from .chunk import chunk_gated_delta_rule
 from .fused_recurrent import (
+    causal_conv1d_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
 )
@@ -20,6 +21,7 @@ from .layernorm_guard import RMSNormGated
 __all__ = [
     "RMSNormGated",
     "chunk_gated_delta_rule",
+    "causal_conv1d_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_gated_delta_rule",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_sigmoid_gating_delta_rule_update",

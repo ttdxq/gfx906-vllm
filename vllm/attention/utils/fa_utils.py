@@ -19,20 +19,34 @@ elif current_platform.is_xpu():
     flash_attn_varlen_func = ops.flash_attn_varlen_func
     get_scheduler_metadata = ops.get_scheduler_metadata
 elif current_platform.is_rocm():
-    try:
-        from flash_attn import flash_attn_varlen_func  # noqa: F401
+    from vllm.platforms.rocm import on_gfx906
 
-        get_scheduler_metadata = None  # type: ignore
-        reshape_and_cache_flash = None  # type: ignore
-    except ImportError:
+    if on_gfx906():
         logger.warning_once(
-            "flash-attn is not installed on ROCm platform. "
-            "Using alternative attention backend. "
-            "For better performance, consider installing flash-attn."
+            "flash-attn is not available on gfx906 ROCm. "
+            "Using alternative attention backend."
         )
         flash_attn_varlen_func = None  # type: ignore
         get_scheduler_metadata = None  # type: ignore
         reshape_and_cache_flash = None  # type: ignore
+    else:
+        try:
+            from flash_attn import flash_attn_varlen_func  # noqa: F401
+
+            get_scheduler_metadata = None  # type: ignore
+            reshape_and_cache_flash = None  # type: ignore
+        except Exception as e:
+            logger.warning_once(
+                "flash-attn is not available on ROCm platform (%s: %s). "
+                "Using alternative attention backend. "
+                "For better performance, install a flash-attn build that supports "
+                "this GPU architecture.",
+                type(e).__name__,
+                e,
+            )
+            flash_attn_varlen_func = None  # type: ignore
+            get_scheduler_metadata = None  # type: ignore
+            reshape_and_cache_flash = None  # type: ignore
 
 
 def get_flash_attn_version(requires_alibi: bool = False) -> int | None:

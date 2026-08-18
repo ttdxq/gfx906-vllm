@@ -13,6 +13,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kCUDA, &moe_sum);
 
+  m.def("moe_weighted_sum(Tensor input, Tensor weights, Tensor! output) -> ()");
+  m.impl("moe_weighted_sum", torch::kCUDA, &moe_weighted_sum);
+
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size.
   m.def(

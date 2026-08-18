@@ -119,8 +119,87 @@ def _is_gfx906_qwen35_gguf(model_config: ModelConfig | None) -> bool:
     )
 
 
+def _is_gfx906_gguf(model_config: ModelConfig | None) -> bool:
+    if model_config is None or model_config.quantization != "gguf":
+        return False
+
+    from vllm.platforms import current_platform
+
+    capability = current_platform.get_device_capability()
+    major = getattr(capability, "major", None)
+    minor = getattr(capability, "minor", None)
+    if isinstance(capability, tuple):
+        major, minor = capability[:2]
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and major == 9
+        and minor == 0
+    )
+
+
+def _auto_enable_async_scheduling_for_gfx906_gguf(
+    model_config: ModelConfig | None,
+) -> bool:
+    if os.getenv("VLLM_GGUF_GFX906_AUTO_ASYNC_SCHEDULING", "1").lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False
+    return _is_gfx906_gguf(model_config)
+
+
 def needs_qwen35_gguf_piecewise_cudagraph(model_config: ModelConfig | None) -> bool:
+    if os.getenv("VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        logger.warning_once(
+            "VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH is set. This bypasses "
+            "the gfx906 Qwen3.5 GGUF PIECEWISE CUDA graph safety guard and "
+            "is intended only for debugging known FULL decode graph "
+            "correctness issues."
+        )
+        return False
     return _is_gfx906_qwen35_gguf(model_config)
+
+
+def needs_qwen35_gguf_eager_decode(model_config: ModelConfig | None) -> bool:
+    if os.getenv("VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+    if os.getenv("VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        logger.warning_once(
+            "VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH is set. This "
+            "restores the old compiled gfx906 Qwen3.5 GGUF PIECEWISE CUDA "
+            "graph fallback for debugging, although local benchmarks showed "
+            "it is slower than eager decode for this path."
+        )
+        return False
+    return _is_gfx906_qwen35_gguf(model_config)
+
+
+def prefer_eager_custom_ops_for_qwen35_gguf(
+    compilation_config: CompilationConfig,
+) -> None:
+    custom_ops = compilation_config.custom_ops
+    while "none" in custom_ops:
+        custom_ops.remove("none")
+    if "all" not in custom_ops:
+        custom_ops.append("all")
 
 
 OPTIMIZATION_LEVEL_00 = {
@@ -576,8 +655,8 @@ class VllmConfig:
                     f"`{executor_backend}`."
                 )
         elif self.scheduler_config.async_scheduling is None:
-            # Enable async scheduling unless there is an incompatible option.
-            # NOTE: we won't reach here until async scheduling is enabled by default.
+            # Enable async scheduling only for measured model/platform
+            # combinations unless there is an incompatible option.
             if (
                 self.parallel_config.pipeline_parallel_size > 1
                 or self.speculative_config is not None
@@ -595,8 +674,16 @@ class VllmConfig:
                     executor_backend,
                 )
                 self.scheduler_config.async_scheduling = False
-            else:
+            elif _auto_enable_async_scheduling_for_gfx906_gguf(self.model_config):
+                logger.info(
+                    "Enabling async scheduling by default for GGUF on gfx906 "
+                    "ROCm to reduce batch=1 scheduler/token synchronization "
+                    "overhead. Use --no-async-scheduling or set "
+                    "VLLM_GGUF_GFX906_AUTO_ASYNC_SCHEDULING=0 to disable."
+                )
                 self.scheduler_config.async_scheduling = True
+            else:
+                self.scheduler_config.async_scheduling = False
 
         from vllm.platforms import current_platform
 
@@ -689,6 +776,32 @@ class VllmConfig:
                 self.compilation_config.custom_ops.append("+rms_norm")
 
         if current_platform.support_static_graph_mode():
+            if (
+                self.model_config is not None
+                and needs_qwen35_gguf_eager_decode(self.model_config)
+                and (
+                    self.compilation_config.mode != CompilationMode.NONE
+                    or self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                )
+            ):
+                logger.warning_once(
+                    "Qwen3.5 GGUF on gfx906 is faster and avoids known "
+                    "GatedDeltaNet state update graph hazards with eager "
+                    "decode. Overriding compilation mode and cudagraph_mode "
+                    "to NONE. Set "
+                    "VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH=1 to restore "
+                    "the previous compiled PIECEWISE fallback for debugging."
+                )
+                self.compilation_config.mode = CompilationMode.NONE
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                self.compilation_config.max_cudagraph_capture_size = 0
+                self.compilation_config.cudagraph_capture_sizes = []
+                self.compilation_config.cudagraph_num_of_warmups = 0
+                self.model_config.enforce_eager = True
+                prefer_eager_custom_ops_for_qwen35_gguf(
+                    self.compilation_config
+                )
+
             # if cudagraph_mode has full cudagraphs, we need to check support
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
                 # decode context parallel does not support full cudagraphs

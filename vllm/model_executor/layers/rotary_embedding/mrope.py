@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import numpy as np
 import torch
 
@@ -11,6 +13,13 @@ from vllm.triton_utils import tl, triton
 from .base import RotaryEmbeddingBase
 from .common import apply_rotary_emb_dispatch
 from .yarn_scaling_rope import YaRNScalingRotaryEmbedding, yarn_get_mscale
+
+ENABLE_GFX906_TRITON_MROPE = os.getenv("VLLM_GFX906_TRITON_MROPE", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 @triton.jit
@@ -330,7 +339,10 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         assert positions.ndim == 1 or positions.ndim == 2
         assert key is not None
 
-        if torch.compiler.is_compiling() or self._use_native_rocm_gfx90:
+        if (
+            torch.compiler.is_compiling()
+            or (self._use_native_rocm_gfx90 and not ENABLE_GFX906_TRITON_MROPE)
+        ):
             return self.forward_native(positions, query, key, offsets)
 
         self._match_cos_sin_cache_dtype(query)

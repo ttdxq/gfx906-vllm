@@ -36,6 +36,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.dynamic_4bit import (
 from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
     ExllamaLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.gfx906_gptq_wna16 import (
+    Gfx906GPTQWNA16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
@@ -140,6 +143,13 @@ except ImportError:
     MarlinLinearKernel = None
 
 try:
+    from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
+        TritonW4A16LinearKernel,
+    )
+except ImportError:
+    TritonW4A16LinearKernel = None
+
+try:
     from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
         XPUwNa16LinearKernel,
     )
@@ -230,6 +240,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         ExllamaLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        Gfx906GPTQWNA16LinearKernel,
         ConchLinearKernel,
         ExllamaLinearKernel,
     ],
@@ -261,10 +272,93 @@ if MarlinLinearKernel is not None:
     _POSSIBLE_KERNELS[PlatformEnum.CUDA].insert(
         len(_POSSIBLE_KERNELS[PlatformEnum.CUDA]) - 2, MarlinLinearKernel
     )
+if TritonW4A16LinearKernel is not None:
+    _POSSIBLE_KERNELS[PlatformEnum.ROCM].insert(1, TritonW4A16LinearKernel)
 if XPUwNa16LinearKernel is not None:
     _POSSIBLE_KERNELS[PlatformEnum.XPU].append(XPUwNa16LinearKernel)
 if TorchWNA16LinearKernel is not None:
     _POSSIBLE_KERNELS[PlatformEnum.ROCM].append(TorchWNA16LinearKernel)
+
+_LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
+    "cutlass": {
+        kernel
+        for kernel in (
+            CutlassInt8ScaledMMLinearKernel,
+            CutlassFP8ScaledMMLinearKernel,
+            CutlassW4A8LinearKernel,
+        )
+        if kernel is not None
+    },
+    "marlin": {kernel for kernel in (MarlinLinearKernel,) if kernel is not None},
+    "triton": {
+        kernel
+        for kernel in (
+            TritonInt8ScaledMMLinearKernel,
+            TritonW4A16LinearKernel,
+        )
+        if kernel is not None
+    },
+    "torch": {
+        kernel
+        for kernel in (
+            PerTensorTorchFP8ScaledMMLinearKernel,
+            ChannelWiseTorchFP8ScaledMMLinearKernel,
+            RowWiseTorchFP8ScaledMMLinearKernel,
+            TorchWNA16LinearKernel,
+        )
+        if kernel is not None
+    },
+    "gfx906_gptq": {
+        kernel for kernel in (Gfx906GPTQWNA16LinearKernel,) if kernel is not None
+    },
+    "aiter": {
+        kernel for kernel in (AiterInt8ScaledMMLinearKernel,) if kernel is not None
+    },
+    "conch": {ConchLinearKernel},
+    "exllama": {ExllamaLinearKernel},
+}
+
+
+def _get_linear_backend() -> str:
+    """Return the requested quantized-linear backend.
+
+    Upstream stores this on KernelConfig. This branch has not fully backported
+    KernelConfig yet, so also allow additional_config/env to drive local tests.
+    """
+    env_backend = os.environ.get("VLLM_LINEAR_BACKEND")
+    if env_backend:
+        return env_backend.lower().replace("-", "_")
+
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+    except Exception:
+        return "auto"
+
+    if config is None:
+        return "auto"
+
+    kernel_config = getattr(config, "kernel_config", None)
+    if kernel_config is not None:
+        backend = getattr(kernel_config, "linear_backend", "auto")
+        if isinstance(backend, str):
+            return backend.lower().replace("-", "_")
+
+    additional_config = getattr(config, "additional_config", {}) or {}
+    if isinstance(additional_config, dict):
+        backend = additional_config.get("linear_backend")
+        if isinstance(backend, str):
+            return backend.lower().replace("-", "_")
+
+    return "auto"
+
+
+def _filter_kernels_by_backend(backend: str, kernels: list[type]) -> list[type]:
+    backend_kernels = _LINEAR_BACKEND_KERNEL_MAP.get(backend)
+    if backend_kernels is None:
+        raise ValueError(f"Unknown linear backend: {backend!r}")
+    return [kernel for kernel in kernels if kernel in backend_kernels]
 
 _KernelT = TypeVar("_KernelT", bound=ScaledMMLinearKernel)
 _KernelConfigT = TypeVar("_KernelConfigT", bound=ScaledMMLinearLayerConfig)
@@ -341,7 +435,18 @@ def choose_scaled_mm_linear_kernel(
             scope="global",
         )
 
-    for kernel in possible_kernels[current_platform._enum]:
+    platform_kernels = possible_kernels[current_platform._enum]
+    linear_backend = _get_linear_backend()
+    if linear_backend != "auto":
+        filtered = _filter_kernels_by_backend(linear_backend, platform_kernels)
+        if not filtered:
+            raise ValueError(
+                f"linear_backend={linear_backend} was requested but no "
+                f"'{linear_backend}' kernel exists for this layer type."
+            )
+        platform_kernels = filtered
+
+    for kernel in platform_kernels:
         is_supported_and_can_implement, failure_reason = (
             is_supported_and_can_implement_kernel(kernel, config, compute_capability)
         )
@@ -450,8 +555,19 @@ def choose_mp_linear_kernel(
         if _cc is not None:
             compute_capability = _cc[0] * 10 + _cc[1]
 
+    platform_kernels = _POSSIBLE_KERNELS[current_platform._enum]
+    linear_backend = _get_linear_backend()
+    if linear_backend != "auto":
+        filtered = _filter_kernels_by_backend(linear_backend, platform_kernels)
+        if not filtered:
+            raise ValueError(
+                f"linear_backend={linear_backend} was requested but no "
+                f"'{linear_backend}' kernel exists for mixed-precision layers."
+            )
+        platform_kernels = filtered
+
     failure_reasons = []
-    for kernel in _POSSIBLE_KERNELS[current_platform._enum]:
+    for kernel in platform_kernels:
         if kernel.__name__ in envs.VLLM_DISABLED_KERNELS:
             failure_reasons.append(
                 f" {kernel.__name__} disabled by environment variable"

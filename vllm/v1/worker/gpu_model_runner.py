@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
@@ -188,6 +189,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        sampled_token_ids_cpu: torch.Tensor | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -205,9 +207,15 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
-            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
-                "cpu", non_blocking=True
-            )
+            if sampled_token_ids_cpu is None:
+                self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+                    "cpu", non_blocking=True
+                )
+            else:
+                self.sampled_token_ids_cpu = sampled_token_ids_cpu
+                self.sampled_token_ids_cpu.copy_(
+                    self._sampled_token_ids, non_blocking=True
+                )
             self._logprobs_tensors_cpu = (
                 self._logprobs_tensors.to_cpu_nonblocking()
                 if self._logprobs_tensors
@@ -457,6 +465,11 @@ class GPUModelRunner(
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
+        self._async_output_cpu_buffer_enabled = os.getenv(
+            "VLLM_DISABLE_ASYNC_OUTPUT_CPU_BUFFER_CACHE", ""
+        ).lower() not in {"1", "true", "yes", "on"}
+        self._async_output_cpu_buffers: list[torch.Tensor] = []
+        self._async_output_cpu_buffer_index = 0
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -475,6 +488,9 @@ class GPUModelRunner(
         self.positions = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
+        )
+        self.single_decode_logits_indices = torch.zeros(
+            1, dtype=torch.int32, device=self.device
         )
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
@@ -598,10 +614,92 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        self._runner_profile_enabled = os.getenv(
+            "VLLM_GFX906_RUNNER_PROFILE", "0"
+        ).lower() in {"1", "true", "yes", "on"}
+        self._runner_profile_limit = int(
+            os.getenv("VLLM_GFX906_RUNNER_PROFILE_LIMIT", "32")
+        )
+        self._runner_profile_execute_count = 0
+        self._runner_profile_sample_count = 0
+        self._disable_single_decode_hidden_select_fastpath = os.getenv(
+            "VLLM_DISABLE_SINGLE_DECODE_HIDDEN_SELECT_FASTPATH", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        self._disable_single_decode_prep_fastpath = os.getenv(
+            "VLLM_DISABLE_SINGLE_DECODE_PREP_FASTPATH", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        self._disable_single_decode_block_table_cache = os.getenv(
+            "VLLM_DISABLE_SINGLE_DECODE_BLOCK_TABLE_CACHE", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        self._single_decode_block_table_cache: list[tuple[str, int, int] | None] = []
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
             self.mm_budget.reset_cache()
+
+    def _get_async_output_cpu_buffer(
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs_tensors: LogprobsTensors | None,
+    ) -> torch.Tensor | None:
+        if (
+            not self._async_output_cpu_buffer_enabled
+            or logprobs_tensors is not None
+            or sampled_token_ids.dim() != 2
+            or sampled_token_ids.shape[1] != 1
+            or sampled_token_ids.shape[0] > self.max_num_reqs
+        ):
+            return None
+
+        if not self._async_output_cpu_buffers:
+            # The async batch queue currently keeps at most a few in-flight
+            # decode outputs. Four buffers avoid reuse before EngineCore pops
+            # the oldest future while keeping the cache tiny.
+            try:
+                self._async_output_cpu_buffers = [
+                    torch.empty(
+                        (self.max_num_reqs, 1),
+                        dtype=sampled_token_ids.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    for _ in range(4)
+                ]
+            except RuntimeError:
+                self._async_output_cpu_buffer_enabled = False
+                return None
+
+        buffer = self._async_output_cpu_buffers[
+            self._async_output_cpu_buffer_index
+        ]
+        self._async_output_cpu_buffer_index = (
+            self._async_output_cpu_buffer_index + 1
+        ) % len(self._async_output_cpu_buffers)
+        return buffer[: sampled_token_ids.shape[0], : sampled_token_ids.shape[1]]
+
+    def _runner_profile_mark(self) -> float:
+        if not self._runner_profile_enabled:
+            return 0.0
+        torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def _runner_profile_ms(self, start: float, end: float) -> float:
+        if not self._runner_profile_enabled:
+            return 0.0
+        return (end - start) * 1000.0
+
+    def _select_sample_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            hidden_states.shape[0] == 1
+            and logits_indices.shape[0] == 1
+            and not self._disable_single_decode_hidden_select_fastpath
+        ):
+            return hidden_states
+        return hidden_states[logits_indices]
 
     @torch.inference_mode()
     def init_fp8_kv_scales(self) -> None:
@@ -1266,6 +1364,98 @@ class GPUModelRunner(
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
         )
 
+    def _try_prepare_single_decode_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+    ) -> tuple[torch.Tensor, None] | None:
+        """Fast path for the common single-request, single-token decode case."""
+        if self._disable_single_decode_prep_fastpath:
+            return None
+        if scheduler_output.total_num_scheduled_tokens != 1:
+            return None
+        if self.input_batch.num_reqs != 1:
+            return None
+        if int(num_scheduled_tokens[0]) != 1:
+            return None
+        if (
+            self.is_pooling_model
+            or self.supports_mm_inputs
+            or self.enable_prompt_embeds
+            or self.uses_mrope
+            or self.uses_xdrope_dim > 0
+            or self.speculative_config
+            or self.lora_config
+            or self.input_batch.req_prompt_embeds
+            or scheduler_output.scheduled_spec_decode_tokens
+        ):
+            return None
+
+        block_tables = self.input_batch.block_table.block_tables
+        if any(
+            block_table.pcp_world_size != 1 or block_table.dcp_world_size != 1
+            for block_table in block_tables
+        ):
+            return None
+
+        req_id = self.input_batch.req_ids[0]
+        assert req_id is not None
+
+        position = int(self.input_batch.num_computed_tokens_cpu[0])
+        self.positions.np[0] = position
+        prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        if prev_sampled_token_ids is None:
+            self.input_ids.cpu[0] = self.input_batch.token_ids_cpu[0, position]
+            copy_input_ids_to_gpu = True
+        else:
+            prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+            if (
+                prev_req_id_to_index is None
+                or prev_req_id_to_index.get(req_id) != 0
+                or prev_sampled_token_ids.shape != (1, 1)
+            ):
+                return None
+            self.input_ids.gpu[:1].copy_(
+                prev_sampled_token_ids[:, 0], non_blocking=True
+            )
+            copy_input_ids_to_gpu = False
+
+        if len(self._single_decode_block_table_cache) != len(block_tables):
+            self._single_decode_block_table_cache = [None] * len(block_tables)
+
+        for i, block_table in enumerate(block_tables):
+            block_index = position // block_table.block_size
+            block_number = block_table.block_table.np[0, block_index]
+            cache_key = (req_id, block_index, int(block_number))
+            if (
+                self._disable_single_decode_block_table_cache
+                or self._single_decode_block_table_cache[i] != cache_key
+            ):
+                block_table.commit_block_table(1)
+                self._single_decode_block_table_cache[i] = cache_key
+            block_offset = position % block_table.block_size
+            block_table.slot_mapping.np[0] = (
+                int(block_number) * block_table.block_size + block_offset
+            )
+            block_table.commit_slot_mapping(1)
+
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1] = 1
+        self.query_start_loc.copy_to_gpu(2)
+
+        seq_len = position + 1
+        self.seq_lens.np[0] = seq_len
+        self.seq_lens.copy_to_gpu(1)
+
+        self.discard_request_mask.np[0] = seq_len < self.requests[req_id].num_tokens
+        self.discard_request_mask.copy_to_gpu(1)
+
+        if copy_input_ids_to_gpu:
+            self.input_ids.copy_to_gpu(1)
+        self.positions.copy_to_gpu(1)
+
+        return self.single_decode_logits_indices, None
+
     def _get_encoder_seq_lens(
         self,
         num_scheduled_tokens: dict[str, int],
@@ -1315,6 +1505,14 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+
+        single_decode_inputs = self._try_prepare_single_decode_inputs(
+            scheduler_output,
+            num_scheduled_tokens,
+        )
+        if single_decode_inputs is not None:
+            return single_decode_inputs
+        self._single_decode_block_table_cache = []
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -2280,9 +2478,10 @@ class GPUModelRunner(
     def get_model(self) -> nn.Module:
         if not hasattr(self, "model"):
             raise ValueError("Cannot get model before model has been initialized")
-        if isinstance(self.model, (CUDAGraphWrapper, UBatchWrapper)):
-            return self.model.unwrap()
-        return self.model
+        model = self.model
+        while isinstance(model, (CUDAGraphWrapper, UBatchWrapper)):
+            model = model.unwrap()
+        return model
 
     def apply_sparse_weight_patches(
         self, patches: Iterable[SparseWeightPatch]
@@ -2959,11 +3158,14 @@ class GPUModelRunner(
         ):
             scheduler_output = deepcopy(scheduler_output)
 
+        profile_start = self._runner_profile_mark()
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
+                profile_update_states_start = self._runner_profile_mark()
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                profile_update_states_end = self._runner_profile_mark()
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -3001,11 +3203,14 @@ class GPUModelRunner(
 
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
+                profile_batch_arrays_start = self._runner_profile_mark()
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+                profile_batch_arrays_end = self._runner_profile_mark()
 
+                profile_prepare_inputs_start = self._runner_profile_mark()
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -3013,6 +3218,7 @@ class GPUModelRunner(
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
+                profile_prepare_inputs_end = self._runner_profile_mark()
 
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
@@ -3024,6 +3230,7 @@ class GPUModelRunner(
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                profile_batch_desc_start = self._runner_profile_mark()
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -3036,6 +3243,7 @@ class GPUModelRunner(
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                 )
+                profile_batch_desc_end = self._runner_profile_mark()
 
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -3054,6 +3262,7 @@ class GPUModelRunner(
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+                profile_attn_metadata_start = self._runner_profile_mark()
                 (attn_metadata, spec_decode_common_attn_metadata) = (
                     self._build_attention_metadata(
                         num_tokens=num_tokens_unpadded,
@@ -3068,7 +3277,9 @@ class GPUModelRunner(
                         cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     )
                 )
+                profile_attn_metadata_end = self._runner_profile_mark()
 
+            profile_preprocess_tail_start = self._runner_profile_mark()
             (
                 input_ids,
                 inputs_embeds,
@@ -3079,6 +3290,8 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+            profile_preprocess_tail_end = self._runner_profile_mark()
+        profile_after_preprocess = self._runner_profile_mark()
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -3110,7 +3323,11 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        profile_after_forward = self._runner_profile_mark()
 
+        profile_select_ms = 0.0
+        profile_logits_ms = 0.0
+        profile_postprocess_start = self._runner_profile_mark()
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -3137,13 +3354,32 @@ class GPUModelRunner(
                     output.kv_connector_output = kv_connector_output
                     return output
 
-                sample_hidden_states = hidden_states[logits_indices]
+                profile_select_start = self._runner_profile_mark()
+                sample_hidden_states = self._select_sample_hidden_states(
+                    hidden_states, logits_indices
+                )
+                profile_select_end = self._runner_profile_mark()
+                profile_logits_start = self._runner_profile_mark()
                 logits = self.model.compute_logits(sample_hidden_states)
+                profile_logits_end = self._runner_profile_mark()
+                profile_logits_ms += self._runner_profile_ms(
+                    profile_logits_start, profile_logits_end
+                )
+                profile_select_ms += self._runner_profile_ms(
+                    profile_select_start, profile_select_end
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
-                sample_hidden_states = hidden_states[logits_indices]
+                profile_select_start = self._runner_profile_mark()
+                sample_hidden_states = self._select_sample_hidden_states(
+                    hidden_states, logits_indices
+                )
+                profile_select_end = self._runner_profile_mark()
+                profile_select_ms += self._runner_profile_ms(
+                    profile_select_start, profile_select_end
+                )
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
@@ -3157,7 +3393,12 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
+                    profile_logits_start = self._runner_profile_mark()
                     logits = self.model.compute_logits(sample_hidden_states)
+                    profile_logits_end = self._runner_profile_mark()
+                    profile_logits_ms += self._runner_profile_ms(
+                        profile_logits_start, profile_logits_end
+                    )
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -3168,6 +3409,56 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+        profile_end = self._runner_profile_mark()
+        if self._runner_profile_enabled:
+            self._runner_profile_execute_count += 1
+            if self._runner_profile_execute_count <= self._runner_profile_limit:
+                logger.info(
+                    "GFX906_RUNNER_PROFILE execute step=%d reqs=%d tokens=%d "
+                    "max_scheduled=%d padded_tokens=%d cudagraph=%s "
+                    "preprocess=%.3fms forward=%.3fms select=%.3fms "
+                    "logits=%.3fms postprocess=%.3fms total=%.3fms",
+                    self._runner_profile_execute_count,
+                    num_reqs,
+                    num_tokens_unpadded,
+                    max_num_scheduled_tokens,
+                    num_tokens_padded,
+                    cudagraph_mode,
+                    self._runner_profile_ms(profile_start, profile_after_preprocess),
+                    self._runner_profile_ms(
+                        profile_after_preprocess, profile_after_forward
+                    ),
+                    profile_select_ms,
+                    profile_logits_ms,
+                    self._runner_profile_ms(profile_postprocess_start, profile_end),
+                    self._runner_profile_ms(profile_start, profile_end),
+                )
+                logger.info(
+                    "GFX906_RUNNER_PROFILE preprocess_detail step=%d "
+                    "update_states=%.3fms batch_arrays=%.3fms "
+                    "prepare_inputs=%.3fms batch_desc=%.3fms "
+                    "attn_metadata=%.3fms tail=%.3fms total=%.3fms",
+                    self._runner_profile_execute_count,
+                    self._runner_profile_ms(
+                        profile_update_states_start, profile_update_states_end
+                    ),
+                    self._runner_profile_ms(
+                        profile_batch_arrays_start, profile_batch_arrays_end
+                    ),
+                    self._runner_profile_ms(
+                        profile_prepare_inputs_start, profile_prepare_inputs_end
+                    ),
+                    self._runner_profile_ms(
+                        profile_batch_desc_start, profile_batch_desc_end
+                    ),
+                    self._runner_profile_ms(
+                        profile_attn_metadata_start, profile_attn_metadata_end
+                    ),
+                    self._runner_profile_ms(
+                        profile_preprocess_tail_start, profile_preprocess_tail_end
+                    ),
+                    self._runner_profile_ms(profile_start, profile_after_preprocess),
+                )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -3219,14 +3510,17 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        profile_start = self._runner_profile_mark()
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
+        profile_after_grammar = self._runner_profile_mark()
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        profile_after_sample = self._runner_profile_mark()
 
         self.input_batch.prev_sampled_token_ids = None
 
@@ -3305,6 +3599,7 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+        profile_after_bookkeep = self._runner_profile_mark()
 
         if (
             self.speculative_config
@@ -3317,6 +3612,7 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
+        profile_after_eplb = self._runner_profile_mark()
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -3331,12 +3627,34 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
             )
+        profile_after_output = self._runner_profile_mark()
+        if self._runner_profile_enabled:
+            self._runner_profile_sample_count += 1
+            if self._runner_profile_sample_count <= self._runner_profile_limit:
+                logger.info(
+                    "GFX906_RUNNER_PROFILE sample step=%d reqs=%d tokens=%d "
+                    "grammar=%.3fms sample=%.3fms bookkeep=%.3fms "
+                    "eplb=%.3fms output=%.3fms total=%.3fms",
+                    self._runner_profile_sample_count,
+                    self.input_batch.num_reqs,
+                    scheduler_output.total_num_scheduled_tokens,
+                    self._runner_profile_ms(profile_start, profile_after_grammar),
+                    self._runner_profile_ms(profile_after_grammar, profile_after_sample),
+                    self._runner_profile_ms(profile_after_sample, profile_after_bookkeep),
+                    self._runner_profile_ms(profile_after_bookkeep, profile_after_eplb),
+                    self._runner_profile_ms(profile_after_eplb, profile_after_output),
+                    self._runner_profile_ms(profile_start, profile_after_output),
+                )
 
         if not self.use_async_scheduling:
             return output
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
+            sampled_token_ids_cpu = self._get_async_output_cpu_buffer(
+                sampler_output.sampled_token_ids,
+                sampler_output.logprobs_tensors,
+            )
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -3344,6 +3662,7 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
+                sampled_token_ids_cpu=sampled_token_ids_cpu,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
@@ -4230,7 +4549,10 @@ class GPUModelRunner(
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
         )
-        return hidden_states, hidden_states[logit_indices_device]
+        last_hidden_states = self._select_sample_hidden_states(
+            hidden_states, logit_indices_device
+        )
+        return hidden_states, last_hidden_states
 
     @torch.inference_mode()
     def _dummy_sampler_run(

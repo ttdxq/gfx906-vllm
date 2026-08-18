@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+from functools import lru_cache
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+ENABLE_GFX906_TRITON_RESHAPE_CACHE = os.getenv(
+    "VLLM_GFX906_TRITON_RESHAPE_CACHE", "1"
+).lower() in {"1", "true", "yes", "on"}
 
+
+@lru_cache(maxsize=1)
 def _is_gfx906_rocm() -> bool:
     capability = current_platform.get_device_capability()
     return (
@@ -193,7 +201,7 @@ def triton_reshape_and_cache_flash(
         "fp8e5m2, uint8, bfloat16, float16, float32, fp8e4m3fnuz."
     )
 
-    if _is_gfx906_rocm():
+    if _is_gfx906_rocm() and not ENABLE_GFX906_TRITON_RESHAPE_CACHE:
         _reshape_and_cache_flash_eager(
             key=key,
             value=value,

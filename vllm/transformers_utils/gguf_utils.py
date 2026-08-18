@@ -157,24 +157,27 @@ def _read_gguf_scalar(
 
 
 def qwen35_gguf_config_dict(model: str) -> dict | None:
-    """Build a Qwen3.5 config dict from qwen35 GGUF metadata."""
+    """Build a Qwen3.5 config dict from qwen35/qwen35moe GGUF metadata."""
     try:
         reader = gguf.GGUFReader(str(model))
     except Exception:
         return None
 
-    if _read_gguf_scalar(reader, "general.architecture") != "qwen35":
+    arch = _read_gguf_scalar(reader, "general.architecture")
+    if arch not in ("qwen35", "qwen35moe"):
         return None
+    prefix = str(arch)
+    is_moe = arch == "qwen35moe"
 
     tokens = _read_gguf_scalar(reader, "tokenizer.ggml.tokens", [])
     linear_key_head_dim = int(
-        _read_gguf_scalar(reader, "qwen35.ssm.state_size", 128)
+        _read_gguf_scalar(reader, f"{prefix}.ssm.state_size", 128)
     )
     linear_value_head_dim = int(
-        _read_gguf_scalar(reader, "qwen35.ssm.state_size", 128)
+        _read_gguf_scalar(reader, f"{prefix}.ssm.state_size", 128)
     )
     linear_num_key_heads = int(
-        _read_gguf_scalar(reader, "qwen35.ssm.group_count")
+        _read_gguf_scalar(reader, f"{prefix}.ssm.group_count")
     )
     qkv_tensor = next(
         (tensor for tensor in reader.tensors if tensor.name == "blk.0.attn_qkv.weight"),
@@ -187,7 +190,12 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
         (qkv_dim - 2 * linear_num_key_heads * linear_key_head_dim)
         // linear_value_head_dim
     )
-    num_hidden_layers = int(_read_gguf_scalar(reader, "qwen35.block_count"))
+    num_nextn_predict_layers = int(
+        _read_gguf_scalar(reader, f"{prefix}.nextn_predict_layers", 0)
+    )
+    num_hidden_layers = int(_read_gguf_scalar(reader, f"{prefix}.block_count"))
+    if is_moe:
+        num_hidden_layers -= num_nextn_predict_layers
     tensor_names = {tensor.name for tensor in reader.tensors}
     layer_types = [
         (
@@ -199,42 +207,43 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
     ]
 
     text_config = {
-        "model_type": "qwen3_5_text",
+        "model_type": "qwen3_5_moe_text" if is_moe else "qwen3_5_text",
         "vocab_size": len(tokens),
-        "hidden_size": int(_read_gguf_scalar(reader, "qwen35.embedding_length")),
+        "hidden_size": int(_read_gguf_scalar(reader, f"{prefix}.embedding_length")),
+        "hidden_act": "silu",
         "intermediate_size": int(
-            _read_gguf_scalar(reader, "qwen35.feed_forward_length")
+            _read_gguf_scalar(reader, f"{prefix}.feed_forward_length", 0)
         ),
         "num_hidden_layers": num_hidden_layers,
         "num_attention_heads": int(
-            _read_gguf_scalar(reader, "qwen35.attention.head_count")
+            _read_gguf_scalar(reader, f"{prefix}.attention.head_count")
         ),
         "num_key_value_heads": int(
-            _read_gguf_scalar(reader, "qwen35.attention.head_count_kv")
+            _read_gguf_scalar(reader, f"{prefix}.attention.head_count_kv")
         ),
         "max_position_embeddings": int(
-            _read_gguf_scalar(reader, "qwen35.context_length")
+            _read_gguf_scalar(reader, f"{prefix}.context_length")
         ),
         "rms_norm_eps": float(
-            _read_gguf_scalar(reader, "qwen35.attention.layer_norm_rms_epsilon")
+            _read_gguf_scalar(reader, f"{prefix}.attention.layer_norm_rms_epsilon")
         ),
-        "head_dim": int(_read_gguf_scalar(reader, "qwen35.attention.key_length")),
+        "head_dim": int(_read_gguf_scalar(reader, f"{prefix}.attention.key_length")),
         "linear_key_head_dim": linear_key_head_dim,
         "linear_value_head_dim": linear_value_head_dim,
         "linear_conv_kernel_dim": int(
-            _read_gguf_scalar(reader, "qwen35.ssm.conv_kernel", 4)
+            _read_gguf_scalar(reader, f"{prefix}.ssm.conv_kernel", 4)
         ),
         "linear_num_key_heads": linear_num_key_heads,
         "linear_num_value_heads": linear_num_value_heads,
         "full_attention_interval": int(
-            _read_gguf_scalar(reader, "qwen35.full_attention_interval", 4)
+            _read_gguf_scalar(reader, f"{prefix}.full_attention_interval", 4)
         ),
         "layer_types": layer_types,
         "rope_parameters": {
             "rope_type": "default",
-            "rope_theta": float(_read_gguf_scalar(reader, "qwen35.rope.freq_base")),
+            "rope_theta": float(_read_gguf_scalar(reader, f"{prefix}.rope.freq_base")),
             "mrope_section": _read_gguf_scalar(
-                reader, "qwen35.rope.dimension_sections", None
+                reader, f"{prefix}.rope.dimension_sections", None
             ),
             "mrope_interleaved": True,
         },
@@ -245,20 +254,68 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
             tensor.name == "output.weight" for tensor in reader.tensors
         ),
     }
+    if is_moe:
+        text_config.update(
+            {
+                "moe_intermediate_size": int(
+                    _read_gguf_scalar(reader, f"{prefix}.expert_feed_forward_length")
+                ),
+                "shared_expert_intermediate_size": int(
+                    _read_gguf_scalar(
+                        reader, f"{prefix}.expert_shared_feed_forward_length", 0
+                    )
+                ),
+                "num_experts_per_tok": int(
+                    _read_gguf_scalar(reader, f"{prefix}.expert_used_count")
+                ),
+                "num_experts": int(
+                    _read_gguf_scalar(reader, f"{prefix}.expert_count")
+                ),
+                "num_nextn_predict_layers": int(
+                    num_nextn_predict_layers
+                ),
+                "norm_topk_prob": True,
+            }
+        )
 
     config_dict = {
-        "architectures": ["Qwen3_5ForCausalLM"],
-        "model_type": "qwen3_5",
+        "architectures": [
+            "Qwen3_5MoeForConditionalGeneration"
+            if is_moe
+            else "Qwen3_5ForCausalLM"
+        ],
+        "model_type": "qwen3_5_moe" if is_moe else "qwen3_5",
         "text_config": text_config,
     }
-    logger.info("Built Qwen3.5 config from qwen35 GGUF metadata: %s", model)
+    if is_moe:
+        config_dict.update(
+            {
+                key: value
+                for key, value in text_config.items()
+                if key
+                in {
+                    "hidden_size",
+                    "hidden_act",
+                    "moe_intermediate_size",
+                    "shared_expert_intermediate_size",
+                    "num_experts_per_tok",
+                    "num_experts",
+                    "norm_topk_prob",
+                    "rms_norm_eps",
+                }
+            }
+        )
+    logger.info("Built Qwen3.5 config from %s GGUF metadata: %s", arch, model)
     return config_dict
 
 
 def _qwen35_gguf_tokenizer_config(
     reader: gguf.GGUFReader,
 ) -> tuple[dict, dict] | None:
-    if _read_gguf_scalar(reader, "general.architecture") != "qwen35":
+    if _read_gguf_scalar(reader, "general.architecture") not in (
+        "qwen35",
+        "qwen35moe",
+    ):
         return None
 
     parsed = {k: {} for k in GGUF_TO_TRANSFORMERS_MAPPING}

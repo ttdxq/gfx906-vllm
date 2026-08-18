@@ -11,10 +11,10 @@
 numba == 0.61.2 # Required for N-gram speculative decoding
 
 # Dependencies for AMD GPUs
---extra-index-url https://download.pytorch.org/whl/rocm6.3
-torch==2.9.0+rocm6.3
-torchvision==0.24.0+rocm6.3
-torchaudio==2.9.0+rocm6.3
+--extra-index-url https://download.pytorch.org/whl/rocm7.2
+torch==2.11.0+rocm7.2
+torchvision==0.26.0+rocm7.2
+torchaudio==2.11.0+rocm7.2
 datasets
 ray[cgraph]>=2.48.0
 peft

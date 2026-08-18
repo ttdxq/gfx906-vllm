@@ -42,6 +42,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
@@ -59,6 +60,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.gguf import (
+    try_gguf_rms_norm_gated_out_proj_mmvq,
+    try_grouped_gguf_linear_mmvq,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -78,6 +83,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
 )
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from .interfaces import (
     HasInnerState,
@@ -118,6 +124,30 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _qwen35_env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _qwen35_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _qwen35_env_optional_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _append_qwen35_load_debug(message: str) -> None:
     debug_file = os.environ.get("VLLM_QWEN35_LOAD_DEBUG_FILE")
     if not debug_file:
@@ -146,6 +176,20 @@ def _is_qwen35_gguf_projection_aux_param(name: str) -> bool:
             "in_proj_a",
         )
     )
+
+
+def _maybe_unsqueeze_shared_expert_gate(
+    name: str, param: torch.Tensor, loaded_weight: torch.Tensor
+) -> torch.Tensor:
+    if (
+        name.endswith("shared_expert_gate.weight")
+        and loaded_weight.ndim == 1
+        and param.ndim == 2
+        and param.shape[0] == 1
+        and param.shape[1] == loaded_weight.shape[0]
+    ):
+        return loaded_weight.unsqueeze(0)
+    return loaded_weight
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -184,16 +228,18 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             return raw.lower() in {"1", "true", "yes", "on"}
 
         self.split_projections = split_projections
-        self.expand_qk_heads_for_gdn = _env_bool(
-            "VLLM_QWEN35_EXPAND_QK", True
-        )
         capability = current_platform.get_device_capability()
-        default_recurrent_prefill = not (
-            self.split_projections
-            and current_platform.is_rocm()
+        self._qwen35_is_gfx906_rocm = (
+            current_platform.is_rocm()
             and capability is not None
             and capability.major == 9
             and capability.minor == 0
+        )
+        self.expand_qk_heads_for_gdn = _env_bool(
+            "VLLM_QWEN35_EXPAND_QK", True
+        )
+        default_recurrent_prefill = not (
+            self.split_projections and self._qwen35_is_gfx906_rocm
         )
         self.use_recurrent_prefill_for_gdn = _env_bool(
             "VLLM_QWEN35_REC_PREFILL", default_recurrent_prefill
@@ -204,7 +250,26 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         self.use_qk_l2norm_in_kernel_for_gdn = _env_bool(
             "VLLM_QWEN35_QK_L2NORM", True
         )
+        self.use_grouped_gguf_mmvq = _env_bool("VLLM_QWEN35_GROUPED_GGUF_MMVQ", True)
+        self.use_grouped_gguf_ba_mmvq = _env_bool(
+            "VLLM_QWEN35_GROUPED_GGUF_BA_MMVQ", True
+        )
+        self.enable_packed_recurrent_decode = self._use_gfx906_packed_decode_path()
+        self.enable_combined_packed_decode = (
+            self.enable_packed_recurrent_decode
+            and self._qwen35_is_gfx906_rocm
+            and _env_bool("VLLM_QWEN35_COMBINED_PACKED_DECODE", True)
+        )
         self.use_transposed_state_for_packed_decode = self.split_projections
+        self.use_empty_core_attn_out_for_single_token = (
+            self.split_projections
+            and self._qwen35_is_gfx906_rocm
+            and _env_bool("VLLM_QWEN35_EMPTY_CORE_ATTN_SINGLE_TOKEN", True)
+        )
+        self.use_tiled_qk_expand = _env_bool(
+            "VLLM_QWEN35_TILED_QK_EXPAND", self.split_projections
+        )
+        self.call_b_first = os.getenv("VLLM_QWEN35_CALL_ORDER", "ba").lower() != "ab"
         if self.split_projections:
             del self.in_proj_qkvz
             del self.in_proj_ba
@@ -244,6 +309,23 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                 self.value_dim,
             ]
             self.in_proj_ba.output_sizes = [self.num_v_heads, self.num_v_heads]
+        self._qwen35_linear_attn_profile_count = 0
+        self._qwen35_linear_attn_profile_enabled = _qwen35_env_flag(
+            "VLLM_QWEN35_LINEAR_ATTN_PROFILE"
+        )
+        self._qwen35_linear_attn_profile_max_tokens = _qwen35_env_optional_int(
+            "VLLM_QWEN35_LINEAR_ATTN_PROFILE_MAX_TOKENS"
+        )
+        self._qwen35_linear_attn_profile_limit = _qwen35_env_int(
+            "VLLM_QWEN35_LINEAR_ATTN_PROFILE_LIMIT", 4
+        )
+        self._qwen35_gguf_debug_enabled = _env_bool(
+            "VLLM_QWEN35_GGUF_DEBUG", False
+        )
+        self._qwen35_gguf_debug_target_prefix = os.getenv(
+            "VLLM_QWEN35_GGUF_DEBUG_LAYER", "model.layers.0.linear_attn"
+        )
+        self._qwen35_gguf_debug_file = os.getenv("VLLM_QWEN35_GGUF_DEBUG_FILE")
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         capability = current_platform.get_device_capability()
@@ -253,6 +335,11 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             and capability.major == 9
             and capability.minor == 0
         ):
+            if self.cache_config.mamba_cache_dtype != "auto":
+                return super().get_state_dtype()
+            if self.cache_config.mamba_ssm_cache_dtype != "auto":
+                _, temporal_dtype = super().get_state_dtype()
+                return (torch.float32, temporal_dtype)
             return (torch.float32, torch.float32)
         return super().get_state_dtype()
 
@@ -268,11 +355,7 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         if head_ratio <= 1:
             return query.contiguous(), key.contiguous()
 
-        tiled_qk_expand = os.getenv(
-            "VLLM_QWEN35_TILED_QK_EXPAND",
-            "1" if self.split_projections else "0",
-        )
-        if tiled_qk_expand.lower() in {"1", "true", "yes", "on"}:
+        if self.use_tiled_qk_expand:
             query = query.repeat(1, 1, head_ratio, 1)
             key = key.repeat(1, 1, head_ratio, 1)
         else:
@@ -295,11 +378,9 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         return raw.lower() in {"1", "true", "yes", "on"}
 
     def _maybe_log_debug_stats(self, **tensors: torch.Tensor) -> None:
-        if os.getenv("VLLM_QWEN35_GGUF_DEBUG", "0") != "1":
+        if not self._qwen35_gguf_debug_enabled:
             return
-        target_prefix = os.getenv(
-            "VLLM_QWEN35_GGUF_DEBUG_LAYER", "model.layers.0.linear_attn"
-        )
+        target_prefix = self._qwen35_gguf_debug_target_prefix
         prefix_matches = self.prefix == target_prefix or self.prefix.endswith(
             ".layers.0.linear_attn"
         )
@@ -324,13 +405,54 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             *[summarize(name, tensor) for name, tensor in tensors.items()],
         ]
         logger.warning("\n".join(lines))
-        debug_file = os.getenv("VLLM_QWEN35_GGUF_DEBUG_FILE")
+        debug_file = self._qwen35_gguf_debug_file
         if debug_file:
             try:
                 with open(debug_file, "a", encoding="utf-8") as f:
                     f.write("\n".join(lines) + "\n")
             except Exception:
                 pass
+
+    def _use_qwen35_linear_attn_profile(self, hidden_states: torch.Tensor) -> bool:
+        if not self._qwen35_linear_attn_profile_enabled:
+            return False
+        try:
+            if torch._dynamo.is_compiling():
+                return False
+        except AttributeError:
+            pass
+        if not hidden_states.is_cuda:
+            return False
+        max_tokens = self._qwen35_linear_attn_profile_max_tokens
+        if max_tokens is not None and hidden_states.shape[0] > max_tokens:
+            return False
+        return self._qwen35_linear_attn_profile_count < (
+            self._qwen35_linear_attn_profile_limit
+        )
+
+    def _record_qwen35_linear_attn_profile(
+        self,
+        hidden_states: torch.Tensor,
+        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]],
+    ) -> None:
+        torch.cuda.synchronize(hidden_states.device)
+        timings = {name: start.elapsed_time(end) for name, start, end in events}
+        total = sum(timings.values())
+        logger.warning(
+            "QWEN35_LINEAR_ATTN_PROFILE prefix=%s tokens=%d proj=%.4fms "
+            "core=%.4fms out=%.4fms total=%.4fms split=%s grouped=%s "
+            "combined_decode=%s",
+            self.prefix,
+            hidden_states.shape[0],
+            timings.get("proj", 0.0),
+            timings.get("core", 0.0),
+            timings.get("out", 0.0),
+            total,
+            self.split_projections,
+            self.use_grouped_gguf_mmvq,
+            self.enable_combined_packed_decode,
+        )
+        self._qwen35_linear_attn_profile_count += 1
 
     def fix_query_key_value_ordering(
         self,
@@ -381,27 +503,73 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         output: torch.Tensor,
     ):
         num_tokens = hidden_states.size(0)
+        profile_linear_attn = self._use_qwen35_linear_attn_profile(hidden_states)
+        profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
 
-        if self.split_projections:
-            projected_states_qkv, _ = self.in_proj_qkv(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
-            b, _ = self.in_proj_b(hidden_states)
-            a, _ = self.in_proj_a(hidden_states)
+        def timed(name: str, fn: Callable[[], object]) -> object:
+            if not profile_linear_attn:
+                return fn()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            result = fn()
+            end.record()
+            profile_events.append((name, start, end))
+            return result
 
-            q_size = self.key_dim // self.tp_size
-            k_size = self.key_dim // self.tp_size
-            v_size = self.value_dim // self.tp_size
-            q, k, v = torch.split(
-                projected_states_qkv,
-                [q_size, k_size, v_size],
-                dim=-1,
-            )
+        def run_projections() -> tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]:
+            if self.split_projections:
+                grouped_mmvq = None
+                if self.use_grouped_gguf_mmvq and self.use_grouped_gguf_ba_mmvq:
+                    grouped_mmvq = try_grouped_gguf_linear_mmvq(
+                        hidden_states,
+                        [
+                            self.in_proj_qkv,
+                            self.in_proj_z,
+                            self.in_proj_b,
+                            self.in_proj_a,
+                        ],
+                    )
+                if grouped_mmvq is None:
+                    grouped_mmvq_qkvz = None
+                    if self.use_grouped_gguf_mmvq:
+                        grouped_mmvq_qkvz = try_grouped_gguf_linear_mmvq(
+                            hidden_states,
+                            [self.in_proj_qkv, self.in_proj_z],
+                        )
+                    if grouped_mmvq_qkvz is None:
+                        projected_states_qkv, _ = self.in_proj_qkv(hidden_states)
+                        z, _ = self.in_proj_z(hidden_states)
+                    else:
+                        projected_states_qkv, z = grouped_mmvq_qkvz
+                    b, _ = self.in_proj_b(hidden_states)
+                    a, _ = self.in_proj_a(hidden_states)
+                else:
+                    projected_states_qkv, z, b, a = grouped_mmvq
 
-            mixed_qkv = projected_states_qkv
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b = b.contiguous()
-            a = a.contiguous()
-        else:
+                q_size = self.key_dim // self.tp_size
+                k_size = self.key_dim // self.tp_size
+                v_size = self.value_dim // self.tp_size
+                q, k, v = torch.split(
+                    projected_states_qkv,
+                    [q_size, k_size, v_size],
+                    dim=-1,
+                )
+
+                mixed_qkv = projected_states_qkv
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
+                b = b.contiguous()
+                a = a.contiguous()
+                return mixed_qkv, q, k, v, z, b, a
+
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
             q, k, v, z, b, a = self.fix_query_key_value_ordering(
@@ -412,6 +580,9 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                 (q, k, v),
             )
             mixed_qkv = torch.cat((q, k, v), dim=-1)
+            return mixed_qkv, q, k, v, z, b, a
+
+        mixed_qkv, q, k, v, z, b, a = timed("proj", run_projections)
         self._maybe_log_debug_stats(
             hidden_states=hidden_states,
             mixed_qkv=mixed_qkv,
@@ -425,30 +596,62 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
 
         b = b.contiguous()
         a = a.contiguous()
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+        core_attn_out_shape = (
+            num_tokens,
+            self.num_v_heads // self.tp_size,
+            self.head_v_dim,
+        )
+        core_attn_out_factory = torch.zeros
+        if (
+            self.use_empty_core_attn_out_for_single_token
+            and num_tokens == 1
+        ) or self._packed_decode_writes_full_core_output(num_tokens):
+            core_attn_out_factory = torch.empty
+        core_attn_out = core_attn_out_factory(
+            core_attn_out_shape,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
 
-        call_b_first = os.getenv("VLLM_QWEN35_CALL_ORDER", "ba").lower() != "ab"
-        torch.ops.vllm.gdn_attention_core(
-            mixed_qkv,
-            b if call_b_first else a,
-            a if call_b_first else b,
-            core_attn_out,
-            self.prefix,
+        timed(
+            "core",
+            lambda: torch.ops.vllm.gdn_attention_core(
+                mixed_qkv,
+                b if self.call_b_first else a,
+                a if self.call_b_first else b,
+                core_attn_out,
+                self.prefix,
+            ),
         )
         self._maybe_log_debug_stats(core_attn_out=core_attn_out)
 
-        z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        self._maybe_log_debug_stats(post_norm=core_attn_out)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens], _ = self.out_proj(core_attn_out)
+        def run_out_proj() -> torch.Tensor:
+            projected_out = try_gguf_rms_norm_gated_out_proj_mmvq(
+                core_attn_out,
+                self.norm.weight,
+                z,
+                self.out_proj,
+                self.norm.eps,
+                self.norm.norm_before_gate,
+            )
+            if projected_out is not None:
+                return projected_out
+            z_shape_og = z.shape
+            local_core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+            local_z = z.reshape(-1, z.shape[-1])
+            local_core_attn_out = self.norm(local_core_attn_out, local_z)
+            self._maybe_log_debug_stats(post_norm=local_core_attn_out)
+            local_core_attn_out = local_core_attn_out.reshape(z_shape_og)
+            local_core_attn_out = rearrange(
+                local_core_attn_out, "... h d -> ... (h d)"
+            )
+            projected_out, _ = self.out_proj(local_core_attn_out)
+            return projected_out
+
+        projected_out = timed("out", run_out_proj)
+        output[:num_tokens] = projected_out
+        if profile_linear_attn:
+            self._record_qwen35_linear_attn_profile(hidden_states, profile_events)
 
     def _use_gfx906_chunk_decode_path(self) -> bool:
         raw = os.getenv("VLLM_QWEN35_CHUNK_DECODE")
@@ -461,6 +664,32 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             and capability is not None
             and capability.major == 9
             and capability.minor == 0
+        )
+
+    def _packed_decode_writes_full_core_output(self, num_tokens: int) -> bool:
+        try:
+            if torch._dynamo.is_compiling():
+                return False
+        except AttributeError:
+            pass
+        if not (
+            self.enable_packed_recurrent_decode and self._qwen35_is_gfx906_rocm
+        ):
+            return False
+        try:
+            attn_metadata = get_forward_context().attn_metadata
+        except Exception:
+            return False
+        if not isinstance(attn_metadata, dict) or self.prefix not in attn_metadata:
+            return False
+        gdn_metadata = attn_metadata[self.prefix]
+        if not isinstance(gdn_metadata, GDNAttentionMetadata):
+            return False
+        return (
+            gdn_metadata.spec_sequence_masks is None
+            and gdn_metadata.num_prefills == 0
+            and gdn_metadata.num_decodes > 0
+            and gdn_metadata.num_actual_tokens == num_tokens
         )
 
 
@@ -483,7 +712,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.layer_idx = extract_layer_index(prefix)
 
         if self.layer_type == "linear_attention":
-            if vllm_config.model_config.quantization == "gguf":
+            if vllm_config.model_config.quantization in {
+                "gguf",
+                "compressed-tensors",
+            }:
                 self.linear_attn = Qwen3_5GatedDeltaNet(
                     config,
                     model_config=model_config,
@@ -553,6 +785,153 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
+
+        self._qwen35_profile_count = 0
+        self._qwen35_layer_profile_enabled = _qwen35_env_flag(
+            "VLLM_QWEN35_LAYER_PROFILE"
+        )
+        self._qwen35_layer_profile_max_tokens = _qwen35_env_optional_int(
+            "VLLM_QWEN35_LAYER_PROFILE_MAX_TOKENS"
+        )
+        self._qwen35_layer_profile_limit = _qwen35_env_int(
+            "VLLM_QWEN35_LAYER_PROFILE_LIMIT", 2
+        )
+
+    def _use_qwen35_layer_profile(self, hidden_states: torch.Tensor) -> bool:
+        if not self._qwen35_layer_profile_enabled:
+            return False
+        try:
+            if torch._dynamo.is_compiling():
+                return False
+        except AttributeError:
+            pass
+        if not hidden_states.is_cuda:
+            return False
+        max_tokens = self._qwen35_layer_profile_max_tokens
+        if max_tokens is not None and hidden_states.shape[0] > max_tokens:
+            return False
+        return self._qwen35_profile_count < self._qwen35_layer_profile_limit
+
+    def _record_qwen35_profile(
+        self,
+        hidden_states: torch.Tensor,
+        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]],
+    ) -> None:
+        torch.cuda.synchronize(hidden_states.device)
+        timings = {name: start.elapsed_time(end) for name, start, end in events}
+        total = sum(timings.values())
+        logger.warning(
+            "QWEN35_LAYER_PROFILE layer=%s type=%s tokens=%d norm1=%.4fms "
+            "attn=%.4fms norm2=%.4fms mlp=%.4fms total=%.4fms",
+            self.layer_idx,
+            self.layer_type,
+            hidden_states.shape[0],
+            timings.get("norm1", 0.0),
+            timings.get("attn", 0.0),
+            timings.get("norm2", 0.0),
+            timings.get("mlp", 0.0),
+            total,
+        )
+        self._qwen35_profile_count += 1
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor = None,
+        **kwargs: object,
+    ):
+        if not self._use_qwen35_layer_profile(hidden_states):
+            return super().forward(
+                hidden_states=hidden_states,
+                residual=residual,
+                positions=positions,
+                **kwargs,
+            )
+
+        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+
+        def timed(name: str, fn: Callable[[], object]) -> object:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            result = fn()
+            end.record()
+            events.append((name, start, end))
+            return result
+
+        def run_norm1():
+            nonlocal hidden_states, residual
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
+
+        timed("norm1", run_norm1)
+
+        self_attention_output = torch.empty_like(hidden_states)
+
+        def run_attn():
+            if self.layer_type == "linear_attention":
+                self.linear_attn(
+                    hidden_states=hidden_states,
+                    output=self_attention_output,
+                )
+            elif self.layer_type == "full_attention":
+                self.self_attn(
+                    hidden_states=hidden_states,
+                    output=self_attention_output,
+                    positions=positions,
+                )
+            else:
+                raise ValueError("Invalid layer_type")
+
+        timed("attn", run_attn)
+        hidden_states = self_attention_output
+
+        if self.layer_scale:
+            if len(hidden_states.shape) == 2:
+                hidden_states = hidden_states * (
+                    self.attn_layer_scale.to(hidden_states.dtype)[0] + 1
+                )
+            else:
+                hidden_states = hidden_states * (
+                    self.attn_layer_scale.to(hidden_states.dtype) + 1
+                )
+
+        def run_norm2():
+            nonlocal hidden_states, residual
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+
+        timed("norm2", run_norm2)
+
+        def run_mlp():
+            nonlocal hidden_states
+            hidden_states = self.mlp(hidden_states)
+
+        timed("mlp", run_mlp)
+
+        if self.layer_scale:
+            if len(hidden_states.shape) == 2:
+                hidden_states = hidden_states * (
+                    self.ffn_layer_scale.to(hidden_states.dtype)[0] + 1
+                )
+            else:
+                assert len(hidden_states.shape) == len(self.ffn_layer_scale.shape), (
+                    f"shape must be the same {len(hidden_states.shape)}, "
+                    f"{len(self.ffn_layer_scale.shape)}"
+                )
+                hidden_states = hidden_states * (
+                    self.ffn_layer_scale.to(hidden_states.dtype) + 1
+                )
+
+        self._record_qwen35_profile(hidden_states, events)
+        return hidden_states, residual
 
 
 @support_torch_compile(
@@ -1004,6 +1383,9 @@ class Qwen3_5Model(Qwen3NextModel):
                             ) from exc
                 else:
                     try:
+                        loaded_weight = _maybe_unsqueeze_shared_expert_gate(
+                            name, param, loaded_weight
+                        )
                         weight_loader(param, loaded_weight)
                     except AssertionError as exc:
                         raise AssertionError(
@@ -1135,6 +1517,9 @@ class Qwen3_5Model(Qwen3NextModel):
                         loaded_params.add(name)
                         continue
                     try:
+                        loaded_weight = _maybe_unsqueeze_shared_expert_gate(
+                            name, param, loaded_weight
+                        )
                         weight_loader(param, loaded_weight)
                     except AssertionError as exc:
                         raise AssertionError(
@@ -1198,6 +1583,15 @@ class Qwen3_5ForCausalLMBase(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        capability = current_platform.get_device_capability()
+        self.cast_logits_input_to_fp32 = (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "gguf"
+            and current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1220,15 +1614,7 @@ class Qwen3_5ForCausalLMBase(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        capability = current_platform.get_device_capability()
-        if (
-            self.quant_config is not None
-            and self.quant_config.get_name() == "gguf"
-            and current_platform.is_rocm()
-            and capability is not None
-            and capability.major == 9
-            and capability.minor == 0
-        ):
+        if self.cast_logits_input_to_fp32:
             hidden_states = hidden_states.float()
         return self.logits_processor(self.lm_head, hidden_states)
 
@@ -1277,17 +1663,25 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         config: Qwen3_5Config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        enable_multimodal = (
+            multimodal_config is not None
+            and not multimodal_config.language_model_only
+            and any(
+                multimodal_config.get_limit_per_prompt(modality) > 0
+                for modality in ("image", "video")
+            )
+        )
 
         self.config = config
-        self.multimodal_config = multimodal_config
+        self.multimodal_config = multimodal_config if enable_multimodal else None
         self.use_data_parallel = (
-            multimodal_config is not None
+            enable_multimodal
             and multimodal_config.mm_encoder_tp_mode == "data"
         )
         # Qwen3.5 does not support multimodal pruning (EVS).
         self.is_multimodal_pruning_enabled = False
 
-        if multimodal_config is not None:
+        if enable_multimodal:
             with self._mark_tower_model(vllm_config, {"image", "video"}):
                 self.visual = Qwen3_VisionTransformer(
                     config.vision_config,
@@ -1420,6 +1814,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             and capability.major == 9
             and capability.minor == 0
         ):
+            if vllm_config.cache_config.mamba_cache_dtype != "auto":
+                return (conv_dtype, temporal_dtype)
+            if vllm_config.cache_config.mamba_ssm_cache_dtype != "auto":
+                return (torch.float32, temporal_dtype)
             return (torch.float32, torch.float32)
         return (conv_dtype, temporal_dtype)
 
@@ -1515,20 +1913,44 @@ class Qwen3_5MoeForConditionalGeneration(
         config: Qwen3_5MoeConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        mm_limits = (
+            getattr(multimodal_config, "limit_per_prompt", {})
+            if multimodal_config is not None
+            else {}
+        )
+        text_only_by_limits = all(
+            getattr(mm_limits.get(modality), "count", None) == 0
+            for modality in ("image", "video")
+        )
+        enable_multimodal = (
+            multimodal_config is not None
+            and not multimodal_config.language_model_only
+            and not text_only_by_limits
+            and any(
+                multimodal_config.get_limit_per_prompt(modality) > 0
+                for modality in ("image", "video")
+            )
+        )
 
         self.config = config
-        self.multimodal_config = multimodal_config
-        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+        self.multimodal_config = multimodal_config if enable_multimodal else None
+        self.use_data_parallel = (
+            enable_multimodal
+            and multimodal_config.mm_encoder_tp_mode == "data"
+        )
         # Qwen3.5 does not support multimodal pruning (EVS).
         self.is_multimodal_pruning_enabled = False
 
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+        if enable_multimodal:
+            with self._mark_tower_model(vllm_config, {"image", "video"}):
+                self.visual = Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
+        else:
+            self.visual = PPMissingLayer()
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5MoeForCausalLM(

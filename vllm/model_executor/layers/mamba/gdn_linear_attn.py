@@ -3,6 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
+from functools import lru_cache
 
 import torch
 from einops import rearrange
@@ -27,6 +28,7 @@ from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
 )
 from vllm.model_executor.layers.fla.ops import (
+    causal_conv1d_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
@@ -52,6 +54,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
+from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -60,6 +63,10 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
+ENABLE_QWEN35_FORCE_Z_ONES = os.getenv("VLLM_QWEN35_FORCE_Z_ONES", "0") == "1"
+ENABLE_QWEN35_EMPTY_CORE_ATTN_OUT = os.getenv(
+    "VLLM_QWEN35_EMPTY_CORE_ATTN_OUT", "0"
+).lower() in {"1", "true", "yes", "on"}
 
 
 def _gdn_runtime_debug_enabled() -> bool:
@@ -78,6 +85,7 @@ def _append_gdn_runtime_debug(message: str) -> None:
         pass
 
 
+@lru_cache(maxsize=1)
 def _is_gfx906_rocm() -> bool:
     capability = current_platform.get_device_capability()
     return (
@@ -364,10 +372,22 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         packed_decode_env = os.environ.get("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE")
         if packed_decode_env is None:
             self.enable_packed_recurrent_decode = getattr(
-                envs, "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", False
+                envs, "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", _is_gfx906_rocm()
             )
         else:
             self.enable_packed_recurrent_decode = packed_decode_env.lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        combined_decode_env = os.environ.get("VLLM_QWEN35_COMBINED_PACKED_DECODE")
+        if combined_decode_env is None:
+            self.enable_combined_packed_decode = (
+                self.enable_packed_recurrent_decode and _is_gfx906_rocm()
+            )
+        else:
+            self.enable_combined_packed_decode = combined_decode_env.lower() in {
                 "1",
                 "true",
                 "yes",
@@ -473,6 +493,20 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    def _can_use_empty_core_attn_out(self, num_tokens: int) -> bool:
+        if not ENABLE_QWEN35_EMPTY_CORE_ATTN_OUT:
+            return False
+        try:
+            attn_metadata = get_forward_context().attn_metadata
+        except Exception:
+            return False
+        if not isinstance(attn_metadata, dict):
+            return False
+        layer_metadata = attn_metadata.get(self.prefix)
+        if not isinstance(layer_metadata, GDNAttentionMetadata):
+            return False
+        return layer_metadata.num_actual_tokens == num_tokens
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -536,11 +570,19 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 b = b.contiguous()
                 a = a.contiguous()
 
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        core_attn_shape = (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim)
+        if self._can_use_empty_core_attn_out(num_tokens):
+            core_attn_out = torch.empty(
+                core_attn_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        else:
+            core_attn_out = torch.zeros(
+                core_attn_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
 
         self._forward_core(
             mixed_qkv=mixed_qkv,
@@ -549,7 +591,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             core_attn_out=core_attn_out,
         )
 
-        if os.getenv("VLLM_QWEN35_FORCE_Z_ONES", "0") == "1":
+        if ENABLE_QWEN35_FORCE_Z_ONES:
             z = torch.ones_like(z)
 
         z_shape_og = z.shape
@@ -660,6 +702,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             _append_gdn_runtime_debug(
                 "COREMETA "
                 f"prefix={self.prefix} packed={self.enable_packed_recurrent_decode} "
+                f"combined={self.enable_combined_packed_decode} "
                 f"spec_is_none={attn_metadata.spec_sequence_masks is None} "
                 f"num_prefills={attn_metadata.num_prefills} num_decodes={attn_metadata.num_decodes}"
             )
@@ -920,17 +963,51 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         a = a[:num_actual_tokens]
 
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        state_indices = non_spec_state_indices_tensor[:num_actual_tokens]
+        if self.enable_combined_packed_decode:
+            try:
+                if _gdn_runtime_debug_enabled():
+                    _append_gdn_runtime_debug(
+                        "DECODE_COMBINED_PACKED "
+                        f"mixed_qkv={tuple(mixed_qkv.shape)} a={tuple(a.shape)} b={tuple(b.shape)} "
+                        f"out={tuple(out_buf.shape)}"
+                    )
+                causal_conv1d_recurrent_gated_delta_rule_packed_decode(
+                    mixed_qkv=mixed_qkv,
+                    conv_state=conv_state,
+                    conv_weight=conv_weights,
+                    conv_bias=self.conv1d.bias,
+                    a=a,
+                    b=b,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    scale=self.head_k_dim**-0.5,
+                    initial_state=ssm_state,
+                    out=out_buf,
+                    ssm_state_indices=state_indices,
+                    pad_slot_id=PAD_SLOT_ID,
+                    silu_activation=self.activation in ("silu", "swish"),
+                    use_qk_l2norm_in_kernel=True,
+                )
+                return
+            except (AttributeError, RuntimeError) as exc:
+                if _gdn_runtime_debug_enabled():
+                    _append_gdn_runtime_debug(
+                        "DECODE_COMBINED_PACKED_FALLBACK "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
         mixed_qkv_non_spec = causal_conv1d_update(
             mixed_qkv,
             conv_state,
             conv_weights,
             self.conv1d.bias,
             self.activation,
-            conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
+            conv_state_indices=state_indices,
             validate_data=False,
         )
 
-        out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         if _gdn_runtime_debug_enabled():
             _append_gdn_runtime_debug(
                 "DECODE_PACKED "
@@ -946,7 +1023,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             scale=self.head_k_dim**-0.5,
             initial_state=ssm_state,
             out=out_buf,
-            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
+            ssm_state_indices=state_indices,
             use_qk_l2norm_in_kernel=True,
         )
 

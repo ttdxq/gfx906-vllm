@@ -147,7 +147,9 @@ class HFConfigParser(ConfigParserBase):
                     else Path(model)
                 )
                 if config_dict := qwen35_gguf_config_dict(str(gguf_path)):
-                    config = _CONFIG_REGISTRY["qwen3_5"].from_dict(config_dict)
+                    config = _CONFIG_REGISTRY[config_dict["model_type"]].from_dict(
+                        config_dict
+                    )
                     return config_dict, _maybe_remap_hf_config_attrs(config)
             raise
         # Use custom model class if it's in our registry
@@ -1017,6 +1019,10 @@ def try_get_safetensors_metadata(
     *,
     revision: str | None = None,
 ):
+    model_path = Path(model)
+    if model_path.is_file():
+        return None
+
     get_safetensors_metadata_partial = partial(
         get_safetensors_metadata,
         model,

@@ -110,6 +110,20 @@ class GGUFModelLoader(BaseModelLoader):
             model_type = "qwen35"
         if model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
             model_type = "qwen35moe"
+            for idx in range(text_config.num_hidden_layers):
+                prefix = "language_model." if vllm_arch in (
+                    "Qwen3_5MoeForCausalLM",
+                    "Qwen3_5MoeForConditionalGeneration",
+                ) else ""
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"{prefix}model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                    f"{prefix}model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                    f"{prefix}model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
@@ -236,7 +250,7 @@ class GGUFModelLoader(BaseModelLoader):
                 gguf_name = text_name_map.get_name(base_name)
 
             if gguf_name is None:
-                if model_type == "qwen35":
+                if model_type in ("qwen35", "qwen35moe"):
                     if m := re.fullmatch(
                         r"model\.layers\.(?P<bid>\d+)\.linear_attn\.dt_bias", hf_name
                     ):
@@ -275,9 +289,11 @@ class GGUFModelLoader(BaseModelLoader):
 
             # Track mapping success
             if gguf_name_with_suffix is not None:
-                if model_type == "qwen35" and vllm_arch in (
+                if model_type in ("qwen35", "qwen35moe") and vllm_arch in (
                     "Qwen3_5ForCausalLM",
                     "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5MoeForCausalLM",
+                    "Qwen3_5MoeForConditionalGeneration",
                 ):
                     if hf_name.startswith(("model.", "lm_head.")):
                         hf_name = f"language_model.{hf_name}"
@@ -287,9 +303,11 @@ class GGUFModelLoader(BaseModelLoader):
                 # Parameter not in manual overrides either
                 unmapped_params.append(hf_name)
 
-        if model_type == "qwen35" and vllm_arch in (
+        if model_type in ("qwen35", "qwen35moe") and vllm_arch in (
             "Qwen3_5ForCausalLM",
             "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
         ):
             for idx in range(text_num_layers):
                 if text_config.layer_types[idx] != "linear_attention":

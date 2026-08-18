@@ -25,6 +25,7 @@
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -39,6 +40,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -50,6 +52,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.gguf import (
+    try_gguf_silu_and_mul_down_mmvq,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -69,6 +74,13 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -104,14 +116,35 @@ class Qwen2MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
+        self.use_shared_expert_gate_fusion = _env_bool(
+            "VLLM_QWEN_MOE_SHARED_GATE_FUSION", True
+        )
+        self.defer_shared_expert_gate_for_add = False
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
-        out, _ = self.down_proj(out)
+        out = try_gguf_silu_and_mul_down_mmvq(gate_up, self.down_proj)
+        if out is None:
+            out = self.act_fn(gate_up)
+            out, _ = self.down_proj(out)
 
-        if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)) * out
+        if self.expert_gate is not None and not self.defer_shared_expert_gate_for_add:
+            gate_weight = self.expert_gate.weight
+            if (
+                self.use_shared_expert_gate_fusion
+                and x.dim() == 2
+                and out.dim() == 2
+                and x.is_cuda
+                and out.is_cuda
+                and gate_weight.is_cuda
+                and x.dtype == out.dtype
+                and gate_weight.dtype == x.dtype
+                and gate_weight.numel() == x.shape[1]
+                and hasattr(torch.ops._C, "shared_expert_gate_mul")
+            ):
+                ops.shared_expert_gate_mul(out, x, gate_weight)
+            else:
+                out = F.sigmoid(self.expert_gate(x)) * out
 
         return out
 
@@ -152,8 +185,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 expert_gate=self.shared_expert_gate,
                 prefix=f"{prefix}.shared_expert",
             )
+            self.use_shared_expert_gate_add_fusion = _env_bool(
+                "VLLM_QWEN_MOE_SHARED_GATE_ADD_FUSION", True
+            )
+            self.shared_expert.defer_shared_expert_gate_for_add = (
+                self.use_shared_expert_gate_add_fusion
+                and hasattr(torch.ops._C, "shared_expert_gate_add")
+            )
         else:
             self.shared_expert = None
+            self.use_shared_expert_gate_add_fusion = False
 
         self.experts = SharedFusedMoE(
             shared_experts=self.shared_expert,
@@ -179,7 +220,43 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states, router_logits=router_logits
         )
         if self.shared_expert is not None:
-            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+            shared_hidden_states, routed_hidden_states = final_hidden_states
+            gate_deferred = getattr(
+                self.shared_expert, "defer_shared_expert_gate_for_add", False
+            )
+            gate_weight = self.shared_expert.expert_gate.weight
+            if (
+                gate_deferred
+                and self.use_shared_expert_gate_add_fusion
+                and hidden_states.dim() == 2
+                and shared_hidden_states.dim() == 2
+                and routed_hidden_states.dim() == 2
+                and hidden_states.is_cuda
+                and shared_hidden_states.is_cuda
+                and routed_hidden_states.is_cuda
+                and gate_weight.is_cuda
+                and hidden_states.dtype == shared_hidden_states.dtype
+                and hidden_states.dtype == routed_hidden_states.dtype
+                and gate_weight.dtype == hidden_states.dtype
+                and shared_hidden_states.shape == routed_hidden_states.shape
+                and gate_weight.numel() == hidden_states.shape[1]
+                and hasattr(torch.ops._C, "shared_expert_gate_add")
+            ):
+                ops.shared_expert_gate_add(
+                    routed_hidden_states,
+                    shared_hidden_states,
+                    hidden_states,
+                    gate_weight,
+                )
+                final_hidden_states = routed_hidden_states
+            elif gate_deferred:
+                final_hidden_states = (
+                    F.sigmoid(self.shared_expert.expert_gate(hidden_states))
+                    * shared_hidden_states
+                    + routed_hidden_states
+                )
+            else:
+                final_hidden_states = shared_hidden_states + routed_hidden_states
         if self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
                 final_hidden_states

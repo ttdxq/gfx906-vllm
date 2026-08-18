@@ -136,20 +136,16 @@ __device__ inline void dequant<float2, 4>(int q, float2* res) {
         static_cast<float>((q >> 28) & 0xF));
 }
 
-// TODO: support 8
-// template <>
-// __device__ inline void dequant<half2, 8>(int q, half2* res) {
-//   static constexpr uint32_t mask_for_elt_01 = 0x5250;
-//   static constexpr uint32_t mask_for_elt_23 = 0x5351;
-//   static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
+template <>
+__device__ inline void dequant<half2, 8>(int q, half2* res) {
+  const uint32_t uq = static_cast<uint32_t>(q);
+  const half w0 = __float2half(static_cast<float>(uq & 0xffu));
+  const half w1 = __float2half(static_cast<float>((uq >> 8) & 0xffu));
+  const half w2 = __float2half(static_cast<float>((uq >> 16) & 0xffu));
+  const half w3 = __float2half(static_cast<float>((uq >> 24) & 0xffu));
 
-//   uint32_t lo = prmt<start_byte_for_fp16, mask_for_elt_01>(q);
-//   uint32_t hi = prmt<start_byte_for_fp16, mask_for_elt_23>(q);
-
-//   static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64006400;
-
-//   res[0] = __hsub2(*reinterpret_cast<half2*>(&lo),
-//                    *reinterpret_cast<const half2*>(&I8s_TO_F16s_MAGIC_NUM));
-//   res[1] = __hsub2(*reinterpret_cast<half2*>(&hi),
-//                    *reinterpret_cast<const half2*>(&I8s_TO_F16s_MAGIC_NUM));
-// }
+  // Match the input swizzle in moe_wna16_gemm_kernel for bit=8:
+  // shared input pairs are laid out as {k0, k2}, then {k1, k3}.
+  res[0] = __halves2half2(w0, w2);
+  res[1] = __halves2half2(w1, w3);
+}

@@ -13,6 +13,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.dynamic_4bit import (
 from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
     ExllamaLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.gfx906_gptq_wna16 import (
+    Gfx906GPTQWNA16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
     MPLinearKernel,
     MPLinearLayerConfig,
@@ -47,6 +50,13 @@ except ImportError:
     MarlinLinearKernel = None
 
 try:
+    from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
+        TritonW4A16LinearKernel,
+    )
+except ImportError:
+    TritonW4A16LinearKernel = None
+
+try:
     from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
         XPUwNa16LinearKernel,
     )
@@ -60,6 +70,7 @@ __all__ = [
     "CPUWNA16LinearKernel",
     "Dynamic4bitLinearKernel",
     "ExllamaLinearKernel",
+    "Gfx906GPTQWNA16LinearKernel",
 ]
 
 if AllSparkLinearKernel is not None:
@@ -70,5 +81,7 @@ if MacheteLinearKernel is not None:
     __all__.append("MacheteLinearKernel")
 if MarlinLinearKernel is not None:
     __all__.append("MarlinLinearKernel")
+if TritonW4A16LinearKernel is not None:
+    __all__.append("TritonW4A16LinearKernel")
 if XPUwNa16LinearKernel is not None:
     __all__.append("XPUwNa16LinearKernel")

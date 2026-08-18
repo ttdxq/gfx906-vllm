@@ -204,7 +204,7 @@ uv pip install vllm==${VLLM_VERSION} \
     # git checkout $FA_BRANCH
     git checkout 0e60e394
     git submodule update --init
-    GPU_ARCHS="gfx942" python3 setup.py install
+    MAX_JOBS=4 GPU_ARCHS="gfx942" python3 setup.py install
     cd ..
     ```
 

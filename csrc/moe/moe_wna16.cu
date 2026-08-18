@@ -252,17 +252,17 @@ void run_moe_wna16_gemm(const scalar_t* input, scalar_t* output,
       kernel = moe_wna16_gemm_kernel<scalar_t, 4, 16>;
     }
   } else {
-    // TODO support 8
-    // if (BLOCK_SIZE_K / group_size == 1) {
-    //   kernel = moe_wna16_gemm_kernel<scalar_t, 8, 1>;
-    // } else if (BLOCK_SIZE_K / group_size == 2) {
-    //   kernel = moe_wna16_gemm_kernel<scalar_t, 8, 2>;
-    // } else if (BLOCK_SIZE_K / group_size == 4) {
-    //   kernel = moe_wna16_gemm_kernel<scalar_t, 8, 4>;
-    // } else if (BLOCK_SIZE_K / group_size == 8) {
-    //   kernel = moe_wna16_gemm_kernel<scalar_t, 8, 8>;
-    // }
-    TORCH_CHECK(false, "???");
+    if (BLOCK_SIZE_K / group_size == 1) {
+      kernel = moe_wna16_gemm_kernel<scalar_t, 8, 1>;
+    } else if (BLOCK_SIZE_K / group_size == 2) {
+      kernel = moe_wna16_gemm_kernel<scalar_t, 8, 2>;
+    } else if (BLOCK_SIZE_K / group_size == 4) {
+      kernel = moe_wna16_gemm_kernel<scalar_t, 8, 4>;
+    } else if (BLOCK_SIZE_K / group_size == 8) {
+      kernel = moe_wna16_gemm_kernel<scalar_t, 8, 8>;
+    } else if (BLOCK_SIZE_K / group_size == 16) {
+      kernel = moe_wna16_gemm_kernel<scalar_t, 8, 16>;
+    }
   }
 
   const int shared_mem_size = BLOCK_SIZE_M * BLOCK_SIZE_K * 2;
@@ -306,9 +306,7 @@ torch::Tensor moe_wna16_gemm(torch::Tensor input, torch::Tensor output,
     topk_weights_ptr = (const float*)topk_weights.value().data_ptr<float>();
 
   int groups_per_block_row = BLOCK_SIZE_K / group_size;
-  // TODO: support 8
-  // TORCH_CHECK(bit == 4 || bit == 8, "bit must be 4 or 8");
-  TORCH_CHECK(bit == 4, "bit must be 4");
+  TORCH_CHECK(bit == 4 || bit == 8, "bit must be 4 or 8");
   TORCH_CHECK(size_k % BLOCK_SIZE_K == 0,
               "size_k must divisible by BLOCK_SIZE_K");
   TORCH_CHECK(BLOCK_SIZE_K % group_size == 0,

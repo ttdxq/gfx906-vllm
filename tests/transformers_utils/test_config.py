@@ -129,6 +129,22 @@ def test_get_config_builds_qwen35_config_from_local_gguf_metadata(
     assert config.text_config.linear_num_value_heads == 24
 
 
+def test_try_get_safetensors_metadata_skips_local_files(monkeypatch, tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"GGUF")
+
+    def fail_get_safetensors_metadata(*args, **kwargs):
+        raise AssertionError("local model files should not query HF metadata")
+
+    monkeypatch.setattr(
+        config_utils,
+        "get_safetensors_metadata",
+        fail_get_safetensors_metadata,
+    )
+
+    assert config_utils.try_get_safetensors_metadata(str(model)) is None
+
+
 def test_qwen35_gguf_config_derives_value_heads_from_attn_qkv(
     monkeypatch,
     tmp_path,

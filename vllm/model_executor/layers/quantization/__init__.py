@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
+
+import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -45,6 +47,40 @@ QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 # The customized quantization methods which will be added to this dict.
 _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
+
+
+class _LazyQuarkConfig(QuantizationConfig):
+    """Quark config proxy that avoids importing optional aiter dependencies.
+
+    ModelConfig probes every quantization method for override support. Importing
+    Quark during that probe can initialize ROCm aiter even when the model uses a
+    different quantization format, so defer the real import until Quark is
+    actually selected and instantiated from config.
+    """
+
+    def get_name(self) -> QuantizationMethods:
+        return "quark"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 70
+
+    @staticmethod
+    def get_config_filenames() -> list[str]:
+        return []
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> QuantizationConfig:
+        from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+
+        return QuarkConfig.from_config(config)
+
+    def get_quant_method(self, layer, prefix):
+        raise RuntimeError("Lazy Quark config should not be used at runtime")
 
 
 def register_quantization_config(quantization: str):
@@ -98,10 +134,13 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
-    from vllm.platforms import current_platform
+    if quantization in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG:
+        return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
 
-    # lazy import to avoid triggering `torch.compile` too early
-    from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+    if quantization == "quark":
+        return _LazyQuarkConfig
+
+    from vllm.platforms import current_platform
 
     from .auto_round import AutoRoundConfig
     from .awq import AWQConfig
@@ -183,7 +222,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "hqq": HQQMarlinConfig,
         "experts_int8": ExpertsInt8Config,
         "ipex": IPEXConfig,
-        "quark": QuarkConfig,
         "moe_wna16": MoeWNA16Config,
         "torchao": TorchAOConfig,
         "auto-round": AutoRoundConfig,
@@ -194,8 +232,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "cpu_gptq": CPUGPTQConfig,
         "cpu_awq": CPUAWQConfig,
     }
-    # Update the `method_to_config` with customized quantization methods.
-    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
 
     return method_to_config[quantization]
 
