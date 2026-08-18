@@ -1,6 +1,29 @@
 import torch
 
-from vllm.model_executor.models.qwen3_5 import Qwen3_5GatedDeltaNet
+from vllm.model_executor.models.qwen3_next import _gdn_recurrent_state_to_cache
+from vllm.model_executor.models.qwen3_5 import (
+    Qwen3_5ForCausalLMBase,
+    Qwen3_5GatedDeltaNet,
+)
+
+
+def test_qwen3_5_gdn_prefill_state_uses_cache_layout():
+    state = torch.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
+
+    cached = _gdn_recurrent_state_to_cache(state)
+
+    assert cached.shape == (2, 3, 5, 4)
+    assert torch.equal(cached, state.transpose(-1, -2))
+
+
+def test_qwen3_8_text_model_uses_three_mrope_position_axes():
+    model = object.__new__(Qwen3_5ForCausalLMBase)
+
+    positions, offset = model.get_mrope_input_positions([10, 20, 30, 40], [])
+
+    expected = torch.arange(4).unsqueeze(0).expand(3, -1)
+    assert torch.equal(positions, expected)
+    assert offset == 0
 
 
 class _FakeQuantConfig:
@@ -18,6 +41,10 @@ class _FakeLinear:
 
 
 class _IdentityNorm:
+    weight = None
+    eps = 1e-6
+    norm_before_gate = True
+
     def __call__(self, core_attn_out: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         del z
         return core_attn_out
@@ -39,6 +66,13 @@ def test_qwen3_5_split_gdn_calls_core_with_b_then_a(monkeypatch):
     module.head_v_dim = 2
     module.num_v_heads = 2
     module.prefix = "model.layers.0.linear_attn"
+    module._qwen35_linear_attn_profile_enabled = False
+    module.use_grouped_gguf_mmvq = False
+    module.use_grouped_gguf_ba_mmvq = False
+    module.use_empty_core_attn_out_for_single_token = False
+    module.enable_packed_recurrent_decode = False
+    module._qwen35_is_gfx906_rocm = False
+    module.call_b_first = True
     module.norm = _IdentityNorm()
     module.out_proj = _FakeOutProj()
     module._maybe_log_debug_stats = lambda **_: None
@@ -89,6 +123,7 @@ def test_qwen3_5_gguf_split_gdn_expands_qk_in_tiled_v_head_order():
     module.quant_config = _FakeQuantConfig()
     module.num_k_heads = 2
     module.num_v_heads = 4
+    module.use_tiled_qk_expand = True
 
     query = torch.tensor([[[[10.0], [20.0]]]])
     key = torch.tensor([[[[30.0], [40.0]]]])
@@ -106,6 +141,7 @@ def test_qwen3_5_non_gguf_gdn_keeps_grouped_qk_expansion():
     module.quant_config = None
     module.num_k_heads = 2
     module.num_v_heads = 4
+    module.use_tiled_qk_expand = False
 
     query = torch.tensor([[[[10.0], [20.0]]]])
     key = torch.tensor([[[[30.0], [40.0]]]])

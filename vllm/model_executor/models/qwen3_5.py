@@ -91,6 +91,7 @@ from .interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -238,9 +239,11 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         self.expand_qk_heads_for_gdn = _env_bool(
             "VLLM_QWEN35_EXPAND_QK", True
         )
-        default_recurrent_prefill = not (
-            self.split_projections and self._qwen35_is_gfx906_rocm
-        )
+        # The FLA chunk prefill path does not reliably preserve Qwen3.5 GDN
+        # state across scheduler chunks on gfx906.  Keep the verified
+        # recurrent/sigmoid path as the correctness default; the environment
+        # override remains available for isolated chunk-kernel development.
+        default_recurrent_prefill = True
         self.use_recurrent_prefill_for_gdn = _env_bool(
             "VLLM_QWEN35_REC_PREFILL", default_recurrent_prefill
         )
@@ -1534,6 +1537,7 @@ class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
 ):
     packed_modules_mapping = {
@@ -1624,6 +1628,14 @@ class Qwen3_5ForCausalLMBase(
             skip_prefixes=["mtp."],
         )
         return loader.load_weights(weights)
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[object],
+    ) -> tuple[torch.Tensor, int]:
+        positions = torch.arange(len(input_tokens), dtype=torch.long)
+        return positions.unsqueeze(0).expand(3, -1), 0
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):

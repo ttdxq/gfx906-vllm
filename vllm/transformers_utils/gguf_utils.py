@@ -194,8 +194,9 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
         _read_gguf_scalar(reader, f"{prefix}.nextn_predict_layers", 0)
     )
     num_hidden_layers = int(_read_gguf_scalar(reader, f"{prefix}.block_count"))
-    if is_moe:
-        num_hidden_layers -= num_nextn_predict_layers
+    # GGUF block_count includes the optional MTP/nextn blocks for both dense
+    # and MoE Qwen3.5 models.  They are not part of the causal LM backbone.
+    num_hidden_layers -= num_nextn_predict_layers
     tensor_names = {tensor.name for tensor in reader.tensors}
     layer_types = [
         (
@@ -239,6 +240,7 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
             _read_gguf_scalar(reader, f"{prefix}.full_attention_interval", 4)
         ),
         "layer_types": layer_types,
+        "num_nextn_predict_layers": num_nextn_predict_layers,
         "rope_parameters": {
             "rope_type": "default",
             "rope_theta": float(_read_gguf_scalar(reader, f"{prefix}.rope.freq_base")),

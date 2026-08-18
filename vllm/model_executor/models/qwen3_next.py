@@ -107,6 +107,11 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _gdn_recurrent_state_to_cache(state: torch.Tensor) -> torch.Tensor:
+    """Convert GDN operator state ``[N, H, K, V]`` to cache ``[N, H, V, K]``."""
+    return state.transpose(-1, -2)
+
+
 def _append_qwen35_runtime_debug(message: str) -> None:
     debug_file = os.environ.get("VLLM_QWEN35_RUNTIME_DEBUG_FILE")
     if not debug_file:
@@ -936,7 +941,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 and capability.major == 9
                 and capability.minor == 0
             )
-            prefill_state_is_cache_layout = False
             if use_sigmoid_prefill_for_split_qwen35:
                 if spec_sequence_masks is not None:
                     a_non_spec = a.index_select(0, non_spec_token_indx)
@@ -995,16 +999,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     cu_seqlens=non_spec_query_start_loc,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
-                prefill_state_is_cache_layout = True
             # Init cache
-            if prefill_state_is_cache_layout:
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                    ssm_state.dtype
-                )
-            else:
-                ssm_state[non_spec_state_indices_tensor] = (
-                    last_recurrent_state.transpose(-1, -2).to(ssm_state.dtype)
-                )
+            # The GDN operators use [H, K, V], while the Mamba cache stores
+            # [H, V, K].  K and V are both 128 for Qwen3.5, so assigning the
+            # state without transposing silently corrupts the next prefill
+            # chunk instead of raising a shape error.
+            ssm_state[non_spec_state_indices_tensor] = _gdn_recurrent_state_to_cache(
+                last_recurrent_state
+            ).to(ssm_state.dtype)
         elif attn_metadata.num_decodes > 0:
             if getattr(self, "prefix", "") == "language_model.model.layers.0.linear_attn":
                 _append_qwen35_runtime_debug(

@@ -207,6 +207,70 @@ def test_qwen35_gguf_config_derives_value_heads_from_attn_qkv(
     assert config_dict["text_config"]["linear_num_value_heads"] == 32
 
 
+def test_qwen35_gguf_config_excludes_dense_mtp_layer(
+    monkeypatch,
+    tmp_path,
+):
+    model = tmp_path / "qwen35-mtp.gguf"
+    model.write_bytes(b"GGUF")
+
+    class FakeField:
+        def __init__(self, value):
+            self.value = value
+
+        def contents(self):
+            return self.value
+
+    class FakeTensor:
+        def __init__(self, name, shape):
+            self.name = name
+            self.shape = shape
+
+    class FakeReader:
+        tensors = [
+            FakeTensor("blk.0.attn_qkv.weight", (2560, 8192)),
+            FakeTensor("blk.1.attn_k.weight", (2560, 1024)),
+            FakeTensor("blk.1.nextn.eh_proj.weight", (2560, 5120)),
+            FakeTensor("output.weight", (248320, 2560)),
+        ]
+
+        def get_field(self, key):
+            fields = {
+                "general.architecture": "qwen35",
+                "tokenizer.ggml.tokens": ["<pad>", "x"],
+                "qwen35.ssm.state_size": 128,
+                "qwen35.ssm.group_count": 16,
+                "qwen35.block_count": 2,
+                "qwen35.nextn_predict_layers": 1,
+                "qwen35.embedding_length": 2560,
+                "qwen35.feed_forward_length": 9728,
+                "qwen35.attention.head_count": 16,
+                "qwen35.attention.head_count_kv": 8,
+                "qwen35.context_length": 32768,
+                "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
+                "qwen35.attention.key_length": 256,
+                "qwen35.ssm.conv_kernel": 4,
+                "qwen35.full_attention_interval": 4,
+                "qwen35.rope.freq_base": 1000000.0,
+                "qwen35.rope.dimension_sections": [8, 8, 8, 0],
+                "tokenizer.ggml.bos_token_id": 0,
+                "tokenizer.ggml.eos_token_id": 1,
+                "tokenizer.ggml.padding_token_id": 0,
+            }
+            value = fields.get(key)
+            return None if value is None else FakeField(value)
+
+    monkeypatch.setattr(gguf_utils.gguf, "GGUFReader", lambda _: FakeReader())
+
+    config_dict = gguf_utils.qwen35_gguf_config_dict(str(model))
+
+    assert config_dict is not None
+    text_config = config_dict["text_config"]
+    assert text_config["num_hidden_layers"] == 1
+    assert len(text_config["layer_types"]) == 1
+    assert text_config["num_nextn_predict_layers"] == 1
+
+
 def test_get_llama3_eos_token():
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
 
