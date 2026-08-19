@@ -21,6 +21,9 @@ float8_info = torch.finfo(current_platform.fp8_dtype())
 ENABLE_GFX906_TRITON_UNIFIED_ATTN = os.getenv(
     "VLLM_GFX906_TRITON_UNIFIED_ATTN", "1"
 ).lower() in {"1", "true", "yes", "on"}
+ENABLE_GFX906_ATTN_MULTI_QUERY_3D = os.getenv(
+    "VLLM_GFX906_ATTN_MULTI_QUERY_3D", "1"
+).lower() in {"1", "true", "yes", "on"}
 
 
 @triton.jit
@@ -1120,8 +1123,17 @@ def unified_attention(
     TILE_SIZE_PREFILL = _final_tile(preferred_prefill)
     TILE_SIZE_DECODE = _final_tile(preferred_decode)
 
+    allow_multi_query_3d = (
+        ENABLE_GFX906_ATTN_MULTI_QUERY_3D
+        and _is_gfx906_rocm()
+        and num_seqs == 1
+        and 1 < max_seqlen_q <= 3
+    )
+
     # if batch contains a prefill
-    if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128:
+    if (
+        max_seqlen_q > 1 and not allow_multi_query_3d
+    ) or total_num_q_blocks * num_kv_heads > 128:
         kernel_unified_attention_2d[
             (
                 total_num_q_blocks,
