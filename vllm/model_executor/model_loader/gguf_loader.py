@@ -75,6 +75,104 @@ class GGUFModelLoader(BaseModelLoader):
             "or <repo_id>:<quant_type>)"
         )
 
+    @staticmethod
+    def _get_qwen35_mtp_weights_map(model_config: ModelConfig) -> dict[str, str]:
+        text_config = model_config.hf_config.get_text_config()
+        num_mtp_layers = getattr(text_config, "mtp_num_hidden_layers", 1)
+        first_mtp_block = text_config.num_hidden_layers
+        is_moe = text_config.model_type == "qwen3_5_moe_text"
+
+        weights_map = {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output.weight": "lm_head.weight",
+        }
+        for mtp_idx in range(num_mtp_layers):
+            block_idx = first_mtp_block + mtp_idx
+            gguf_prefix = f"blk.{block_idx}"
+            hf_prefix = f"mtp.layers.{mtp_idx}"
+            weights_map.update(
+                {
+                    f"{gguf_prefix}.nextn.eh_proj.weight": "mtp.fc.weight",
+                    f"{gguf_prefix}.nextn.enorm.weight": (
+                        "mtp.pre_fc_norm_embedding.weight"
+                    ),
+                    f"{gguf_prefix}.nextn.hnorm.weight": (
+                        "mtp.pre_fc_norm_hidden.weight"
+                    ),
+                    f"{gguf_prefix}.nextn.shared_head_norm.weight": (
+                        "mtp.norm.weight"
+                    ),
+                    f"{gguf_prefix}.attn_q.weight": (
+                        f"{hf_prefix}.self_attn.q_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_k.weight": (
+                        f"{hf_prefix}.self_attn.k_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_v.weight": (
+                        f"{hf_prefix}.self_attn.v_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_output.weight": (
+                        f"{hf_prefix}.self_attn.o_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_q_norm.weight": (
+                        f"{hf_prefix}.self_attn.q_norm.weight"
+                    ),
+                    f"{gguf_prefix}.attn_k_norm.weight": (
+                        f"{hf_prefix}.self_attn.k_norm.weight"
+                    ),
+                    f"{gguf_prefix}.attn_norm.weight": (
+                        f"{hf_prefix}.input_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.post_attention_norm.weight": (
+                        f"{hf_prefix}.post_attention_layernorm.weight"
+                    ),
+                }
+            )
+            if is_moe:
+                weights_map.update(
+                    {
+                        f"{gguf_prefix}.ffn_gate_inp.weight": (
+                            f"{hf_prefix}.mlp.gate.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_gate_exps.weight": (
+                            f"{hf_prefix}.mlp.experts.0.gate_proj.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_up_exps.weight": (
+                            f"{hf_prefix}.mlp.experts.0.up_proj.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_down_exps.weight": (
+                            f"{hf_prefix}.mlp.experts.0.down_proj.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_gate_shexp.weight": (
+                            f"{hf_prefix}.mlp.shared_expert.gate_proj.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_up_shexp.weight": (
+                            f"{hf_prefix}.mlp.shared_expert.up_proj.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_down_shexp.weight": (
+                            f"{hf_prefix}.mlp.shared_expert.down_proj.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_gate_inp_shexp.weight": (
+                            f"{hf_prefix}.mlp.shared_expert_gate.weight"
+                        ),
+                    }
+                )
+            else:
+                weights_map.update(
+                    {
+                        f"{gguf_prefix}.ffn_gate.weight": (
+                            f"{hf_prefix}.mlp.gate_proj.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_up.weight": (
+                            f"{hf_prefix}.mlp.up_proj.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_down.weight": (
+                            f"{hf_prefix}.mlp.down_proj.weight"
+                        ),
+                    }
+                )
+        return weights_map
+
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """
         GGUF uses this naming convention for their tensors from HF checkpoint:
@@ -86,12 +184,23 @@ class GGUFModelLoader(BaseModelLoader):
         """
         config = model_config.hf_config
         vllm_arch = model_config.architecture
+        if vllm_arch in ("Qwen3_5MTP", "Qwen3_5MoeMTP"):
+            return self._get_qwen35_mtp_weights_map(model_config)
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
         # Gemma3Config, this returns config.text_config. For text-only
         # models, this returns config itself.
         text_config = config.get_text_config()
         model_type = config.model_type
+        qwen35_language_model_prefix = (
+            "language_model."
+            if vllm_arch
+            in (
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
+            else ""
+        )
         detected_mm = detect_gguf_multimodal(model_config.model)
         is_multimodal = (
             hasattr(config, "vision_config")
@@ -111,18 +220,17 @@ class GGUFModelLoader(BaseModelLoader):
         if model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
             model_type = "qwen35moe"
             for idx in range(text_config.num_hidden_layers):
-                prefix = "language_model." if vllm_arch in (
-                    "Qwen3_5MoeForCausalLM",
-                    "Qwen3_5MoeForConditionalGeneration",
-                ) else ""
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
-                    f"{prefix}model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                    f"{qwen35_language_model_prefix}"
+                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
-                    f"{prefix}model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                    f"{qwen35_language_model_prefix}"
+                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
-                    f"{prefix}model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                    f"{qwen35_language_model_prefix}"
+                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
                 )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
@@ -289,14 +397,12 @@ class GGUFModelLoader(BaseModelLoader):
 
             # Track mapping success
             if gguf_name_with_suffix is not None:
-                if model_type in ("qwen35", "qwen35moe") and vllm_arch in (
-                    "Qwen3_5ForCausalLM",
-                    "Qwen3_5ForConditionalGeneration",
-                    "Qwen3_5MoeForCausalLM",
-                    "Qwen3_5MoeForConditionalGeneration",
+                if (
+                    model_type in ("qwen35", "qwen35moe")
+                    and qwen35_language_model_prefix
                 ):
                     if hf_name.startswith(("model.", "lm_head.")):
-                        hf_name = f"language_model.{hf_name}"
+                        hf_name = f"{qwen35_language_model_prefix}{hf_name}"
                 gguf_to_hf_name_map[gguf_name_with_suffix] = hf_name
                 logger.debug("Mapped GGUF %s → HF %s", gguf_name_with_suffix, hf_name)
             elif hf_name not in gguf_to_hf_name_map.values():
@@ -313,19 +419,19 @@ class GGUFModelLoader(BaseModelLoader):
                 if text_config.layer_types[idx] != "linear_attention":
                     continue
                 gguf_to_hf_name_map[f"blk.{idx}.attn_qkv.weight"] = (
-                    "language_model."
+                    f"{qwen35_language_model_prefix}"
                     f"model.layers.{idx}.linear_attn.in_proj_qkv.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.attn_gate.weight"] = (
-                    "language_model."
+                    f"{qwen35_language_model_prefix}"
                     f"model.layers.{idx}.linear_attn.in_proj_z.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ssm_beta.weight"] = (
-                    "language_model."
+                    f"{qwen35_language_model_prefix}"
                     f"model.layers.{idx}.linear_attn.in_proj_b.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ssm_alpha.weight"] = (
-                    "language_model."
+                    f"{qwen35_language_model_prefix}"
                     f"model.layers.{idx}.linear_attn.in_proj_a.weight"
                 )
 
@@ -434,7 +540,9 @@ class GGUFModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = initialize_model(vllm_config=vllm_config)
+                model = initialize_model(
+                    vllm_config=vllm_config, model_config=model_config
+                )
             self.load_weights(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)

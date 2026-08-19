@@ -102,6 +102,184 @@ __global__ void causal_conv1d_gfx906_decode_update_kernel(
              (state_len - 1) * state_stride_s] = static_cast<state_t>(x_val);
 }
 
+template <typename scalar_t, typename state_t, typename accepted_t>
+__global__ void causal_conv1d_gfx906_mtp_update_width4_kernel(
+    const scalar_t* __restrict__ x, state_t* __restrict__ conv_state,
+    const scalar_t* __restrict__ weight, const scalar_t* __restrict__ bias,
+    const int32_t* __restrict__ state_indices,
+    const int32_t* __restrict__ cu_seqlens,
+    const accepted_t* __restrict__ num_accepted_tokens,
+    scalar_t* __restrict__ out, int64_t dim, int64_t state_len,
+    int64_t x_stride_t, int64_t x_stride_d, int64_t state_stride_slot,
+    int64_t state_stride_d, int64_t state_stride_s,
+    int64_t weight_stride_d, int64_t weight_stride_w,
+    int64_t indices_stride_req, int64_t out_stride_t,
+    int64_t out_stride_d, int64_t pad_slot_id, bool has_bias,
+    bool silu_activation) {
+  const int64_t request_idx = blockIdx.x;
+  const int64_t dim_idx = blockIdx.y * blockDim.x + threadIdx.x;
+  if (dim_idx >= dim) {
+    return;
+  }
+
+  const int64_t seq_start = cu_seqlens[request_idx];
+  const int64_t seq_end = cu_seqlens[request_idx + 1];
+  const int64_t query_len = seq_end - seq_start;
+  if (query_len <= 0) {
+    return;
+  }
+  const int64_t state_offset =
+      static_cast<int64_t>(num_accepted_tokens[request_idx]) - 1;
+  if (state_offset < 0 || state_offset + 2 >= state_len ||
+      query_len > state_len - 2) {
+    return;
+  }
+  const int64_t state_idx = state_indices[request_idx * indices_stride_req];
+  if (state_idx < 0 || state_idx == pad_slot_id) {
+    return;
+  }
+
+  float col0 = static_cast<float>(
+      conv_state[state_idx * state_stride_slot + dim_idx * state_stride_d +
+                 state_offset * state_stride_s]);
+  float col1 = static_cast<float>(
+      conv_state[state_idx * state_stride_slot + dim_idx * state_stride_d +
+                 (state_offset + 1) * state_stride_s]);
+  float col2 = static_cast<float>(
+      conv_state[state_idx * state_stride_slot + dim_idx * state_stride_d +
+                 (state_offset + 2) * state_stride_s]);
+  const float rolled_col0 = col1;
+  const float rolled_col1 = col2;
+  const float w0 = static_cast<float>(
+      weight[dim_idx * weight_stride_d + 0 * weight_stride_w]);
+  const float w1 = static_cast<float>(
+      weight[dim_idx * weight_stride_d + 1 * weight_stride_w]);
+  const float w2 = static_cast<float>(
+      weight[dim_idx * weight_stride_d + 2 * weight_stride_w]);
+  const float w3 = static_cast<float>(
+      weight[dim_idx * weight_stride_d + 3 * weight_stride_w]);
+  const float bias_val =
+      has_bias ? static_cast<float>(bias[dim_idx]) : 0.0f;
+  float candidate_tokens[64];
+
+  for (int64_t token_position = 0; token_position < query_len;
+       ++token_position) {
+    const int64_t token_idx = seq_start + token_position;
+    const float x_val = static_cast<float>(
+        x[token_idx * x_stride_t + dim_idx * x_stride_d]);
+    candidate_tokens[token_position] = x_val;
+    float acc = bias_val + col0 * w0 + col1 * w1 + col2 * w2 + x_val * w3;
+    if (silu_activation) {
+      acc = acc / (1.0f + expf(-acc));
+    }
+    out[token_idx * out_stride_t + dim_idx * out_stride_d] =
+        static_cast<scalar_t>(acc);
+    col0 = col1;
+    col1 = col2;
+    col2 = x_val;
+  }
+
+  const int64_t state_base = state_idx * state_stride_slot +
+                             dim_idx * state_stride_d;
+  conv_state[state_base] = static_cast<state_t>(rolled_col0);
+  conv_state[state_base + state_stride_s] = static_cast<state_t>(rolled_col1);
+  for (int64_t token_position = 0; token_position < query_len;
+       ++token_position) {
+    conv_state[state_base + (token_position + 2) * state_stride_s] =
+        static_cast<state_t>(candidate_tokens[token_position]);
+  }
+}
+
+template <typename scalar_t, typename state_t, typename accepted_t>
+__global__ void causal_conv1d_gfx906_mtp_update_kernel(
+    const scalar_t* __restrict__ x, state_t* __restrict__ conv_state,
+    const scalar_t* __restrict__ weight, const scalar_t* __restrict__ bias,
+    const int32_t* __restrict__ state_indices,
+    const int32_t* __restrict__ cu_seqlens,
+    const accepted_t* __restrict__ num_accepted_tokens,
+    scalar_t* __restrict__ out, int64_t dim, int64_t width,
+    int64_t state_len, int64_t x_stride_t, int64_t x_stride_d,
+    int64_t state_stride_slot,
+    int64_t state_stride_d, int64_t state_stride_s,
+    int64_t weight_stride_d, int64_t weight_stride_w,
+    int64_t indices_stride_req, int64_t out_stride_t,
+    int64_t out_stride_d, int64_t pad_slot_id, bool has_bias,
+    bool silu_activation) {
+  const int64_t request_idx = blockIdx.x;
+  const int64_t dim_idx = blockIdx.y * blockDim.x + threadIdx.x;
+  if (dim_idx >= dim) {
+    return;
+  }
+
+  const int64_t seq_start = cu_seqlens[request_idx];
+  const int64_t seq_end = cu_seqlens[request_idx + 1];
+  const int64_t query_len = seq_end - seq_start;
+  if (query_len <= 0) {
+    return;
+  }
+  const int64_t state_offset =
+      static_cast<int64_t>(num_accepted_tokens[request_idx]) - 1;
+  if (state_offset < 0 || state_offset + width - 2 >= state_len ||
+      query_len > state_len - (width - 2)) {
+    return;
+  }
+  const int64_t state_idx = state_indices[request_idx * indices_stride_req];
+  if (state_idx < 0 || state_idx == pad_slot_id) {
+    return;
+  }
+
+  float history[5];
+  float candidate_tokens[64];
+  for (int64_t history_position = 0; history_position < width - 1;
+       ++history_position) {
+    history[history_position] = static_cast<float>(conv_state[
+        state_idx * state_stride_slot + dim_idx * state_stride_d +
+        (state_offset + history_position) * state_stride_s]);
+  }
+
+  for (int64_t token_position = 0; token_position < query_len;
+       ++token_position) {
+    const int64_t token_idx = seq_start + token_position;
+    const float x_val = static_cast<float>(
+        x[token_idx * x_stride_t + dim_idx * x_stride_d]);
+    candidate_tokens[token_position] = x_val;
+    float acc = has_bias ? static_cast<float>(bias[dim_idx]) : 0.0f;
+    for (int64_t width_position = 0; width_position < width; ++width_position) {
+      const float input_val =
+          width_position == width - 1
+              ? x_val
+              : history[width_position];
+      acc += input_val * static_cast<float>(
+                             weight[dim_idx * weight_stride_d +
+                                    width_position * weight_stride_w]);
+    }
+    if (silu_activation) {
+      acc = acc / (1.0f + expf(-acc));
+    }
+    out[token_idx * out_stride_t + dim_idx * out_stride_d] =
+        static_cast<scalar_t>(acc);
+    for (int64_t history_position = 0; history_position < width - 2;
+         ++history_position) {
+      history[history_position] = history[history_position + 1];
+    }
+    history[width - 2] = x_val;
+  }
+
+  const int64_t state_base =
+      state_idx * state_stride_slot + dim_idx * state_stride_d;
+  for (int64_t history_position = 0; history_position < width - 2;
+       ++history_position) {
+    conv_state[state_base + history_position * state_stride_s] =
+        conv_state[state_base +
+                   (state_offset + history_position + 1) * state_stride_s];
+  }
+  for (int64_t token_position = 0; token_position < query_len;
+       ++token_position) {
+    conv_state[state_base + (width - 2 + token_position) * state_stride_s] =
+        static_cast<state_t>(candidate_tokens[token_position]);
+  }
+}
+
 template <typename scalar_t, typename state_t>
 __global__ void fused_sigmoid_gating_delta_rule_gfx906_decode_kernel(
     const scalar_t* __restrict__ A_log, const scalar_t* __restrict__ a,
@@ -317,6 +495,139 @@ __global__ void fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kernel(
     out_val += new_state * q_val;
   }
 
+  out[token_idx * out_stride_t + hv_idx * out_stride_h +
+      value_idx * out_stride_v] = static_cast<scalar_t>(out_val);
+}
+
+template <typename scalar_t, typename state_t, typename accepted_t>
+__global__ void fused_sigmoid_gating_delta_rule_gfx906_mtp_update_kernel(
+    const scalar_t* __restrict__ A_log, const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b, const scalar_t* __restrict__ dt_bias,
+    const scalar_t* __restrict__ q, const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v, state_t* __restrict__ state,
+    const int32_t* __restrict__ state_indices,
+    const int32_t* __restrict__ cu_seqlens,
+    const accepted_t* __restrict__ num_accepted_tokens,
+    scalar_t* __restrict__ out, int64_t requests, int64_t token_position,
+    int64_t heads, int64_t kv_heads, int64_t key_dim, int64_t value_dim,
+    int64_t q_stride_t, int64_t q_stride_h, int64_t q_stride_k,
+    int64_t k_stride_t, int64_t k_stride_h, int64_t k_stride_k,
+    int64_t v_stride_t, int64_t v_stride_h, int64_t v_stride_v,
+    int64_t a_stride_t, int64_t a_stride_h, int64_t b_stride_t,
+    int64_t b_stride_h, int64_t state_stride_slot,
+    int64_t state_stride_h, int64_t state_stride_v,
+    int64_t state_stride_k, int64_t indices_stride_req,
+    int64_t indices_stride_tok, int64_t out_stride_t,
+    int64_t out_stride_h, int64_t out_stride_v, double beta,
+    double threshold, double scale, bool use_qk_l2norm_in_kernel) {
+  const int64_t linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t total = requests * kv_heads * value_dim;
+  if (linear_idx >= total) {
+    return;
+  }
+
+  const int64_t value_idx = linear_idx % value_dim;
+  const int64_t hv_idx = (linear_idx / value_dim) % kv_heads;
+  const int64_t request_idx = linear_idx / (value_dim * kv_heads);
+  const int64_t seq_start = cu_seqlens[request_idx];
+  const int64_t seq_end = cu_seqlens[request_idx + 1];
+  if (token_position >= seq_end - seq_start) {
+    return;
+  }
+
+  const int64_t token_idx = seq_start + token_position;
+  const int64_t initial_position =
+      static_cast<int64_t>(num_accepted_tokens[request_idx]) - 1;
+  const int64_t source_position =
+      token_position == 0 ? initial_position : token_position - 1;
+  const int64_t source_state_idx =
+      source_position >= 0
+          ? state_indices[request_idx * indices_stride_req +
+                          source_position * indices_stride_tok]
+          : -1;
+  const int64_t destination_state_idx =
+      state_indices[request_idx * indices_stride_req +
+                    token_position * indices_stride_tok];
+  if (source_state_idx < 0 || destination_state_idx < 0) {
+    out[token_idx * out_stride_t + hv_idx * out_stride_h +
+        value_idx * out_stride_v] = static_cast<scalar_t>(0.0f);
+    return;
+  }
+
+  const int64_t head_ratio = kv_heads / heads;
+  const int64_t q_head_idx = hv_idx / head_ratio;
+  float q_norm = 1.0f;
+  float k_norm = 1.0f;
+  if (use_qk_l2norm_in_kernel) {
+    float q_norm_sq = 0.0f;
+    float k_norm_sq = 0.0f;
+    for (int64_t k_idx = 0; k_idx < key_dim; ++k_idx) {
+      const float q_val = static_cast<float>(
+          q[token_idx * q_stride_t + q_head_idx * q_stride_h +
+            k_idx * q_stride_k]);
+      const float k_val = static_cast<float>(
+          k[token_idx * k_stride_t + q_head_idx * k_stride_h +
+            k_idx * k_stride_k]);
+      q_norm_sq += q_val * q_val;
+      k_norm_sq += k_val * k_val;
+    }
+    q_norm = rsqrtf(q_norm_sq + 1e-6f);
+    k_norm = rsqrtf(k_norm_sq + 1e-6f);
+  }
+
+  const float x = static_cast<float>(
+                      a[token_idx * a_stride_t + hv_idx * a_stride_h]) +
+                  static_cast<float>(dt_bias[hv_idx]);
+  const float beta_x = static_cast<float>(beta) * x;
+  const float softplus_x =
+      beta_x <= static_cast<float>(threshold)
+          ? static_cast<float>(1.0 / beta) * log1pf(expf(beta_x))
+          : x;
+  const float decay =
+      expf(-expf(static_cast<float>(A_log[hv_idx])) * softplus_x);
+  const float beta_t =
+      1.0f / (1.0f + expf(-static_cast<float>(
+                            b[token_idx * b_stride_t + hv_idx * b_stride_h])));
+
+  float state_dot_k = 0.0f;
+  for (int64_t k_idx = 0; k_idx < key_dim; ++k_idx) {
+    const float k_val =
+        static_cast<float>(k[token_idx * k_stride_t +
+                             q_head_idx * k_stride_h + k_idx * k_stride_k]) *
+        k_norm;
+    const int64_t source_offset =
+        source_state_idx * state_stride_slot + hv_idx * state_stride_h +
+        value_idx * state_stride_v + k_idx * state_stride_k;
+    state_dot_k +=
+        static_cast<float>(state[source_offset]) * decay * k_val;
+  }
+
+  const float v_residual =
+      (static_cast<float>(v[token_idx * v_stride_t + hv_idx * v_stride_h +
+                            value_idx * v_stride_v]) -
+       state_dot_k) *
+      beta_t;
+  float out_val = 0.0f;
+  for (int64_t k_idx = 0; k_idx < key_dim; ++k_idx) {
+    const float k_val =
+        static_cast<float>(k[token_idx * k_stride_t +
+                             q_head_idx * k_stride_h + k_idx * k_stride_k]) *
+        k_norm;
+    const int64_t source_offset =
+        source_state_idx * state_stride_slot + hv_idx * state_stride_h +
+        value_idx * state_stride_v + k_idx * state_stride_k;
+    const int64_t destination_offset =
+        destination_state_idx * state_stride_slot + hv_idx * state_stride_h +
+        value_idx * state_stride_v + k_idx * state_stride_k;
+    const float new_state =
+        static_cast<float>(state[source_offset]) * decay + v_residual * k_val;
+    state[destination_offset] = static_cast<state_t>(new_state);
+    const float q_val =
+        static_cast<float>(q[token_idx * q_stride_t +
+                             q_head_idx * q_stride_h + k_idx * q_stride_k]) *
+        q_norm * static_cast<float>(scale);
+    out_val += new_state * q_val;
+  }
   out[token_idx * out_stride_t + hv_idx * out_stride_h +
       value_idx * out_stride_v] = static_cast<scalar_t>(out_val);
 }
@@ -1245,6 +1556,144 @@ torch::Tensor causal_conv1d_gfx906_decode_update(
   return out;
 }
 
+torch::Tensor causal_conv1d_gfx906_mtp_update(
+    torch::Tensor x, torch::Tensor conv_state, torch::Tensor weight,
+    std::optional<torch::Tensor> bias, torch::Tensor state_indices,
+    torch::Tensor cu_seqlens, torch::Tensor num_accepted_tokens,
+    int64_t pad_slot_id, bool silu_activation) {
+  TORCH_CHECK(x.is_cuda() && conv_state.is_cuda() && weight.is_cuda(),
+              "x, conv_state, and weight must be CUDA tensors");
+  TORCH_CHECK(state_indices.is_cuda() && cu_seqlens.is_cuda() &&
+                  num_accepted_tokens.is_cuda(),
+              "MTP metadata must be CUDA tensors");
+  TORCH_CHECK(x.device() == conv_state.device() &&
+                  x.device() == weight.device() &&
+                  x.device() == state_indices.device() &&
+                  x.device() == cu_seqlens.device() &&
+                  x.device() == num_accepted_tokens.device(),
+              "all tensors must be on the same device");
+  TORCH_CHECK(x.dim() == 2, "x must have shape [total_tokens, dim]");
+  TORCH_CHECK(conv_state.dim() == 3,
+              "conv_state must have shape [slots, dim, state_len]");
+  TORCH_CHECK(weight.dim() == 2, "weight must have shape [dim, width]");
+  TORCH_CHECK(state_indices.dim() == 1,
+              "state_indices must have shape [requests]");
+  TORCH_CHECK(cu_seqlens.dim() == 1,
+              "cu_seqlens must have shape [requests + 1]");
+  TORCH_CHECK(num_accepted_tokens.dim() == 1,
+              "num_accepted_tokens must have shape [requests]");
+  TORCH_CHECK(state_indices.scalar_type() == at::ScalarType::Int &&
+                  cu_seqlens.scalar_type() == at::ScalarType::Int,
+              "state_indices and cu_seqlens must be int32");
+  TORCH_CHECK(num_accepted_tokens.scalar_type() == at::ScalarType::Int ||
+                  num_accepted_tokens.scalar_type() == at::ScalarType::Long,
+              "num_accepted_tokens must be int32 or int64");
+  TORCH_CHECK(x.scalar_type() == at::ScalarType::Half ||
+                  x.scalar_type() == at::ScalarType::BFloat16,
+              "x and weight must be float16 or bfloat16");
+  TORCH_CHECK(weight.scalar_type() == x.scalar_type(),
+              "x and weight must have the same dtype");
+  TORCH_CHECK(conv_state.scalar_type() == at::ScalarType::Half ||
+                  conv_state.scalar_type() == at::ScalarType::BFloat16 ||
+                  conv_state.scalar_type() == at::ScalarType::Float,
+              "conv_state must be float16, bfloat16, or float32");
+  TORCH_CHECK(x.size(1) == conv_state.size(1),
+              "x dim must match conv_state dim");
+  TORCH_CHECK(x.size(1) == weight.size(0), "x dim must match weight dim");
+  TORCH_CHECK(weight.size(1) >= 2,
+              "convolution width must be at least 2");
+  TORCH_CHECK(weight.size(1) <= 6,
+              "convolution width greater than 6 is not supported");
+  TORCH_CHECK(conv_state.size(2) <= 64,
+              "conv_state length greater than 64 is not supported");
+  TORCH_CHECK(conv_state.size(2) >= weight.size(1) - 1,
+              "conv_state is shorter than convolution width - 1");
+  const int64_t requests = state_indices.numel();
+  TORCH_CHECK(cu_seqlens.numel() == requests + 1,
+              "cu_seqlens shape must be [requests + 1]");
+  TORCH_CHECK(num_accepted_tokens.numel() == requests,
+              "num_accepted_tokens shape must be [requests]");
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->is_cuda(), "bias must be a CUDA tensor");
+    TORCH_CHECK(bias->device() == x.device(),
+                "bias must be on the same device as x");
+    TORCH_CHECK(bias->scalar_type() == x.scalar_type(),
+                "bias must have the same dtype as x");
+    TORCH_CHECK(bias->numel() == x.size(1), "bias shape must be [dim]");
+  }
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+  auto out = torch::empty_like(x);
+  if (x.numel() == 0 || requests == 0) {
+    return out;
+  }
+  const int64_t dim = x.size(1);
+  const int64_t width = weight.size(1);
+  const int64_t state_len = conv_state.size(2);
+  const int threads = 256;
+  const dim3 blocks(static_cast<unsigned int>(requests),
+                    static_cast<unsigned int>((dim + threads - 1) / threads));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+#define VLLM_GFX906_CAUSAL_CONV_MTP_LAUNCH(STATE_TYPE, ACCEPTED_TYPE)   \
+  VLLM_DISPATCH_HALF_TYPES(                                             \
+      x.scalar_type(), "causal_conv1d_gfx906_mtp_update", [&] {         \
+        if (width == 4) {                                               \
+          causal_conv1d_gfx906_mtp_update_width4_kernel<                \
+              scalar_t, STATE_TYPE, ACCEPTED_TYPE>                      \
+              <<<blocks, threads, 0, stream>>>(                         \
+              x.data_ptr<scalar_t>(), conv_state.data_ptr<STATE_TYPE>(),\
+              weight.data_ptr<scalar_t>(),                              \
+              bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,  \
+              state_indices.data_ptr<int32_t>(),                        \
+              cu_seqlens.data_ptr<int32_t>(),                           \
+              num_accepted_tokens.data_ptr<ACCEPTED_TYPE>(),            \
+              out.data_ptr<scalar_t>(), dim, state_len, x.stride(0),    \
+              x.stride(1), conv_state.stride(0),                        \
+              conv_state.stride(1), conv_state.stride(2),               \
+              weight.stride(0), weight.stride(1),                       \
+              state_indices.stride(0), out.stride(0), out.stride(1),    \
+              pad_slot_id,                                              \
+              bias.has_value(), silu_activation);                       \
+        } else {                                                        \
+          causal_conv1d_gfx906_mtp_update_kernel<                       \
+              scalar_t, STATE_TYPE, ACCEPTED_TYPE>                      \
+              <<<blocks, threads, 0, stream>>>(                         \
+              x.data_ptr<scalar_t>(), conv_state.data_ptr<STATE_TYPE>(),\
+              weight.data_ptr<scalar_t>(),                              \
+              bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,  \
+              state_indices.data_ptr<int32_t>(),                        \
+              cu_seqlens.data_ptr<int32_t>(),                           \
+              num_accepted_tokens.data_ptr<ACCEPTED_TYPE>(),            \
+              out.data_ptr<scalar_t>(), dim, width, state_len,          \
+              x.stride(0), x.stride(1), conv_state.stride(0),           \
+              conv_state.stride(1),                                     \
+              conv_state.stride(2), weight.stride(0), weight.stride(1), \
+              state_indices.stride(0), out.stride(0), out.stride(1),    \
+              pad_slot_id,                                              \
+              bias.has_value(), silu_activation);                       \
+        }                                                               \
+      })
+
+  if (num_accepted_tokens.scalar_type() == at::ScalarType::Long) {
+    if (conv_state.scalar_type() == at::ScalarType::Float) {
+      VLLM_GFX906_CAUSAL_CONV_MTP_LAUNCH(float, int64_t);
+    } else if (conv_state.scalar_type() == at::ScalarType::Half) {
+      VLLM_GFX906_CAUSAL_CONV_MTP_LAUNCH(at::Half, int64_t);
+    } else {
+      VLLM_GFX906_CAUSAL_CONV_MTP_LAUNCH(at::BFloat16, int64_t);
+    }
+  } else if (conv_state.scalar_type() == at::ScalarType::Float) {
+    VLLM_GFX906_CAUSAL_CONV_MTP_LAUNCH(float, int32_t);
+  } else if (conv_state.scalar_type() == at::ScalarType::Half) {
+    VLLM_GFX906_CAUSAL_CONV_MTP_LAUNCH(at::Half, int32_t);
+  } else {
+    VLLM_GFX906_CAUSAL_CONV_MTP_LAUNCH(at::BFloat16, int32_t);
+  }
+#undef VLLM_GFX906_CAUSAL_CONV_MTP_LAUNCH
+  return out;
+}
+
 torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_decode(
     torch::Tensor A_log, torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor state,
@@ -1727,6 +2176,170 @@ torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state(
                   threshold, scale, use_qk_l2norm_in_kernel);
         });
   }
+  return out;
+}
+
+torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
+    torch::Tensor A_log, torch::Tensor a, torch::Tensor b,
+    torch::Tensor dt_bias, torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor state, torch::Tensor state_indices,
+    torch::Tensor cu_seqlens, torch::Tensor num_accepted_tokens, double beta,
+    double threshold, double scale, bool use_qk_l2norm_in_kernel) {
+  TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
+              "q, k, and v must be CUDA tensors");
+  TORCH_CHECK(A_log.is_cuda() && a.is_cuda() && b.is_cuda() &&
+                  dt_bias.is_cuda(),
+              "A_log, a, b, and dt_bias must be CUDA tensors");
+  TORCH_CHECK(state.is_cuda() && state_indices.is_cuda() &&
+                  cu_seqlens.is_cuda() && num_accepted_tokens.is_cuda(),
+              "state and MTP metadata must be CUDA tensors");
+  TORCH_CHECK(q.device() == k.device() && q.device() == v.device() &&
+                  q.device() == A_log.device() && q.device() == a.device() &&
+                  q.device() == b.device() && q.device() == dt_bias.device() &&
+                  q.device() == state.device() &&
+                  q.device() == state_indices.device() &&
+                  q.device() == cu_seqlens.device() &&
+                  q.device() == num_accepted_tokens.device(),
+              "all tensors must be on the same device");
+  TORCH_CHECK(q.dim() == 4 && q.size(0) == 1,
+              "q must have shape [1, total_tokens, heads, key_dim]");
+  TORCH_CHECK(k.dim() == 4 && k.size(0) == 1,
+              "k must have shape [1, total_tokens, heads, key_dim]");
+  TORCH_CHECK(v.dim() == 4 && v.size(0) == 1,
+              "v must have shape [1, total_tokens, kv_heads, value_dim]");
+  TORCH_CHECK(state.dim() == 4,
+              "state must have shape [slots, kv_heads, value_dim, key_dim]");
+  TORCH_CHECK(state_indices.dim() == 2,
+              "state_indices must have shape [requests, max_query_len]");
+  TORCH_CHECK(cu_seqlens.dim() == 1,
+              "cu_seqlens must have shape [requests + 1]");
+  TORCH_CHECK(num_accepted_tokens.dim() == 1,
+              "num_accepted_tokens must have shape [requests]");
+  TORCH_CHECK(state_indices.scalar_type() == at::ScalarType::Int &&
+                  cu_seqlens.scalar_type() == at::ScalarType::Int,
+              "state_indices and cu_seqlens must be int32");
+  TORCH_CHECK(num_accepted_tokens.scalar_type() == at::ScalarType::Int ||
+                  num_accepted_tokens.scalar_type() == at::ScalarType::Long,
+              "num_accepted_tokens must be int32 or int64");
+  TORCH_CHECK(q.scalar_type() == at::ScalarType::Half ||
+                  q.scalar_type() == at::ScalarType::BFloat16,
+              "q, k, v, A_log, a, b, and dt_bias must be float16 or bfloat16");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type() &&
+                  q.scalar_type() == v.scalar_type() &&
+                  q.scalar_type() == A_log.scalar_type() &&
+                  q.scalar_type() == a.scalar_type() &&
+                  q.scalar_type() == b.scalar_type() &&
+                  q.scalar_type() == dt_bias.scalar_type(),
+              "q, k, v, A_log, a, b, and dt_bias must have the same dtype");
+  TORCH_CHECK(state.scalar_type() == at::ScalarType::Half ||
+                  state.scalar_type() == at::ScalarType::BFloat16 ||
+                  state.scalar_type() == at::ScalarType::Float,
+              "state must be float16, bfloat16, or float32");
+  TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1),
+              "q, k, and v token counts must match");
+  TORCH_CHECK(q.size(2) == k.size(2), "q and k head counts must match");
+  TORCH_CHECK(q.size(3) == k.size(3), "q and k key dims must match");
+  TORCH_CHECK(q.size(2) > 0 && v.size(2) % q.size(2) == 0,
+              "kv_heads must be divisible by heads");
+  TORCH_CHECK(state.size(1) == v.size(2), "state kv_heads mismatch");
+  TORCH_CHECK(state.size(2) == v.size(3), "state value_dim mismatch");
+  TORCH_CHECK(state.size(3) == q.size(3), "state key_dim mismatch");
+  TORCH_CHECK(A_log.numel() == v.size(2),
+              "A_log shape must be [kv_heads]");
+  TORCH_CHECK(dt_bias.numel() == v.size(2),
+              "dt_bias shape must be [kv_heads]");
+  const int64_t requests = state_indices.size(0);
+  const int64_t max_query_len = state_indices.size(1);
+  TORCH_CHECK(cu_seqlens.numel() == requests + 1,
+              "cu_seqlens shape must be [requests + 1]");
+  TORCH_CHECK(num_accepted_tokens.numel() == requests,
+              "num_accepted_tokens shape must be [requests]");
+  TORCH_CHECK(max_query_len > 0 || q.size(1) == 0,
+              "state_indices must have at least one token column");
+  TORCH_CHECK(beta > 0.0, "beta must be positive");
+  TORCH_CHECK(scale > 0.0, "scale must be positive");
+  if (a.dim() == 2) {
+    TORCH_CHECK(a.size(0) == q.size(1) && a.size(1) == v.size(2),
+                "a shape must be [total_tokens, kv_heads]");
+  } else {
+    TORCH_CHECK(a.dim() == 3 && a.size(0) == 1 &&
+                    a.size(1) == q.size(1) && a.size(2) == v.size(2),
+                "a shape must be [total_tokens, kv_heads] or "
+                "[1, total_tokens, kv_heads]");
+  }
+  if (b.dim() == 2) {
+    TORCH_CHECK(b.size(0) == q.size(1) && b.size(1) == v.size(2),
+                "b shape must be [total_tokens, kv_heads]");
+  } else {
+    TORCH_CHECK(b.dim() == 3 && b.size(0) == 1 &&
+                    b.size(1) == q.size(1) && b.size(2) == v.size(2),
+                "b shape must be [total_tokens, kv_heads] or "
+                "[1, total_tokens, kv_heads]");
+  }
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+  const int64_t tokens = q.size(1);
+  const int64_t heads = q.size(2);
+  const int64_t kv_heads = v.size(2);
+  const int64_t key_dim = q.size(3);
+  const int64_t value_dim = v.size(3);
+  auto out = torch::empty({tokens, kv_heads, value_dim}, q.options());
+  if (tokens == 0 || requests == 0) {
+    return out;
+  }
+
+  const torch::Tensor a_view = a.dim() == 2 ? a : a.squeeze(0);
+  const torch::Tensor b_view = b.dim() == 2 ? b : b.squeeze(0);
+  const int threads = 256;
+  const int64_t total = requests * kv_heads * value_dim;
+  const int blocks = static_cast<int>((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+#define VLLM_GFX906_MTP_LAUNCH(STATE_TYPE, ACCEPTED_TYPE)               \
+  VLLM_DISPATCH_HALF_TYPES(                                             \
+      q.scalar_type(),                                                  \
+      "fused_sigmoid_gating_delta_rule_gfx906_mtp_update", [&] {       \
+        for (int64_t token_position = 0; token_position < max_query_len; \
+             ++token_position) {                                       \
+          fused_sigmoid_gating_delta_rule_gfx906_mtp_update_kernel<    \
+              scalar_t, STATE_TYPE, ACCEPTED_TYPE>                      \
+              <<<blocks, threads, 0, stream>>>(                         \
+              A_log.data_ptr<scalar_t>(), a_view.data_ptr<scalar_t>(),  \
+              b_view.data_ptr<scalar_t>(), dt_bias.data_ptr<scalar_t>(),\
+              q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(),           \
+              v.data_ptr<scalar_t>(), state.data_ptr<STATE_TYPE>(),     \
+              state_indices.data_ptr<int32_t>(),                        \
+              cu_seqlens.data_ptr<int32_t>(),                           \
+              num_accepted_tokens.data_ptr<ACCEPTED_TYPE>(),            \
+              out.data_ptr<scalar_t>(), requests, token_position, heads,\
+              kv_heads, key_dim, value_dim, q.stride(1), q.stride(2),   \
+              q.stride(3), k.stride(1), k.stride(2), k.stride(3),       \
+              v.stride(1), v.stride(2), v.stride(3), a_view.stride(0),  \
+              a_view.stride(1), b_view.stride(0), b_view.stride(1),     \
+              state.stride(0), state.stride(1), state.stride(2),        \
+              state.stride(3), state_indices.stride(0),                 \
+              state_indices.stride(1), out.stride(0), out.stride(1),    \
+              out.stride(2), beta, threshold, scale,                    \
+              use_qk_l2norm_in_kernel);                                 \
+        }                                                               \
+      })
+
+  if (num_accepted_tokens.scalar_type() == at::ScalarType::Long) {
+    if (state.scalar_type() == at::ScalarType::Float) {
+      VLLM_GFX906_MTP_LAUNCH(float, int64_t);
+    } else if (state.scalar_type() == at::ScalarType::Half) {
+      VLLM_GFX906_MTP_LAUNCH(at::Half, int64_t);
+    } else {
+      VLLM_GFX906_MTP_LAUNCH(at::BFloat16, int64_t);
+    }
+  } else if (state.scalar_type() == at::ScalarType::Float) {
+    VLLM_GFX906_MTP_LAUNCH(float, int32_t);
+  } else if (state.scalar_type() == at::ScalarType::Half) {
+    VLLM_GFX906_MTP_LAUNCH(at::Half, int32_t);
+  } else {
+    VLLM_GFX906_MTP_LAUNCH(at::BFloat16, int32_t);
+  }
+#undef VLLM_GFX906_MTP_LAUNCH
   return out;
 }
 

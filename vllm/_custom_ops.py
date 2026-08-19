@@ -2469,6 +2469,23 @@ if hasattr(torch.ops._C, "causal_conv1d_gfx906_decode_update"):
         return torch.empty_like(x)
 
 
+if hasattr(torch.ops._C, "causal_conv1d_gfx906_mtp_update"):
+
+    @register_fake("_C::causal_conv1d_gfx906_mtp_update")
+    def _causal_conv1d_gfx906_mtp_update_fake(
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        pad_slot_id: int,
+        silu_activation: bool,
+    ) -> torch.Tensor:
+        return torch.empty_like(x)
+
+
 if hasattr(torch.ops._C, "fused_sigmoid_gating_delta_rule_gfx906_decode"):
 
     @register_fake("_C::fused_sigmoid_gating_delta_rule_gfx906_decode")
@@ -2562,6 +2579,32 @@ if hasattr(torch.ops._C,
                            device=q.device)
 
 
+if hasattr(torch.ops._C,
+           "fused_sigmoid_gating_delta_rule_gfx906_mtp_update"):
+
+    @register_fake("_C::fused_sigmoid_gating_delta_rule_gfx906_mtp_update")
+    def _fused_sigmoid_gating_delta_rule_gfx906_mtp_update_fake(
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        beta: float,
+        threshold: float,
+        scale: float,
+        use_qk_l2norm_in_kernel: bool,
+    ) -> torch.Tensor:
+        return torch.empty((q.size(1), v.size(2), v.size(3)),
+                           dtype=q.dtype,
+                           device=q.device)
+
+
 if hasattr(torch.ops._C, "fused_recurrent_gated_delta_rule_gfx906_packed_decode"):
 
     @register_fake("_C::fused_recurrent_gated_delta_rule_gfx906_packed_decode")
@@ -2651,6 +2694,22 @@ def causal_conv1d_gfx906_decode_update(
         silu_activation)
 
 
+def causal_conv1d_gfx906_mtp_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    pad_slot_id: int,
+    silu_activation: bool,
+) -> torch.Tensor:
+    return torch.ops._C.causal_conv1d_gfx906_mtp_update(
+        x, conv_state, weight, bias, state_indices, cu_seqlens,
+        num_accepted_tokens, pad_slot_id, silu_activation)
+
+
 def fused_sigmoid_gating_delta_rule_gfx906_decode(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -2728,6 +2787,31 @@ def fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state(
     return torch.ops._C.fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state(
         A_log, a, b, dt_bias, q, k, v, state, state_indices, beta, threshold,
         scale, use_qk_l2norm_in_kernel)
+
+
+def fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+    scale: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> torch.Tensor:
+    if scale is None:
+        scale = k.size(-1)**-0.5
+    return torch.ops._C.fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
+        A_log, a, b, dt_bias, q, k, v, state, state_indices, cu_seqlens,
+        num_accepted_tokens, beta, threshold, scale,
+        use_qk_l2norm_in_kernel)
 
 
 def fused_recurrent_gated_delta_rule_gfx906_packed_decode(

@@ -110,6 +110,76 @@ def causal_conv1d_update_ref(
     return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
 
 
+@pytest.mark.skipif(
+    not (
+        current_platform.is_rocm()
+        and current_platform.get_device_capability() == (9, 0)
+    ),
+    reason="gfx906-specific speculative causal-conv path",
+)
+@pytest.mark.parametrize(
+    ("dtype", "state_dtype"),
+    [
+        (torch.float16, torch.float16),
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+@pytest.mark.parametrize("accepted_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_accepted", [1, 2, 3])
+def test_gfx906_causal_conv1d_mtp_update(
+    dtype, state_dtype, accepted_dtype, num_accepted
+):
+    torch.manual_seed(7)
+    query_len, dim, width, state_len = 3, 37, 4, 5
+    x = torch.randn(query_len, dim, device="cuda", dtype=dtype)
+    state_storage = torch.randn(
+        2, state_len, dim, device="cuda", dtype=state_dtype
+    )
+    conv_state = state_storage.transpose(1, 2)
+    initial_state = conv_state.clone()
+    weight = torch.randn(dim, width, device="cuda", dtype=dtype)
+    bias = torch.randn(dim, device="cuda", dtype=dtype)
+    state_indices = torch.tensor([1], device="cuda", dtype=torch.int32)
+    query_start_loc = torch.tensor(
+        [0, query_len], device="cuda", dtype=torch.int32
+    )
+    accepted = torch.tensor([num_accepted], device="cuda", dtype=accepted_dtype)
+
+    history = initial_state[
+        1, :, num_accepted - 1 : num_accepted + width - 2
+    ].float()
+    expected_outputs = []
+    for token in x.float():
+        output = (history * weight.float()[:, :-1]).sum(-1)
+        output += token * weight.float()[:, -1] + bias.float()
+        expected_outputs.append(F.silu(output))
+        history = torch.cat((history[:, 1:], token[:, None]), dim=1)
+    expected_output = torch.stack(expected_outputs).to(dtype)
+
+    expected_state = initial_state.clone()
+    expected_state[1, :, : width - 2] = initial_state[
+        1, :, num_accepted : num_accepted + width - 2
+    ]
+    expected_state[1, :, width - 2 :] = x.transpose(0, 1)
+
+    output = causal_conv1d_update(
+        x=x,
+        conv_state=conv_state,
+        weight=weight,
+        bias=bias,
+        activation="silu",
+        conv_state_indices=state_indices,
+        num_accepted_tokens=accepted,
+        query_start_loc=query_start_loc,
+        max_query_len=query_len,
+    )
+
+    assert torch.allclose(output, expected_output, rtol=2e-2, atol=2e-2)
+    assert torch.equal(conv_state, expected_state)
+
+
 @pytest.mark.parametrize("itype", [torch.bfloat16, torch.float])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])

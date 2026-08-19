@@ -224,24 +224,6 @@ class Qwen3ForSequenceClassificationConfig(VerifyAndUpdateConfig):
         vllm_config.model_config.hf_config.method = "from_2_way_softmax"
 
 
-class Qwen3_5ForCausalLMConfig(VerifyAndUpdateConfig):
-    @staticmethod
-    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        structured_outputs_config = vllm_config.structured_outputs_config
-        model_config = vllm_config.model_config
-        hf_config = model_config.hf_config
-
-        if (
-            structured_outputs_config.reasoning_parser == ""
-            and model_config.quantization == "gguf"
-            and getattr(hf_config, "model_type", "").startswith("qwen3_5")
-        ):
-            structured_outputs_config.reasoning_parser = "qwen3_5"
-            logger.info(
-                "Using qwen3_5 reasoning parser for Qwen3.5 GGUF model."
-            )
-
-
 class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -267,6 +249,29 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 mamba_ssm_dtype,
                 cache_config.mamba_ssm_cache_dtype,
             )
+
+
+class Qwen3_5ForCausalLMConfig(Qwen3_5ForConditionalGenerationConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+        structured_outputs_config = vllm_config.structured_outputs_config
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_config
+
+        rope_parameters = getattr(model_config.hf_text_config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_parameters.pop("mrope_section", None)
+            rope_parameters.pop("mrope_interleaved", None)
+
+        if (
+            structured_outputs_config.reasoning_parser == ""
+            and model_config.quantization == "gguf"
+            and getattr(hf_config, "model_type", "").startswith("qwen3_5")
+        ):
+            structured_outputs_config.reasoning_parser = "qwen3_5"
+            logger.info("Using qwen3_5 reasoning parser for Qwen3.5 GGUF model.")
 
 
 class JinaVLForSequenceClassificationConfig(VerifyAndUpdateConfig):
@@ -546,6 +551,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen3ForSequenceClassification": Qwen3ForSequenceClassificationConfig,
     "Qwen3_5ForCausalLM": Qwen3_5ForCausalLMConfig,
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
+    "Qwen3_5MoeForCausalLM": Qwen3_5ForCausalLMConfig,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,
     "JinaVLForRanking": JinaVLForSequenceClassificationConfig,
     "JambaForSequenceClassification": JambaForSequenceClassificationConfig,

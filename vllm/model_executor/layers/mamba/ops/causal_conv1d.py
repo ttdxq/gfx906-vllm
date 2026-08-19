@@ -4,6 +4,9 @@
 # Copyright (c) 2024, Tri Dao.
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
+import os
+import sys
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -13,6 +16,9 @@ import vllm.envs as envs
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+
+_GFX906_MTP_CONV_DEBUG_REPORTED = False
 
 
 def _causal_conv1d_gfx906_fallback(
@@ -1370,6 +1376,78 @@ def causal_conv1d_update(
                 conv_state_indices=conv_state_indices,
                 activation=activation,
                 pad_slot_id=pad_slot_id,
+            )
+        # The mainline speculative layout uses one conv cache slot per
+        # request. ``num_accepted_tokens - 1`` selects the history offset
+        # inside that slot; it is not a token-to-slot table like the GDN state.
+        mtp_custom_eligible = (
+            query_start_loc is not None
+            and num_accepted_tokens is not None
+            and conv_state_indices is not None
+            and conv_state_indices.dim() == 1
+            and x.dim() == 2
+            and x.dtype == weight.dtype
+            and conv_state.dtype in (x.dtype, torch.float32)
+            and (bias is None or bias.dtype == x.dtype)
+        )
+        if mtp_custom_eligible:
+            try:
+                return ops.causal_conv1d_gfx906_mtp_update(
+                    x=x,
+                    conv_state=conv_state,
+                    weight=weight,
+                    bias=bias,
+                    state_indices=conv_state_indices,
+                    cu_seqlens=query_start_loc,
+                    num_accepted_tokens=num_accepted_tokens,
+                    pad_slot_id=pad_slot_id,
+                    silu_activation=activation in ["silu", "swish"],
+                )
+            except (AttributeError, RuntimeError) as exc:
+                global _GFX906_MTP_CONV_DEBUG_REPORTED
+                if (
+                    not _GFX906_MTP_CONV_DEBUG_REPORTED
+                    and os.getenv("VLLM_QWEN35_MTP_CONV_DEBUG", "0").lower()
+                    in {"1", "true", "yes", "on"}
+                ):
+                    _GFX906_MTP_CONV_DEBUG_REPORTED = True
+                    print(
+                        "QWEN35_MTP_CONV_FALLBACK "
+                        f"{type(exc).__name__}: {exc}; "
+                        f"x={tuple(x.shape)}/{x.dtype}/{x.stride()} "
+                        f"state={tuple(conv_state.shape)}/{conv_state.dtype}/"
+                        f"{conv_state.stride()} "
+                        f"weight={tuple(weight.shape)}/{weight.dtype}/"
+                        f"{weight.stride()} "
+                        f"bias={None if bias is None else (tuple(bias.shape), bias.dtype)} "
+                        f"indices={tuple(conv_state_indices.shape)}/"
+                        f"{conv_state_indices.dtype} "
+                        f"query={tuple(query_start_loc.shape)}/"
+                        f"{query_start_loc.dtype} "
+                        f"accepted={tuple(num_accepted_tokens.shape)}/"
+                        f"{num_accepted_tokens.dtype}",
+                        file=sys.stderr,
+                    )
+        elif (
+            not _GFX906_MTP_CONV_DEBUG_REPORTED
+            and query_start_loc is not None
+            and num_accepted_tokens is not None
+            and os.getenv("VLLM_QWEN35_MTP_CONV_DEBUG", "0").lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            _GFX906_MTP_CONV_DEBUG_REPORTED = True
+            print(
+                "QWEN35_MTP_CONV_INELIGIBLE "
+                f"x={tuple(x.shape)}/{x.dtype}/{x.stride()} "
+                f"state={tuple(conv_state.shape)}/{conv_state.dtype}/"
+                f"{conv_state.stride()} "
+                f"weight={tuple(weight.shape)}/{weight.dtype}/{weight.stride()} "
+                f"bias={None if bias is None else (tuple(bias.shape), bias.dtype)} "
+                f"indices={None if conv_state_indices is None else (tuple(conv_state_indices.shape), conv_state_indices.dtype)} "
+                f"query={tuple(query_start_loc.shape)}/{query_start_loc.dtype} "
+                f"accepted={tuple(num_accepted_tokens.shape)}/"
+                f"{num_accepted_tokens.dtype}",
+                file=sys.stderr,
             )
         return _causal_conv1d_gfx906_fallback(
             x=x,

@@ -44,6 +44,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
@@ -90,8 +91,8 @@ from .interfaces import (
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
-    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -114,6 +115,7 @@ from .qwen3_vl import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
@@ -193,6 +195,31 @@ def _maybe_unsqueeze_shared_expert_gate(
     return loaded_weight
 
 
+def _make_qwen35_fused_expert_params_mapping(
+    model: nn.Module,
+) -> list[tuple[str, str, int, str]]:
+    base_layer = (
+        "base_layer."
+        if any(".base_layer." in name for name, _ in model.named_parameters())
+        else ""
+    )
+    mapping: list[tuple[str, str, int, str]] = []
+    for param_name, ckpt_name, _, shard_id in FusedMoE.make_expert_params_mapping(
+        ckpt_gate_proj_name="gate_up_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="gate_up_proj",
+        num_experts=1,
+    ):
+        if shard_id == "w3":
+            continue
+        target = "w13_weight" if param_name.startswith("experts.w13_") else "w2_weight"
+        parts = ckpt_name.split(".")
+        mapping.append(
+            (f"experts.{base_layer}{target}", f"{parts[0]}.{parts[2]}", 0, shard_id)
+        )
+    return mapping
+
+
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
@@ -200,7 +227,7 @@ class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
 
 class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen3_5MoeConfig)
+        return self.ctx.get_hf_config((Qwen3_5MoeConfig, Qwen3_5MoeTextConfig))
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
@@ -1116,10 +1143,7 @@ class Qwen3_5Model(Qwen3NextModel):
         partition_sizes: dict[str, dict[int, int]] = {}
         expert_params_mapping = self.get_expert_mapping()
         is_fused_expert = False
-        fused_expert_params_mapping = [
-            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
-            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
-        ]
+        fused_expert_params_mapping = _make_qwen35_fused_expert_params_mapping(self)
         num_experts = (
             self.config.num_experts if hasattr(self.config, "num_experts") else 0
         )
@@ -1534,10 +1558,15 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    IsHybrid,
+    SupportsEagle3,
     SupportsLoRA,
-    SupportsMRoPE,
     SupportsPP,
 ):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"model.language_model.": "model."},
+    )
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1545,6 +1574,8 @@ class Qwen3_5ForCausalLMBase(
             "v_proj",
         ],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1612,6 +1643,60 @@ class Qwen3_5ForCausalLMBase(
 
         return hidden_states
 
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        conv_dtype, temporal_dtype = (
+            MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            )
+        )
+        capability = current_platform.get_device_capability()
+        if (
+            current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        ):
+            if vllm_config.cache_config.mamba_cache_dtype != "auto":
+                return (conv_dtype, temporal_dtype)
+            if vllm_config.cache_config.mamba_ssm_cache_dtype != "auto":
+                return (torch.float32, temporal_dtype)
+            return (torch.float32, torch.float32)
+        return (conv_dtype, temporal_dtype)
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -1625,16 +1710,7 @@ class Qwen3_5ForCausalLMBase(
             self,
             skip_prefixes=["mtp."],
         )
-        return loader.load_weights(weights)
-
-    def get_mrope_input_positions(
-        self,
-        input_tokens: list[int],
-        mm_features: list[object],
-    ) -> tuple[torch.Tensor, int]:
-        positions = torch.arange(len(input_tokens), dtype=torch.long)
-        return positions.unsqueeze(0).expand(3, -1), 0
-
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
     pass

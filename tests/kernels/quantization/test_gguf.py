@@ -109,6 +109,31 @@ def test_mmvq(hidden_size: int, dtype: torch.dtype, quant_type: GGMLQuantization
         torch.testing.assert_close(output, ref_output, atol=1, rtol=1e-1)
 
 
+@pytest.mark.parametrize("quant_type", QUANT_TYPES)
+@torch.inference_mode()
+def test_mmvq_small_batch_matches_single_vectors(quant_type: GGMLQuantizationType):
+    current_platform.seed_everything(0)
+
+    hidden_size = 1024
+    x = torch.rand((3, hidden_size), dtype=torch.float16, device="cuda")
+    for tensor in get_gguf_sample_tensors(hidden_size, quant_type):
+        qweight = torch.tensor(tensor.data, device="cuda")
+        output = ops.ggml_mul_mat_vec_a8(
+            qweight, x, quant_type, qweight.shape[0]
+        )
+        reference = torch.cat(
+            [
+                ops.ggml_mul_mat_vec_a8(
+                    qweight, x[index : index + 1], quant_type, qweight.shape[0]
+                )
+                for index in range(x.shape[0])
+            ],
+            dim=0,
+        )
+
+        torch.testing.assert_close(output, reference, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @torch.inference_mode()

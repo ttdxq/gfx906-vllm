@@ -3522,6 +3522,8 @@ class GPUModelRunner(
             sampler_output = self._sample(logits, spec_decode_metadata)
         profile_after_sample = self._runner_profile_mark()
 
+        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
+
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):

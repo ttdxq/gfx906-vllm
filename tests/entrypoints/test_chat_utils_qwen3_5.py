@@ -1,6 +1,17 @@
 from types import SimpleNamespace
 
-from vllm.entrypoints.chat_utils import apply_hf_chat_template
+from vllm.entrypoints.chat_utils import _detect_content_format, apply_hf_chat_template
+
+
+def test_qwen3_5_content_loop_is_detected_as_openai_format():
+    template = """
+    {% for message in messages %}
+      {% set content = message['content'] %}
+      {% for item in content %}{{ item['text'] }}{% endfor %}
+    {% endfor %}
+    """
+
+    assert _detect_content_format(template, default="string") == "openai"
 
 
 def test_apply_hf_chat_template_strips_empty_qwen3_5_thinking_scaffold():

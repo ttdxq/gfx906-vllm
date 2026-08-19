@@ -1,13 +1,103 @@
+from types import SimpleNamespace
+
 import torch
 
+import vllm.model_executor.layers.fla.ops.fused_sigmoid_gating as gating_module
+import vllm.model_executor.models.qwen3_5 as qwen3_5_module
+from vllm.model_executor.models.qwen3_5 import (
+    Qwen3_5ForCausalLMBase,
+    Qwen3_5GatedDeltaNet,
+    _make_qwen35_fused_expert_params_mapping,
+)
 from vllm.model_executor.models.qwen3_next import (
     _gdn_convert_state_layout,
     _gdn_recurrent_state_to_cache,
 )
-from vllm.model_executor.models.qwen3_5 import (
-    Qwen3_5ForCausalLMBase,
-    Qwen3_5GatedDeltaNet,
-)
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+
+
+def test_gfx906_mtp_gdn_uses_custom_update(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_mtp_update(**kwargs):
+        captured.update(kwargs)
+        q = kwargs["q"]
+        v = kwargs["v"]
+        return torch.zeros(
+            (q.shape[1], v.shape[2], v.shape[3]), dtype=q.dtype, device=q.device
+        )
+
+    monkeypatch.setattr(gating_module, "_is_gfx906_rocm", lambda: True)
+    monkeypatch.setattr(
+        gating_module.ops,
+        "fused_sigmoid_gating_delta_rule_gfx906_mtp_update",
+        fake_mtp_update,
+    )
+
+    q = torch.randn(1, 3, 2, 4)
+    k = torch.randn_like(q)
+    v = torch.randn(1, 3, 4, 5)
+    a = torch.randn(3, 4)
+    b = torch.randn(3, 4)
+    state = torch.randn(4, 4, 5, 4)
+    state_indices = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+    num_accepted_tokens = torch.tensor([2], dtype=torch.int32)
+
+    output, final_state = gating_module.fused_sigmoid_gating_delta_rule_update(
+        A_log=torch.randn(4),
+        a=a,
+        b=b,
+        dt_bias=torch.randn(4),
+        q=q,
+        k=k,
+        v=v,
+        initial_state=state,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    assert output.shape == (1, 3, 4, 5)
+    assert final_state is state
+    assert captured["state"] is state
+    assert captured["state_indices"] is state_indices
+    assert captured["num_accepted_tokens"] is num_accepted_tokens
+
+
+def test_gdn_mixed_batch_builds_prefill_only_metadata():
+    builder = object.__new__(GDNAttentionMetadataBuilder)
+    builder.use_spec_decode = False
+    builder.use_full_cuda_graph = False
+
+    query_start_loc = torch.tensor([0, 1, 2, 5], dtype=torch.int32)
+    common = SimpleNamespace(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        num_computed_tokens_cpu=torch.tensor([8, 9, 0], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[3], [4], [5]], dtype=torch.int32),
+        max_query_len=3,
+        num_reqs=3,
+        num_actual_tokens=5,
+    )
+
+    metadata = builder.build(0, common)
+
+    assert metadata.num_decodes == 2
+    assert metadata.num_prefills == 1
+    assert torch.equal(
+        metadata.prefill_query_start_loc,
+        torch.tensor([0, 3], dtype=torch.int32),
+    )
+    assert torch.equal(
+        metadata.prefill_state_indices,
+        torch.tensor([5], dtype=torch.int32),
+    )
+    assert torch.equal(
+        metadata.prefill_has_initial_state,
+        torch.tensor([False]),
+    )
 
 
 def test_qwen3_5_gdn_prefill_state_uses_cache_layout():
@@ -45,19 +135,50 @@ def test_qwen3_5_chunk_state_transposes_for_standard_cache_layout():
     assert cached.is_contiguous()
 
 
-def test_qwen3_8_text_model_uses_three_mrope_position_axes():
-    model = object.__new__(Qwen3_5ForCausalLMBase)
-
-    positions, offset = model.get_mrope_input_positions([10, 20, 30, 40], [])
-
-    expected = torch.arange(4).unsqueeze(0).expand(3, -1)
-    assert torch.equal(positions, expected)
-    assert offset == 0
+def test_qwen3_5_text_model_declares_hybrid_cache_interface():
+    assert Qwen3_5ForCausalLMBase.is_hybrid
+    assert callable(Qwen3_5ForCausalLMBase.get_mamba_state_dtype_from_config)
+    assert callable(Qwen3_5ForCausalLMBase.get_mamba_state_shape_from_config)
+    assert callable(Qwen3_5ForCausalLMBase.get_mamba_state_copy_func)
 
 
 class _FakeQuantConfig:
     def get_name(self) -> str:
         return "gguf"
+
+
+def test_qwen3_5_load_uses_native_checkpoint_mapper(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _FakeLoader:
+        def __init__(self, model, skip_prefixes):
+            del model, skip_prefixes
+
+        def load_weights(self, weights, mapper=None):
+            del weights
+            captured["mapper"] = mapper
+            return set()
+
+    monkeypatch.setattr(qwen3_5_module, "AutoWeightsLoader", _FakeLoader)
+
+    model = object.__new__(Qwen3_5ForCausalLMBase)
+    torch.nn.Module.__init__(model)
+    model.quant_config = None
+
+    model.load_weights([])
+
+    assert captured["mapper"] is model.hf_to_vllm_mapper
+
+
+def test_qwen3_5_fused_expert_mapping_supports_base_layer_layout():
+    class _FakeModel:
+        def named_parameters(self):
+            return [("model.layers.0.mlp.experts.base_layer.w13_weight", object())]
+
+    mapping = _make_qwen35_fused_expert_params_mapping(_FakeModel())
+
+    assert any(target == "experts.base_layer.w13_weight" for target, *_ in mapping)
+    assert any(target == "experts.base_layer.w2_weight" for target, *_ in mapping)
 
 
 class _FakeLinear:

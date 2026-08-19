@@ -797,7 +797,25 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             mixed_qkv_non_spec = None
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+        split_non_spec = (
+            spec_sequence_masks is None
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes > 0
+        )
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        if split_non_spec:
+            assert mixed_qkv_non_spec is not None
+            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
+                mixed_qkv_non_spec[:num_decode_tokens]
+            )
+            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+                mixed_qkv_non_spec[num_decode_tokens:]
+            )
+        else:
+            query_decode = key_decode = value_decode = None
+            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+                mixed_qkv_non_spec
+            )
 
         g_non_spec: torch.Tensor | None = None
         beta_non_spec: torch.Tensor | None = None
@@ -810,6 +828,9 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             if spec_sequence_masks is not None:
                 g_non_spec = g.index_select(1, non_spec_token_indx)
                 beta_non_spec = beta.index_select(1, non_spec_token_indx)
+            elif split_non_spec:
+                g_non_spec = g[:, num_decode_tokens:]
+                beta_non_spec = beta[:, num_decode_tokens:]
             else:
                 g_non_spec = g
                 beta_non_spec = beta
@@ -833,17 +854,52 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
+        if split_non_spec:
+            assert query_decode is not None
+            assert key_decode is not None
+            assert value_decode is not None
+            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                a=a[:num_decode_tokens],
+                b=b[:num_decode_tokens],
+                dt_bias=self.dt_bias,
+                q=query_decode,
+                k=key_decode,
+                v=value_decode,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
+                ssm_state_indices=non_spec_state_indices_tensor[
+                    : attn_metadata.num_decodes
+                ],
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            core_attn_out_decode = None
+
         if attn_metadata.num_prefills > 0:
+            prefill_query_start_loc = attn_metadata.prefill_query_start_loc
+            prefill_state_indices = attn_metadata.prefill_state_indices
+            prefill_has_initial_state = attn_metadata.prefill_has_initial_state
+            assert prefill_query_start_loc is not None
+            assert prefill_state_indices is not None
+            assert prefill_has_initial_state is not None
             if _is_gfx906_rocm():
                 if spec_sequence_masks is not None:
                     a_non_spec = a.index_select(0, non_spec_token_indx)
                     b_non_spec = b.index_select(0, non_spec_token_indx)
+                elif split_non_spec:
+                    a_non_spec = a[num_decode_tokens:]
+                    b_non_spec = b[num_decode_tokens:]
                 else:
                     a_non_spec = a
                     b_non_spec = b
-                initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
-                if has_initial_state is not None:
-                    initial_state[~has_initial_state, ...] = 0
+                initial_state = (
+                    ssm_state[prefill_state_indices]
+                    .transpose(-1, -2)
+                    .contiguous()
+                )
+                initial_state[~prefill_has_initial_state, ...] = 0
                 if _gdn_runtime_debug_enabled():
                     _append_gdn_runtime_debug(
                         "PREFILL "
@@ -860,20 +916,19 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     v=value_non_spec,
                     initial_state=initial_state,
                     inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc,
+                    cu_seqlens=prefill_query_start_loc,
                     ssm_state_indices=None,
                     use_qk_l2norm_in_kernel=True,
                 )
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.transpose(
+                ssm_state[prefill_state_indices] = last_recurrent_state.transpose(
                     -1, -2
                 ).to(ssm_state.dtype)
             else:
                 ensure_non_spec_gating()
                 assert g_non_spec is not None
                 assert beta_non_spec is not None
-                initial_state = ssm_state.contiguous()
-                if has_initial_state is not None:
-                    initial_state[non_spec_state_indices_tensor[~has_initial_state], ...] = 0
+                initial_state = ssm_state[prefill_state_indices].contiguous()
+                initial_state[~prefill_has_initial_state, ...] = 0
                 if _gdn_runtime_debug_enabled():
                     _append_gdn_runtime_debug(
                         "PREFILL "
@@ -886,13 +941,20 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     v=value_non_spec.transpose(1, 2),
                     g=g_non_spec.transpose(1, 2),
                     beta=beta_non_spec.transpose(1, 2),
-                    initial_state=ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous(),
+                    initial_state=initial_state.transpose(-1, -2).contiguous(),
                     output_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc,
+                    cu_seqlens=prefill_query_start_loc,
                     head_first=True,
                     use_qk_l2norm_in_kernel=True,
                 )
-                ssm_state.copy_(last_recurrent_state.to(ssm_state.dtype))
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
+
+            if core_attn_out_decode is not None:
+                core_attn_out_non_spec = torch.cat(
+                    (core_attn_out_decode, core_attn_out_non_spec), dim=1
+                )
         elif attn_metadata.num_decodes > 0:
             if _is_gfx906_rocm():
                 core_attn_out_non_spec, last_recurrent_state = fused_sigmoid_gating_delta_rule_update(

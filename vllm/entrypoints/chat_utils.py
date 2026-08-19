@@ -387,10 +387,16 @@ def _iter_nodes_assign_content_item(root: jinja2.nodes.Node):
         varname for _, varname in _iter_nodes_assign_messages_item(root)
     ]
 
-    # Search for {%- for content in message['content'] -%} loops
+    # Search for {%- for content in message['content'] -%} loops, including
+    # templates that first bind message['content'] to the name `content`.
     for loop_ast in root.find_all(jinja2.nodes.For):
         loop_iter = loop_ast.iter
         loop_target = loop_ast.target
+
+        if isinstance(loop_iter, jinja2.nodes.Name) and loop_iter.name == "content":
+            assert isinstance(loop_target, jinja2.nodes.Name)
+            yield loop_ast, loop_target.name
+            continue
 
         for varname in message_varnames:
             if _is_var_or_elems_access(loop_iter, varname, "content"):

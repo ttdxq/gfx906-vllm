@@ -318,6 +318,12 @@ torch::Tensor causal_conv1d_gfx906_decode_update(
     std::optional<torch::Tensor> conv_state_indices, int64_t pad_slot_id,
     bool silu_activation);
 
+torch::Tensor causal_conv1d_gfx906_mtp_update(
+    torch::Tensor x, torch::Tensor conv_state, torch::Tensor weight,
+    std::optional<torch::Tensor> bias, torch::Tensor state_indices,
+    torch::Tensor cu_seqlens, torch::Tensor num_accepted_tokens,
+    int64_t pad_slot_id, bool silu_activation);
+
 torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_decode(
     torch::Tensor A_log, torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor state,
@@ -341,6 +347,13 @@ torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor state,
     torch::Tensor state_indices, double beta, double threshold, double scale,
     bool use_qk_l2norm_in_kernel);
+
+torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
+    torch::Tensor A_log, torch::Tensor a, torch::Tensor b,
+    torch::Tensor dt_bias, torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor state, torch::Tensor state_indices,
+    torch::Tensor cu_seqlens, torch::Tensor num_accepted_tokens, double beta,
+    double threshold, double scale, bool use_qk_l2norm_in_kernel);
 
 torch::Tensor fused_recurrent_gated_delta_rule_gfx906_packed_decode(
     torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b,

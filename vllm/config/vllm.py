@@ -27,8 +27,8 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
 
-from .cache import CacheConfig
 from .attention import AttentionConfig
+from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
 from .ec_transfer import ECTransferConfig
@@ -657,9 +657,13 @@ class VllmConfig:
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling only for measured model/platform
             # combinations unless there is an incompatible option.
+            speculative_async_supported = self.speculative_config is None or (
+                self.speculative_config.method in get_args(EagleModelTypes)
+                and not self.speculative_config.disable_padded_drafter_batch
+            )
             if (
                 self.parallel_config.pipeline_parallel_size > 1
-                or self.speculative_config is not None
+                or not speculative_async_supported
             ):
                 logger.warning(
                     "Async scheduling is not yet supported with speculative decoding "

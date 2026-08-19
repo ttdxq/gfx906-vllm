@@ -34,6 +34,7 @@ MTPModelTypes = Literal[
     "glm4_moe_mtp",
     "ernie_mtp",
     "qwen3_next_mtp",
+    "qwen3_5_mtp",
     "longcat_flash_mtp",
     "mtp",
     "pangu_ultra_moe_mtp",
@@ -219,6 +220,21 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Qwen3NextMTP"]}
+            )
+        if hf_config.model_type in (
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        ):
+            is_moe = hf_config.model_type in ("qwen3_5_moe", "qwen3_5_moe_text")
+            hf_config.model_type = "qwen3_5_mtp"
+            n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
+            hf_config.update(
+                {
+                    "n_predict": n_predict,
+                    "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
+                }
             )
         if hf_config.model_type == "longcat_flash":
             hf_config.model_type = "longcat_flash_mtp"

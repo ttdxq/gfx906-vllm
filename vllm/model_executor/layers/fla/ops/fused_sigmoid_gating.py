@@ -7,11 +7,16 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
+import sys
 from functools import lru_cache
 
 import torch
 
 from vllm import _custom_ops as ops
+
+
+_GFX906_MTP_GDN_DEBUG_REPORTED = False
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -88,7 +93,9 @@ def _fused_sigmoid_gating_delta_rule_update_gfx906_eager(
             init_token_idx = 0
             if num_accepted_tokens is not None:
                 init_token_idx = max(int(num_accepted_tokens[seq_idx].item()) - 1, 0)
-            state_index = _lookup_state_index(ssm_state_indices, seq_idx, init_token_idx)
+            state_index = _lookup_state_index(
+                ssm_state_indices, seq_idx, init_token_idx
+            )
             if state_index < 0:
                 continue
             state = initial_state[state_index].float().clone()
@@ -101,7 +108,10 @@ def _fused_sigmoid_gating_delta_rule_update_gfx906_eager(
                 k_t = k[batch_idx, token_idx, q_head_idx].float()
                 v_t = v[batch_idx, token_idx, head_idx].float()
 
-                x = a[batch_idx, token_idx, head_idx].float() + dt_bias[head_idx].float()
+                x = (
+                    a[batch_idx, token_idx, head_idx].float()
+                    + dt_bias[head_idx].float()
+                )
                 softplus_x = torch.where(
                     beta * x <= threshold,
                     (1.0 / beta) * torch.log1p(torch.exp(beta * x)),
@@ -153,7 +163,7 @@ def _fused_sigmoid_gating_delta_rule_decode_gfx906(
     use_qk_l2norm_in_kernel: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _, T, H, K = q.shape
-    HV, V = v.shape[2], v.shape[3]
+    HV = v.shape[2]
     if a.ndim == 2:
         a = a.unsqueeze(0)
     if b.ndim == 2:
@@ -593,6 +603,87 @@ def fused_sigmoid_gating_delta_rule_update(
             scale = k.shape[-1] ** -0.5
         else:
             assert scale > 0, "scale must be positive"
+        mtp_gfx906_path = (
+            cu_seqlens is not None
+            and q.shape[0] == 1
+            and initial_state is not None
+            and inplace_final_state
+            and ssm_state_indices is not None
+            and num_accepted_tokens is not None
+        )
+        if mtp_gfx906_path:
+            try:
+                o = ops.fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
+                    A_log=A_log,
+                    a=a,
+                    b=b,
+                    dt_bias=dt_bias,
+                    q=q,
+                    k=k,
+                    v=v,
+                    state=initial_state,
+                    state_indices=ssm_state_indices,
+                    cu_seqlens=cu_seqlens,
+                    num_accepted_tokens=num_accepted_tokens,
+                    beta=beta,
+                    threshold=threshold,
+                    scale=scale,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+                global _GFX906_MTP_GDN_DEBUG_REPORTED
+                if (
+                    not _GFX906_MTP_GDN_DEBUG_REPORTED
+                    and os.getenv("VLLM_QWEN35_MTP_GDN_DEBUG", "0").lower()
+                    in {"1", "true", "yes", "on"}
+                ):
+                    _GFX906_MTP_GDN_DEBUG_REPORTED = True
+                    print(
+                        "QWEN35_MTP_GDN_CUSTOM_HIT "
+                        f"q={tuple(q.shape)}/{q.dtype} "
+                        f"state={tuple(initial_state.shape)}/"
+                        f"{initial_state.dtype} "
+                        f"accepted={num_accepted_tokens.dtype}",
+                        file=sys.stderr,
+                    )
+                return o.unsqueeze(0), initial_state
+            except (AttributeError, RuntimeError) as exc:
+                if os.getenv("VLLM_QWEN35_MTP_GDN_DEBUG", "0").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    print(
+                        "QWEN35_MTP_GDN_FALLBACK "
+                        f"{type(exc).__name__}: {exc}; "
+                        f"q={tuple(q.shape)}/{q.dtype} "
+                        f"a={tuple(a.shape)}/{a.dtype} "
+                        f"A_log={tuple(A_log.shape)}/{A_log.dtype} "
+                        f"state={tuple(initial_state.shape)}/{initial_state.dtype} "
+                        f"indices={tuple(ssm_state_indices.shape)}/"
+                        f"{ssm_state_indices.dtype} "
+                        f"cu={tuple(cu_seqlens.shape)}/{cu_seqlens.dtype} "
+                        f"accepted={tuple(num_accepted_tokens.shape)}/"
+                        f"{num_accepted_tokens.dtype}",
+                        file=sys.stderr,
+                    )
+        elif (
+            not _GFX906_MTP_GDN_DEBUG_REPORTED
+            and num_accepted_tokens is not None
+            and os.getenv("VLLM_QWEN35_MTP_GDN_DEBUG", "0").lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            _GFX906_MTP_GDN_DEBUG_REPORTED = True
+            print(
+                "QWEN35_MTP_GDN_INELIGIBLE "
+                f"cu={cu_seqlens is not None} q={tuple(q.shape)}/{q.dtype} "
+                f"state={None if initial_state is None else (tuple(initial_state.shape), initial_state.dtype)} "
+                f"inplace={inplace_final_state} "
+                f"indices={None if ssm_state_indices is None else tuple(ssm_state_indices.shape)} "
+                f"accepted={tuple(num_accepted_tokens.shape)}/"
+                f"{num_accepted_tokens.dtype}",
+                file=sys.stderr,
+            )
         decode_gfx906_path = (
             cu_seqlens is not None
             and q.shape[0] == 1

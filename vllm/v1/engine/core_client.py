@@ -265,7 +265,8 @@ class InprocClient(EngineCoreClient):
         self.resources = SimpleNamespace(engine_dead=False)
 
     def get_output(self) -> EngineCoreOutputs:
-        outputs, _ = self.engine_core.step_fn()
+        outputs, model_executed = self.engine_core.step_fn()
+        self.engine_core.post_step(model_executed=model_executed)
         return outputs and outputs.get(0) or EngineCoreOutputs()
 
     async def get_output_async(self) -> EngineCoreOutputs:

@@ -12,8 +12,8 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
-from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.attention.backends.abstract import AttentionMetadata
+from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
@@ -36,13 +36,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops import (
     causal_conv1d_recurrent_gated_delta_rule_packed_decode,
     chunk_gated_delta_rule,
-    fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule,
+    fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
     fused_sigmoid_gating_delta_rule_update_kv_cache_gfx906,
 )
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
 )
@@ -901,24 +902,67 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            ensure_gating()
-            assert g_spec is not None
-            assert beta_spec is not None
-            spec_initial_state = ssm_state.transpose(-1, -2).contiguous()
-            core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                q=query_spec,
-                k=key_spec,
-                v=value_spec,
-                g=g_spec,
-                beta=beta_spec,
-                initial_state=spec_initial_state,
-                inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
-                ssm_state_indices=spec_state_indices_tensor,
-                num_accepted_tokens=num_accepted_tokens,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gfx906_sigmoid_spec_update = (
+                getattr(self, "split_projections", False)
+                and current_platform.is_rocm()
+                and capability is not None
+                and capability.major == 9
+                and capability.minor == 0
             )
-            ssm_state.copy_(last_recurrent_state.transpose(-1, -2).to(ssm_state.dtype))
+            if use_gfx906_sigmoid_spec_update:
+                if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                    a_spec = a
+                    b_spec = b
+                else:
+                    a_spec = a.index_select(0, spec_token_indx)
+                    b_spec = b.index_select(0, spec_token_indx)
+                spec_state = ssm_state
+                if getattr(self, "use_transposed_state_for_packed_decode", False):
+                    spec_state = ssm_state.transpose(-1, -2)
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a_spec,
+                        b=b_spec,
+                        dt_bias=self.dt_bias,
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        initial_state=spec_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[
+                            : attn_metadata.num_spec_decodes + 1
+                        ],
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=num_accepted_tokens,
+                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    )
+                )
+            else:
+                ensure_gating()
+                assert g_spec is not None
+                assert beta_spec is not None
+                spec_initial_state = ssm_state.transpose(-1, -2).contiguous()
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_recurrent_gated_delta_rule(
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        g=g_spec,
+                        beta=beta_spec,
+                        initial_state=spec_initial_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[
+                            : attn_metadata.num_spec_decodes + 1
+                        ],
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=num_accepted_tokens,
+                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    )
+                )
+                ssm_state.copy_(
+                    last_recurrent_state.transpose(-1, -2).to(ssm_state.dtype)
+                )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
@@ -1241,13 +1285,48 @@ class Qwen3NextAttention(nn.Module):
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def forward(
+        capability = current_platform.get_device_capability()
+        is_gfx906 = (
+            current_platform.is_rocm()
+            and capability is not None
+            and capability.major == 9
+            and capability.minor == 0
+        )
+        mm_config = model_config.multimodal_config if model_config else None
+        text_only = mm_config is None or mm_config.language_model_only
+        fused_qk_enabled = os.getenv("VLLM_QWEN35_FUSED_QK_NORM_ROPE", "1").lower()
+        self.use_fused_qk_norm_rope_gate = (
+            fused_qk_enabled in {"1", "true", "yes", "on"}
+            and self.attn_output_gate
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and (current_platform.is_cuda() or is_gfx906)
+            and text_only
+        )
+
+    def _project_qkv_gate(
         self,
+        qkv: torch.Tensor,
         positions: torch.Tensor,
-        output: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ):
-        qkv, _ = self.qkv_proj(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self.use_fused_qk_norm_rope_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            pos = positions[0] if positions.ndim == 2 else positions
+            q, k, gate = fused_qk_rmsnorm_rope_gate(
+                q_gate,
+                k,
+                self.q_norm.weight.float() + 1.0,
+                self.k_norm.weight.float() + 1.0,
+                self.rotary_emb.cos_sin_cache,
+                pos,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+            )
+            return q, k, v, gate
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -1260,6 +1339,7 @@ class Qwen3NextAttention(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
 
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
@@ -1267,12 +1347,21 @@ class Qwen3NextAttention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
             -1, self.num_kv_heads * self.head_dim
         )
-
         q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v, gate = self._project_qkv_gate(qkv, positions)
 
         attn_output = self.attn(q, k, v)
 
-        if self.attn_output_gate:
+        if gate is not None:
             projected_out = try_gguf_sigmoid_gated_out_proj_mmvq(
                 attn_output,
                 gate,

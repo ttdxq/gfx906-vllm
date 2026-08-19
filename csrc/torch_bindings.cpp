@@ -533,6 +533,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &causal_conv1d_gfx906_decode_update);
 
   ops.def(
+      "causal_conv1d_gfx906_mtp_update("
+      "Tensor x, Tensor conv_state, Tensor weight, Tensor? bias, "
+      "Tensor state_indices, Tensor cu_seqlens, Tensor num_accepted_tokens, "
+      "int pad_slot_id, bool silu_activation) -> Tensor");
+  ops.impl("causal_conv1d_gfx906_mtp_update", torch::kCUDA,
+           &causal_conv1d_gfx906_mtp_update);
+
+  ops.def(
       "fused_sigmoid_gating_delta_rule_gfx906_decode("
       "Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, Tensor q, Tensor k, "
       "Tensor v, Tensor state, float beta, float threshold, float scale, "
@@ -564,6 +572,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state",
            torch::kCUDA,
            &fused_sigmoid_gating_delta_rule_gfx906_indexed_decode_kv_state);
+
+  ops.def(
+      "fused_sigmoid_gating_delta_rule_gfx906_mtp_update("
+      "Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, Tensor q, Tensor k, "
+      "Tensor v, Tensor state, Tensor state_indices, Tensor cu_seqlens, "
+      "Tensor num_accepted_tokens, float beta, float threshold, float scale, "
+      "bool use_qk_l2norm_in_kernel) -> Tensor");
+  ops.impl("fused_sigmoid_gating_delta_rule_gfx906_mtp_update", torch::kCUDA,
+           &fused_sigmoid_gating_delta_rule_gfx906_mtp_update);
 
   ops.def(
       "fused_recurrent_gated_delta_rule_gfx906_packed_decode("

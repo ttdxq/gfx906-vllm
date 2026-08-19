@@ -241,6 +241,7 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
         ),
         "layer_types": layer_types,
         "num_nextn_predict_layers": num_nextn_predict_layers,
+        "mtp_num_hidden_layers": num_nextn_predict_layers,
         "rope_parameters": {
             "rope_type": "default",
             "rope_theta": float(_read_gguf_scalar(reader, f"{prefix}.rope.freq_base")),
@@ -276,6 +277,7 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
                 "num_nextn_predict_layers": int(
                     num_nextn_predict_layers
                 ),
+                "mtp_num_hidden_layers": int(num_nextn_predict_layers),
                 "norm_topk_prob": True,
             }
         )
