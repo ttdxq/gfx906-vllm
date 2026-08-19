@@ -47,6 +47,23 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _maybe_convert_gguf_rms_norm_weight(
+    name: str,
+    weight: torch.Tensor,
+    modules: dict[str, nn.Module],
+    is_gguf: bool,
+) -> torch.Tensor:
+    if not is_gguf:
+        return weight
+
+    module_name, _, param_leaf = name.rpartition(".")
+    if param_leaf == "weight" and isinstance(
+        modules.get(module_name), Qwen3_5RMSNorm
+    ):
+        return weight - 1.0
+    return weight
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -446,6 +463,12 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        modules = dict(self.named_modules())
+        is_gguf = (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "gguf"
+        )
+
         def remap_weight_names(weights):
             for name, weight in weights:
                 if name.startswith("mtp."):
@@ -455,6 +478,9 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
                         name = name.replace("language_model.", "")
                 else:
                     continue
+                weight = _maybe_convert_gguf_rms_norm_weight(
+                    name, weight, modules, is_gguf
+                )
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
