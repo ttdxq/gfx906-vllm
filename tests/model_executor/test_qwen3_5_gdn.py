@@ -1,6 +1,9 @@
 import torch
 
-from vllm.model_executor.models.qwen3_next import _gdn_recurrent_state_to_cache
+from vllm.model_executor.models.qwen3_next import (
+    _gdn_convert_state_layout,
+    _gdn_recurrent_state_to_cache,
+)
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForCausalLMBase,
     Qwen3_5GatedDeltaNet,
@@ -14,6 +17,32 @@ def test_qwen3_5_gdn_prefill_state_uses_cache_layout():
 
     assert cached.shape == (2, 3, 5, 4)
     assert torch.equal(cached, state.transpose(-1, -2))
+
+
+def test_qwen3_5_chunk_state_keeps_packed_decode_layout():
+    state = torch.arange(2 * 3 * 5 * 7).reshape(2, 3, 5, 7)
+
+    cached = _gdn_convert_state_layout(
+        state,
+        source_uses_kv_layout=True,
+        target_uses_kv_layout=True,
+    )
+
+    assert torch.equal(cached, state)
+    assert cached.is_contiguous()
+
+
+def test_qwen3_5_chunk_state_transposes_for_standard_cache_layout():
+    state = torch.arange(2 * 3 * 5 * 7).reshape(2, 3, 5, 7)
+
+    cached = _gdn_convert_state_layout(
+        state,
+        source_uses_kv_layout=True,
+        target_uses_kv_layout=False,
+    )
+
+    assert torch.equal(cached, state.transpose(-1, -2))
+    assert cached.is_contiguous()
 
 
 def test_qwen3_8_text_model_uses_three_mrope_position_axes():

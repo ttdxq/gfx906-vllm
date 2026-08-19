@@ -112,6 +112,17 @@ def _gdn_recurrent_state_to_cache(state: torch.Tensor) -> torch.Tensor:
     return state.transpose(-1, -2)
 
 
+def _gdn_convert_state_layout(
+    state: torch.Tensor,
+    *,
+    source_uses_kv_layout: bool,
+    target_uses_kv_layout: bool,
+) -> torch.Tensor:
+    if source_uses_kv_layout == target_uses_kv_layout:
+        return state.contiguous()
+    return state.transpose(-1, -2).contiguous()
+
+
 def _append_qwen35_runtime_debug(message: str) -> None:
     debug_file = os.environ.get("VLLM_QWEN35_RUNTIME_DEBUG_FILE")
     if not debug_file:
@@ -913,10 +924,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].transpose(
-                -1, -2
-            ).contiguous()
-            initial_state[~has_initial_state, ...] = 0
+            cache_uses_kv_layout = getattr(
+                self, "use_transposed_state_for_packed_decode", False
+            )
+            cached_state = ssm_state[non_spec_state_indices_tensor]
             if getattr(self, "prefix", "") == "language_model.model.layers.0.linear_attn":
                 _append_qwen35_runtime_debug(
                     "PREFILL q={} k={} v={} g={} beta={} q_stride={} k_stride={} v_stride={} g_stride={} beta_stride={}".format(
@@ -942,6 +953,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 and capability.minor == 0
             )
             if use_sigmoid_prefill_for_split_qwen35:
+                initial_state = _gdn_convert_state_layout(
+                    cached_state,
+                    source_uses_kv_layout=cache_uses_kv_layout,
+                    target_uses_kv_layout=False,
+                )
+                initial_state[~has_initial_state, ...] = 0
                 if spec_sequence_masks is not None:
                     a_non_spec = a.index_select(0, non_spec_token_indx)
                     b_non_spec = b.index_select(0, non_spec_token_indx)
@@ -965,6 +982,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     )
                 )
             elif getattr(self, "use_recurrent_prefill_for_gdn", False):
+                initial_state = _gdn_convert_state_layout(
+                    cached_state,
+                    source_uses_kv_layout=cache_uses_kv_layout,
+                    target_uses_kv_layout=False,
+                )
+                initial_state[~has_initial_state, ...] = 0
                 ensure_gating()
                 assert g_non_spec is not None
                 assert beta_non_spec is not None
@@ -982,6 +1005,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     )
                 )
             else:
+                initial_state = _gdn_convert_state_layout(
+                    cached_state,
+                    source_uses_kv_layout=cache_uses_kv_layout,
+                    target_uses_kv_layout=True,
+                )
+                initial_state[~has_initial_state, ...] = 0
                 ensure_gating()
                 assert g_non_spec is not None
                 assert beta_non_spec is not None
@@ -999,13 +1028,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     cu_seqlens=non_spec_query_start_loc,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
-            # Init cache
-            # The GDN operators use [H, K, V], while the Mamba cache stores
-            # [H, V, K].  K and V are both 128 for Qwen3.5, so assigning the
-            # state without transposing silently corrupts the next prefill
-            # chunk instead of raising a shape error.
-            ssm_state[non_spec_state_indices_tensor] = _gdn_recurrent_state_to_cache(
-                last_recurrent_state
+            state_uses_kv_layout = not (
+                use_sigmoid_prefill_for_split_qwen35
+                or getattr(self, "use_recurrent_prefill_for_gdn", False)
+            )
+            ssm_state[non_spec_state_indices_tensor] = _gdn_convert_state_layout(
+                last_recurrent_state,
+                source_uses_kv_layout=state_uses_kv_layout,
+                target_uses_kv_layout=cache_uses_kv_layout,
             ).to(ssm_state.dtype)
         elif attn_metadata.num_decodes > 0:
             if getattr(self, "prefix", "") == "language_model.model.layers.0.linear_attn":

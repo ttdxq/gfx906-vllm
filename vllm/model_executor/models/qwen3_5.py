@@ -239,11 +239,9 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         self.expand_qk_heads_for_gdn = _env_bool(
             "VLLM_QWEN35_EXPAND_QK", True
         )
-        # The FLA chunk prefill path does not reliably preserve Qwen3.5 GDN
-        # state across scheduler chunks on gfx906.  Keep the verified
-        # recurrent/sigmoid path as the correctness default; the environment
-        # override remains available for isolated chunk-kernel development.
-        default_recurrent_prefill = True
+        # The chunk path preserves the packed-decode state layout across
+        # scheduler chunks. Keep the recurrent path as a debugging fallback.
+        default_recurrent_prefill = False
         self.use_recurrent_prefill_for_gdn = _env_bool(
             "VLLM_QWEN35_REC_PREFILL", default_recurrent_prefill
         )
