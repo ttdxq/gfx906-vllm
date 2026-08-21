@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fla.ops import (
 )
 from vllm.model_executor.layers.fla.ops import (
     causal_conv1d_recurrent_gated_delta_rule_packed_decode,
+    fused_post_conv_prep,
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
@@ -808,32 +809,57 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]
             )
-            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
-                mixed_qkv_non_spec[num_decode_tokens:]
-            )
+            query_non_spec = key_non_spec = value_non_spec = None
         else:
             query_decode = key_decode = value_decode = None
-            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
-                mixed_qkv_non_spec
-            )
+            if attn_metadata.num_prefills == 0:
+                query_non_spec, key_non_spec, value_non_spec = (
+                    self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+                )
+            else:
+                query_non_spec = key_non_spec = value_non_spec = None
 
         g_non_spec: torch.Tensor | None = None
         beta_non_spec: torch.Tensor | None = None
 
-        def ensure_non_spec_gating() -> None:
-            nonlocal g_non_spec, beta_non_spec
-            if g_non_spec is not None:
-                return
-            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        if attn_metadata.num_prefills > 0:
+            assert mixed_qkv_non_spec is not None
             if spec_sequence_masks is not None:
-                g_non_spec = g.index_select(1, non_spec_token_indx)
-                beta_non_spec = beta.index_select(1, non_spec_token_indx)
+                mixed_qkv_prefill = mixed_qkv_non_spec
+                a_prefill = a.index_select(0, non_spec_token_indx)
+                b_prefill = b.index_select(0, non_spec_token_indx)
             elif split_non_spec:
-                g_non_spec = g[:, num_decode_tokens:]
-                beta_non_spec = beta[:, num_decode_tokens:]
+                mixed_qkv_prefill = mixed_qkv_non_spec[num_decode_tokens:]
+                a_prefill = a[num_decode_tokens:]
+                b_prefill = b[num_decode_tokens:]
             else:
-                g_non_spec = g
-                beta_non_spec = beta
+                mixed_qkv_prefill = mixed_qkv_non_spec
+                a_prefill = a
+                b_prefill = b
+
+            (
+                query_non_spec,
+                key_non_spec,
+                value_non_spec,
+                g_non_spec,
+                beta_non_spec,
+            ) = fused_post_conv_prep(
+                conv_output=mixed_qkv_prefill,
+                a=a_prefill,
+                b=b_prefill,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                num_k_heads=self.num_k_heads // self.tp_size,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                apply_l2norm=True,
+                output_g_exp=False,
+            )
+            query_non_spec = query_non_spec.unsqueeze(0)
+            key_non_spec = key_non_spec.unsqueeze(0)
+            value_non_spec = value_non_spec.unsqueeze(0)
+            g_non_spec = g_non_spec.unsqueeze(0)
+            beta_non_spec = beta_non_spec.unsqueeze(0)
 
         if spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = fused_sigmoid_gating_delta_rule_update(
@@ -918,13 +944,12 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     inplace_final_state=True,
                     cu_seqlens=prefill_query_start_loc,
                     ssm_state_indices=None,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=False,
                 )
                 ssm_state[prefill_state_indices] = last_recurrent_state.transpose(
                     -1, -2
                 ).to(ssm_state.dtype)
             else:
-                ensure_non_spec_gating()
                 assert g_non_spec is not None
                 assert beta_non_spec is not None
                 initial_state = ssm_state[prefill_state_indices].contiguous()
@@ -945,7 +970,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     output_final_state=True,
                     cu_seqlens=prefill_query_start_loc,
                     head_first=True,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=False,
                 )
                 ssm_state[prefill_state_indices] = last_recurrent_state.to(
                     ssm_state.dtype
