@@ -5,13 +5,13 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import os
+import sqlite3
 from typing import TYPE_CHECKING
 
 import numpy as np
 import regex as re
 import torch
 from cachetools import LRUCache
-from diskcache import Cache
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -168,6 +168,70 @@ def get_outlines_cache_path() -> str:
         return os.path.join(tempdir, ".cache", "outlines")
 
 
+class OutlinesDiskCache:
+    """SQLite-backed cache for outlines_core.Index objects.
+
+    Uses outlines_core's native binary serialization (via Rust serde)
+    instead of pickle, eliminating arbitrary code execution risk on
+    deserialization.
+    """
+
+    _TYPE_INDEX = "I"
+    _TYPE_STRING = "S"
+
+    def __init__(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        db_path = os.path.join(path, "outlines_cache.db")
+        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS cache "
+            "(key TEXT PRIMARY KEY, type_tag TEXT NOT NULL, value BLOB NOT NULL)"
+        )
+        self._db.commit()
+
+    def __contains__(self, key: str) -> bool:
+        row = self._db.execute("SELECT 1 FROM cache WHERE key=?", (key,)).fetchone()
+        return row is not None
+
+    def __getitem__(self, key: str):
+        row = self._db.execute(
+            "SELECT type_tag, value FROM cache WHERE key=?", (key,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(key)
+        type_tag, data = row
+        if type_tag == self._TYPE_STRING:
+            return data.decode("utf-8")
+        return oc.Index.from_binary(data)
+
+    def __setitem__(self, key: str, value):
+        if isinstance(value, str):
+            type_tag = self._TYPE_STRING
+            data = value.encode("utf-8")
+        else:
+            type_tag = self._TYPE_INDEX
+            data = value.__reduce__()[1][0]
+        self._db.execute(
+            "INSERT OR REPLACE INTO cache (key, type_tag, value) VALUES (?, ?, ?)",
+            (key, type_tag, data),
+        )
+        self._db.commit()
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def set(self, key: str, value):
+        self[key] = value
+
+    def clear(self):
+        self._db.execute("DELETE FROM cache")
+        self._db.commit()
+
+
 def get_outlines_cache():
     """Get the Cache instance to be used for index caching"""
 
@@ -178,7 +242,7 @@ def get_outlines_cache():
             "cache. It may consume a lot of disk space and should "
             "not be used with untrusted clients."
         )
-        cache = Cache(cache_dir, eviction_policy="none", cull_limit=0)
+        cache = OutlinesDiskCache(cache_dir)
         outlines_version = importlib.metadata.version("outlines_core")
 
         cached_version = cache.get("__version__", None)
