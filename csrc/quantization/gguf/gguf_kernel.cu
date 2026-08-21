@@ -742,6 +742,30 @@ static int q6_k_fixed_cols_min_rows() {
   return min_rows;
 }
 
+static int q8_0_row_tile() {
+  static const int rows = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q8_0_ROW_TILE");
+    if (env != nullptr) {
+      return std::atoi(env);
+    }
+#if defined(USE_ROCM)
+    const auto* properties = at::cuda::getCurrentDeviceProperties();
+    return std::string(properties->gcnArchName).find("gfx906") == 0 ? 4 : 0;
+#else
+    return 0;
+#endif
+  }();
+  return rows;
+}
+
+static int q8_0_row_tile_min_rows() {
+  static const int min_rows = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q8_0_ROW_TILE_MIN_ROWS");
+    return env == nullptr ? 2048 : std::max(1, std::atoi(env));
+  }();
+  return min_rows;
+}
+
 template <typename scalar_t>
 static void ggml_mul_mat_vec_q8_dispatch(
     const void* W, const void* quant_X, scalar_t* dst, int col, int row,
@@ -764,8 +788,18 @@ static void ggml_mul_mat_vec_q8_dispatch(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
       break;
     case 8:
-      mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      if (vecs == 1 && row >= q8_0_row_tile_min_rows() &&
+          q8_0_row_tile() == 2) {
+        mul_mat_vec_q8_0_q8_1_row_tile_cuda<scalar_t, 2>(
+            W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      } else if (vecs == 1 && row >= q8_0_row_tile_min_rows() &&
+                 q8_0_row_tile() == 4) {
+        mul_mat_vec_q8_0_q8_1_row_tile_cuda<scalar_t, 4>(
+            W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      } else {
+        mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
+            W, quant_X, dst, col, row, vecs, stream, dst_stride);
+      }
       break;
     case 10:
       mul_mat_vec_q2_K_q8_1_cuda<scalar_t>(

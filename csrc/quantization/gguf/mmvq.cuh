@@ -149,6 +149,93 @@ static void mul_mat_vec_q8_0_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
+template <typename scalar_t, int rows_per_wave>
+static __global__ void mul_mat_vec_q8_0_q8_1_row_tile(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    scalar_t * __restrict__ dst, const int ncols, const int nrows,
+    const int nvecs, const int dst_stride) {
+    const int first_row = blockIdx.x * rows_per_wave;
+    const int vec = blockIdx.y;
+    if (first_row >= nrows || vec >= nvecs) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / QK8_0;
+    const int blocks_per_wave =
+        VDR_Q8_0_Q8_1_MMVQ * WARP_SIZE / QI8_0;
+    const int q8_blocks_per_vec =
+        ((ncols + 512 - 1) / 512 * 512) / QK8_1;
+    const block_q8_0 * x = static_cast<const block_q8_0 *>(vx);
+    const block_q8_1 * y = static_cast<const block_q8_1 *>(vy);
+    float tmp[rows_per_wave] = {};
+
+    for (int i = threadIdx.x / (QI8_0 / VDR_Q8_0_Q8_1_MMVQ);
+         i < blocks_per_row; i += blocks_per_wave) {
+        const int iqs = VDR_Q8_0_Q8_1_MMVQ *
+            (threadIdx.x % (QI8_0 / VDR_Q8_0_Q8_1_MMVQ));
+        const block_q8_1 * y_block =
+            &y[vec * q8_blocks_per_vec + i];
+        int activation[VDR_Q8_0_Q8_1_MMVQ];
+#pragma unroll
+        for (int word = 0; word < VDR_Q8_0_Q8_1_MMVQ; ++word) {
+            activation[word] =
+                get_int_from_int8_aligned(y_block->qs, iqs + word);
+        }
+        const float activation_scale = __low2float(y_block->ds);
+
+#pragma unroll
+        for (int row_offset = 0; row_offset < rows_per_wave; ++row_offset) {
+            const int row = first_row + row_offset;
+            if (row >= nrows) {
+                continue;
+            }
+            const block_q8_0 * weight_block =
+                &x[row * blocks_per_row + i];
+            int dot = 0;
+#pragma unroll
+            for (int word = 0; word < VDR_Q8_0_Q8_1_MMVQ; ++word) {
+                const int weight =
+                    get_int_from_int8(weight_block->qs, iqs + word);
+                dot = __dp4a(weight, activation[word], dot);
+            }
+            tmp[row_offset] += __half2float(weight_block->d) *
+                activation_scale * dot;
+        }
+    }
+
+#pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+#pragma unroll
+        for (int row_offset = 0; row_offset < rows_per_wave; ++row_offset) {
+            tmp[row_offset] += VLLM_SHFL_XOR_SYNC(tmp[row_offset], mask);
+        }
+    }
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int row_offset = 0; row_offset < rows_per_wave; ++row_offset) {
+            const int row = first_row + row_offset;
+            if (row < nrows) {
+                dst[vec * dst_stride + row] = tmp[row_offset];
+            }
+        }
+    }
+}
+
+template <typename scalar_t, int rows_per_wave>
+static void mul_mat_vec_q8_0_q8_1_row_tile_cuda(
+    const void * vx, const void * vy, scalar_t * dst, const int ncols,
+    const int nrows, const int nvecs, cudaStream_t stream,
+    const int dst_stride = -1) {
+    const dim3 block_nums(
+        (nrows + rows_per_wave - 1) / rows_per_wave, nvecs, 1);
+    const dim3 block_dims(WARP_SIZE, 1, 1);
+    mul_mat_vec_q8_0_q8_1_row_tile<scalar_t, rows_per_wave>
+        <<<block_nums, block_dims, 0, stream>>>(
+            vx, vy, dst, ncols, nrows, nvecs,
+            dst_stride < 0 ? nrows : dst_stride);
+}
+
 template<typename scalar_t>
 static void mul_mat_vec_q2_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
