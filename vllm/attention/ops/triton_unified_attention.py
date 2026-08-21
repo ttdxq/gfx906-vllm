@@ -56,6 +56,28 @@ def _num_query_blocks(
     return num_query_tokens // block_q + num_seqs
 
 
+def _decode_num_segments(
+    max_seqlen_k: int,
+    num_query_blocks: int,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+) -> int:
+    if not _is_gfx906_rocm() or max_seqlen_k < 2048:
+        return 16
+
+    base_grid_size = max(num_query_blocks * num_kv_heads, 1)
+    target_grid_size = 1024 if num_queries_per_kv <= 2 else 512
+    if max_seqlen_k >= 8192:
+        target_grid_size = max(target_grid_size, 1024)
+    if max_seqlen_k >= 16384 and num_queries_per_kv == 1:
+        target_grid_size = 2048
+    if max_seqlen_k >= 24576:
+        target_grid_size = 4096 if num_queries_per_kv == 1 else 2048
+
+    segments = (target_grid_size + base_grid_size - 1) // base_grid_size
+    return min(128, max(16, triton.next_power_of_2(segments)))
+
+
 @triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y
@@ -1070,9 +1092,9 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
-    # Launch the exact number of blocks for uniform decode and single-sequence
-    # batches. For mixed query lengths, avoid realizing query_lens on the CPU
-    # and retain the safe upper bound:
+    # Launch the exact number of blocks for single-sequence batches. For
+    # multiple sequences, retain the mapping gaps expected by find_seq_idx and
+    # use the safe upper bound without realizing query_lens on the CPU:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # \sum_i[ceil(query_len[i] / BLOCK_Q)]
     #   <= \sum_i[floor(query_len[i] / BLOCK_Q) + 1]
@@ -1228,14 +1250,13 @@ def unified_attention(
         decode_segments_override = os.getenv("VLLM_TRITON_ATTN_DECODE_SEGMENTS")
         if decode_segments_override is not None:
             NUM_SEGMENTS = int(decode_segments_override)
-        elif _is_gfx906_rocm() and max_seqlen_k >= 16384:
-            NUM_SEGMENTS = 128
-        elif _is_gfx906_rocm() and max_seqlen_k >= 8192:
-            NUM_SEGMENTS = 64
-        elif _is_gfx906_rocm() and max_seqlen_k >= 4096:
-            NUM_SEGMENTS = 32
         else:
-            NUM_SEGMENTS = 16
+            NUM_SEGMENTS = _decode_num_segments(
+                max_seqlen_k,
+                total_num_q_blocks,
+                num_kv_heads,
+                num_queries_per_kv,
+            )
         if NUM_SEGMENTS <= 0:
             NUM_SEGMENTS = 16
         NUM_SEGMENTS = triton.next_power_of_2(NUM_SEGMENTS)

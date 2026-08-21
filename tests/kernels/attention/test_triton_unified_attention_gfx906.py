@@ -107,6 +107,48 @@ def test_num_query_blocks_keeps_safe_mixed_batch_upper_bound():
     assert unified_attn._num_query_blocks(7, 3, 2) == 6
 
 
+@pytest.mark.parametrize(
+    ("kv_len", "num_kv_heads", "gqa_ratio", "expected"),
+    [
+        (1024, 4, 6, 16),
+        (2048, 32, 1, 32),
+        (16384, 32, 1, 64),
+        (24576, 32, 1, 128),
+        (2048, 16, 2, 64),
+        (24576, 16, 2, 128),
+        (2048, 8, 4, 64),
+        (8192, 8, 4, 128),
+        (2048, 4, 6, 128),
+    ],
+)
+def test_decode_num_segments_scales_with_available_parallelism(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_len: int,
+    num_kv_heads: int,
+    gqa_ratio: int,
+    expected: int,
+):
+    monkeypatch.setattr(unified_attn, "_is_gfx906_rocm", lambda: True)
+    assert (
+        unified_attn._decode_num_segments(kv_len, 1, num_kv_heads, gqa_ratio)
+        == expected
+    )
+
+
+def test_decode_num_segments_accounts_for_batched_query_grid(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(unified_attn, "_is_gfx906_rocm", lambda: True)
+    assert unified_attn._decode_num_segments(2048, 4, 4, 6) == 32
+
+
+def test_decode_num_segments_keeps_default_off_gfx906(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(unified_attn, "_is_gfx906_rocm", lambda: False)
+    assert unified_attn._decode_num_segments(32768, 1, 4, 6) == 16
+
+
 def test_unified_attention_decode_eager_matches_gfx906_fallback():
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
