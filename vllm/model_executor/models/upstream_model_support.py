@@ -5,9 +5,6 @@ kept separate from the local tables.  The registry merges them after its
 legacy entries and preserves the local Qwen3.5/Qwen3.8 mappings.
 """
 
-from __future__ import annotations
-
-
 MODEL_SUPPORT_ENTRIES: dict[str, tuple[str, str]] = {
     # Text and MoE models.
     "BailingMoeV3ForCausalLM": (
@@ -90,7 +87,6 @@ MODEL_SUPPORT_ENTRIES: dict[str, tuple[str, str]] = {
         "vllm.model_executor.models.mistral",
         "MistralForCausalLM",
     ),
-
     # Multimodal, vision, audio, and OCR models.
     "Cheers": (
         "vllm.model_executor.models.cheers",
@@ -204,7 +200,6 @@ MODEL_SUPPORT_ENTRIES: dict[str, tuple[str, str]] = {
         "vllm.model_executor.models.unlimited_ocr",
         "UnlimitedOCRForCausalLM",
     ),
-
     # Embedding, retrieval, ranking, and token-classification models.
     "ColPaliForRetrieval": (
         "vllm.model_executor.models.colpali",
@@ -230,7 +225,6 @@ MODEL_SUPPORT_ENTRIES: dict[str, tuple[str, str]] = {
         "vllm.model_executor.models.qwen3_asr_forced_aligner",
         "Qwen3ASRForcedAlignerForTokenClassification",
     ),
-
     # Draft/MTP classes which are not Qwen3.5/Qwen3.8 classes.
     "DFlashDraftModel": (
         "vllm.model_executor.models.qwen3_dflash",
@@ -316,10 +310,6 @@ MODEL_SUPPORT_ENTRIES.update(
             "vllm.model_executor.models.bailing_moe_linear",
             "BailingMoeV25ForCausalLM",
         ),
-        "BailingMoeV3ForCausalLM": (
-            "vllm.model_executor.models.bailing_moe_v3",
-            "BailingMoeV3ForCausalLM",
-        ),
         "ExaoneMoeForCausalLM": (
             "vllm.model_executor.models.exaone_moe",
             "ExaoneMoeForCausalLM",
@@ -327,6 +317,10 @@ MODEL_SUPPORT_ENTRIES.update(
         "Glm4MoeLiteForCausalLM": (
             "vllm.model_executor.models.glm4_moe_lite",
             "Glm4MoeLiteForCausalLM",
+        ),
+        "GlmMoeDsaForCausalLM": (
+            "vllm.model_executor.models.deepseek_v2",
+            "GlmMoeDsaForCausalLM",
         ),
         "IQuestCoderForCausalLM": (
             "vllm.model_executor.models.llama",
@@ -364,6 +358,10 @@ MODEL_SUPPORT_ENTRIES.update(
             "vllm.model_executor.models.step3p5",
             "Step3p5ForCausalLM",
         ),
+        "PanguProMoEV2ForCausalLM": (
+            "vllm.model_executor.models.openpangu",
+            "PanguProMoEV2ForCausalLM",
+        ),
         # Hardware-isolated model packages.
         "DeepseekV32ForCausalLM": (
             "vllm.models.deepseek_v32",
@@ -381,10 +379,6 @@ MODEL_SUPPORT_ENTRIES.update(
             "vllm.models.inkling",
             "InklingForConditionalGeneration",
         ),
-        "MiniMaxM3SparseForCausalLM": (
-            "vllm.models.minimax_m3",
-            "MiniMaxM3SparseForCausalLM",
-        ),
         "MiniMaxM3SparseForConditionalGeneration": (
             "vllm.models.minimax_m3",
             "MiniMaxM3SparseForConditionalGeneration",
@@ -393,6 +387,14 @@ MODEL_SUPPORT_ENTRIES.update(
         "VoyageQwen3BidirectionalEmbedModel": (
             "vllm.model_executor.models.voyage",
             "VoyageQwen3BidirectionalEmbedModel",
+        ),
+        "BertForMaskedLM": (
+            "vllm.model_executor.models.bert",
+            "BertForMaskedLM",
+        ),
+        "BgeM3EmbeddingModel": (
+            "vllm.model_executor.models.roberta",
+            "BgeM3EmbeddingModel",
         ),
         "LlamaBidirectionalModel": (
             "vllm.model_executor.models.llama",
@@ -430,6 +432,14 @@ MODEL_SUPPORT_ENTRIES.update(
             "vllm.model_executor.models.modernbert",
             "ModernBertForTokenClassification",
         ),
+        "RobertaForTokenClassification": (
+            "vllm.model_executor.models.roberta",
+            "RobertaForTokenClassification",
+        ),
+        "XLMRobertaForTokenClassification": (
+            "vllm.model_executor.models.roberta",
+            "RobertaForTokenClassification",
+        ),
         "BertForSequenceClassification": (
             "vllm.model_executor.models.bert",
             "BertForSequenceClassification",
@@ -445,6 +455,14 @@ MODEL_SUPPORT_ENTRIES.update(
         "JinaVLForRanking": (
             "vllm.model_executor.models.jina_vl",
             "JinaVLForSequenceClassification",
+        ),
+        "LlamaNemotronVLModel": (
+            "vllm.model_executor.models.nemotron_vl",
+            "LlamaNemotronVLForEmbedding",
+        ),
+        "LlamaNemotronVLForSequenceClassification": (
+            "vllm.model_executor.models.nemotron_vl",
+            "LlamaNemotronVLForSequenceClassification",
         ),
         # Additional multimodal, audio, and OCR models.
         "AudioFlamingo3ForConditionalGeneration": (
@@ -572,14 +590,6 @@ MODEL_SUPPORT_ENTRIES.update(
             "TransformersMultiModalForCausalLM",
         ),
         # Additional speculative decoding and MTP aliases.
-        "MiMoV2MTPModel": (
-            "vllm.model_executor.models.mimo_v2_mtp",
-            "MiMoV2MTP",
-        ),
-        "MiMoV2OmniMTPModel": (
-            "vllm.model_executor.models.mimo_v2_mtp",
-            "MiMoV2OmniMTP",
-        ),
         "EagleCohereForCausalLM": (
             "vllm.model_executor.models.cohere_eagle",
             "EagleCohereForCausalLM",
@@ -609,10 +619,6 @@ MODEL_SUPPORT_ENTRIES.update(
             "Eagle3LlamaForCausalLM",
         ),
         "PeagleLlamaForCausalLM": (
-            "vllm.model_executor.models.llama_eagle3",
-            "Eagle3LlamaForCausalLM",
-        ),
-        "Eagle3MiniMaxM2ForCausalLM": (
             "vllm.model_executor.models.llama_eagle3",
             "Eagle3LlamaForCausalLM",
         ),
@@ -659,14 +665,6 @@ MODEL_SUPPORT_ENTRIES.update(
         "InternS2MobiusMTP": (
             "vllm.model_executor.models.interns2_mobius",
             "InternS2MobiusMTP",
-        ),
-        "HYV3MTPModel": (
-            "vllm.model_executor.models.hy_v3_mtp",
-            "HYV3MTP",
-        ),
-        "KimiK3MTPModel": (
-            "vllm.models.kimi_k3",
-            "KimiK3MTP",
         ),
     }
 )

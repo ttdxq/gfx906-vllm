@@ -1049,3 +1049,9 @@ class PanguEmbeddedForCausalLM(OpenPanguEmbeddedModel):
 
 class PanguUltraMoEForCausalLM(OpenPanguMoEModel):
     pass
+
+
+class PanguProMoEV2ForCausalLM(OpenPanguMoEModel):
+    """Pangu Pro MoE v2 shares the existing OpenPangu MoE implementation."""
+
+    pass

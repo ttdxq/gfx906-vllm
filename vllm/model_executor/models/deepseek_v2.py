@@ -1694,6 +1694,12 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
+class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
+    """GLM MoE-DSA uses the DeepSeek V2 execution path."""
+
+    pass
+
+
 # Compatibility with
 # https://huggingface.co/deepseek-ai/DeepSeek-V3-Base/blob/main/configuration_deepseek.py
 def get_spec_layer_idx_from_weight_name(

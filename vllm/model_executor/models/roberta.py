@@ -1,20 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import itertools
 from collections.abc import Iterable
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import RobertaConfig
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.model_executor.layers.pooler import (
+    AllPooler,
     ClassifierPooler,
     CLSPool,
     DispatchPooler,
     Pooler,
+    PoolingParamsUpdate,
+    TokenClassifierPoolerHead,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.bert import (
     TOKEN_TYPE_SHIFT,
     BertEmbeddingModel,
@@ -31,7 +38,7 @@ from vllm.sequence import IntermediateTensors
 
 from .bert_with_rope import BertWithRope, JinaRobertaModel
 from .interfaces import SupportsCrossEncoding
-from .interfaces_base import default_pooling_type
+from .interfaces_base import attn_type, default_pooling_type
 
 
 class RobertaEmbedding(nn.Module):
@@ -160,6 +167,153 @@ class RobertaEmbeddingModel(BertEmbeddingModel):
         return loader.load_weights(weights_list, mapper=mapper)
 
 
+class _BgeM3TokenEmbeddingHead(nn.Module):
+    """Apply the BGE-M3 ColBERT projection in the legacy pooler API."""
+
+    def __init__(self, linear: nn.Module, head_dtype: torch.dtype):
+        super().__init__()
+        self.linear = linear
+        self.head_dtype = head_dtype
+
+    def forward(self, hidden_states: torch.Tensor, pooling_param) -> torch.Tensor:
+        output = self.linear(hidden_states.to(self.head_dtype))
+        if pooling_param.dimensions is not None:
+            output = output[..., : pooling_param.dimensions]
+        if pooling_param.normalize:
+            output = F.normalize(output, p=2, dim=-1)
+        return output
+
+
+class _BgeM3BOSEOSFilter(Pooler):
+    """Remove special tokens from token-level BGE-M3 outputs."""
+
+    def __init__(
+        self,
+        pooler: Pooler,
+        bos_token_id: int | None,
+        eos_token_id: int | None = None,
+    ):
+        super().__init__()
+        self.pooler = pooler
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+
+    def get_supported_tasks(self):
+        return self.pooler.get_supported_tasks()
+
+    def get_pooling_updates(self, task):
+        return PoolingParamsUpdate(requires_token_ids=True)
+
+    def forward(self, hidden_states, pooling_metadata):
+        outputs = self.pooler(hidden_states, pooling_metadata)
+        token_ids = pooling_metadata.prompt_token_ids
+        if token_ids is None or not isinstance(outputs, list):
+            return outputs
+
+        filtered = []
+        for index, output in enumerate(outputs):
+            ids = token_ids[index, : output.shape[0]]
+            keep = torch.ones_like(ids, dtype=torch.bool)
+            if self.bos_token_id is not None:
+                keep &= ids != self.bos_token_id
+            if self.eos_token_id is not None:
+                keep &= ids != self.eos_token_id
+            filtered.append(output[keep])
+        return filtered
+
+
+def _filter_secondary_weights(
+    all_weights: Iterable[tuple[str, torch.Tensor]],
+    secondary_prefixes: list[str],
+) -> tuple[Iterable[tuple[str, torch.Tensor]], Iterable[tuple[str, torch.Tensor]]]:
+    all_weights1, all_weights2 = itertools.tee(all_weights)
+
+    def is_secondary(name: str) -> bool:
+        return any(name.startswith(prefix) for prefix in secondary_prefixes)
+
+    return (
+        ((name, weight) for name, weight in all_weights1 if is_secondary(name)),
+        ((name, weight) for name, weight in all_weights2 if not is_secondary(name)),
+    )
+
+
+class BgeM3EmbeddingModel(RobertaEmbeddingModel):
+    """BGE-M3 sparse and late-interaction embedding model.
+
+    The upstream implementation uses the split ``layers.pooler`` package.  The
+    gfx906 branch keeps the older single-file pooler, so the two small adapter
+    poolers above provide the same projection and BOS/EOS filtering behavior.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        config = vllm_config.model_config.hf_config
+        self.hidden_size = config.hidden_size
+        self.head_dtype = vllm_config.model_config.head_dtype
+        self.bos_token_id = getattr(config, "bos_token_id", None)
+        self.eos_token_id = getattr(config, "eos_token_id", None)
+
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        self.secondary_weight_prefixes = ["sparse_linear.", "colbert_linear."]
+        self.secondary_weight_files = [
+            f"{name}pt" for name in self.secondary_weight_prefixes
+        ]
+        self.secondary_weights = [
+            DefaultModelLoader.Source(
+                model_or_path=vllm_config.model_config.model,
+                revision=vllm_config.model_config.revision,
+                prefix=weight_prefix,
+                allow_patterns_overrides=[filename],
+            )
+            for filename, weight_prefix in zip(
+                self.secondary_weight_files, self.secondary_weight_prefixes
+            )
+        ]
+
+    def _build_pooler(self, pooler_config):
+        self.sparse_linear = nn.Linear(self.hidden_size, 1, dtype=self.head_dtype)
+        self.colbert_linear = nn.Linear(
+            self.hidden_size, self.hidden_size, dtype=self.head_dtype
+        )
+
+        sparse_pooler = _BgeM3BOSEOSFilter(
+            AllPooler(
+                TokenClassifierPoolerHead(
+                    classifier=self.sparse_linear, act_fn=torch.relu
+                )
+            ),
+            self.bos_token_id,
+            self.eos_token_id,
+        )
+        colbert_pooler = _BgeM3BOSEOSFilter(
+            AllPooler(_BgeM3TokenEmbeddingHead(self.colbert_linear, self.head_dtype)),
+            self.bos_token_id,
+        )
+
+        return DispatchPooler(
+            {
+                "embed": Pooler.for_embed(pooler_config),
+                "token_embed": colbert_pooler,
+                "token_classify": sparse_pooler,
+            }
+        )
+
+    def load_weights(self, all_weights: Iterable[tuple[str, torch.Tensor]]):
+        secondary, weights = _filter_secondary_weights(
+            all_weights, self.secondary_weight_prefixes
+        )
+        loaded = super().load_weights(weights)
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in secondary:
+            param = params_dict.get(name)
+            if param is None:
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+        return loaded
+
+
 @default_pooling_type("CLS")
 class RobertaForSequenceClassification(nn.Module, SupportsCrossEncoding):
     """A model that uses Roberta to provide embedding functionalities.
@@ -257,3 +411,64 @@ def replace_roberta_positions(
     # - https://github.com/huggingface/transformers/blob/a3d69a8994d673899608a7c17fbf4f953f50474e/src/transformers/models/roberta/modeling_roberta.py#L1669
     # vllm does not use padding tokens, let's make things simpler
     position_ids += padding_idx + 1
+
+
+@attn_type("encoder_only")
+@default_pooling_type("ALL")
+class RobertaForTokenClassification(nn.Module):
+    """RoBERTa/XLM-RoBERTa token classification with legacy poolers."""
+
+    is_pooling_model = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        self.padding_idx = config.pad_token_id
+        self.head_dtype = vllm_config.model_config.head_dtype
+        self.num_labels = config.num_labels
+        self.roberta = BertModel(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "roberta"),
+            embedding_class=RobertaEmbedding,
+        )
+        self.classifier = nn.Linear(
+            config.hidden_size, config.num_labels, dtype=self.head_dtype
+        )
+
+        pooler_config = vllm_config.model_config.pooler_config
+        assert pooler_config is not None
+        self.pooler = Pooler.for_token_classify(pooler_config)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.roberta.embed_input_ids(input_ids)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        replace_roberta_positions(
+            input_ids=input_ids,
+            position_ids=positions,
+            padding_idx=self.padding_idx,
+        )
+        if token_type_ids is not None:
+            assert self.roberta.config.vocab_size < (1 << TOKEN_TYPE_SHIFT)
+            assert input_ids is not None
+            _encode_token_type_ids(input_ids, token_type_ids)
+
+        hidden_states = self.roberta(
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+            intermediate_tensors=intermediate_tensors,
+        )
+        hidden_states = hidden_states.to(self.head_dtype)
+        return self.classifier(hidden_states)

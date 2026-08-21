@@ -284,6 +284,37 @@ class JinaVLForSequenceClassificationConfig(VerifyAndUpdateConfig):
             pooler_config.logit_bias = 2.65
 
 
+class LlamaNemotronVLConfig(VerifyAndUpdateConfig):
+    """Configure bidirectional attention and pooling for Nemotron VL."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_config
+        hf_config.is_causal = False
+
+        for name in ("text_config", "llm_config"):
+            inner_config = getattr(hf_config, name, None)
+            if inner_config is not None:
+                inner_config.is_causal = False
+
+        vision_config = getattr(hf_config, "vision_config", None)
+        if vision_config is not None:
+            hf_config.patch_size = vision_config.patch_size
+
+        pooling = getattr(hf_config, "pooling", None)
+        if pooling is None:
+            inner_config = getattr(hf_config, "llm_config", None)
+            pooling = getattr(inner_config, "pooling", "avg")
+
+        pooling_type = {"avg": "MEAN", "cls": "CLS", "last": "LAST"}.get(pooling)
+        if pooling_type is None:
+            raise ValueError(f"pool_type {pooling!r} not supported")
+
+        assert model_config.pooler_config is not None
+        model_config.pooler_config.pooling_type = pooling_type
+
+
 class SnowflakeGteNewModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -556,6 +587,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "XLMRobertaModel": JinaRobertaModelConfig,
     "JinaVLForRanking": JinaVLForSequenceClassificationConfig,
     "JambaForSequenceClassification": JambaForSequenceClassificationConfig,
+    "LlamaNemotronVLForSequenceClassification": LlamaNemotronVLConfig,
+    "LlamaNemotronVLModel": LlamaNemotronVLConfig,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
     "MambaForCausalLM": MambaModelConfig,
     "Mamba2ForCausalLM": MambaModelConfig,

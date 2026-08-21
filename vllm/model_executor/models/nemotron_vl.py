@@ -7,6 +7,7 @@
 # Copyright (c) 2023 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
+import math
 from abc import ABC
 from collections.abc import Iterable
 
@@ -18,6 +19,14 @@ from transformers import AutoModel, PretrainedConfig
 from transformers.image_processing_utils_fast import BaseImageProcessorFast
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.pooler import (
+    ClassifierPooler,
+    DispatchPooler,
+    Pooler,
+    PoolingMethod,
+    PoolingType,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.models.internvl import (
@@ -30,20 +39,33 @@ from vllm.model_executor.models.internvl import (
     InternVLProcessor,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.models.siglip import SiglipVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.processing import PromptUpdateDetails
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import TokenizerLike
 from vllm.transformers_utils.processor import cached_image_processor_from_config
+from vllm.transformers_utils.processors.nemotron_vl import (
+    LlamaNemotronVLEmbedImageProcessor,
+    LlamaNemotronVLEmbedProcessor,
+)
+from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsCrossEncoding,
     SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
 )
-from .utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
+from .interfaces_base import VllmModelForPooling, default_pooling_type
+from .utils import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    init_vllm_registered_model,
+    maybe_prefix,
+)
 
 IMG_START = "<img>"
 IMG_END = "</img>"
@@ -651,3 +673,185 @@ class LlamaNemotronVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, Suppor
             connector="mlp1",
             tower_model="vision_model",
         )
+
+
+class LlamaNemotronVLEmbedProcessingInfo(BaseInternVLProcessingInfo):
+    """Processing info for the SigLIP-based Nemotron VL embed model."""
+
+    def get_image_processor(self, **kwargs):
+        model_config = self.ctx.model_config
+        config = self.get_hf_config()
+        processor_config = (
+            get_hf_file_to_dict(
+                "processor_config.json",
+                model_config.model,
+                model_config.revision,
+            )
+            or {}
+        )
+
+        kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
+        kwargs.setdefault("image_size", config.force_image_size)
+        kwargs.setdefault(
+            "min_dynamic_patch",
+            processor_config.get(
+                "min_input_tiles", getattr(config, "min_dynamic_patch", 1)
+            ),
+        )
+        kwargs.setdefault(
+            "max_dynamic_patch",
+            processor_config.get(
+                "max_input_tiles", getattr(config, "max_dynamic_patch", 1)
+            ),
+        )
+        kwargs.setdefault(
+            "dynamic_image_size",
+            processor_config.get(
+                "dynamic_image_size", getattr(config, "dynamic_image_size", True)
+            ),
+        )
+        kwargs.setdefault("use_thumbnail", True)
+        return LlamaNemotronVLEmbedImageProcessor(**kwargs)
+
+    def get_hf_processor(self, **kwargs: object) -> LlamaNemotronVLEmbedProcessor:
+        config = self.get_hf_config()
+        image_processor = self.get_image_processor(**kwargs)
+        image_seq_length = int(
+            (image_processor.image_size // config.vision_config.patch_size) ** 2
+            * (config.downsample_ratio**2)
+        )
+        return LlamaNemotronVLEmbedProcessor(
+            tokenizer=self.get_tokenizer(),
+            image_processor=image_processor,
+            image_seq_length=image_seq_length,
+        )
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    BaseInternVLMultiModalProcessor[LlamaNemotronVLEmbedProcessingInfo],
+    info=LlamaNemotronVLEmbedProcessingInfo,
+    dummy_inputs=BaseInternVLDummyInputsBuilder[LlamaNemotronVLEmbedProcessingInfo],
+)
+@default_pooling_type("CLS")
+class LlamaNemotronVLForEmbedding(LlamaNemotronVLChatModel, VllmModelForPooling):
+    """SigLIP-based Nemotron VL embedding model."""
+
+    is_pooling_model = True
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "language_model.layers.": "language_model.model.layers.",
+            "language_model.embed_tokens.": ("language_model.model.embed_tokens."),
+            "language_model.norm.": "language_model.model.norm.",
+            "vision_model.encoder.": "vision_model.vision_model.encoder.",
+            "vision_model.embeddings.": "vision_model.vision_model.embeddings.",
+            "vision_model.post_layernorm.": (
+                "vision_model.vision_model.post_layernorm."
+            ),
+        }
+    )
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        config = vllm_config.model_config.hf_config
+        self.img_context_token_id = getattr(config, "img_context_token_id", None)
+
+        pooler_config = vllm_config.model_config.pooler_config
+        assert pooler_config is not None
+        self.pooler = DispatchPooler({"embed": Pooler.for_embed(pooler_config)})
+
+    def _init_vision_model(
+        self,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None,
+        *,
+        prefix: str,
+    ) -> nn.Module:
+        return SiglipVisionModel(
+            config.vision_config,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def _init_mlp1(self, config: PretrainedConfig) -> nn.Module:
+        vit_hidden_size = config.vision_config.hidden_size
+        llm_hidden_size = config.text_config.hidden_size
+        projected_size = vit_hidden_size * int(1 / self.downsample_ratio) ** 2
+        return nn.Sequential(
+            nn.LayerNorm(projected_size, bias=True),
+            nn.Linear(projected_size, llm_hidden_size, bias=True),
+            nn.GELU(),
+            nn.Linear(llm_hidden_size, llm_hidden_size),
+        )
+
+    def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        vit_embeds = self.vision_model(pixel_values)
+        h = w = int(vit_embeds.shape[1] ** 0.5)
+        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+        vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
+        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
+        return self.mlp1(vit_embeds)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+
+@default_pooling_type("CLS")
+class LlamaNemotronVLForSequenceClassification(
+    LlamaNemotronVLForEmbedding, SupportsCrossEncoding
+):
+    """Sequence-classification/reranking variant of Nemotron VL."""
+
+    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.": ""}) | (
+        LlamaNemotronVLForEmbedding.hf_to_vllm_mapper
+    )
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        config = vllm_config.model_config.hf_config
+        text_config = config.text_config
+        model_config = vllm_config.model_config
+        self.score = ReplicatedLinear(
+            text_config.hidden_size,
+            text_config.num_labels,
+            bias=False,
+            params_dtype=model_config.head_dtype,
+            quant_config=vllm_config.quant_config,
+            return_bias=False,
+            prefix=maybe_prefix(prefix, "score"),
+        )
+
+        pooler_config = model_config.pooler_config
+        assert pooler_config is not None
+        assert pooler_config.pooling_type is not None
+        pooling_type = PoolingType[pooler_config.pooling_type]
+        self.pooler = DispatchPooler(
+            {
+                "classify": ClassifierPooler(
+                    pooling=PoolingMethod.from_pooling_type(pooling_type),
+                    classifier=self.score,
+                    act_fn="classify",
+                ),
+                "score": ClassifierPooler(
+                    pooling=PoolingMethod.from_pooling_type(pooling_type),
+                    classifier=self.score,
+                    act_fn="score",
+                ),
+            }
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded_weights = super().load_weights(weights)
+        for name, param in self.named_parameters():
+            if not name.startswith("language_model.score.") or name in loaded_weights:
+                continue
+            if name.endswith(".weight"):
+                torch.nn.init.kaiming_uniform_(param, a=math.sqrt(5))
+            elif name.endswith(".bias"):
+                torch.nn.init.zeros_(param)
+            else:
+                torch.nn.init.normal_(param, mean=0.0, std=0.02)
+            loaded_weights.add(name)
+        return loaded_weights
