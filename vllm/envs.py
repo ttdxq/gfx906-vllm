@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
     VLLM_RPC_TIMEOUT: int = 10000  # ms
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
+    VLLM_MAX_N_SEQUENCES: int = 16384
     VLLM_PLUGINS: list[str] | None = None
     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
     VLLM_TORCH_CUDA_PROFILE: bool = False
@@ -826,6 +827,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
+    ),
+    # Maximum number of output sequences allowed per request.
+    # Keep this bounded to prevent a single request from exhausting resources.
+    "VLLM_MAX_N_SEQUENCES": lambda: int(
+        os.environ.get("VLLM_MAX_N_SEQUENCES", "16384")
     ),
     # a list of plugin names to load, separated by commas.
     # if this is not set, it means all plugins will be loaded

@@ -365,3 +365,38 @@ class TestEnvSetWithChoices:
         with patch.dict(os.environ, {"TEST_ENV": "option1,option1,option2"}):
             env_func = env_set_with_choices("TEST_ENV", [], ["option1", "option2"])
             assert env_func() == {"option1", "option2"}
+
+
+class TestVllmMaxNSequences:
+    def test_default_value(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("VLLM_MAX_N_SEQUENCES", raising=False)
+        assert envs.VLLM_MAX_N_SEQUENCES == 16384
+
+    def test_custom_value(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("VLLM_MAX_N_SEQUENCES", "128")
+        assert envs.VLLM_MAX_N_SEQUENCES == 128
+
+
+def test_sampling_params_rejects_excessive_n(monkeypatch: pytest.MonkeyPatch):
+    from vllm import SamplingParams
+
+    monkeypatch.setenv("VLLM_MAX_N_SEQUENCES", "4")
+    SamplingParams(n=4)
+    with pytest.raises(ValueError, match="n must be at most 4"):
+        SamplingParams(n=5)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", float("nan")),
+        ("temperature", float("inf")),
+        ("repetition_penalty", float("nan")),
+        ("repetition_penalty", float("inf")),
+    ],
+)
+def test_sampling_params_rejects_non_finite_values(field: str, value: float):
+    from vllm import SamplingParams
+
+    with pytest.raises(ValueError, match="finite number"):
+        SamplingParams(**{field: value})

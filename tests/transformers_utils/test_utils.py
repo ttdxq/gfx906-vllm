@@ -46,6 +46,8 @@ class TestIsRemoteGGUF:
         assert is_remote_gguf("user/repo:Q2_K")
         assert is_remote_gguf("repo/model:Q4_K")
         assert is_remote_gguf("repo/model:Q8_0")
+        assert is_remote_gguf("unsloth/Qwen3-GGUF:UD-IQ1_S")
+        assert is_remote_gguf("repo/model:Custom-Q4_K_XL")
 
         # Invalid quant types should return False
         assert not is_remote_gguf("repo/model:quant")
@@ -104,6 +106,10 @@ class TestSplitRemoteGGUF:
         assert repo_id == "repo/model"
         assert quant_type == "Q2_K"
 
+        repo_id, quant_type = split_remote_gguf("repo/model:UD-IQ1_S")
+        assert repo_id == "repo/model"
+        assert quant_type == "UD-IQ1_S"
+
     def test_split_remote_gguf_with_path_object(self):
         """Test split_remote_gguf with Path object."""
         repo_id, quant_type = split_remote_gguf(Path("unsloth/Qwen3-0.6B-GGUF:IQ1_S"))
@@ -144,6 +150,7 @@ class TestIsGGUF:
         assert is_gguf("unsloth/Qwen3-0.6B-GGUF:IQ1_S")
         assert is_gguf("repo/model:Q2_K")
         assert is_gguf("repo/model:Q4_K")
+        assert is_gguf("repo/model:UD-IQ1_S")
 
         # Invalid quant_type should return False
         assert not is_gguf("repo/model:quant")
