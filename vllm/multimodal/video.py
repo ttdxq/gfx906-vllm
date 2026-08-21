@@ -21,6 +21,19 @@ from .image import ImageMediaIO
 
 logger = init_logger(__name__)
 
+_DEFAULT_MAX_IMAGE_PIXELS = 178_956_970
+
+
+def _check_frame_pixel_limit(width: int, height: int) -> None:
+    max_pixels = getattr(envs, "VLLM_MAX_IMAGE_PIXELS", _DEFAULT_MAX_IMAGE_PIXELS)
+    num_pixels = width * height
+    if max_pixels > 0 and num_pixels > max_pixels:
+        raise ValueError(
+            f"Video frame dimensions {width}x{height} "
+            f"({num_pixels} pixels) exceed the maximum of {max_pixels} pixels. "
+            "Set VLLM_MAX_IMAGE_PIXELS to increase this limit."
+        )
+
 
 def resize_video(frames: npt.NDArray, size: tuple[int, int]) -> npt.NDArray:
     num_frames, _, _, channels = frames.shape
@@ -151,6 +164,10 @@ class OpenCVVideoBackend(VideoLoader):
         if not cap.isOpened():
             raise ValueError("Could not open video stream")
 
+        _check_frame_pixel_limit(
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        )
         total_frames_num = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         original_fps = cap.get(cv2.CAP_PROP_FPS)
         duration = total_frames_num / original_fps if original_fps > 0 else 0
@@ -213,6 +230,10 @@ class OpenCVDynamicVideoBackend(OpenCVVideoBackend):
         if not cap.isOpened():
             raise ValueError("Could not open video stream")
 
+        _check_frame_pixel_limit(
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        )
         total_frames_num = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         original_fps = cap.get(cv2.CAP_PROP_FPS)
         duration = total_frames_num / original_fps if original_fps > 0 else 0
@@ -301,8 +322,15 @@ class VideoMediaIO(MediaIO[npt.NDArray]):
                 "image/jpeg",
             )
 
+            if self.num_frames > 0:
+                frame_parts = data.split(",", self.num_frames)[: self.num_frames]
+            elif self.num_frames == 0:
+                raise ValueError("num_frames must be greater than 0 or -1")
+            else:
+                frame_parts = data.split(",")
+
             return np.stack(
-                [np.asarray(load_frame(frame_data)) for frame_data in data.split(",")]
+                [np.asarray(load_frame(frame_data)) for frame_data in frame_parts]
             ), {}
 
         return self.load_bytes(base64.b64decode(data))

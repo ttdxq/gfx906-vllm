@@ -270,6 +270,7 @@ class MistralTokenizer(TokenizerLike):
         # Vocab sorted by token id.
         self._vocab = self.tokenizer._vocab
         self._max_token_id = self.vocab_size - 1
+        self._max_chars_per_token = max(len(token) for token in self._vocab)
 
     def _get_special_token_ids(self) -> list[int]:
         from mistral_common.tokens.tokenizers.sentencepiece import (
@@ -330,6 +331,10 @@ class MistralTokenizer(TokenizerLike):
     @property
     def max_token_id(self) -> int:
         return self._max_token_id
+
+    @property
+    def max_chars_per_token(self) -> int:
+        return self._max_chars_per_token
 
     @property
     def truncation_side(self) -> str:

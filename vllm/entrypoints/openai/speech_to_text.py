@@ -9,7 +9,7 @@ from functools import cached_property
 from typing import Literal, TypeAlias, TypeVar, cast
 
 import numpy as np
-from fastapi import Request
+from fastapi import Request, UploadFile
 from transformers import PreTrainedTokenizerBase
 
 import vllm.envs as envs
@@ -33,12 +33,15 @@ from vllm.entrypoints.openai.protocol import (
 )
 from vllm.entrypoints.openai.serving_engine import OpenAIServing, SpeechToTextRequest
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
+from vllm.exceptions import VLLMValidationError
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
 from vllm.model_executor.models import SupportsTranscription
+from vllm.multimodal.audio import load_audio
 from vllm.outputs import RequestOutput
 from vllm.transformers_utils.tokenizer import get_tokenizer
 from vllm.utils.import_utils import PlaceholderModule
+from vllm.utils.mem_constants import MiB_bytes
 
 try:
     import librosa
@@ -62,6 +65,42 @@ ResponseType: TypeAlias = (
 )
 
 logger = init_logger(__name__)
+
+_READ_CHUNK_SIZE = 64 * 1024
+
+
+async def read_upload_with_limit(
+    file: UploadFile,
+    max_size_mb: float | None = None,
+) -> bytes:
+    """Read an uploaded audio file without materializing oversized inputs."""
+    if max_size_mb is None:
+        max_size_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
+
+    max_bytes = int(max_size_mb * MiB_bytes)
+    if file.size is not None and file.size > max_bytes:
+        raise VLLMValidationError(
+            "Maximum file size exceeded",
+            parameter="audio_filesize_mb",
+            value=file.size / MiB_bytes,
+        )
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_READ_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise VLLMValidationError(
+                "Maximum file size exceeded",
+                parameter="audio_filesize_mb",
+                value=total / MiB_bytes,
+            )
+        chunks.append(chunk)
+
+    return b"".join(chunks)
 
 
 class OpenAISpeechToText(OpenAIServing):
@@ -97,6 +136,8 @@ class OpenAISpeechToText(OpenAIServing):
         self.enable_force_include_usage = enable_force_include_usage
 
         self.max_audio_filesize_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
+        self.max_audio_decode_duration_s = envs.VLLM_MAX_AUDIO_DECODE_DURATION_S
+        self.max_audio_decode_bytes = envs.VLLM_MAX_AUDIO_DECODE_BYTES
         if self.model_cls.supports_segment_timestamp:
             self.tokenizer = cast(
                 PreTrainedTokenizerBase,
@@ -139,7 +180,12 @@ class OpenAISpeechToText(OpenAIServing):
         with io.BytesIO(audio_data) as bytes_:
             # NOTE resample to model SR here for efficiency. This is also a
             # pre-requisite for chunking, as it assumes Whisper SR.
-            y, sr = librosa.load(bytes_, sr=self.asr_config.sample_rate)
+            y, sr = load_audio(
+                bytes_,
+                sr=self.asr_config.sample_rate,
+                max_duration_s=self.max_audio_decode_duration_s,
+                max_decode_bytes=self.max_audio_decode_bytes,
+            )
 
         duration = librosa.get_duration(y=y, sr=sr)
         do_split_audio = (

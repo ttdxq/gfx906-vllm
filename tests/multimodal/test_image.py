@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image, ImageChops
 
+import vllm.envs as envs
 from vllm.multimodal.image import ImageMediaIO, convert_image_mode
 
 pytestmark = pytest.mark.cpu_test
@@ -157,3 +159,46 @@ def test_rgba_background_color_validation():
     ImageMediaIO(rgba_background_color=(0, 0, 0))  # Should not raise
     ImageMediaIO(rgba_background_color=[255, 255, 255])  # Should not raise
     ImageMediaIO(rgba_background_color=(128, 128, 128))  # Should not raise
+
+
+def _encode_png(image: Image.Image) -> bytes:
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_image_pixel_limit_respected(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 10_000, raising=False)
+    data = _encode_png(Image.new("RGB", (100, 100), (255, 0, 0)))
+
+    result = ImageMediaIO().load_bytes(data)
+
+    assert result.size == (100, 100)
+
+
+def test_image_pixel_limit_rejected(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100, raising=False)
+    data = _encode_png(Image.new("RGB", (20, 20), (0, 255, 0)))
+
+    with pytest.raises(ValueError, match="exceed"):
+        ImageMediaIO().load_bytes(data)
+
+
+def test_image_file_pixel_limit_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100, raising=False)
+    image_path = tmp_path / "oversized.png"
+    Image.new("RGB", (20, 20), (0, 255, 0)).save(image_path)
+
+    with pytest.raises(ValueError, match="exceed"):
+        ImageMediaIO().load_file(image_path)
+
+
+def test_image_pixel_limit_disabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 0, raising=False)
+    data = _encode_png(Image.new("RGB", (1000, 1000), (0, 0, 255)))
+
+    result = ImageMediaIO().load_bytes(data)
+
+    assert result.size == (1000, 1000)

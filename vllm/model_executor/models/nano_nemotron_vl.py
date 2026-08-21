@@ -80,12 +80,6 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .utils import _merge_multimodal_embeddings
 
-# Configure PIL to handle large images without warnings
-# This prevents DecompressionBombWarning for legitimate large images
-Image.MAX_IMAGE_PIXELS = None  # Disable the limit entirely
-# Alternative: Set a specific higher limit
-# Image.MAX_IMAGE_PIXELS = 300000000  # ~300M pixels
-
 IMG_START = "<img>"
 IMG_END = "</img>"
 IMG_CONTEXT = "<image>"

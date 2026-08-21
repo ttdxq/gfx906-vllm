@@ -377,6 +377,25 @@ class TestVllmMaxNSequences:
         assert envs.VLLM_MAX_N_SEQUENCES == 128
 
 
+@pytest.mark.parametrize(
+    ("name", "default", "custom"),
+    [
+        ("VLLM_MAX_AUDIO_DECODE_DURATION_S", 600, 10),
+        ("VLLM_MAX_AUDIO_DECODE_BYTES", 268_435_456, 1024),
+        ("VLLM_MAX_IMAGE_PIXELS", 178_956_970, 4096),
+        ("VLLM_MAX_COMPLETION_PROMPTS", 1024, 8),
+    ],
+)
+def test_resource_limit_envs(
+    monkeypatch: pytest.MonkeyPatch, name: str, default: int, custom: int
+):
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() == default
+
+    monkeypatch.setenv(name, str(custom))
+    assert environment_variables[name]() == custom
+
+
 def test_sampling_params_rejects_excessive_n(monkeypatch: pytest.MonkeyPatch):
     from vllm import SamplingParams
 

@@ -86,6 +86,7 @@ from vllm.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
     OpenAIServingTranslation,
 )
+from vllm.entrypoints.openai.speech_to_text import read_upload_with_limit
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
@@ -101,6 +102,7 @@ from vllm.entrypoints.utils import (
     process_lora_modules,
     with_cancellation,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tasks import POOLING_TASKS
@@ -796,7 +798,12 @@ async def create_transcriptions(
             message="The model does not support Transcriptions API"
         )
 
-    audio_data = await request.file.read()
+    try:
+        audio_data = await read_upload_with_limit(request.file)
+    except VLLMValidationError as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)
+        ) from exc
     try:
         generator = await handler.create_transcription(audio_data, request, raw_request)
     except Exception as e:
@@ -835,7 +842,12 @@ async def create_translations(
             message="The model does not support Translations API"
         )
 
-    audio_data = await request.file.read()
+    try:
+        audio_data = await read_upload_with_limit(request.file)
+    except VLLMValidationError as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)
+        ) from exc
     try:
         generator = await handler.create_translation(audio_data, request, raw_request)
     except Exception as e:

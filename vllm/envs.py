@@ -70,6 +70,9 @@ if TYPE_CHECKING:
     VLLM_MEDIA_URL_ALLOW_REDIRECTS: bool = True
     VLLM_MEDIA_LOADING_THREAD_COUNT: int = 8
     VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: int = 25
+    VLLM_MAX_AUDIO_DECODE_DURATION_S: int = 600
+    VLLM_MAX_AUDIO_DECODE_BYTES: int = 268_435_456
+    VLLM_MAX_IMAGE_PIXELS: int = 178_956_970
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
     VLLM_MEDIA_CONNECTOR: str = "http"
     VLLM_MM_INPUT_CACHE_GIB: int = 4
@@ -87,6 +90,7 @@ if TYPE_CHECKING:
     VLLM_RPC_TIMEOUT: int = 10000  # ms
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
     VLLM_MAX_N_SEQUENCES: int = 16384
+    VLLM_MAX_COMPLETION_PROMPTS: int = 1024
     VLLM_PLUGINS: list[str] | None = None
     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
     VLLM_TORCH_CUDA_PROFILE: bool = False
@@ -755,6 +759,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB": lambda: int(
         os.getenv("VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", "25")
     ),
+    # Maximum decoded audio duration. This is enforced before full PCM
+    # materialization when metadata is reliable, and during decoding otherwise.
+    # Set to 0 to disable this limit.
+    "VLLM_MAX_AUDIO_DECODE_DURATION_S": lambda: int(
+        os.getenv("VLLM_MAX_AUDIO_DECODE_DURATION_S", "600")
+    ),
+    # Maximum decoded float32 PCM bytes. This complements the duration guard
+    # for forged sample-rate headers and multichannel expansion. Set to 0 to
+    # disable this limit.
+    "VLLM_MAX_AUDIO_DECODE_BYTES": lambda: int(
+        os.getenv("VLLM_MAX_AUDIO_DECODE_BYTES", "268435456")
+    ),
+    # Maximum decoded image pixels. Set to 0 to disable vLLM's explicit check.
+    "VLLM_MAX_IMAGE_PIXELS": lambda: int(
+        os.getenv("VLLM_MAX_IMAGE_PIXELS", "178956970")
+    ),
     # Backend for Video IO
     # - "opencv": Default backend that uses OpenCV stream buffered backend.
     #
@@ -832,6 +852,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep this bounded to prevent a single request from exhausting resources.
     "VLLM_MAX_N_SEQUENCES": lambda: int(
         os.environ.get("VLLM_MAX_N_SEQUENCES", "16384")
+    ),
+    # Maximum number of prompts allowed in one /v1/completions request.
+    "VLLM_MAX_COMPLETION_PROMPTS": lambda: int(
+        os.environ.get("VLLM_MAX_COMPLETION_PROMPTS", "1024")
     ),
     # a list of plugin names to load, separated by commas.
     # if this is not set, it means all plugins will be loaded
@@ -1677,6 +1701,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MEDIA_URL_ALLOW_REDIRECTS",
         "VLLM_MEDIA_LOADING_THREAD_COUNT",
         "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB",
+        "VLLM_MAX_AUDIO_DECODE_DURATION_S",
+        "VLLM_MAX_AUDIO_DECODE_BYTES",
+        "VLLM_MAX_IMAGE_PIXELS",
+        "VLLM_MAX_COMPLETION_PROMPTS",
         "VLLM_VIDEO_LOADER_BACKEND",
         "VLLM_MEDIA_CONNECTOR",
         "VLLM_ASSETS_CACHE",

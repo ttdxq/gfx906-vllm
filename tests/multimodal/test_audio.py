@@ -2,15 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # test_audio.py
 import base64
+from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+import soundfile as sf
 
 from vllm.multimodal.audio import (
     AudioMediaIO,
     AudioResampler,
+    load_audio,
+    load_audio_pyav,
+    load_audio_soundfile,
     resample_audio_librosa,
     resample_audio_scipy,
 )
@@ -93,10 +98,15 @@ def dummy_audio_bytes():
 
 def test_audio_media_io_load_bytes(dummy_audio_bytes):
     audio_io = AudioMediaIO()
-    with patch("vllm.multimodal.audio.librosa.load") as mock_load:
+    with patch("vllm.multimodal.audio.load_audio") as mock_load:
         mock_load.return_value = (np.array([0.1, 0.2]), 16000)
         out = audio_io.load_bytes(dummy_audio_bytes)
         mock_load.assert_called_once()
+        assert mock_load.call_args.kwargs == {
+            "sr": None,
+            "max_duration_s": 600,
+            "max_decode_bytes": 268_435_456,
+        }
         assert isinstance(out[0], np.ndarray)
         assert out[1] == 16000
 
@@ -115,10 +125,15 @@ def test_audio_media_io_load_base64(dummy_audio_bytes):
 def test_audio_media_io_load_file():
     audio_io = AudioMediaIO()
     path = Path("/fake/path.wav")
-    with patch("vllm.multimodal.audio.librosa.load") as mock_load:
+    with patch("vllm.multimodal.audio.load_audio") as mock_load:
         mock_load.return_value = (np.array([0.1, 0.2]), 16000)
         out = audio_io.load_file(path)
-        mock_load.assert_called_once_with(path, sr=None)
+        mock_load.assert_called_once_with(
+            path,
+            sr=None,
+            max_duration_s=600,
+            max_decode_bytes=268_435_456,
+        )
         assert isinstance(out[0], np.ndarray)
         assert out[1] == 16000
 
@@ -137,3 +152,80 @@ def test_audio_media_io_encode_base64(dummy_audio):
         decoded = base64.b64decode(out)
         assert decoded == b"dummy_wav_data"
         mock_write.assert_called_once()
+
+
+def _make_flac_bytes(frames: int, channels: int, samplerate: int) -> bytes:
+    data = np.zeros((frames, channels), dtype=np.int16)
+    buffer = BytesIO()
+    sf.write(buffer, data, samplerate, format="FLAC")
+    return buffer.getvalue()
+
+
+def test_load_audio_duration_limit():
+    payload = _make_flac_bytes(frames=16000, channels=1, samplerate=16000)
+
+    audio, sample_rate = load_audio(
+        BytesIO(payload), sr=None, max_duration_s=1, max_decode_bytes=1024**2
+    )
+    assert len(audio) == 16000
+    assert sample_rate == 16000
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed duration"):
+        load_audio(
+            BytesIO(payload),
+            sr=None,
+            max_duration_s=0.5,
+            max_decode_bytes=1024**2,
+        )
+
+    audio, sample_rate = load_audio(
+        BytesIO(payload), sr=None, max_duration_s=0, max_decode_bytes=0
+    )
+    assert len(audio) == 16000
+    assert sample_rate == 16000
+
+
+def test_load_audio_memory_limit_rejects_forged_samplerate():
+    payload = _make_flac_bytes(frames=100_000, channels=8, samplerate=655_350)
+
+    with pytest.raises(ValueError, match="VLLM_MAX_AUDIO_DECODE_BYTES"):
+        load_audio_soundfile(
+            BytesIO(payload),
+            sr=None,
+            max_duration_s=600,
+            max_decode_bytes=1024**2,
+        )
+
+
+def test_load_audio_threads_memory_limit():
+    payload = _make_flac_bytes(frames=50_000, channels=4, samplerate=44_100)
+
+    with pytest.raises(ValueError, match="VLLM_MAX_AUDIO_DECODE_BYTES"):
+        load_audio(
+            BytesIO(payload),
+            sr=None,
+            max_duration_s=600,
+            max_decode_bytes=512 * 1024,
+        )
+
+
+def test_load_audio_pyav_memory_limit():
+    frame = MagicMock()
+    frame.to_ndarray.return_value = np.zeros((2, 1024), dtype=np.float32)
+    stream = MagicMock(rate=16000, duration=None, time_base=None)
+    container = MagicMock(duration=None)
+    container.streams.audio = [stream]
+    container.decode.return_value = [frame]
+
+    context = MagicMock()
+    context.__enter__.return_value = container
+    with (
+        patch("vllm.multimodal.audio.av.open", return_value=context),
+        pytest.raises(ValueError, match="VLLM_MAX_AUDIO_DECODE_BYTES"),
+    ):
+        load_audio_pyav(
+            BytesIO(b"audio"),
+            sr=None,
+            max_duration_s=600,
+            max_decode_bytes=1024,
+        )

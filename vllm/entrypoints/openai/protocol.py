@@ -67,7 +67,9 @@ from pydantic import (
     model_validator,
 )
 
+import vllm.envs as envs
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam, make_tool_call_id
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.sampling_params import (
@@ -77,6 +79,7 @@ from vllm.sampling_params import (
     StructuredOutputsParams,
 )
 from vllm.utils import random_uuid
+from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
@@ -1306,6 +1309,39 @@ class CompletionRequest(OpenAIBaseModel):
     def validate_stream_options(cls, data):
         if data.get("stream_options") and not data.get("stream"):
             raise ValueError("Stream options can only be defined when `stream=True`.")
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_prompt_list_length(cls, data):
+        max_prompts = envs.VLLM_MAX_COMPLETION_PROMPTS
+
+        prompt = data.get("prompt")
+        # A flat list[int] is one tokenized prompt. Only fan-out forms
+        # (list[str] and list[list[int]]) need the per-request count bound.
+        if (
+            isinstance(prompt, list)
+            and len(prompt) > 0
+            and not is_list_of(prompt, int)
+            and len(prompt) > max_prompts
+        ):
+            raise VLLMValidationError(
+                f"prompt list length {len(prompt)} exceeds the maximum "
+                f"allowed count of {max_prompts}. To increase this limit, "
+                "set the VLLM_MAX_COMPLETION_PROMPTS environment variable.",
+                parameter="prompt",
+            )
+
+        prompt_embeds = data.get("prompt_embeds")
+        if isinstance(prompt_embeds, list) and len(prompt_embeds) > max_prompts:
+            raise VLLMValidationError(
+                f"prompt_embeds list length {len(prompt_embeds)} exceeds "
+                f"the maximum allowed count of {max_prompts}. To increase "
+                "this limit, set the VLLM_MAX_COMPLETION_PROMPTS environment "
+                "variable.",
+                parameter="prompt_embeds",
+            )
 
         return data
 

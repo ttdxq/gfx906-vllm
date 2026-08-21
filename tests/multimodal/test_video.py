@@ -1,18 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import io
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
+import pybase64
 import pytest
 from PIL import Image
 
+import vllm.envs as envs
 from vllm.assets.base import get_vllm_public_assets
 from vllm.assets.video import video_to_ndarrays, video_to_pil_images_list
 from vllm.multimodal.image import ImageMediaIO
-from vllm.multimodal.video import VIDEO_LOADER_REGISTRY, VideoLoader, VideoMediaIO
+from vllm.multimodal.video import (
+    VIDEO_LOADER_REGISTRY,
+    OpenCVDynamicVideoBackend,
+    OpenCVVideoBackend,
+    VideoLoader,
+    VideoMediaIO,
+)
 
 from .utils import cosine_similarity, create_video_from_image, normalize_image
 
@@ -177,3 +186,67 @@ def test_video_backend_handles_broken_frames(monkeypatch: pytest.MonkeyPatch):
             f"Expected fewer than {metadata['total_num_frames']} frames, "
             f"but loaded {frames.shape[0]} frames"
         )
+
+
+def _make_jpeg_b64_frames(n: int, width: int = 8, height: int = 8) -> list[str]:
+    frames = []
+    for i in range(n):
+        image = Image.new("RGB", (width, height), color=(i % 256, 0, 0))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG")
+        frames.append(pybase64.b64encode(buffer.getvalue()).decode("ascii"))
+    return frames
+
+
+def test_load_base64_jpeg_enforces_num_frames_limit():
+    data = ",".join(_make_jpeg_b64_frames(20))
+
+    frames, metadata = VideoMediaIO(ImageMediaIO(), num_frames=4).load_base64(
+        "video/jpeg", data
+    )
+
+    assert frames.shape[0] == 4
+    assert metadata == {}
+
+
+def test_load_base64_jpeg_no_limit_when_num_frames_negative():
+    data = ",".join(_make_jpeg_b64_frames(10))
+
+    frames, metadata = VideoMediaIO(ImageMediaIO(), num_frames=-1).load_base64(
+        "video/jpeg", data
+    )
+
+    assert frames.shape[0] == 10
+    assert metadata == {}
+
+
+def test_load_base64_jpeg_raises_on_zero_num_frames():
+    data = ",".join(_make_jpeg_b64_frames(3))
+
+    with pytest.raises(ValueError, match="num_frames must be greater than 0 or -1"):
+        VideoMediaIO(ImageMediaIO(), num_frames=0).load_base64("video/jpeg", data)
+
+
+@pytest.mark.parametrize("backend_cls", [OpenCVVideoBackend, OpenCVDynamicVideoBackend])
+def test_opencv_backends_reject_oversized_frames(
+    monkeypatch: pytest.MonkeyPatch, backend_cls: type[VideoLoader]
+):
+    import cv2
+
+    class FakeCapture:
+        def isOpened(self):
+            return True
+
+        def get(self, prop):
+            if prop == cv2.CAP_PROP_FRAME_WIDTH:
+                return 20
+            if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+                return 20
+            raise AssertionError("frame limit must be checked before other metadata")
+
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100, raising=False)
+    monkeypatch.setattr(backend_cls, "get_cv2_video_api", lambda self: None)
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *args, **kwargs: FakeCapture())
+
+    with pytest.raises(ValueError, match="Video frame dimensions 20x20"):
+        backend_cls.load_bytes(b"video")

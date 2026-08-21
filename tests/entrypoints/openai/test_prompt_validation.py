@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 # imports for structured outputs tests
@@ -11,8 +12,13 @@ import pytest
 import regex as re
 import torch
 
+import vllm.envs as envs
 from vllm.config import ModelConfig
+from vllm.entrypoints.openai.protocol import CompletionRequest
 from vllm.entrypoints.renderer import CompletionRenderer
+from vllm.exceptions import VLLMValidationError
+from vllm.renderers import TokenizeParams
+from vllm.renderers.hf import HfRenderer
 
 from ...utils import RemoteOpenAIServer
 
@@ -50,6 +56,120 @@ async def test_out_of_vocab_token_ids():
             await client.completions.create(
                 model=model_name, prompt=[999999], max_tokens=5, temperature=0.0
             )
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        ["a", "b", "c", "d"],
+        [[1], [2], [3], [4]],
+    ],
+)
+def test_completion_prompt_list_limit(monkeypatch: pytest.MonkeyPatch, prompt: list):
+    monkeypatch.setattr(envs, "VLLM_MAX_COMPLETION_PROMPTS", 3)
+
+    with pytest.raises(ValueError, match="prompt list length 4 exceeds"):
+        CompletionRequest(model="test", prompt=prompt, max_tokens=1)
+
+
+def test_completion_prompt_list_exact_limit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_COMPLETION_PROMPTS", 3)
+
+    request = CompletionRequest(model="test", prompt=["a", "b", "c"], max_tokens=1)
+    assert request.prompt == ["a", "b", "c"]
+
+
+def test_completion_flat_token_prompt_is_single_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_MAX_COMPLETION_PROMPTS", 1)
+
+    request = CompletionRequest(model="test", prompt=[1, 2, 3], max_tokens=1)
+    assert request.prompt == [1, 2, 3]
+
+
+def test_completion_prompt_embeds_list_limit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_COMPLETION_PROMPTS", 2)
+
+    with pytest.raises(ValueError, match="prompt_embeds list length 3 exceeds"):
+        CompletionRequest(
+            model="test",
+            prompt_embeds=[b"a", b"b", b"c"],
+            max_tokens=1,
+        )
+
+
+class _BoundedTokenizer:
+    max_chars_per_token = 1
+    truncation_side = "left"
+    pad_token_id = 0
+
+    def __init__(self):
+        self.texts: list[str] = []
+        self.kwargs: dict[str, object] = {}
+
+    def __call__(self, text: str, **kwargs):
+        self.texts.append(text)
+        self.kwargs = kwargs
+        return {"input_ids": [ord(char) for char in text]}
+
+
+def _bounded_renderer(tokenizer: _BoundedTokenizer) -> HfRenderer:
+    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=100))
+    return HfRenderer(config, tokenizer)
+
+
+def test_tokenizer_rejects_unbounded_prompt_before_tokenization():
+    tokenizer = _BoundedTokenizer()
+    renderer = _bounded_renderer(tokenizer)
+
+    with pytest.raises(VLLMValidationError, match="maximum context length"):
+        renderer.tokenize_prompts(
+            [{"prompt": "x" * 101}], TokenizeParams(max_total_tokens=100)
+        )
+
+    assert tokenizer.texts == []
+
+
+def test_explicit_truncation_bounds_tokenizer_input():
+    tokenizer = _BoundedTokenizer()
+    renderer = _bounded_renderer(tokenizer)
+
+    result = renderer.tokenize_prompts(
+        [{"prompt": "x" * 500}],
+        TokenizeParams(
+            max_total_tokens=100,
+            truncate_prompt_tokens=4,
+            truncation_side="left",
+        ),
+    )[0]
+
+    assert len(tokenizer.texts[0]) == 100
+    assert tokenizer.kwargs["truncation"] is False
+    assert len(result["prompt_token_ids"]) == 4
+
+
+@pytest.mark.parametrize(
+    ("side", "expected"),
+    [
+        ("left", [ord(char) for char in "6789"]),
+        ("right", [ord(char) for char in "0123"]),
+    ],
+)
+def test_explicit_truncation_side_is_applied_after_tokenization(side, expected):
+    tokenizer = _BoundedTokenizer()
+    renderer = _bounded_renderer(tokenizer)
+
+    result = renderer.tokenize_prompts(
+        [{"prompt": "0123456789"}],
+        TokenizeParams(
+            max_total_tokens=100,
+            truncate_prompt_tokens=4,
+            truncation_side=side,
+        ),
+    )[0]
+
+    assert result["prompt_token_ids"] == expected
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
