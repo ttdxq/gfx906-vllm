@@ -1763,6 +1763,37 @@ static __device__ __forceinline__ void get_int_from_table_16(const uint32_t & q4
     val2 = v1 | (v2 << 16);
 }
 
+static __device__ __forceinline__ uint32_t lookup_iq4nl_values_gfx906(
+        const uint32_t indices) {
+#if defined(USE_ROCM) && defined(__gfx906__)
+    constexpr uint32_t values_0_3   = 0xBFAD9881;
+    constexpr uint32_t values_4_7   = 0xF6EADDCF;
+    constexpr uint32_t values_8_11  = 0x26190D01;
+    constexpr uint32_t values_12_15 = 0x71594535;
+
+    const uint32_t dict_select = indices & 0x07070707;
+    const uint32_t low_values =
+        __builtin_amdgcn_perm(values_4_7, values_0_3, dict_select);
+    const uint32_t high_values =
+        __builtin_amdgcn_perm(values_12_15, values_8_11, dict_select);
+    const uint32_t group_select =
+        ((indices & 0x08080808) >> 1) | 0x03020100;
+    return __builtin_amdgcn_perm(high_values, low_values, group_select);
+#else
+    return indices;
+#endif
+}
+
+static __device__ __forceinline__ void get_int_from_iq4nl_table_16(
+        const uint32_t & q4, const uint8_t * values, int & val1, int & val2) {
+#if defined(USE_ROCM) && defined(__gfx906__)
+    val1 = lookup_iq4nl_values_gfx906(q4 & 0x0F0F0F0F);
+    val2 = lookup_iq4nl_values_gfx906((q4 >> 4) & 0x0F0F0F0F);
+#else
+    get_int_from_table_16(q4, values, val1, val2);
+#endif
+}
+
 static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 #if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
@@ -1778,7 +1809,7 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
     int sumi1 = 0, sumi2 = 0;
     for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
         const uint32_t aux = q4[2*l] | (q4[2*l+1] << 16);
-        get_int_from_table_16(aux, values, v1, v2);
+        get_int_from_iq4nl_table_16(aux, values, v1, v2);
         sumi1 = __dp4a(v1, q8[l+0], sumi1);
         sumi2 = __dp4a(v2, q8[l+4], sumi2);
     }
@@ -1801,7 +1832,7 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     for (int j = 0; j < 4; ++j) {
         const uint32_t aux_q4 = get_int_b4(bq4->qs, iqs + j);
         int v1, v2;
-        get_int_from_table_16(aux_q4, values, v1, v2);
+        get_int_from_iq4nl_table_16(aux_q4, values, v1, v2);
 
         const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
         const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);

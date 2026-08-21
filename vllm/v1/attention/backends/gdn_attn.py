@@ -291,7 +291,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
         ):
             num_actual_tokens = self.vllm_config.pad_for_cudagraph(m.num_actual_tokens)
-            batch_size = min(self.decode_cudagraph_max_bs, num_actual_tokens)
+            # Token buffers are padded for FULL graph replay, but GDN state,
+            # sequence, query-start, and accepted-token metadata is per request.
+            batch_size = m.num_reqs
 
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
                 spec_state_indices_tensor, non_blocking=True
@@ -338,7 +340,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_decodes <= self.decode_cudagraph_max_bs
         ):
             num_actual_tokens = self.vllm_config.pad_for_cudagraph(m.num_actual_tokens)
-            batch_size = num_actual_tokens
+            batch_size = m.num_reqs
 
             self.non_spec_state_indices_tensor[:num_decodes].copy_(
                 non_spec_state_indices_tensor, non_blocking=True

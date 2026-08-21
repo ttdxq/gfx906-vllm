@@ -176,12 +176,11 @@ static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
-template <typename scalar_t>
-static __global__ void mul_mat_vec_q4_K_q8_1_col2560(
+template <typename scalar_t, int ncols>
+static __global__ void mul_mat_vec_q4_K_q8_1_fixed_cols(
     const void * __restrict__ vx, const void * __restrict__ vy,
     scalar_t * __restrict__ dst, const int nrows, const int nvecs,
     const int dst_stride) {
-    constexpr int ncols = 2560;
     constexpr int blocks_per_row = ncols / QK_K;
     constexpr int q8_blocks_per_vec = ncols / QK8_1;
     constexpr int blocks_per_warp = VDR_Q4_K_Q8_1_MMVQ * BLOCK_SIZE / QI4_K;
@@ -238,12 +237,18 @@ static __global__ void mul_mat_vec_q4_K_q8_1_col2560(
     }
 }
 
-template<typename scalar_t>
-static void mul_mat_vec_q4_K_q8_1_col2560_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+template<typename scalar_t, int ncols>
+static void mul_mat_vec_q4_K_q8_1_fixed_cols_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
     const dim3 block_nums(nrows, nvecs, 1);
     const dim3 block_dims(BLOCK_SIZE, 1, 1);
-    mul_mat_vec_q4_K_q8_1_col2560<scalar_t>
+    mul_mat_vec_q4_K_q8_1_fixed_cols<scalar_t, ncols>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+}
+
+template<typename scalar_t>
+static void mul_mat_vec_q4_K_q8_1_col2560_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 2560>(
+        vx, vy, dst, nrows, nvecs, stream, dst_stride);
 }
 
 template<typename scalar_t>
@@ -255,12 +260,11 @@ static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
-template <typename scalar_t>
-static __global__ void mul_mat_vec_q5_K_q8_1_col2560(
+template <typename scalar_t, int ncols>
+static __global__ void mul_mat_vec_q5_K_q8_1_fixed_cols(
     const void * __restrict__ vx, const void * __restrict__ vy,
     scalar_t * __restrict__ dst, const int nrows, const int nvecs,
     const int dst_stride) {
-    constexpr int ncols = 2560;
     constexpr int blocks_per_row = ncols / QK_K;
     constexpr int q8_blocks_per_vec = ncols / QK8_1;
     constexpr int blocks_per_warp = VDR_Q5_K_Q8_1_MMVQ * BLOCK_SIZE / QI5_K;
@@ -317,12 +321,18 @@ static __global__ void mul_mat_vec_q5_K_q8_1_col2560(
     }
 }
 
-template<typename scalar_t>
-static void mul_mat_vec_q5_K_q8_1_col2560_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+template<typename scalar_t, int ncols>
+static void mul_mat_vec_q5_K_q8_1_fixed_cols_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
     const dim3 block_nums(nrows, nvecs, 1);
     const dim3 block_dims(BLOCK_SIZE, 1, 1);
-    mul_mat_vec_q5_K_q8_1_col2560<scalar_t>
+    mul_mat_vec_q5_K_q8_1_fixed_cols<scalar_t, ncols>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+}
+
+template<typename scalar_t>
+static void mul_mat_vec_q5_K_q8_1_col2560_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 2560>(
+        vx, vy, dst, nrows, nvecs, stream, dst_stride);
 }
 
 template<typename scalar_t>
@@ -334,12 +344,11 @@ static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
-template <typename scalar_t>
-static __global__ void mul_mat_vec_q6_K_q8_1_col2560(
+template <typename scalar_t, int ncols>
+static __global__ void mul_mat_vec_q6_K_q8_1_fixed_cols(
     const void * __restrict__ vx, const void * __restrict__ vy,
     scalar_t * __restrict__ dst, const int nrows, const int nvecs,
     const int dst_stride) {
-    constexpr int ncols = 2560;
     constexpr int blocks_per_row = ncols / QK_K;
     constexpr int q8_blocks_per_vec = ncols / QK8_1;
     constexpr int blocks_per_warp = VDR_Q6_K_Q8_1_MMVQ * BLOCK_SIZE / QI6_K;
@@ -394,12 +403,18 @@ static __global__ void mul_mat_vec_q6_K_q8_1_col2560(
     }
 }
 
-template<typename scalar_t>
-static void mul_mat_vec_q6_K_q8_1_col2560_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+template<typename scalar_t, int ncols>
+static void mul_mat_vec_q6_K_q8_1_fixed_cols_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
     const dim3 block_nums(nrows, nvecs, 1);
     const dim3 block_dims(BLOCK_SIZE, 1, 1);
-    mul_mat_vec_q6_K_q8_1_col2560<scalar_t>
+    mul_mat_vec_q6_K_q8_1_fixed_cols<scalar_t, ncols>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+}
+
+template<typename scalar_t>
+static void mul_mat_vec_q6_K_q8_1_col2560_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 2560>(
+        vx, vy, dst, nrows, nvecs, stream, dst_stride);
 }
 
 template<typename scalar_t>

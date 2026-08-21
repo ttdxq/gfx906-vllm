@@ -548,7 +548,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | ChatCompletionNamedToolChoiceParam
         | None
     ) = "none"
-    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "none"] | None = None
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 

@@ -67,9 +67,7 @@ def _parse_enc_prompt(prompt: PromptType | object) -> EncoderPrompt:
     if isinstance(prompt, dict):
         _validate_prompt_dict(prompt)
         if "prompt_embeds" in prompt:
-            raise TypeError(
-                "Cannot pass embeddings prompt to encoder-decoder models"
-            )
+            raise TypeError("Cannot pass embeddings prompt to encoder-decoder models")
         if "prompt" in prompt or "prompt_token_ids" in prompt:
             return cast(EncoderPrompt, prompt)
         raise TypeError("Prompt dictionary must contain text or tokens")
@@ -86,9 +84,7 @@ def _parse_dec_prompt(prompt: PromptType | object) -> DecoderPrompt:
     if isinstance(prompt, dict):
         _validate_prompt_dict(prompt)
         if "prompt_embeds" in prompt:
-            raise TypeError(
-                "Cannot pass embeddings prompt to encoder-decoder models"
-            )
+            raise TypeError("Cannot pass embeddings prompt to encoder-decoder models")
         if (
             "multi_modal_data" in prompt
             or "mm_processor_kwargs" in prompt
@@ -105,8 +101,15 @@ def parse_dec_only_prompt(prompt: PromptType | object) -> DecoderOnlyPrompt:
     if isinstance(prompt, dict) and "encoder_prompt" in prompt:
         raise TypeError("Cannot pass encoder-decoder prompt to decoder-only models")
 
-    if isinstance(prompt, dict) and "prompt_embeds" in prompt:
-        return cast(DecoderOnlyPrompt, prompt)
+    if isinstance(prompt, dict):
+        _validate_prompt_dict(prompt)
+        if (
+            "prompt" in prompt
+            or "prompt_token_ids" in prompt
+            or "prompt_embeds" in prompt
+        ):
+            return cast(DecoderOnlyPrompt, prompt)
+        raise TypeError("Prompt dictionary must contain text, tokens, or embeddings")
 
     return cast(DecoderOnlyPrompt, _parse_dec_prompt(prompt))
 

@@ -40,7 +40,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
     SchedulerStats,
@@ -202,6 +202,70 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        mamba_block_sizes = {
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        }
+        if len(mamba_block_sizes) > 1:
+            raise ValueError(
+                "Mamba align cache mode requires a uniform Mamba block size, "
+                f"but found {sorted(mamba_block_sizes)}."
+            )
+        self.mamba_block_size = next(iter(mamba_block_sizes), None)
+        self.need_mamba_block_aligned_split = self._needs_mamba_block_aligned_split(
+            self.mamba_block_size,
+            self.cache_config.enable_prefix_caching,
+            self.cache_config.mamba_cache_mode,
+        )
+
+    @staticmethod
+    def _needs_mamba_block_aligned_split(
+        mamba_block_size: int | None,
+        enable_prefix_caching: bool,
+        mamba_cache_mode: str,
+    ) -> bool:
+        return (
+            mamba_block_size is not None
+            and enable_prefix_caching
+            and mamba_cache_mode == "align"
+        )
+
+    def _mamba_block_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_computed_tokens: int | None = None,
+    ) -> int:
+        start = (
+            request.num_computed_tokens
+            if num_computed_tokens is None
+            else num_computed_tokens
+        )
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start >= prefill_end:
+            return num_new_tokens
+
+        block_size = self.mamba_block_size
+        assert block_size is not None
+        end = start + num_new_tokens
+
+        if end < prefill_end:
+            max_prefill_tokens = self.max_num_scheduled_tokens
+            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+            if long_prefill_threshold > 0:
+                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            aligned_end = end // block_size * block_size
+            if aligned_end > start or block_size <= max_prefill_tokens:
+                end = aligned_end
+
+        if start % block_size != 0:
+            next_block_boundary = (start // block_size + 1) * block_size
+            if start < next_block_boundary < end:
+                end = next_block_boundary
+
+        return max(end - start, 0)
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -283,6 +347,11 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens,
                     encoder_compute_budget,
                     shift_computed_tokens=1 if self.use_eagle else 0,
+                )
+
+            if self.need_mamba_block_aligned_split:
+                num_new_tokens = self._mamba_block_aligned_split(
+                    request, num_new_tokens
                 )
 
             if num_new_tokens == 0:
@@ -546,6 +615,15 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            break
+
+                    if self.need_mamba_block_aligned_split:
+                        num_new_tokens = self._mamba_block_aligned_split(
+                            request,
+                            num_new_tokens,
+                            num_computed_tokens=num_computed_tokens,
+                        )
+                        if num_new_tokens == 0:
                             break
 
                 # Handles an edge case when P/D Disaggregation

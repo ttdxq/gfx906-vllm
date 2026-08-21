@@ -48,6 +48,15 @@ def test_prefix_caching_from_cli():
         args = parser.parse_args(["--prefix-caching-hash-algo", "invalid"])
 
 
+def test_mamba_cache_mode_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args(["--mamba-cache-mode", "align"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+
+    assert engine_args.mamba_cache_mode == "align"
+
+
 def test_defaults_with_usage_context():
     engine_args = EngineArgs(model="facebook/opt-125m")
     vllm_config: VllmConfig = engine_args.create_engine_config(UsageContext.LLM_CLASS)

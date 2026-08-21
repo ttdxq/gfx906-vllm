@@ -3,6 +3,7 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -69,3 +70,40 @@ async def test_async_mistral_tokenizer_does_not_block_event_loop(
     tokens = await task
     assert tokens == expected_tokens, "Mocked blocking tokenizer was not called"
     assert blocked_count == 0, "Event loop blocked during tokenization"
+
+
+def test_reasoning_effort_forwarded_to_chat_template_kwargs(
+    serving: OpenAIServing,
+):
+    request = SimpleNamespace(reasoning_effort="low")
+    assert serving._get_effective_chat_template_kwargs(None, request) == {
+        "enable_thinking": True,
+        "reasoning_effort": "low",
+    }
+
+    request = SimpleNamespace(reasoning_effort="none")
+    assert serving._get_effective_chat_template_kwargs(None, request) == {
+        "enable_thinking": False,
+        "reasoning_effort": "none",
+    }
+
+    # Unset effort must not inject any kwargs.
+    request = SimpleNamespace(reasoning_effort=None)
+    assert (
+        serving._get_effective_chat_template_kwargs({"a": 1}, request) == {"a": 1}
+    )
+
+    # Explicit chat_template_kwargs take precedence over the request field
+    # (enable_thinking is still derived from the request field).
+    request = SimpleNamespace(reasoning_effort="low")
+    assert serving._get_effective_chat_template_kwargs(
+        {"reasoning_effort": "xhigh"}, request
+    ) == {"enable_thinking": True, "reasoning_effort": "xhigh"}
+
+
+def test_reasoning_effort_from_responses_request(serving: OpenAIServing):
+    request = SimpleNamespace(reasoning=SimpleNamespace(effort="medium"))
+    assert serving._get_effective_chat_template_kwargs(None, request) == {
+        "enable_thinking": True,
+        "reasoning_effort": "medium",
+    }

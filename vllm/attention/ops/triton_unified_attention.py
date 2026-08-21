@@ -26,6 +26,26 @@ ENABLE_GFX906_ATTN_MULTI_QUERY_3D = os.getenv(
 ).lower() in {"1", "true", "yes", "on"}
 
 
+def _decode_num_warps(head_size: int, max_seqlen_k: int) -> int:
+    override = os.getenv("VLLM_TRITON_ATTN_DECODE_NUM_WARPS")
+    if override is not None:
+        num_warps = int(override)
+        if num_warps not in {1, 2, 4, 8}:
+            raise ValueError(
+                "VLLM_TRITON_ATTN_DECODE_NUM_WARPS must be one of 1, 2, 4, 8"
+            )
+        return num_warps
+    if _is_gfx906_rocm() and head_size > 128 and max_seqlen_k >= 1536:
+        return 4
+    return 2
+
+
+def _decode_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
+    if _is_gfx906_rocm() and head_size == 256 and num_queries_per_kv == 6:
+        return 8
+    return None
+
+
 @triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y
@@ -362,7 +382,6 @@ def kernel_unified_attention_2d(
     )
 
 
-@triton.autotune(configs=[triton.Config({}, num_stages=1, num_warps=2)], key=[])
 @triton.jit
 def kernel_unified_attention_3d(
     segm_output_ptr,
@@ -1031,7 +1050,12 @@ def unified_attention(
     head_size = q.shape[2]
     head_size_padded = triton.next_power_of_2(head_size)
 
-    BLOCK_M = (
+    decode_block_m = (
+        _decode_block_m(head_size, num_queries_per_kv)
+        if max_seqlen_q == 1
+        else None
+    )
+    BLOCK_M = decode_block_m or (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
@@ -1271,6 +1295,8 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
+            num_stages=1,
+            num_warps=_decode_num_warps(head_size, max_seqlen_k),
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,

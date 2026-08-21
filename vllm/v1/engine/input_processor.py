@@ -59,6 +59,12 @@ class InputProcessor:
         self.mm_processor_cache = processor_cache_from_config(vllm_config, mm_registry)
 
         renderer = renderer_from_config(vllm_config, tokenizer=tokenizer)
+        if self.model_config.is_multimodal_model:
+            renderer.mm_processor = mm_registry.create_processor(
+                self.model_config,
+                tokenizer=tokenizer,
+                cache=self.mm_processor_cache,
+            )
 
         self.input_preprocessor = InputPreprocessor(
             vllm_config,

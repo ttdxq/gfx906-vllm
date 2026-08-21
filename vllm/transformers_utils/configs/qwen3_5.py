@@ -133,6 +133,7 @@ class Qwen3_5VisionConfig(PretrainedConfig):
         temporal_patch_size=2,
         out_hidden_size=3584,
         num_position_embeddings=2304,
+        deepstack_visual_indexes=None,
         initializer_range=0.02,
         **kwargs,
     ):
@@ -149,6 +150,7 @@ class Qwen3_5VisionConfig(PretrainedConfig):
         self.temporal_patch_size = temporal_patch_size
         self.out_hidden_size = out_hidden_size
         self.num_position_embeddings = num_position_embeddings
+        self.deepstack_visual_indexes = deepstack_visual_indexes or []
         self.initializer_range = initializer_range
 
 

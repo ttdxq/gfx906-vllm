@@ -2,7 +2,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdlib>
+#include <string>
 #include <torch/all.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include "../../cuda_compat.h"
@@ -683,6 +685,62 @@ void ggml_rms_norm_gated_quantize_row_q8_1_out(
       });
 }
 
+static bool q4_k_fixed_cols_fast_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q4_K_FIXED_COLS_FAST");
+    if (env != nullptr) {
+      return env[0] != '0';
+    }
+#if defined(USE_ROCM)
+    const auto* properties = at::cuda::getCurrentDeviceProperties();
+    return std::string(properties->gcnArchName).find("gfx906") == 0;
+#else
+    return false;
+#endif
+  }();
+  return enabled;
+}
+
+static bool q5_k_fixed_cols_fast_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q5_K_FIXED_COLS_FAST");
+    if (env != nullptr) {
+      return env[0] != '0';
+    }
+#if defined(USE_ROCM)
+    const auto* properties = at::cuda::getCurrentDeviceProperties();
+    return std::string(properties->gcnArchName).find("gfx906") == 0;
+#else
+    return false;
+#endif
+  }();
+  return enabled;
+}
+
+static bool q6_k_fixed_cols_fast_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q6_K_FIXED_COLS_FAST");
+    if (env != nullptr) {
+      return env[0] != '0';
+    }
+#if defined(USE_ROCM)
+    const auto* properties = at::cuda::getCurrentDeviceProperties();
+    return std::string(properties->gcnArchName).find("gfx906") == 0;
+#else
+    return false;
+#endif
+  }();
+  return enabled;
+}
+
+static int q6_k_fixed_cols_min_rows() {
+  static const int min_rows = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q6_K_FIXED_COLS_MIN_ROWS");
+    return env == nullptr ? 65536 : std::max(1, std::atoi(env));
+  }();
+  return min_rows;
+}
+
 template <typename scalar_t>
 static void ggml_mul_mat_vec_q8_dispatch(
     const void* W, const void* quant_X, scalar_t* dst, int col, int row,
@@ -717,11 +775,43 @@ static void ggml_mul_mat_vec_q8_dispatch(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
       break;
     case 12: {
+      const bool q4_k_fixed_cols_fast = q4_k_fixed_cols_fast_enabled();
       static const bool q4_k_col2560_fast = [] {
         const char* env = std::getenv("VLLM_GGUF_Q4_K_COL2560_FAST");
         return env == nullptr || env[0] != '0';
       }();
-      if (q4_k_col2560_fast && col == 2560) {
+      if (q4_k_fixed_cols_fast && vecs == 1 && col != 2560) {
+        switch (col) {
+          case 2048:
+            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 2048>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          case 4096:
+            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 4096>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          case 5120:
+            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          case 6144:
+            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 6144>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          case 9216:
+            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 9216>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          case 17408:
+            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 17408>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          default:
+            mul_mat_vec_q4_K_q8_1_cuda<scalar_t>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+        }
+      } else if (q4_k_col2560_fast && col == 2560) {
         mul_mat_vec_q4_K_q8_1_col2560_cuda<scalar_t>(
             W, quant_X, dst, row, vecs, stream, dst_stride);
       } else {
@@ -731,11 +821,49 @@ static void ggml_mul_mat_vec_q8_dispatch(
       break;
     }
     case 13: {
+      const bool q5_k_fixed_cols_fast = q5_k_fixed_cols_fast_enabled();
+      static const bool q5_k_5120_6144_fast = [] {
+        const char* env = std::getenv("VLLM_GGUF_Q5_K_5120_6144_FAST");
+        return env == nullptr || env[0] != '0';
+      }();
       static const bool q5_k_col2560_fast = [] {
         const char* env = std::getenv("VLLM_GGUF_Q5_K_COL2560_FAST");
         return env == nullptr || env[0] != '0';
       }();
-      if (q5_k_col2560_fast && col == 2560) {
+      if (q5_k_fixed_cols_fast && vecs == 1 && col != 2560) {
+        switch (col) {
+          case 5120:
+            if (q5_k_5120_6144_fast) {
+              mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
+                  W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            }
+            break;
+          case 6144:
+            if (q5_k_5120_6144_fast) {
+              mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 6144>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
+                  W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            }
+            break;
+          case 9216:
+            mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 9216>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          case 17408:
+            mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 17408>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          default:
+            mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+        }
+      } else if (q5_k_col2560_fast && col == 2560) {
         mul_mat_vec_q5_K_q8_1_col2560_cuda<scalar_t>(
             W, quant_X, dst, row, vecs, stream, dst_stride);
       } else {
@@ -744,12 +872,16 @@ static void ggml_mul_mat_vec_q8_dispatch(
       }
       break;
     }
-    case 14:
+    case 14: {
       static const bool q6_k_col2560_fast = [] {
         const char* env = std::getenv("VLLM_GGUF_Q6_K_COL2560_FAST");
         return env == nullptr || env[0] != '0';
       }();
-      if (q6_k_col2560_fast && col == 2560 && row > 65536) {
+      if (q6_k_fixed_cols_fast_enabled() && vecs == 1 && col == 5120 &&
+          row >= q6_k_fixed_cols_min_rows()) {
+        mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
+            W, quant_X, dst, row, vecs, stream, dst_stride);
+      } else if (q6_k_col2560_fast && col == 2560 && row > 65536) {
         mul_mat_vec_q6_K_q8_1_col2560_cuda<scalar_t>(
             W, quant_X, dst, row, vecs, stream, dst_stride);
       } else {
@@ -757,6 +889,7 @@ static void ggml_mul_mat_vec_q8_dispatch(
             W, quant_X, dst, col, row, vecs, stream, dst_stride);
       }
       break;
+    }
     case 16:
       mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);

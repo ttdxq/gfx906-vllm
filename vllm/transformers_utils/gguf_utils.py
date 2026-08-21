@@ -3,14 +3,15 @@
 """GGUF utility functions."""
 
 import hashlib
+import re
 from pathlib import Path
 
 import gguf
 from gguf.constants import Keys, VisionProjectorType
 from transformers import (
     Gemma3Config,
-    PreTrainedTokenizerFast,
     PretrainedConfig,
+    PreTrainedTokenizerFast,
     SiglipVisionConfig,
 )
 from transformers.integrations.ggml import convert_gguf_tokenizer
@@ -24,6 +25,25 @@ from vllm.logger import init_logger
 from .repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
+
+
+def _gguf_model_family(path: Path) -> str:
+    tokens = re.split(r"[-_.]+", path.stem.lower())
+    if tokens and tokens[0] == "mmproj":
+        tokens = tokens[1:]
+
+    family_tokens = []
+    for idx, token in enumerate(tokens):
+        if token == "mmproj":
+            break
+        if token == "ud" and idx + 1 < len(tokens):
+            next_token = tokens[idx + 1]
+            if re.fullmatch(r"(?:i?q|tq)\d+", next_token):
+                break
+        if re.fullmatch(r"(?:i?q|tq)\d+|(?:bf|f|fp)\d+", token):
+            break
+        family_tokens.append(token)
+    return "-".join(family_tokens)
 
 
 def detect_gguf_multimodal(model: str) -> Path | None:
@@ -44,11 +64,21 @@ def detect_gguf_multimodal(model: str) -> Path | None:
             return None
 
         model_dir = model_path.parent
-        mmproj_patterns = ["mmproj.gguf", "mmproj-*.gguf", "*mmproj*.gguf"]
-        for pattern in mmproj_patterns:
-            mmproj_files = list(model_dir.glob(pattern))
-            if mmproj_files:
-                return mmproj_files[0]
+        mmproj_files = sorted(
+            path for path in model_dir.glob("*.gguf") if "mmproj" in path.stem.lower()
+        )
+        model_family = _gguf_model_family(model_path)
+        for mmproj_file in mmproj_files:
+            if _gguf_model_family(mmproj_file) == model_family:
+                return mmproj_file
+
+        model_families = {
+            _gguf_model_family(path)
+            for path in model_dir.glob("*.gguf")
+            if "mmproj" not in path.stem.lower()
+        }
+        if len(mmproj_files) == 1 and model_family and model_families == {model_family}:
+            return mmproj_files[0]
         return None
     except Exception:
         return None
@@ -127,6 +157,13 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
     # Note: num_channels and attention_dropout use SiglipVisionConfig defaults
     # (3 and 0.0 respectively) which are correct for all models
     config = SiglipVisionConfig(**config_params)
+    config.projector_type = projector_type
+    projection_dim = _read_gguf_scalar(reader, "clip.vision.projection_dim")
+    if projection_dim is not None:
+        config.projection_dim = int(projection_dim)
+    spatial_merge_size = _read_gguf_scalar(reader, "clip.vision.spatial_merge_size")
+    if spatial_merge_size is not None:
+        config.spatial_merge_size = int(spatial_merge_size)
 
     if projector_type:
         logger.info(
@@ -176,9 +213,7 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
     linear_value_head_dim = int(
         _read_gguf_scalar(reader, f"{prefix}.ssm.state_size", 128)
     )
-    linear_num_key_heads = int(
-        _read_gguf_scalar(reader, f"{prefix}.ssm.group_count")
-    )
+    linear_num_key_heads = int(_read_gguf_scalar(reader, f"{prefix}.ssm.group_count"))
     qkv_tensor = next(
         (tensor for tensor in reader.tensors if tensor.name == "blk.0.attn_qkv.weight"),
         None,
@@ -271,12 +306,8 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
                 "num_experts_per_tok": int(
                     _read_gguf_scalar(reader, f"{prefix}.expert_used_count")
                 ),
-                "num_experts": int(
-                    _read_gguf_scalar(reader, f"{prefix}.expert_count")
-                ),
-                "num_nextn_predict_layers": int(
-                    num_nextn_predict_layers
-                ),
+                "num_experts": int(_read_gguf_scalar(reader, f"{prefix}.expert_count")),
+                "num_nextn_predict_layers": int(num_nextn_predict_layers),
                 "mtp_num_hidden_layers": int(num_nextn_predict_layers),
                 "norm_topk_prob": True,
             }
@@ -284,9 +315,7 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
 
     config_dict = {
         "architectures": [
-            "Qwen3_5MoeForConditionalGeneration"
-            if is_moe
-            else "Qwen3_5ForCausalLM"
+            "Qwen3_5MoeForConditionalGeneration" if is_moe else "Qwen3_5ForCausalLM"
         ],
         "model_type": "qwen3_5_moe" if is_moe else "qwen3_5",
         "text_config": text_config,
@@ -395,6 +424,27 @@ def qwen35_gguf_tokenizer_path(model: str) -> str | None:
     return str(tokenizer_dir)
 
 
+def gguf_multimodal_processor_repo(model: str) -> str | None:
+    """Return the original HF repo needed for multimodal GGUF processing."""
+    if detect_gguf_multimodal(model) is None:
+        return None
+
+    try:
+        reader = gguf.GGUFReader(str(model))
+    except Exception:
+        return None
+
+    repo_url = _read_gguf_scalar(reader, "general.base_model.0.repo_url")
+    if not isinstance(repo_url, str):
+        return None
+
+    prefix = "https://huggingface.co/"
+    if not repo_url.startswith(prefix):
+        return None
+    repo_id = repo_url.removeprefix(prefix).strip("/").split("/tree/", 1)[0]
+    return repo_id or None
+
+
 def maybe_patch_hf_config_from_gguf(
     model: str,
     hf_config: PretrainedConfig,
@@ -432,18 +482,35 @@ def maybe_patch_hf_config_from_gguf(
             )
             hf_config = new_hf_config
 
-    if (
-        mmproj_path is None
-        and getattr(hf_config, "model_type", "") in ("qwen3_5", "qwen3_5_text")
-        and getattr(hf_config, "architectures", None) == ["Qwen3_5ForCausalLM"]
-    ):
-        hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
+        is_qwen35 = hf_config.model_type in (
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+        )
+        if vision_config is not None and is_qwen35:
+            qwen_vision_config = hf_config.vision_config
+            qwen_vision_config.depth = vision_config.num_hidden_layers
+            qwen_vision_config.hidden_size = vision_config.hidden_size
+            qwen_vision_config.intermediate_size = vision_config.intermediate_size
+            qwen_vision_config.num_heads = vision_config.num_attention_heads
+            qwen_vision_config.patch_size = vision_config.patch_size
+            qwen_vision_config.num_position_embeddings = (
+                vision_config.image_size // vision_config.patch_size
+            ) ** 2
+            if hasattr(vision_config, "spatial_merge_size"):
+                qwen_vision_config.spatial_merge_size = vision_config.spatial_merge_size
+            if hasattr(vision_config, "projection_dim"):
+                qwen_vision_config.out_hidden_size = vision_config.projection_dim
+            hf_config.architectures = [
+                "Qwen3_5MoeForConditionalGeneration"
+                if "moe" in hf_config.model_type
+                else "Qwen3_5ForConditionalGeneration"
+            ]
+
     if getattr(hf_config, "model_type", "") in ("qwen3_5", "qwen3_5_text"):
         rope_parameters = getattr(hf_config, "rope_parameters", None)
-        if (
-            isinstance(rope_parameters, dict)
-            and "theta" in rope_parameters
-        ):
+        if isinstance(rope_parameters, dict) and "theta" in rope_parameters:
             rope_parameters["rope_theta"] = rope_parameters.pop("theta")
 
     return hf_config

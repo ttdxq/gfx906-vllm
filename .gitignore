@@ -21,6 +21,8 @@ __pycache__/
 
 # C extensions
 *.so
+/vllm/_C.abi3.so.*.hipv4-*
+/vllm/_C.abi3.so.*.host-*
 
 # Distribution / packaging
 .Python
@@ -279,6 +281,8 @@ PRE_PUSH_CHECK.md
 # Test and verification scripts (not required for runtime)
 verify_*.py
 test_*.py
+!tests/v1/core/test_mamba_align_chunk_split.py
+!tests/v1/attention/test_gdn_metadata_builder.py
 *_test.py
 *_verify.py
 *_validation.py

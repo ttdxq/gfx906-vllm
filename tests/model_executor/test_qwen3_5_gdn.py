@@ -10,6 +10,7 @@ from vllm.model_executor.models.qwen3_5 import (
     _make_qwen35_fused_expert_params_mapping,
 )
 from vllm.model_executor.models.qwen3_next import (
+    Qwen3NextSparseMoeBlock,
     _gdn_convert_state_layout,
     _gdn_recurrent_state_to_cache,
 )
@@ -137,9 +138,56 @@ def test_qwen3_5_chunk_state_transposes_for_standard_cache_layout():
 
 def test_qwen3_5_text_model_declares_hybrid_cache_interface():
     assert Qwen3_5ForCausalLMBase.is_hybrid
+    assert Qwen3_5ForCausalLMBase.supports_mrope
     assert callable(Qwen3_5ForCausalLMBase.get_mamba_state_dtype_from_config)
     assert callable(Qwen3_5ForCausalLMBase.get_mamba_state_shape_from_config)
     assert callable(Qwen3_5ForCausalLMBase.get_mamba_state_copy_func)
+
+
+def test_qwen3_5_text_mrope_positions():
+    model = object.__new__(Qwen3_5ForCausalLMBase)
+
+    positions, delta = model.get_mrope_input_positions([11, 12, 13], [])
+
+    assert positions.dtype == torch.long
+    assert positions.shape == (3, 3)
+    assert torch.equal(positions, torch.tensor([[0, 1, 2]]).expand(3, -1))
+    assert delta == 0
+
+
+def test_qwen3_next_moe_sequence_parallel_restores_full_tokens(monkeypatch):
+    module = object.__new__(Qwen3NextSparseMoeBlock)
+    torch.nn.Module.__init__(module)
+    module.is_sequence_parallel = True
+    module.shared_expert = None
+    module.tp_size = 2
+
+    class _FakeExperts:
+        is_internal_router = True
+
+        def __call__(self, hidden_states, router_logits):
+            assert router_logits is hidden_states
+            return hidden_states + 1
+
+    module.experts = _FakeExperts()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_next.sequence_parallel_chunk",
+        lambda hidden_states: hidden_states[:2],
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_next.tensor_model_parallel_all_gather",
+        lambda hidden_states, dim: torch.cat(
+            [hidden_states, hidden_states + 10], dim=dim
+        ),
+    )
+
+    hidden_states = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    output = module(hidden_states)
+
+    assert output.shape == hidden_states.shape
+    assert torch.equal(output[:2], hidden_states[:2] + 1)
+    assert torch.equal(output[2:], hidden_states[:2] + 11)
 
 
 class _FakeQuantConfig:

@@ -1,3 +1,5 @@
+[English](./README_EN.md)
+
 # vLLM for AMD gfx906
 
 [![vLLM](https://img.shields.io/badge/vLLM-gfx906-red)](https://github.com/vllm-project/vllm)
@@ -23,14 +25,9 @@
 
 ## 最新更新
 
-### ✅ 2026年6月更新
+### ✅ 2026年8月更新
 
-- **Qwen3.5 GGUF dense fallback 修复** - 修复 GGUF dense 权重路径在 gfx906 上的兼容问题，避免错误反量化路径影响推理。
-- **Qwen3.5 GDN projection 合并优化** - 将 Gated DeltaNet 的多组 linear 合并，减少 GGUF 路径上的额外算子开销。
-- **Qwen3.5 GGUF piecewise compile 支持** - 补齐 layernorm、mRoPE、KV cache reshape 等 gfx906 capture-safe fallback，支持 `PIECEWISE` CUDA/HIP Graph 路径。
-- **Qwen3.5 GGUF FULL decode graph 支持** - 补齐 causal conv1d、fused recurrent、sigmoid gating、unified attention 等 decode fallback，已验证 `FULL_AND_PIECEWISE` 可完成 FULL decode graph capture。
-- **当前推荐配置** - Qwen3.5 GGUF 在 gfx906 上建议使用 `--reasoning-parser qwen3_5`，并优先使用 `FULL_AND_PIECEWISE` + `max_cudagraph_capture_size=128`。
-- **当前限制** - 默认 capture size 512 仍可能因显存压力 OOM；27B 级 GGUF 仍属实验支持，复杂长输出质量需继续测试。
+- **Qwen3.5 多模态 GGUF 支持** - 补齐 Qwen3.5 GGUF 主模型与 `mmproj` 的视觉配置、权重名称映射、Conv3d patch embedding 合并和多模态输入处理链路。
 
 ### 支持的模型
 
@@ -39,10 +36,14 @@
 本项目已从上游 vLLM 同步了大量新模型文件（49+ 个模型），但这些模型**未经 ROCm/gfx906 架构的适配和测试**。虽然文件已包含在代码库中，但不保证在 AMD gfx906 GPU 上能正常运行。
 
 **已测试并确认可用：**
-- ✅ Qwen/Qwen3.5-0.8B（非多模态）
-- ✅ Qwen/Qwen3.5-2B（非多模态）
-- ✅ Qwen/Qwen3.5-4B（非多模态）
-- ✅ Qwen/Qwen3.5-9B（非多模态）
+
+- ✅ Qwen/Qwen3.5-0.8B(原始F16权重)
+- ✅ Qwen/Qwen3.5-2B(原始F16权重)
+- ✅ Qwen/Qwen3.5-4B(原始F16权重)
+- ✅ Qwen/Qwen3.5-9B(原始F16权重)
+- ✅ unsloth/Qwen3.5-27B-GGUF
+- ✅ unsloth/Qwen3.6-27B-GGUF
+- ✅ unsloth/Qwen3.8-27B-GGUF
 
 **已知无法运行：**
 - ❌ **Qwen/Qwen3.5-35B-A3B-GPTQ-Int4** - MoE + GPTQ Int4 量化组合存在兼容性问题，导致服务无法正常启动或推理失败
@@ -66,10 +67,16 @@
 ## 系统要求
 
 - **硬件**: AMD gfx906 GPU（Radeon VII、Radeon Pro VII、Instinct MI50、Instinct MI60）
-- **ROCm**: 6.3+（需要内核模式驱动）
+- **ROCm**: 支持以下社区兼容组合（均需要内核模式驱动）
+  - ROCm 6.3 + PyTorch 2.9 + triton-gfx906 v3.5.0+gfx906（原有兼容组合）
+  - ROCm 7.2 + PyTorch 2.11 + triton-rocm 3.6.0（当前仓库依赖组合）
 - **Python**: 3.10+
-- **Triton**: triton-gfx906 v3.5.0+gfx906（[安装指南](https://github.com/nlzy/triton-gfx906/tree/v3.5.0+gfx906)）
 - **操作系统**: Linux（在 Ubuntu 上测试）
+
+ROCm 6.3 组合的 Triton 安装方式请参阅
+[triton-gfx906 安装指南](https://github.com/nlzy/triton-gfx906/tree/v3.5.0+gfx906)。
+当前仓库的依赖文件默认使用 ROCm 7.2 组合。该组合需要可用于 gfx906 的
+rocBLAS Tensile 文件；必要时通过 `ROCBLAS_TENSILE_LIBPATH` 指定其路径。
 
 ## 安装方式
 
@@ -81,28 +88,30 @@ sudo apt install python3-venv python3-dev
 
 # 克隆仓库
 git clone https://github.com/ttdxq/gfx906-vllm.git
-cd vllm-gfx906
+cd gfx906-vllm
 
 # 创建虚拟环境
-python3 -m venv venv
-source venv/bin/activate
+uv venv --python 3.12 .venv
+source .venv/bin/activate
 
-# 安装 ROCm 版本的 PyTorch
-pip install torch==2.9 torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
+# 安装当前 ROCm 7.2 构建和运行依赖
+uv pip install -r requirements/rocm-build.txt -r requirements/rocm.txt
 
-# 安装依赖
-pip install -r requirements/rocm-build.txt -r requirements/rocm.txt
-
-# 安装 vLLM
-pip install --no-build-isolation -e .
+# 构建并安装 vLLM
+MAX_JOBS=$(nproc) CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
+  uv pip install --no-build-isolation -e .
 ```
+
+上述源码构建命令对应当前仓库的 ROCm 7.2 + PyTorch 2.11 依赖。继续使用
+ROCm 6.3 原有组合时，请按 triton-gfx906 安装指南准备对应的 PyTorch 和
+Triton 环境，不要混用两套 ROCm/PyTorch/Triton 依赖。
 
 ## 使用方法
 
 ### 启动服务
 
 ```bash
-# 对于多模态模型（禁用多模态功能）
+# 文本模型或仅使用文本功能时，可以显式禁用多模态输入
 VLLM_USE_MODELSCOPE=true vllm serve Qwen/Qwen3.5-0.8B \
   --port 8000 \
   --tensor-parallel-size 1 \
@@ -118,35 +127,17 @@ vllm serve Qwen/Qwen3.5-0.8B \
   --reasoning-parser qwen3_5
 ```
 
-### Qwen3.5-27B GGUF（gfx906 实验状态）
+### Qwen3.5系列 多模态 GGUF支持
 
-对于 `Qwen3.5-27B` 级别的 GGUF，当前仓库仍以**原生 vLLM 路径排障**为主。现阶段建议仅将其视为实验性支持：
+主模型和对应 `mmproj` 应放在同一目录，并保持可识别的配对命名。
+
+为约束启动 profiling 使用的 dummy 图片尺寸，建议设置与业务图片上限相符的 `width` 和 `height`：
 
 ```bash
-export HIP_VISIBLE_DEVICES=0
-export GPU_MAX_HW_QUEUES=1
-export HSA_ENABLE_SDMA=0
-export VLLM_WORKER_MULTIPROC_METHOD=fork
-export VLLM_COMPILATION_MODE=0
-
-vllm serve /root/model/Qwen3.5-27B-Q6_K.gguf \
-  --port 8001 \
-  --tensor-parallel-size 1 \
-  --max-model-len 4096 \
-  --reasoning-parser qwen3_5 \
-  --compilation-config '{"mode":3,"backend":"eager","cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":128}' \
-  --limit-mm-per-prompt '{"image": 0, "video": 0}'
+--limit-mm-per-prompt '{"image":{"count":1,"width":512,"height":512},"video":0}'
 ```
 
-**当前观察：**
-
-- ✅ 服务启动与基础 OpenAI 接口链路可打通
-- ✅ 简单问答、数字题、部分短回答已明显改善
-- ✅ `FULL_AND_PIECEWISE` + `max_cudagraph_capture_size=128` 已可完成 FULL decode graph capture
-- ✅ reasoning 内容会进入 OpenAI 响应的 `reasoning` / `reasoning_content` 字段，普通 `content` 可能为空
-- ⚠️ 默认 capture size 512 仍可能因显存压力 OOM
-- ⚠️ 复杂长回答质量仍需继续测试
-- ⚠️ 目前仅建议作为实验性验证，不建议视为稳定生产支持
+`width` 和 `height` 用于约束启动 profiling 的 dummy 图片尺寸，并不是运行时图片的硬限制。部署时应使用与实际最大图片尺寸匹配的 profiling 配置。
 
 ### 测试 API
 
@@ -190,8 +181,8 @@ print(response.choices[0].message.content)
 ## 核心修改
 
 ### 1. ROCm GEMM 优化
-- **问题**: `torch.nn.functional.linear` 在 gfx906 上触发 `HIPBLAS_STATUS_INTERNAL_ERROR`
-- **解决方案**: 使用通用 Triton 矩阵乘法实现，避免 hipBLAS 调用
+- **问题**: gfx906 上不同 batch、矩阵形状和 dtype 对 ROCm GEMM 路径的兼容性与性能差异较大
+- **解决方案**: 按输入形状选择实现；符合条件的单 token FP16 路径使用 `LLMM1`，部分非 gfx9 小 batch 使用 Triton，其余 gfx906 路径使用 PyTorch/ROCm GEMM fallback
 - **修改文件**: `vllm/model_executor/layers/utils.py`
 
 ### 2. CacheConfig 兼容性
@@ -205,9 +196,9 @@ print(response.choices[0].message.content)
 ## 量化支持
 
 基于原项目测试结果：
-- ✅ **GPTQ** - 推荐
-- ✅ **AWQ** - 推荐
-- ✅ **W4A16 INT** - 支持（通过 llm-compressor）
+- ⚠️ **GPTQ** - 部分模型可用，但 kernel、张量形状和 MoE 组合仍可能存在兼容性或性能问题
+- ⚠️ **AWQ** - 部分 dense 模型可用；默认使用 Triton 路径，部分模型仍可能输出异常或启动失败
+- ⚠️ **W4A16 INT** - 部分模型不可用（通过 llm-compressor）
 - ⚠️ **MoE 量化模型** - 速度显著较慢，不推荐
 - ⚠️ **非量化模型** - 略慢，但可用
 
@@ -223,22 +214,21 @@ export VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ=1
 
 ## 已知限制
 
-1. **不支持多模态** - 必须使用 `--limit-mm-per-prompt` 禁用
-2. **首次推理较慢** - Triton 内核首次运行时需要编译
-3. **内存占用较大** - KV cache 预分配会占用大量 GPU 内存
-4. **实验性质** - 使用风险自负
-5. **MoE + GPTQ 量化兼容性** - Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 等大型 MoE + GPTQ Int4 量化模型存在已知问题：
+1. **首次推理较慢** - Triton 内核首次运行时需要编译
+2. **内存占用较大** - KV cache 预分配会占用大量 GPU 内存
+3. **实验性质** - 使用风险自负
+4. **MoE + GPTQ 量化兼容性** - Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 等大型 MoE + GPTQ Int4 量化模型存在已知问题：
    - Triton kernel 在处理特定分块大小时会出现内存访问错误
    - aiter 后端在复杂 MoE 路由场景下不稳定
    - 建议使用非量化 MoE 模型或较小的 MoE + GPTQ 模型
-6. **Qwen3.5 GGUF on gfx906** - 当前 27B 级 GGUF 在原生 vLLM 路径下仍可能出现复杂提示上的题目复述、thinking 文本异常或语义漂移，暂不建议视为稳定支持
 
 ## 性能优化建议
 
 1. **减小 `max-model-len`** - 对于小模型可以节省内存
 2. **使用 `--gpu-memory-utilization`** - 显式管理内存使用
-3. **优先使用 `FULL_AND_PIECEWISE`** - Qwen3.5 GGUF 推荐配合 `max_cudagraph_capture_size=128`
-4. **重启前清理进程** - 使用 `pkill -9 -f "vllm serve"` 杀死现有进程
+3. **保持默认 eager decode** - Qwen3.5/Qwen3.8 GGUF 的 CUDA/HIP Graph 路径仅用于排障和实验验证
+4. **限制多模态 profiling 尺寸** - 通过 `--limit-mm-per-prompt` 设置与业务相符的图片数量和最大测试尺寸
+5. **重启前确认进程归属** - 使用 `rocm-smi` 和 `ps` 检查占用，避免终止其他 GPU 工作线的进程
 
 ## 故障排除
 
@@ -246,11 +236,10 @@ export VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ=1
 这是正常现象 - Triton 正在编译内核。请等待 1-2 分钟。
 
 ### GPU 内存错误
-- 杀死现有进程: `pkill -9 -f "vllm serve"`
-- 降低 GPU 内存使用率: `--gpu-memory-utilization 0.7`
-
-### HIPBLAS 错误
-最新版本应该已修复。如果遇到，请提交 issue。
+- 使用 `rocm-smi` 检查目标 GPU 的显存占用和进程归属
+- 降低 `--max-model-len`、`--max-num-batched-tokens` 或 KV cache 大小
+- 多模态模型应通过 `--limit-mm-per-prompt` 降低 profiling 图片尺寸
+- 如果 OOM 发生在启动阶段的视觉 profiling，可临时使用 `--skip-mm-profiling` 判断是否为 profiling 峰值导致
 
 ## 贡献
 

@@ -8,11 +8,22 @@ from vllm.config import ModelConfig
 from vllm.inputs import EmbedsPrompt
 from vllm.inputs import zip_enc_dec_prompts
 from vllm.inputs.parse import parse_raw_prompts
-from vllm.inputs.preprocess import InputPreprocessor
+from vllm.inputs.preprocess import InputPreprocessor, parse_dec_only_prompt
 from vllm.renderers.hf import HfRenderer
 from vllm.tokenizers import init_tokenizer_from_config
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_parse_decoder_only_multimodal_prompt():
+    prompt = {
+        "prompt": "<image>describe this image",
+        "multi_modal_data": {"image": object()},
+        "mm_processor_kwargs": {"do_resize": True},
+        "multi_modal_uuids": {"image": "image-0"},
+    }
+
+    assert parse_dec_only_prompt(prompt) == prompt
 
 
 class _DummyRendererModelConfig:

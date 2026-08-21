@@ -299,6 +299,13 @@ class OpenAIServing:
         user_kwargs = request_chat_template_kwargs or {}
         if reasoning_effort is not None and "enable_thinking" not in user_kwargs:
             extra_kwargs["enable_thinking"] = reasoning_effort != "none"
+        # Forward the effort level so chat templates that declare
+        # `reasoning_effort` (e.g. Qwen3.5) can honor it; templates that do
+        # not reference the variable ignore it. Aligned with upstream
+        # build_chat_params, which passes reasoning_effort into the render
+        # kwargs and lets merge_kwargs drop the unset (None) case.
+        if reasoning_effort is not None and "reasoning_effort" not in user_kwargs:
+            extra_kwargs["reasoning_effort"] = reasoning_effort
 
         if not self.default_chat_template_kwargs:
             if not extra_kwargs:

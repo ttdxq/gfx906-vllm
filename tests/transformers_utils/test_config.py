@@ -7,11 +7,108 @@ only get the `eos_token_id` from the tokenizer as defined by
 """
 
 import pytest
+from transformers import SiglipVisionConfig
 
 from vllm.tokenizers import get_tokenizer
 from vllm.transformers_utils import config as config_utils
 from vllm.transformers_utils import gguf_utils
 from vllm.transformers_utils.config import try_get_generation_config
+from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected_class_name"),
+    [
+        ("qwen3_5_text", "Qwen3_5TextConfig"),
+        ("qwen3_5_moe_text", "Qwen3_5MoeTextConfig"),
+    ],
+)
+def test_qwen35_text_only_config_registry(model_type, expected_class_name):
+    assert config_utils._CONFIG_REGISTRY[model_type].__name__ == expected_class_name
+
+
+def test_detect_gguf_multimodal_ignores_unrelated_shared_projector(tmp_path):
+    model = tmp_path / "Qwen3.6-27B-UD-Q4_K_XL.gguf"
+    model.touch()
+    (tmp_path / "Qwen3.8-27B-UD-Q4_K_XL.gguf").touch()
+    (tmp_path / "Qwen3.8-27B-mmproj-F16.gguf").touch()
+
+    assert gguf_utils.detect_gguf_multimodal(str(model)) is None
+
+
+def test_detect_gguf_multimodal_matches_model_family(tmp_path):
+    model = tmp_path / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    model.touch()
+    mmproj = tmp_path / "Qwen3.8-27B-mmproj-F16.gguf"
+    mmproj.touch()
+    (tmp_path / "Qwen3.6-27B-UD-Q4_K_XL.gguf").touch()
+
+    assert gguf_utils.detect_gguf_multimodal(str(model)) == mmproj
+
+
+def test_detect_gguf_multimodal_accepts_single_family_directory(tmp_path):
+    model = tmp_path / "gemma-3-4b-it-Q4_K_M.gguf"
+    model.touch()
+    (tmp_path / "gemma-3-4b-it-Q6_K.gguf").touch()
+    mmproj = tmp_path / "mmproj-model-f16-4B.gguf"
+    mmproj.touch()
+
+    assert gguf_utils.detect_gguf_multimodal(str(model)) == mmproj
+
+
+def test_patch_qwen35_multimodal_gguf_config(monkeypatch, tmp_path):
+    model = tmp_path / "qwen35.gguf"
+    mmproj = tmp_path / "mmproj.gguf"
+    model.write_bytes(b"GGUF")
+    mmproj.write_bytes(b"GGUF")
+    vision_config = SiglipVisionConfig(
+        hidden_size=1152,
+        intermediate_size=4304,
+        num_hidden_layers=27,
+        num_attention_heads=16,
+        image_size=768,
+        patch_size=16,
+    )
+    vision_config.projection_dim = 5120
+    vision_config.spatial_merge_size = 2
+
+    monkeypatch.setattr(gguf_utils, "detect_gguf_multimodal", lambda _: mmproj)
+    monkeypatch.setattr(
+        gguf_utils,
+        "extract_vision_config_from_gguf",
+        lambda _: vision_config,
+    )
+
+    config = Qwen3_5Config(architectures=["Qwen3_5ForCausalLM"])
+    patched = gguf_utils.maybe_patch_hf_config_from_gguf(str(model), config)
+
+    assert patched.architectures == ["Qwen3_5ForConditionalGeneration"]
+    assert patched.vision_config.depth == 27
+    assert patched.vision_config.num_heads == 16
+    assert patched.vision_config.out_hidden_size == 5120
+    assert patched.vision_config.num_position_embeddings == 2304
+    assert patched.vision_config.deepstack_visual_indexes == []
+
+
+def test_multimodal_gguf_uses_original_processor_repo(monkeypatch, tmp_path):
+    model = tmp_path / "qwen35.gguf"
+    mmproj = tmp_path / "mmproj.gguf"
+    model.write_bytes(b"GGUF")
+    mmproj.write_bytes(b"GGUF")
+
+    monkeypatch.setattr(gguf_utils, "detect_gguf_multimodal", lambda _: mmproj)
+    monkeypatch.setattr(gguf_utils.gguf, "GGUFReader", lambda _: object())
+    monkeypatch.setattr(
+        gguf_utils,
+        "_read_gguf_scalar",
+        lambda _reader, key, default=None: (
+            "https://huggingface.co/Qwen/Qwen3.8-27B"
+            if key == "general.base_model.0.repo_url"
+            else default
+        ),
+    )
+
+    assert gguf_utils.gguf_multimodal_processor_repo(str(model)) == "Qwen/Qwen3.8-27B"
 
 
 def test_maybe_override_with_speculators_skips_unsupported_local_gguf_arch(
@@ -22,9 +119,7 @@ def test_maybe_override_with_speculators_skips_unsupported_local_gguf_arch(
     model.write_bytes(b"GGUF")
 
     def fail_get_config_dict(*args, **kwargs):
-        raise ValueError(
-            "GGUF model with architecture qwen35 is not supported yet."
-        )
+        raise ValueError("GGUF model with architecture qwen35 is not supported yet.")
 
     monkeypatch.setattr(
         config_utils.PretrainedConfig,
@@ -47,9 +142,7 @@ def test_maybe_override_with_speculators_reraises_hf_config_path_gguf_errors(
     model.write_bytes(b"GGUF")
 
     def fail_get_config_dict(*args, **kwargs):
-        raise ValueError(
-            "GGUF model with architecture qwen35 is not supported yet."
-        )
+        raise ValueError("GGUF model with architecture qwen35 is not supported yet.")
 
     monkeypatch.setattr(
         config_utils.PretrainedConfig,
@@ -74,9 +167,7 @@ def test_get_config_builds_qwen35_config_from_local_gguf_metadata(
     model.write_bytes(b"GGUF")
 
     def fail_get_config_dict(*args, **kwargs):
-        raise ValueError(
-            "GGUF model with architecture qwen35 is not supported yet."
-        )
+        raise ValueError("GGUF model with architecture qwen35 is not supported yet.")
 
     config_dict = {
         "architectures": ["Qwen3_5ForCausalLM"],
@@ -153,7 +244,6 @@ def test_qwen35_gguf_config_derives_value_heads_from_attn_qkv(
     model.write_bytes(b"GGUF")
 
     class FakeField:
-
         def __init__(self, value):
             self.value = value
 
@@ -161,13 +251,11 @@ def test_qwen35_gguf_config_derives_value_heads_from_attn_qkv(
             return self.value
 
     class FakeTensor:
-
         def __init__(self, name, shape):
             self.name = name
             self.shape = shape
 
     class FakeReader:
-
         tensors = [
             FakeTensor("blk.0.attn_qkv.weight", (2560, 8192)),
             FakeTensor("output.weight", (151936, 2560)),

@@ -37,6 +37,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_utils import (
     detect_gguf_multimodal,
+    gguf_multimodal_processor_repo,
     maybe_patch_hf_config_from_gguf,
     qwen35_gguf_tokenizer_path,
 )
@@ -129,6 +130,7 @@ def uses_mrope(*args, **kwargs):
 
 def uses_xdrope_dim(*args, **kwargs):
     return _tu_config().uses_xdrope_dim(*args, **kwargs)
+
 
 RunnerOption = Literal["auto", RunnerType]
 ConvertType = Literal["none", "embed", "classify", "reward"]
@@ -451,9 +453,7 @@ class ModelConfig:
         # For some models (e.g. Qwen3-VL), whether the MM code path is enabled
         # affects the language model computation graph, so include it in hash.
         if self.multimodal_config:
-            factors["language_model_only"] = (
-                self.multimodal_config.language_model_only
-            )
+            factors["language_model_only"] = self.multimodal_config.language_model_only
         return hash_factors(factors)
 
     def _update_nested(
@@ -522,7 +522,9 @@ class ModelConfig:
         candidates = sorted(
             p
             for p in model_path.parent.iterdir()
-            if p.is_dir() and p.name.endswith("-repo") and p.name.startswith(model_prefix)
+            if p.is_dir()
+            and p.name.endswith("-repo")
+            and p.name.startswith(model_prefix)
         )
         if len(candidates) == 1:
             self.tokenizer = str(candidates[0])
@@ -545,6 +547,15 @@ class ModelConfig:
 
     def _maybe_use_qwen35_gguf_tokenizer(self) -> None:
         if self.tokenizer is None or self.tokenizer != self.model:
+            return
+
+        processor_repo = gguf_multimodal_processor_repo(self.model)
+        if processor_repo is not None:
+            self.tokenizer = processor_repo
+            logger.info(
+                "Using original multimodal GGUF processor repository: %s",
+                self.tokenizer,
+            )
             return
 
         tokenizer_path = qwen35_gguf_tokenizer_path(self.model)
@@ -1771,7 +1782,9 @@ class ModelConfig:
                 "vLLM instance with `--generation-config vllm`."
             )
 
-        if check_gguf_file(self.model) and getattr(self.hf_config, "model_type", "") in (
+        if check_gguf_file(self.model) and getattr(
+            self.hf_config, "model_type", ""
+        ) in (
             "qwen3_5",
             "qwen3_5_text",
             "qwen35",

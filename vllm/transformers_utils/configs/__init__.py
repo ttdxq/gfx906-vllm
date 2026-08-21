@@ -40,9 +40,15 @@ from vllm.transformers_utils.configs.nemotron import NemotronConfig
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 from vllm.transformers_utils.configs.olmo3 import Olmo3Config
 from vllm.transformers_utils.configs.ovis import OvisConfig
+from vllm.transformers_utils.configs.qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5TextConfig,
+)
+from vllm.transformers_utils.configs.qwen3_5_moe import (
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+)
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
-from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
 from vllm.transformers_utils.configs.radio import RadioConfig
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 from vllm.transformers_utils.configs.step3_vl import (
@@ -77,7 +83,9 @@ __all__ = [
     "Olmo3Config",
     "OvisConfig",
     "Qwen3_5Config",
+    "Qwen3_5TextConfig",
     "Qwen3_5MoeConfig",
+    "Qwen3_5MoeTextConfig",
     "Qwen3NextConfig",
     "RadioConfig",
     "SpeculatorsConfig",

@@ -3,6 +3,7 @@
 import os
 import re
 from collections.abc import Generator
+from pathlib import Path
 
 import gguf
 import torch
@@ -29,6 +30,14 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
 
+_MULTIMODAL_GGUF_ARCHITECTURES = frozenset(
+    {
+        "Gemma3ForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
+
 
 class GGUFModelLoader(BaseModelLoader):
     """
@@ -44,6 +53,16 @@ class GGUFModelLoader(BaseModelLoader):
                 f"Model loader extra config is not supported for "
                 f"load format {load_config.load_format}"
             )
+
+    @staticmethod
+    def _get_mmproj_file(
+        model_config: ModelConfig, model_name_or_path: str | None = None
+    ) -> Path | None:
+        if model_config.architecture not in _MULTIMODAL_GGUF_ARCHITECTURES:
+            return None
+        if getattr(model_config.hf_config, "vision_config", None) is None:
+            return None
+        return detect_gguf_multimodal(model_name_or_path or model_config.model)
 
     def _prepare_weights(self, model_config: ModelConfig):
         model_name_or_path = model_config.model
@@ -99,9 +118,7 @@ class GGUFModelLoader(BaseModelLoader):
                     f"{gguf_prefix}.nextn.hnorm.weight": (
                         "mtp.pre_fc_norm_hidden.weight"
                     ),
-                    f"{gguf_prefix}.nextn.shared_head_norm.weight": (
-                        "mtp.norm.weight"
-                    ),
+                    f"{gguf_prefix}.nextn.shared_head_norm.weight": ("mtp.norm.weight"),
                     f"{gguf_prefix}.attn_q.weight": (
                         f"{hf_prefix}.self_attn.q_proj.weight"
                     ),
@@ -192,21 +209,19 @@ class GGUFModelLoader(BaseModelLoader):
         # models, this returns config itself.
         text_config = config.get_text_config()
         model_type = config.model_type
-        qwen35_language_model_prefix = (
-            "language_model."
-            if vllm_arch
-            in (
-                "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-            )
-            else ""
+        is_qwen35_multimodal = vllm_arch in (
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
         )
-        detected_mm = detect_gguf_multimodal(model_config.model)
-        is_multimodal = (
-            hasattr(config, "vision_config")
-            and config.vision_config is not None
-            and detected_mm is not None
-        )
+
+        def qwen35_text_hf_name(name: str) -> str:
+            if not is_qwen35_multimodal:
+                return name
+            if name.startswith("model."):
+                return f"model.language_model.{name.removeprefix('model.')}"
+            return name
+
+        is_multimodal = self._get_mmproj_file(model_config) is not None
         gguf_to_hf_name_map = {}
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
@@ -221,16 +236,19 @@ class GGUFModelLoader(BaseModelLoader):
             model_type = "qwen35moe"
             for idx in range(text_config.num_hidden_layers):
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
-                    f"{qwen35_language_model_prefix}"
-                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                    qwen35_text_hf_name(
+                        f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                    )
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
-                    f"{qwen35_language_model_prefix}"
-                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                    qwen35_text_hf_name(
+                        f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                    )
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
-                    f"{qwen35_language_model_prefix}"
-                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                    qwen35_text_hf_name(
+                        f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                    )
                 )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
@@ -276,7 +294,13 @@ class GGUFModelLoader(BaseModelLoader):
 
         if is_multimodal:
             mm_proj_arch = gguf.MODEL_ARCH.MMPROJ
-            vision_num_layers = config.vision_config.num_hidden_layers
+            vision_num_layers = getattr(
+                config.vision_config,
+                "num_hidden_layers",
+                getattr(config.vision_config, "depth", None),
+            )
+            if vision_num_layers is None:
+                raise RuntimeError("GGUF vision config does not define its layer count")
             vision_name_map = gguf.get_tensor_name_map(mm_proj_arch, vision_num_layers)
         else:
             vision_name_map = None
@@ -334,7 +358,11 @@ class GGUFModelLoader(BaseModelLoader):
             # tensor mappings expect parameter names without this prefix.
             # Note: 'model.' prefix should be KEPT for text-only models as
             # gguf-py expects it.
-            if hf_name.startswith("language_model."):
+            if is_qwen35_multimodal and hf_name.startswith("model.language_model."):
+                hf_name = "model." + hf_name.removeprefix("model.language_model.")
+            elif is_qwen35_multimodal and hf_name.startswith("model.visual."):
+                hf_name = hf_name.removeprefix("model.")
+            elif hf_name.startswith("language_model."):
                 hf_name = hf_name[15:]  # Remove 'language_model.'
 
             # Parse parameter name and suffix
@@ -347,6 +375,13 @@ class GGUFModelLoader(BaseModelLoader):
                 if base_name.endswith("_weight"):
                     base_name = base_name[:-7]  # Remove '_weight'
                     suffix = "weight"
+
+            if is_qwen35_multimodal:
+                base_name = {
+                    "visual.merger.norm": "visual.merger.ln_q",
+                    "visual.merger.linear_fc1": "visual.merger.mlp.0",
+                    "visual.merger.linear_fc2": "visual.merger.mlp.2",
+                }.get(base_name, base_name)
 
             gguf_name = None
             # Priority 1: Search vision/projector parameters for multimodal models
@@ -397,12 +432,6 @@ class GGUFModelLoader(BaseModelLoader):
 
             # Track mapping success
             if gguf_name_with_suffix is not None:
-                if (
-                    model_type in ("qwen35", "qwen35moe")
-                    and qwen35_language_model_prefix
-                ):
-                    if hf_name.startswith(("model.", "lm_head.")):
-                        hf_name = f"{qwen35_language_model_prefix}{hf_name}"
                 gguf_to_hf_name_map[gguf_name_with_suffix] = hf_name
                 logger.debug("Mapped GGUF %s → HF %s", gguf_name_with_suffix, hf_name)
             elif hf_name not in gguf_to_hf_name_map.values():
@@ -418,21 +447,21 @@ class GGUFModelLoader(BaseModelLoader):
             for idx in range(text_num_layers):
                 if text_config.layer_types[idx] != "linear_attention":
                     continue
-                gguf_to_hf_name_map[f"blk.{idx}.attn_qkv.weight"] = (
-                    f"{qwen35_language_model_prefix}"
+                gguf_to_hf_name_map[f"blk.{idx}.attn_qkv.weight"] = qwen35_text_hf_name(
                     f"model.layers.{idx}.linear_attn.in_proj_qkv.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.attn_gate.weight"] = (
-                    f"{qwen35_language_model_prefix}"
-                    f"model.layers.{idx}.linear_attn.in_proj_z.weight"
+                    qwen35_text_hf_name(
+                        f"model.layers.{idx}.linear_attn.in_proj_z.weight"
+                    )
                 )
-                gguf_to_hf_name_map[f"blk.{idx}.ssm_beta.weight"] = (
-                    f"{qwen35_language_model_prefix}"
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_beta.weight"] = qwen35_text_hf_name(
                     f"model.layers.{idx}.linear_attn.in_proj_b.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ssm_alpha.weight"] = (
-                    f"{qwen35_language_model_prefix}"
-                    f"model.layers.{idx}.linear_attn.in_proj_a.weight"
+                    qwen35_text_hf_name(
+                        f"model.layers.{idx}.linear_attn.in_proj_a.weight"
+                    )
                 )
 
         # All parameters must be mapped: both vision/projector and backbone
@@ -453,12 +482,8 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = get_gguf_weight_type_map(
             model_name_or_path, gguf_to_hf_name_map
         )
-        is_multimodal = detect_gguf_multimodal(model_name_or_path) is not None
-        if is_multimodal:
-            mmproj_file = detect_gguf_multimodal(model_name_or_path)
-            assert mmproj_file is not None, (
-                "Could not find mm_proj file for multimodal GGUF model"
-            )
+        mmproj_file = self._get_mmproj_file(model_config, model_name_or_path)
+        if mmproj_file is not None:
             logger.info("Loading extra mm_proj weights from %s...", mmproj_file)
             mm_proj_weight_type_map = get_gguf_weight_type_map(
                 mmproj_file, gguf_to_hf_name_map
@@ -483,16 +508,36 @@ class GGUFModelLoader(BaseModelLoader):
         Yields:
             Tuples of (parameter_name, tensor) for all model weights
         """
-        hf_config = model_config.hf_config
-        is_multimodal = detect_gguf_multimodal(model_name_or_path) is not None
-
-        if is_multimodal:
+        mmproj_file = self._get_mmproj_file(model_config, model_name_or_path)
+        if mmproj_file is not None:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
-            mmproj_file = detect_gguf_multimodal(model_name_or_path)
-            assert mmproj_file is not None, (
-                "Could not find mm_proj file for multimodal GGUF model"
+            mmproj_weights = gguf_quant_weights_iterator(
+                mmproj_file, gguf_to_hf_name_map
             )
-            yield from gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
+            if model_config.architecture in (
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            ):
+                reader = gguf.GGUFReader(str(mmproj_file))
+                temporal_patch = next(
+                    (
+                        torch.tensor(tensor.data)
+                        for tensor in reader.tensors
+                        if tensor.name == "v.patch_embd.weight.1"
+                    ),
+                    None,
+                )
+                patch_embed_name = gguf_to_hf_name_map.get("v.patch_embd.weight")
+                for name, weight in mmproj_weights:
+                    if (
+                        temporal_patch is not None
+                        and name == patch_embed_name
+                        and weight.ndim == 4
+                    ):
+                        weight = torch.stack((weight, temporal_patch), dim=2)
+                    yield name, weight
+            else:
+                yield from mmproj_weights
 
         yield from gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
 
