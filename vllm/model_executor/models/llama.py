@@ -60,6 +60,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+from .adapters import as_embedding_model, as_seq_cls_model
 from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -708,3 +709,13 @@ class LlamaForCausalLM(
                 name = name.replace(item, mapping[item])
 
         return name, loaded_weight
+
+
+class LlamaBidirectionalForSequenceClassification(
+    as_seq_cls_model(LlamaForCausalLM)
+):
+    """Bidirectional Llama classification variant used by pooling models."""
+
+
+class LlamaBidirectionalModel(as_embedding_model(LlamaForCausalLM)):
+    """Bidirectional Llama embedding variant used by pooling models."""

@@ -6,6 +6,7 @@ Whenever you add an architecture to this page, please also update
 """
 
 import importlib
+import importlib.util
 import json
 import os
 import pickle
@@ -60,6 +61,7 @@ from .interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from .upstream_model_support import MODEL_SUPPORT_ENTRIES
 
 logger = init_logger(__name__)
 
@@ -507,6 +509,7 @@ _VLLM_MODELS = {
     **_SPECULATIVE_DECODING_MODELS,
     **_TRANSFORMERS_SUPPORTED_MODELS,
     **_TRANSFORMERS_BACKEND_MODELS,
+    **MODEL_SUPPORT_ENTRIES,
 }
 
 # This variable is used as the args for subprocess.run(). We
@@ -680,10 +683,24 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
 
     @logtime(logger=logger, msg="Registry inspect model class")
     def inspect_model_cls(self) -> _ModelInfo:
-        model_path = Path(__file__).parent / f"{self.module_name.split('.')[-1]}.py"
+        # Hardware-isolated model packages live outside
+        # ``model_executor/models``. Resolve their module spec directly so
+        # model-info cache invalidation hashes the actual implementation.
+        if self.module_name.startswith("vllm.model_executor.models."):
+            model_path = (
+                Path(__file__).parent / f"{self.module_name.split('.')[-1]}.py"
+            )
+        else:
+            try:
+                spec = importlib.util.find_spec(self.module_name)
+            except (ImportError, ValueError):
+                spec = None
+            model_path = (
+                Path(spec.origin) if spec is not None and spec.origin else None
+            )
         module_hash = None
 
-        if model_path.exists():
+        if model_path is not None and model_path.exists():
             with open(model_path, "rb") as f:
                 module_hash = safe_hash(f.read(), usedforsecurity=False).hexdigest()
 
@@ -1137,7 +1154,11 @@ class _ModelRegistry:
 ModelRegistry = _ModelRegistry(
     {
         model_arch: _LazyRegisteredModel(
-            module_name=f"vllm.model_executor.models.{mod_relname}",
+            module_name=(
+                mod_relname
+                if mod_relname.startswith("vllm.")
+                else f"vllm.model_executor.models.{mod_relname}"
+            ),
             class_name=cls_name,
         )
         for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()
