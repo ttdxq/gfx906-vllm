@@ -1927,7 +1927,7 @@ class TokenizeResponse(OpenAIBaseModel):
 
 class DetokenizeRequest(OpenAIBaseModel):
     model: str | None = None
-    tokens: list[int]
+    tokens: list[Annotated[int, Field(ge=0, le=2**63 - 1)]]
 
 
 class DetokenizeResponse(OpenAIBaseModel):

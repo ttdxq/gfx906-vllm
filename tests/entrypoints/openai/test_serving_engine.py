@@ -4,13 +4,16 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.config import ModelConfig
+from vllm.entrypoints.openai.protocol import DetokenizeRequest, ErrorResponse
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
+from vllm.entrypoints.openai.serving_tokenization import OpenAIServingTokenization
 from vllm.tokenizers import MistralTokenizer
 
 
@@ -33,6 +36,57 @@ def serving() -> OpenAIServing:
         request_logger=None,
     )
     return serving
+
+
+@pytest.fixture()
+def serving_tokenization() -> OpenAIServingTokenization:
+    engine_client = Mock()
+    engine_client.get_tokenizer = AsyncMock()
+    model_config = Mock(spec=ModelConfig)
+    model_config.max_model_len = 4
+    models = Mock(spec=OpenAIServingModels)
+    models.model_config = model_config
+    models.input_processor = Mock()
+    models.io_processor = Mock()
+
+    return OpenAIServingTokenization(
+        engine_client=engine_client,
+        models=models,
+        request_logger=None,
+        chat_template=None,
+        chat_template_content_format="auto",
+    )
+
+
+def test_detokenize_token_id_bounds():
+    assert DetokenizeRequest(tokens=[0, 2**63 - 1]).tokens == [0, 2**63 - 1]
+
+    with pytest.raises(ValidationError):
+        DetokenizeRequest(tokens=[-1])
+    with pytest.raises(ValidationError):
+        DetokenizeRequest(tokens=[2**63])
+
+
+@pytest.mark.asyncio
+async def test_detokenize_resource_bound_precedes_decode(
+    serving_tokenization: OpenAIServingTokenization,
+):
+    serving_tokenization._check_model = AsyncMock(return_value=None)
+    request = DetokenizeRequest(tokens=[1, 2, 3, 4, 5])
+
+    response = await serving_tokenization.create_detokenize(request, Mock())
+
+    assert isinstance(response, ErrorResponse)
+    assert response.error.code == 400
+    assert "tokens length (5) exceeds max_model_len (4)" in response.error.message
+    serving_tokenization.engine_client.get_tokenizer.assert_not_awaited()
+
+
+def test_detokenize_resource_bound_accepts_max_model_len(
+    serving_tokenization: OpenAIServingTokenization,
+):
+    request = DetokenizeRequest(tokens=[1, 2, 3, 4])
+    assert serving_tokenization._validate_detokenize_bounds(request) is None
 
 
 @pytest.mark.asyncio

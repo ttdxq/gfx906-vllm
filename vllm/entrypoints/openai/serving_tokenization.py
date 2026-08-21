@@ -52,6 +52,16 @@ class OpenAIServingTokenization(OpenAIServing):
         self.chat_template_content_format: Final = chat_template_content_format
         self.trust_request_chat_template = trust_request_chat_template
 
+    def _validate_detokenize_bounds(
+        self, request: DetokenizeRequest
+    ) -> ErrorResponse | None:
+        if len(request.tokens) > self.max_model_len:
+            return self.create_error_response(
+                f"tokens length ({len(request.tokens)}) exceeds "
+                f"max_model_len ({self.max_model_len})."
+            )
+        return None
+
     async def create_tokenize(
         self,
         request: TokenizeRequest,
@@ -135,6 +145,10 @@ class OpenAIServingTokenization(OpenAIServing):
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
+
+        bounds_error = self._validate_detokenize_bounds(request)
+        if bounds_error is not None:
+            return bounds_error
 
         request_id = f"tokn-{self._base_request_id(raw_request)}"
 
