@@ -75,6 +75,38 @@ def test_decode_block_m_keeps_default_for_non_gfx906(
     assert unified_attn._decode_block_m(256, 6) is None
 
 
+def test_num_query_blocks_is_exact_for_single_sequence_decode():
+    assert unified_attn._num_query_blocks(1, 1, 1) == 1
+
+
+@pytest.mark.parametrize("num_seqs", [2, 17])
+def test_num_query_blocks_keeps_sequence_mapping_gaps_for_batched_decode(
+    num_seqs: int,
+):
+    assert (
+        unified_attn._num_query_blocks(num_seqs, num_seqs, 1) == 2 * num_seqs
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_query_tokens", "block_q", "expected"),
+    [(2, 1, 2), (3, 1, 3), (3, 2, 2), (8, 3, 3)],
+)
+def test_num_query_blocks_is_exact_for_single_sequence(
+    num_query_tokens: int,
+    block_q: int,
+    expected: int,
+):
+    assert (
+        unified_attn._num_query_blocks(num_query_tokens, 1, block_q)
+        == expected
+    )
+
+
+def test_num_query_blocks_keeps_safe_mixed_batch_upper_bound():
+    assert unified_attn._num_query_blocks(7, 3, 2) == 6
+
+
 def test_unified_attention_decode_eager_matches_gfx906_fallback():
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -132,10 +164,12 @@ def test_unified_attention_decode_eager_matches_gfx906_fallback():
     ("head_size", "num_queries_per_kv"),
     [(160, 1), (192, 4), (256, 6), (256, 8)],
 )
+@pytest.mark.parametrize("num_seqs", [1, 2])
 @torch.inference_mode()
 def test_unified_attention_wide_head_decode_matches_eager(
     head_size: int,
     num_queries_per_kv: int,
+    num_seqs: int,
 ):
     torch.manual_seed(0)
     device = "cuda"
@@ -144,9 +178,10 @@ def test_unified_attention_wide_head_decode_matches_eager(
     num_q_heads = num_kv_heads * num_queries_per_kv
     block_size = 16
     kv_len = 1536
-    num_blocks = kv_len // block_size
+    num_blocks_per_seq = kv_len // block_size
+    num_blocks = num_seqs * num_blocks_per_seq
 
-    q = torch.randn(1, num_q_heads, head_size, device=device, dtype=dtype)
+    q = torch.randn(num_seqs, num_q_heads, head_size, device=device, dtype=dtype)
     k = torch.randn(
         num_blocks,
         block_size,
@@ -158,10 +193,10 @@ def test_unified_attention_wide_head_decode_matches_eager(
     v = torch.randn_like(k)
     out_3d = torch.empty_like(q)
     out_eager = torch.empty_like(q)
-    cu_seqlens_q = torch.tensor([0, 1], device=device, dtype=torch.int32)
-    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    cu_seqlens_q = torch.arange(num_seqs + 1, device=device, dtype=torch.int32)
+    seqused_k = torch.full((num_seqs,), kv_len, device=device, dtype=torch.int32)
     block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
-        1, -1
+        num_seqs, -1
     )
     scale = head_size**-0.5
 

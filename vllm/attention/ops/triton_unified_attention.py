@@ -46,6 +46,16 @@ def _decode_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
     return None
 
 
+def _num_query_blocks(
+    num_query_tokens: int,
+    num_seqs: int,
+    block_q: int,
+) -> int:
+    if num_seqs == 1:
+        return (num_query_tokens + block_q - 1) // block_q
+    return num_query_tokens // block_q + num_seqs
+
+
 @triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y
@@ -1060,16 +1070,18 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
-    # Ideally we would launch with kernel with:
+    # Launch the exact number of blocks for uniform decode and single-sequence
+    # batches. For mixed query lengths, avoid realizing query_lens on the CPU
+    # and retain the safe upper bound:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
-    # However, it is slow to realize the query_lens on cpu.
-    # Instead we use upper-bound:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)]
     #   <= \sum_i[floor(query_len[i] / BLOCK_Q) + 1]
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    total_num_q_blocks = _num_query_blocks(
+        q.shape[0], num_seqs, BLOCK_Q
+    )
 
     # Assigning default tile sizes for prefill and decode.
     # Note: each tile size must be at least 32 for "fp8" (q.element_size() == 1)
