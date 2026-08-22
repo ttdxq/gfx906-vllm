@@ -1037,28 +1037,27 @@ class RocmPlatform(Platform):
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
+        # Flush the caching allocator first so freed-but-cached blocks (e.g.
+        # the draft model's embed_tokens/lm_head copies dropped by MTP
+        # sharing) are not reported as in use, mirroring cuda.py's
+        # empty_cache() before measuring.
+        #
+        # Use the driver view from mem_get_info instead of amdsmi: on this
+        # gfx906 setup the amdsmi VRAM counter does not decrement when
+        # empty_cache() releases blocks back to the driver (measured
+        # 2026-08-22: after freeing 1 GiB and calling empty_cache, amdsmi
+        # kept reporting it, then accumulated to a 9 GiB high-water mark
+        # while mem_get_info tracked every transition exactly), which both
+        # overstated weights memory and left stale readings. The driver view
+        # stays device-level, which MemorySnapshot needs to derive non-torch
+        # memory (gfx906 custom kernels allocate outside the torch
+        # allocator). Do not reset peak stats here: MemorySnapshot reads
+        # torch peak counters across snapshots.
         device_obj = (
             torch.device(device) if device is not None else torch.device("cuda:0")
         )
-        physical_device_id = cls.device_id_to_physical_device_id(device_obj.index or 0)
-
-        try:
-            amdsmi_init()
-            handles = amdsmi_get_processor_handles()
-            if physical_device_id < len(handles):
-                return amdsmi_get_gpu_memory_usage(
-                    handles[physical_device_id], AmdSmiMemoryType.VRAM
-                )
-        except Exception:
-            pass
-        finally:
-            try:
-                amdsmi_shut_down()
-            except Exception:
-                pass
-
-        torch.cuda.reset_peak_memory_stats(device)
-        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        torch.cuda.empty_cache()
+        free_mem, total_mem = torch.cuda.mem_get_info(device_obj)
         return total_mem - free_mem
 
     @classmethod
