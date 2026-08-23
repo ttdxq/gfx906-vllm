@@ -309,7 +309,7 @@ static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
-template <typename scalar_t, int ncols>
+template <typename scalar_t, int ncols, bool PREPARED = false>
 static __global__ void mul_mat_vec_q4_K_q8_1_fixed_cols(
     const void * __restrict__ vx, const void * __restrict__ vy,
     scalar_t * __restrict__ dst, const int nrows, const int nvecs,
@@ -330,20 +330,39 @@ static __global__ void mul_mat_vec_q4_K_q8_1_fixed_cols(
     const block_q8_1 * y = (const block_q8_1 *) vy;
     float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    for (int i = threadIdx.x / (QI4_K / VDR_Q4_K_Q8_1_MMVQ);
-         i < blocks_per_row; i += blocks_per_warp) {
+    if constexpr (PREPARED) {
+      // Multi-vector path: the weight-side unpack runs once per weight block
+      // and is shared across the combined vectors.
+      MmvqWeightQ4K w4;
+      for (int i = threadIdx.x / (QI4_K / VDR_Q4_K_Q8_1_MMVQ);
+           i < blocks_per_row; i += blocks_per_warp) {
         const int ibx = row * blocks_per_row + i;
         const int iqs = VDR_Q4_K_Q8_1_MMVQ *
             (threadIdx.x % (QI4_K / VDR_Q4_K_Q8_1_MMVQ));
+        mmvq_prepare_q4_K(&x[ibx], iqs, w4);
+        const block_q8_1 * y_row =
+            &y[first_vec * q8_blocks_per_vec + i * (QK_K / QK8_1)];
 #pragma unroll
         for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
-            if (vec_offset >= vec_count) {
-                break;
-            }
-            const int iby = (first_vec + vec_offset) * q8_blocks_per_vec +
-                i * (QK_K / QK8_1);
-            tmp[vec_offset] += vec_dot_q4_K_q8_1(&x[ibx], &y[iby], iqs);
+          if (vec_offset >= vec_count) {
+            break;
+          }
+          tmp[vec_offset] += mmvq_dot_q4_K(
+              w4, y_row + vec_offset * q8_blocks_per_vec, iqs);
         }
+      }
+    } else {
+      // Single-vector instantiation: the original one-call vec_dot, whose
+      // codegen measured faster when there is nothing to share across
+      // vectors.
+      for (int i = threadIdx.x / (QI4_K / VDR_Q4_K_Q8_1_MMVQ);
+           i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;
+        const int iqs = VDR_Q4_K_Q8_1_MMVQ *
+            (threadIdx.x % (QI4_K / VDR_Q4_K_Q8_1_MMVQ));
+        const int iby = first_vec * q8_blocks_per_vec + i * (QK_K / QK8_1);
+        tmp[0] += vec_dot_q4_K_q8_1(&x[ibx], &y[iby], iqs);
+      }
     }
 
     constexpr int warp_size = WARP_SIZE;
@@ -395,8 +414,13 @@ template<typename scalar_t, int ncols>
 static void mul_mat_vec_q4_K_q8_1_fixed_cols_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
     const dim3 block_nums(nrows, gguf_mmvq_grid_vecs(nvecs), 1);
     const dim3 block_dims(BLOCK_SIZE, 1, 1);
-    mul_mat_vec_q4_K_q8_1_fixed_cols<scalar_t, ncols>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+    if (nvecs >= 2) {
+        mul_mat_vec_q4_K_q8_1_fixed_cols<scalar_t, ncols, true>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+    } else {
+        mul_mat_vec_q4_K_q8_1_fixed_cols<scalar_t, ncols, false>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+    }
 }
 
 template<typename scalar_t>
@@ -414,7 +438,7 @@ static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
-template <typename scalar_t, int ncols>
+template <typename scalar_t, int ncols, bool PREPARED = false>
 static __global__ void mul_mat_vec_q5_K_q8_1_fixed_cols(
     const void * __restrict__ vx, const void * __restrict__ vy,
     scalar_t * __restrict__ dst, const int nrows, const int nvecs,
@@ -435,20 +459,39 @@ static __global__ void mul_mat_vec_q5_K_q8_1_fixed_cols(
     const block_q8_1 * y = (const block_q8_1 *) vy;
     float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    for (int i = threadIdx.x / (QI5_K / VDR_Q5_K_Q8_1_MMVQ);
-         i < blocks_per_row; i += blocks_per_warp) {
+    if constexpr (PREPARED) {
+      // Multi-vector path: the weight-side unpack runs once per weight block
+      // and is shared across the combined vectors.
+      MmvqWeightQ5K w5;
+      for (int i = threadIdx.x / (QI5_K / VDR_Q5_K_Q8_1_MMVQ);
+           i < blocks_per_row; i += blocks_per_warp) {
         const int ibx = row * blocks_per_row + i;
         const int iqs = VDR_Q5_K_Q8_1_MMVQ *
             (threadIdx.x % (QI5_K / VDR_Q5_K_Q8_1_MMVQ));
+        mmvq_prepare_q5_K(&x[ibx], iqs, w5);
+        const block_q8_1 * y_row =
+            &y[first_vec * q8_blocks_per_vec + i * (QK_K / QK8_1)];
 #pragma unroll
         for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
-            if (vec_offset >= vec_count) {
-                break;
-            }
-            const int iby = (first_vec + vec_offset) * q8_blocks_per_vec +
-                i * (QK_K / QK8_1);
-            tmp[vec_offset] += vec_dot_q5_K_q8_1(&x[ibx], &y[iby], iqs);
+          if (vec_offset >= vec_count) {
+            break;
+          }
+          tmp[vec_offset] += mmvq_dot_q5_K(
+              w5, y_row + vec_offset * q8_blocks_per_vec, iqs);
         }
+      }
+    } else {
+      // Single-vector instantiation: the original one-call vec_dot, whose
+      // codegen measured faster when there is nothing to share across
+      // vectors.
+      for (int i = threadIdx.x / (QI5_K / VDR_Q5_K_Q8_1_MMVQ);
+           i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;
+        const int iqs = VDR_Q5_K_Q8_1_MMVQ *
+            (threadIdx.x % (QI5_K / VDR_Q5_K_Q8_1_MMVQ));
+        const int iby = first_vec * q8_blocks_per_vec + i * (QK_K / QK8_1);
+        tmp[0] += vec_dot_q5_K_q8_1(&x[ibx], &y[iby], iqs);
+      }
     }
 
     constexpr int warp_size = WARP_SIZE;
@@ -498,10 +541,15 @@ static __global__ void mul_mat_vec_q5_K_q8_1_fixed_cols(
 
 template<typename scalar_t, int ncols>
 static void mul_mat_vec_q5_K_q8_1_fixed_cols_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
-    const dim3 block_nums(nrows, gguf_mmvq_grid_vecs(nvecs), 1);
-    const dim3 block_dims(BLOCK_SIZE, 1, 1);
-    mul_mat_vec_q5_K_q8_1_fixed_cols<scalar_t, ncols>
+  const dim3 block_nums(nrows, gguf_mmvq_grid_vecs(nvecs), 1);
+  const dim3 block_dims(BLOCK_SIZE, 1, 1);
+  if (nvecs >= 2) {
+    mul_mat_vec_q5_K_q8_1_fixed_cols<scalar_t, ncols, true>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+  } else {
+    mul_mat_vec_q5_K_q8_1_fixed_cols<scalar_t, ncols, false>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+  }
 }
 
 template<typename scalar_t>
@@ -519,7 +567,7 @@ static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
-template <typename scalar_t, int ncols>
+template <typename scalar_t, int ncols, bool PREPARED = false>
 static __global__ void mul_mat_vec_q6_K_q8_1_fixed_cols(
     const void * __restrict__ vx, const void * __restrict__ vy,
     scalar_t * __restrict__ dst, const int nrows, const int nvecs,
@@ -540,18 +588,35 @@ static __global__ void mul_mat_vec_q6_K_q8_1_fixed_cols(
     const block_q8_1 * y = (const block_q8_1 *) vy;
     float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    for (int i = threadIdx.x / QI6_K; i < blocks_per_row; i += blocks_per_warp) {
+    if constexpr (PREPARED) {
+      // Multi-vector path: the weight-side unpack runs once per weight block
+      // and is shared across the combined vectors.
+      MmvqWeightQ6K w6;
+      for (int i = threadIdx.x / QI6_K; i < blocks_per_row; i += blocks_per_warp) {
         const int ibx = row * blocks_per_row + i;
         const int iqs = threadIdx.x % QI6_K;
+        mmvq_prepare_q6_K(&x[ibx], iqs, w6);
+        const block_q8_1 * y_row =
+            &y[first_vec * q8_blocks_per_vec + i * (QK_K / QK8_1)];
 #pragma unroll
         for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
-            if (vec_offset >= vec_count) {
-                break;
-            }
-            const int iby = (first_vec + vec_offset) * q8_blocks_per_vec +
-                i * (QK_K / QK8_1);
-            tmp[vec_offset] += vec_dot_q6_K_q8_1(&x[ibx], &y[iby], iqs);
+          if (vec_offset >= vec_count) {
+            break;
+          }
+          tmp[vec_offset] += mmvq_dot_q6_K(
+              w6, y_row + vec_offset * q8_blocks_per_vec, iqs);
         }
+      }
+    } else {
+      // Single-vector instantiation: the original one-call vec_dot, whose
+      // codegen measured faster when there is nothing to share across
+      // vectors.
+      for (int i = threadIdx.x / QI6_K; i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;
+        const int iqs = threadIdx.x % QI6_K;
+        const int iby = first_vec * q8_blocks_per_vec + i * (QK_K / QK8_1);
+        tmp[0] += vec_dot_q6_K_q8_1(&x[ibx], &y[iby], iqs);
+      }
     }
 
     constexpr int warp_size = WARP_SIZE;
@@ -601,10 +666,15 @@ static __global__ void mul_mat_vec_q6_K_q8_1_fixed_cols(
 
 template<typename scalar_t, int ncols>
 static void mul_mat_vec_q6_K_q8_1_fixed_cols_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
-    const dim3 block_nums(nrows, gguf_mmvq_grid_vecs(nvecs), 1);
-    const dim3 block_dims(BLOCK_SIZE, 1, 1);
-    mul_mat_vec_q6_K_q8_1_fixed_cols<scalar_t, ncols>
+  const dim3 block_nums(nrows, gguf_mmvq_grid_vecs(nvecs), 1);
+  const dim3 block_dims(BLOCK_SIZE, 1, 1);
+  if (nvecs >= 2) {
+    mul_mat_vec_q6_K_q8_1_fixed_cols<scalar_t, ncols, true>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+  } else {
+    mul_mat_vec_q6_K_q8_1_fixed_cols<scalar_t, ncols, false>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+  }
 }
 
 template<typename scalar_t>

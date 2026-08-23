@@ -254,6 +254,7 @@ class EagleProposer:
 
         if self.attn_metadata_builder is None:
             attn_metadata_builder = self._get_attention_metadata_builder()
+            self.attn_metadata_builder = attn_metadata_builder
         else:
             attn_metadata_builder = self.attn_metadata_builder
 

@@ -1440,6 +1440,198 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, __half2float(bq6_K->d), d8);
 }
 
+// ---------------------------------------------------------------------------
+// Weight-prepare split for combined multi-vector MMVQ kernels.
+//
+// vec_dot_*_q8_1 above unpacks the weight block (nibble/6-bit extraction,
+// scale extraction) on every call, so when one thread block combines 2-4
+// activation vectors that weight-side ALU is re-executed per vector. The
+// helpers below run the weight-side work once per (weight block, iqs) and
+// leave only the q8_1 activation loads plus the dp4a chain per vector. The
+// arithmetic and accumulation order mirror vec_dot_*_q8_1 exactly, so
+// results are bit-identical to the single-vector path.
+// ---------------------------------------------------------------------------
+
+struct MmvqWeightQ4K {
+    int v0i[QR4_K];
+    int v1i[QR4_K];
+    int sc[QR4_K];
+    int m[QR4_K];
+    float2 dm;
+};
+
+static __device__ __forceinline__ void mmvq_prepare_q4_K(
+    const block_q4_K * __restrict__ bq, const int & iqs, MmvqWeightQ4K & w) {
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+
+    const int * q4 = (const int *)(bq->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int v0 = q4[0];
+    const int v1 = q4[4];
+
+    const uint16_t * scales = (const uint16_t *)bq->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc8 = (const uint8_t *)aux;
+    const uint8_t * m8  = sc8 + 2;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        w.v0i[i] = (v0 >> (4*i)) & 0x0F0F0F0F;
+        w.v1i[i] = (v1 >> (4*i)) & 0x0F0F0F0F;
+        w.sc[i]  = sc8[i];
+        w.m[i]   = m8[i];
+    }
+    w.dm = __half22float2(bq->dm);
+}
+
+// y_block must point at the vec's i-th QK_K/QK8_1 q8_1 group, i.e.
+// &y[vec*(q8_blocks_per_vec) + i*(QK_K/QK8_1)]; the bq8_offset stride is
+// applied inside, matching vec_dot_q4_K_q8_1(&x[..], &y[iby], iqs).
+static __device__ __forceinline__ float mmvq_dot_q4_K(
+    const MmvqWeightQ4K & w, const block_q8_1 * __restrict__ y_block,
+    const int & iqs) {
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    int u[2*QR4_K];
+    float d8[QR4_K];
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = y_block + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const int dot1 = __dp4a(w.v1i[i], u[2*i+1], __dp4a(w.v0i[i], u[2*i+0], 0));
+        const int dot2 = __dp4a(0x01010101, u[2*i+1], __dp4a(0x01010101, u[2*i+0], 0));
+        sumf_d += d8[i] * (dot1 * w.sc[i]);
+        sumf_m += d8[i] * (dot2 * w.m[i]);
+    }
+    return w.dm.x*sumf_d - w.dm.y*sumf_m;
+}
+
+struct MmvqWeightQ5K {
+    int v0i[QR5_K];
+    int v1i[QR5_K];
+    int sc[QR5_K];
+    int m[QR5_K];
+    float2 dm;
+};
+
+static __device__ __forceinline__ void mmvq_prepare_q5_K(
+    const block_q5_K * __restrict__ bq, const int & iqs, MmvqWeightQ5K & w) {
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+
+    const int * ql = (const int *)(bq->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int * qh = (const int *)(bq->qh + 4 * ((iqs/2)%4));
+    const int vl0 = ql[0];
+    const int vl1 = ql[4];
+    const int vh0 = qh[0] >> bq8_offset;
+    const int vh1 = qh[4] >> bq8_offset;
+
+    const uint16_t * scales = (const uint16_t *)bq->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc8 = (const uint8_t *)aux;
+    const uint8_t * m8  = sc8 + 2;
+
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        w.v0i[i] = ((vl0 >> (4*i)) & 0x0F0F0F0F) | (((vh0 >> i) << 4) & 0x10101010);
+        w.v1i[i] = ((vl1 >> (4*i)) & 0x0F0F0F0F) | (((vh1 >> i) << 4) & 0x10101010);
+        w.sc[i]  = sc8[i];
+        w.m[i]   = m8[i];
+    }
+    w.dm = __half22float2(bq->dm);
+}
+
+static __device__ __forceinline__ float mmvq_dot_q5_K(
+    const MmvqWeightQ5K & w, const block_q8_1 * __restrict__ y_block,
+    const int & iqs) {
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+    int u[2*QR5_K];
+    float d8[QR5_K];
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        const block_q8_1 * bq8i = y_block + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        const int dot1 = __dp4a(w.v0i[i], u[2*i+0], __dp4a(w.v1i[i], u[2*i+1], 0));
+        const int dot2 = __dp4a(0x01010101, u[2*i+0], __dp4a(0x01010101, u[2*i+1], 0));
+        sumf_d += d8[i] * (dot1 * w.sc[i]);
+        sumf_m += d8[i] * (dot2 * w.m[i]);
+    }
+    return w.dm.x*sumf_d - w.dm.y*sumf_m;
+}
+
+struct MmvqWeightQ6K {
+    int vi[QR6_K];
+    int sc[QR6_K];
+    float d;
+};
+
+static __device__ __forceinline__ void mmvq_prepare_q6_K(
+    const block_q6_K * __restrict__ bq, const int & iqs, MmvqWeightQ6K & w) {
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int vl = get_int_from_uint8(bq->ql, iqs);
+    const int vh = get_int_from_uint8(bq->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+    const int8_t * scales = bq->scales + scale_offset;
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+        w.vi[i] = __vsubss4(vil | vih, 0x20202020);
+        w.sc[i] = scales[4*i];
+    }
+    w.d = __half2float(bq->d);
+}
+
+static __device__ __forceinline__ float mmvq_dot_q6_K(
+    const MmvqWeightQ6K & w, const block_q8_1 * __restrict__ y_block,
+    const int & iqs) {
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    int u[QR6_K];
+    float d8[QR6_K];
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        u[i]  = get_int_from_int8_aligned(y_block[bq8_offset + 2*i].qs, iqs % QI8_1);
+        d8[i] = __low2float(y_block[bq8_offset + 2*i].ds);
+    }
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        sumf += d8[i] * (__dp4a(w.vi[i], u[i], 0) * w.sc[i]);
+    }
+    return w.d*sumf;
+}
+
 template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q6_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
     __shared__ int   tile_x_ql[mmq_y * (2*WARP_SIZE_GGUF)     + mmq_y];
     __shared__ half2 tile_x_dm[mmq_y * (WARP_SIZE_GGUF/QI6_K) + mmq_y/QI6_K];

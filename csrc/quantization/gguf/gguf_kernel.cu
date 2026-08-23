@@ -916,6 +916,31 @@ static void ggml_mul_mat_vec_q8_dispatch(
           col == 5120 && row >= q6_k_fixed_cols_min_rows()) {
         mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
             W, quant_X, dst, row, vecs, stream, dst_stride);
+      } else if (q6_k_fixed_cols_fast_enabled() && vecs >= 2 && vecs <= 4 &&
+                 col != 5120) {
+        // The prepared-weight fixed-cols kernel re-uses the weight unpack
+        // across the combined vectors; the win is multi-vector only (the
+        // single-vector code path stays on the generic kernel). col 5120
+        // keeps the row gate above: measured on gfx906, small-row 5120
+        // matrices run faster on the 2-rows-per-block generic kernel.
+        switch (col) {
+          case 6144:
+            mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 6144>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          case 9216:
+            mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 9216>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          case 17408:
+            mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 17408>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+            break;
+          default:
+            mul_mat_vec_q6_K_q8_1_cuda<scalar_t>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+        }
       } else if (q6_k_col2560_fast && col == 2560 && row > 65536) {
         mul_mat_vec_q6_K_q8_1_col2560_cuda<scalar_t>(
             W, quant_X, dst, row, vecs, stream, dst_stride);
@@ -972,8 +997,51 @@ static bool gguf_sharded_group_same_type_enabled() {
   return enabled;
 }
 
+// Weight-prepare ops for grouped K-quant MMVQ. When one thread block combines
+// 2-4 activation vectors, the weight-side unpack runs once per weight block
+// instead of once per vector (see the MmvqWeight* helpers in vecdotq.cuh).
+// Only instantiated for the K-quants; other types keep the per-vector
+// vec_dot_q_cuda path.
+template <typename block_q_t> struct MmvqKQuantOps;
+
+template <> struct MmvqKQuantOps<block_q4_K> {
+  using Weight = MmvqWeightQ4K;
+  static __device__ __forceinline__ void prepare(
+      const void* vbq, const int& iqs, Weight& w) {
+    mmvq_prepare_q4_K(static_cast<const block_q4_K*>(vbq), iqs, w);
+  }
+  static __device__ __forceinline__ float dot(
+      const Weight& w, const block_q8_1* y_block, const int& iqs) {
+    return mmvq_dot_q4_K(w, y_block, iqs);
+  }
+};
+
+template <> struct MmvqKQuantOps<block_q5_K> {
+  using Weight = MmvqWeightQ5K;
+  static __device__ __forceinline__ void prepare(
+      const void* vbq, const int& iqs, Weight& w) {
+    mmvq_prepare_q5_K(static_cast<const block_q5_K*>(vbq), iqs, w);
+  }
+  static __device__ __forceinline__ float dot(
+      const Weight& w, const block_q8_1* y_block, const int& iqs) {
+    return mmvq_dot_q5_K(w, y_block, iqs);
+  }
+};
+
+template <> struct MmvqKQuantOps<block_q6_K> {
+  using Weight = MmvqWeightQ6K;
+  static __device__ __forceinline__ void prepare(
+      const void* vbq, const int& iqs, Weight& w) {
+    mmvq_prepare_q6_K(static_cast<const block_q6_K*>(vbq), iqs, w);
+  }
+  static __device__ __forceinline__ float dot(
+      const Weight& w, const block_q8_1* y_block, const int& iqs) {
+    return mmvq_dot_q6_K(w, y_block, iqs);
+  }
+};
+
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_cuda_t vec_dot_q_cuda>
+          vec_dot_q_cuda_t vec_dot_q_cuda, bool KQ_PREPARED = false>
 static __global__ void mul_mat_vec_q_grouped_same_type(
     const void* __restrict__ vx0, const void* __restrict__ vx1,
     const void* __restrict__ vx2, const void* __restrict__ vx3,
@@ -1037,18 +1105,40 @@ static __global__ void mul_mat_vec_q_grouped_same_type(
   const int vec_count = combine_vecs ? nvecs : 1;
   float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  for (int i = threadIdx.x / (qi / vdr); i < blocks_per_row;
-       i += blocks_per_warp) {
-    const int ibx = local_row * blocks_per_row + i;
-    const int iqs = vdr * (threadIdx.x % (qi / vdr));
+  if constexpr (KQ_PREPARED) {
+    // Multi-vector instantiation: the weight-side unpack runs once per
+    // weight block and is shared across the combined vectors.
+    for (int i = threadIdx.x / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+      const int ibx = local_row * blocks_per_row + i;
+      const int iqs = vdr * (threadIdx.x % (qi / vdr));
+      typename MmvqKQuantOps<block_q_t>::Weight w;
+      MmvqKQuantOps<block_q_t>::prepare(&x[ibx], iqs, w);
 #pragma unroll
-    for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
-      if (vec_offset >= vec_count) {
-        break;
+      for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+        if (vec_offset >= vec_count) {
+          break;
+        }
+        const int iby =
+            (vec + vec_offset) * (nrows_y / QK8_1) + i * (qk / QK8_1);
+        tmp[vec_offset] +=
+            MmvqKQuantOps<block_q_t>::dot(w, &y[iby], iqs);
       }
-      const int iby =
-          (vec + vec_offset) * (nrows_y / QK8_1) + i * (qk / QK8_1);
-      tmp[vec_offset] += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+    }
+  } else {
+    for (int i = threadIdx.x / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+      const int ibx = local_row * blocks_per_row + i;
+      const int iqs = vdr * (threadIdx.x % (qi / vdr));
+#pragma unroll
+      for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+        if (vec_offset >= vec_count) {
+          break;
+        }
+        const int iby =
+            (vec + vec_offset) * (nrows_y / QK8_1) + i * (qk / QK8_1);
+        tmp[vec_offset] += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+      }
     }
   }
 
@@ -1098,7 +1188,7 @@ static __global__ void mul_mat_vec_q_grouped_same_type(
 }
 
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_cuda_t vec_dot_q_cuda>
+          vec_dot_q_cuda_t vec_dot_q_cuda, bool KQ_PREPARED = false>
 static void mul_mat_vec_q_grouped_same_type_cuda(
     const void* vx0, const void* vx1, const void* vx2, const void* vx3,
     const void* vx4, const void* vx5, const void* vx6, const void* vx7,
@@ -1109,16 +1199,37 @@ static void mul_mat_vec_q_grouped_same_type_cuda(
   const int block_num_y = (total_rows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, gguf_mmvq_grid_vecs(nvecs), 1);
   const dim3 block_dims(BLOCK_SIZE, GGML_CUDA_MMV_Y, 1);
-  mul_mat_vec_q_grouped_same_type<scalar_t, qk, qi, block_q_t, vdr,
-                                  vec_dot_q_cuda>
-      <<<block_nums, block_dims, 0, stream>>>(
-          vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vy, dst, ncols, total_rows,
-          nvecs, dst_stride > 0 ? dst_stride : total_rows, n0, n1, n2, n3, n4,
-          n5, n6, n7);
+  if constexpr (KQ_PREPARED) {
+    // The prepared variant only pays off for multi-vector batches; select
+    // the instantiation at launch time so single-vector batches keep the
+    // original codegen.
+    if (nvecs >= 2) {
+      mul_mat_vec_q_grouped_same_type<scalar_t, qk, qi, block_q_t, vdr,
+                                      vec_dot_q_cuda, true>
+          <<<block_nums, block_dims, 0, stream>>>(
+              vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vy, dst, ncols,
+              total_rows, nvecs, dst_stride > 0 ? dst_stride : total_rows, n0,
+              n1, n2, n3, n4, n5, n6, n7);
+    } else {
+      mul_mat_vec_q_grouped_same_type<scalar_t, qk, qi, block_q_t, vdr,
+                                      vec_dot_q_cuda, false>
+          <<<block_nums, block_dims, 0, stream>>>(
+              vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vy, dst, ncols,
+              total_rows, nvecs, dst_stride > 0 ? dst_stride : total_rows, n0,
+              n1, n2, n3, n4, n5, n6, n7);
+    }
+  } else {
+    mul_mat_vec_q_grouped_same_type<scalar_t, qk, qi, block_q_t, vdr,
+                                    vec_dot_q_cuda, false>
+        <<<block_nums, block_dims, 0, stream>>>(
+            vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vy, dst, ncols, total_rows,
+            nvecs, dst_stride > 0 ? dst_stride : total_rows, n0, n1, n2, n3,
+            n4, n5, n6, n7);
+  }
 }
 
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_cuda_t vec_dot_q_cuda>
+          vec_dot_q_cuda_t vec_dot_q_cuda, bool KQ_PREPARED = false>
 static __global__ void mul_mat_vec_q_grouped_same_type_col2560(
     const void* __restrict__ vx0, const void* __restrict__ vx1,
     const void* __restrict__ vx2, const void* __restrict__ vx3,
@@ -1183,18 +1294,40 @@ static __global__ void mul_mat_vec_q_grouped_same_type_col2560(
   const int vec_count = combine_vecs ? nvecs : 1;
   float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  for (int i = threadIdx.x / (qi / vdr); i < blocks_per_row;
-       i += blocks_per_warp) {
-    const int ibx = local_row * blocks_per_row + i;
-    const int iqs = vdr * (threadIdx.x % (qi / vdr));
+  if constexpr (KQ_PREPARED) {
+    // Multi-vector instantiation: the weight-side unpack runs once per
+    // weight block and is shared across the combined vectors.
+    for (int i = threadIdx.x / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+      const int ibx = local_row * blocks_per_row + i;
+      const int iqs = vdr * (threadIdx.x % (qi / vdr));
+      typename MmvqKQuantOps<block_q_t>::Weight w;
+      MmvqKQuantOps<block_q_t>::prepare(&x[ibx], iqs, w);
 #pragma unroll
-    for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
-      if (vec_offset >= vec_count) {
-        break;
+      for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+        if (vec_offset >= vec_count) {
+          break;
+        }
+        const int iby = (vec + vec_offset) * q8_blocks_per_vec +
+            i * (qk / QK8_1);
+        tmp[vec_offset] +=
+            MmvqKQuantOps<block_q_t>::dot(w, &y[iby], iqs);
       }
-      const int iby = (vec + vec_offset) * q8_blocks_per_vec +
-          i * (qk / QK8_1);
-      tmp[vec_offset] += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+    }
+  } else {
+    for (int i = threadIdx.x / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+      const int ibx = local_row * blocks_per_row + i;
+      const int iqs = vdr * (threadIdx.x % (qi / vdr));
+#pragma unroll
+      for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+        if (vec_offset >= vec_count) {
+          break;
+        }
+        const int iby = (vec + vec_offset) * q8_blocks_per_vec +
+            i * (qk / QK8_1);
+        tmp[vec_offset] += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+      }
     }
   }
 
@@ -1244,7 +1377,7 @@ static __global__ void mul_mat_vec_q_grouped_same_type_col2560(
 }
 
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_cuda_t vec_dot_q_cuda>
+          vec_dot_q_cuda_t vec_dot_q_cuda, bool KQ_PREPARED = false>
 static void mul_mat_vec_q_grouped_same_type_col2560_cuda(
     const void* vx0, const void* vx1, const void* vx2, const void* vx3,
     const void* vx4, const void* vx5, const void* vx6, const void* vx7,
@@ -1254,12 +1387,30 @@ static void mul_mat_vec_q_grouped_same_type_col2560_cuda(
     const int dst_stride = -1) {
   const dim3 block_nums(total_rows, gguf_mmvq_grid_vecs(nvecs), 1);
   const dim3 block_dims(BLOCK_SIZE, 1, 1);
-  mul_mat_vec_q_grouped_same_type_col2560<scalar_t, qk, qi, block_q_t, vdr,
-                                          vec_dot_q_cuda>
-      <<<block_nums, block_dims, 0, stream>>>(
-          vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vy, dst, total_rows, nvecs,
-          dst_stride > 0 ? dst_stride : total_rows, n0, n1, n2, n3, n4, n5, n6,
-          n7);
+  if constexpr (KQ_PREPARED) {
+    if (nvecs >= 2) {
+      mul_mat_vec_q_grouped_same_type_col2560<scalar_t, qk, qi, block_q_t,
+                                              vdr, vec_dot_q_cuda, true>
+          <<<block_nums, block_dims, 0, stream>>>(
+              vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vy, dst, total_rows,
+              nvecs, dst_stride > 0 ? dst_stride : total_rows, n0, n1, n2, n3,
+              n4, n5, n6, n7);
+    } else {
+      mul_mat_vec_q_grouped_same_type_col2560<scalar_t, qk, qi, block_q_t,
+                                              vdr, vec_dot_q_cuda, false>
+          <<<block_nums, block_dims, 0, stream>>>(
+              vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vy, dst, total_rows,
+              nvecs, dst_stride > 0 ? dst_stride : total_rows, n0, n1, n2, n3,
+              n4, n5, n6, n7);
+    }
+  } else {
+    mul_mat_vec_q_grouped_same_type_col2560<scalar_t, qk, qi, block_q_t, vdr,
+                                            vec_dot_q_cuda, false>
+        <<<block_nums, block_dims, 0, stream>>>(
+            vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vy, dst, total_rows, nvecs,
+            dst_stride > 0 ? dst_stride : total_rows, n0, n1, n2, n3, n4, n5,
+            n6, n7);
+  }
 }
 
 template <typename scalar_t>
@@ -1329,10 +1480,11 @@ static void ggml_mul_mat_vec_q8_grouped_dispatch(
     case 12:
       mul_mat_vec_q_grouped_same_type_cuda<
           scalar_t, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ,
-          vec_dot_q4_K_q8_1>(vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, quant_X,
-                             dst, col, total_rows, vecs, stream, rows[0],
-                             rows[1], rows[2], rows[3], rows[4], rows[5],
-                             rows[6], rows[7], dst_stride);
+          vec_dot_q4_K_q8_1, true>(vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7,
+                                   quant_X, dst, col, total_rows, vecs,
+                                   stream, rows[0], rows[1], rows[2], rows[3],
+                                   rows[4], rows[5], rows[6], rows[7],
+                                   dst_stride);
       break;
     case 13:
       static const bool q5_k_grouped_col2560_fast = [] {
@@ -1342,26 +1494,29 @@ static void ggml_mul_mat_vec_q8_grouped_dispatch(
       if (q5_k_grouped_col2560_fast && col == 2560) {
         mul_mat_vec_q_grouped_same_type_col2560_cuda<
             scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ,
-            vec_dot_q5_K_q8_1>(vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7,
-                               quant_X, dst, total_rows, vecs, stream,
-                               rows[0], rows[1], rows[2], rows[3], rows[4],
-                               rows[5], rows[6], rows[7], dst_stride);
+            vec_dot_q5_K_q8_1, true>(vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7,
+                                     quant_X, dst, total_rows, vecs, stream,
+                                     rows[0], rows[1], rows[2], rows[3],
+                                     rows[4], rows[5], rows[6], rows[7],
+                                     dst_stride);
       } else {
         mul_mat_vec_q_grouped_same_type_cuda<
             scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ,
-            vec_dot_q5_K_q8_1>(vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7,
-                               quant_X, dst, col, total_rows, vecs, stream,
-                               rows[0], rows[1], rows[2], rows[3], rows[4],
-                               rows[5], rows[6], rows[7], dst_stride);
+            vec_dot_q5_K_q8_1, true>(vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7,
+                                     quant_X, dst, col, total_rows, vecs,
+                                     stream, rows[0], rows[1], rows[2],
+                                     rows[3], rows[4], rows[5], rows[6],
+                                     rows[7], dst_stride);
       }
       break;
     case 14:
       mul_mat_vec_q_grouped_same_type_cuda<
           scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ,
-          vec_dot_q6_K_q8_1>(vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, quant_X,
-                             dst, col, total_rows, vecs, stream, rows[0],
-                             rows[1], rows[2], rows[3], rows[4], rows[5],
-                             rows[6], rows[7], dst_stride);
+          vec_dot_q6_K_q8_1, true>(vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7,
+                                   quant_X, dst, col, total_rows, vecs,
+                                   stream, rows[0], rows[1], rows[2], rows[3],
+                                   rows[4], rows[5], rows[6], rows[7],
+                                   dst_stride);
       break;
     case 16:
       mul_mat_vec_q_grouped_same_type_cuda<

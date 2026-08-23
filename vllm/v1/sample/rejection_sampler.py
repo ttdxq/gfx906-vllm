@@ -130,8 +130,15 @@ class RejectionSampler(nn.Module):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
-        # Compute probability distribution from target logits.
-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+        if sampling_metadata.all_greedy:
+            # Skip the full-vocabulary softmax for all-greedy rejection
+            # sampling: the greedy path below only needs the argmax, and
+            # argmax over logits equals argmax over their softmax (mainline
+            # commit 8980001c93).
+            target_probs = target_logits
+        else:
+            # Compute probability distribution from target logits.
+            target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
 
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
