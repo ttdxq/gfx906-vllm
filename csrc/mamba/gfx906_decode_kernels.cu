@@ -738,7 +738,7 @@ void fused_sigmoid_gating_delta_rule_gfx906_mtp_v2_kernel(
     const accepted_t* __restrict__ num_accepted_tokens,
     scalar_t* __restrict__ out, int64_t max_query_len, int64_t heads,
     double beta, double threshold, double scale, bool use_qk_l2norm_in_kernel,
-    GdnMtpV2Strides s) {
+    bool use_tiled_qk_head_mapping, GdnMtpV2Strides s) {
   constexpr int kThreads = 256;
   constexpr int kWaveSize = 64;  // gfx906 GCN wave64
   constexpr int kWarps = kThreads / kWaveSize;
@@ -753,7 +753,9 @@ void fused_sigmoid_gating_delta_rule_gfx906_mtp_v2_kernel(
   const int lane = tid % kWaveSize;
   const int warp = tid / kWaveSize;
   const int head_ratio = static_cast<int>(gridDim.x / heads);
-  const int q_head = hv / head_ratio;
+  const int q_head = use_tiled_qk_head_mapping
+                         ? (hv % static_cast<int>(heads))
+                         : (hv / head_ratio);
 
   const int bos = cu_seqlens[request];
   const int eos = cu_seqlens[request + 1];
@@ -828,100 +830,94 @@ void fused_sigmoid_gating_delta_rule_gfx906_mtp_v2_kernel(
 
   const state_t* source_state = state +
       static_cast<int64_t>(source_slot) * s.state_slot + hv * s.state_h;
-  float h[kRowsPerWarp][2];
-  float h_next[kRowsPerWarp][2];
-  float out_acc[kMaxTokens][2] = {};
-  gdn_mtp_v2_load_kchunk(h, source_state, 0, warp, lane);
+  // The full key range is split across warps (8 k rows each), so each warp
+  // keeps its share of ALL four 32-key chunks in registers and every dot is
+  // reduced across warps BEFORE the delta update: per token we do one full-k
+  // dot exchange, then update/store. (A per-chunk partial dot would be
+  // mathematically wrong.)
+  float h_all[kPasses][kRowsPerWarp][2];
 #pragma unroll
   for (int pass = 0; pass < kPasses; ++pass) {
-    if (pass + 1 < kPasses) {
-      gdn_mtp_v2_load_kchunk(h_next, source_state, pass + 1, warp, lane);
-    }
-#pragma unroll
-    for (int t = 0; t < kMaxTokens; ++t) {
-      if (t >= num_tokens) {
-        continue;
-      }
-      const float decay = smem_decay[t];
-      const float beta_t = smem_beta[t];
-
-      float krow[kRowsPerWarp];
-      float qrow[kRowsPerWarp];
-#pragma unroll
-      for (int row = 0; row < kRowsPerWarp; ++row) {
-        const int k_idx = pass * 32 + warp + row * kWarps;
-        krow[row] = smem_k[t][k_idx];
-        qrow[row] = smem_q[t][k_idx];
-      }
-
-      float partial_dot[2] = {0.0f, 0.0f};
-#pragma unroll
-      for (int row = 0; row < kRowsPerWarp; ++row) {
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-          h[row][i] *= decay;
-          partial_dot[i] += h[row][i] * krow[row];
-        }
-      }
-
-      __syncthreads();
-      smem_partial[warp][lane * 2] = partial_dot[0];
-      smem_partial[warp][lane * 2 + 1] = partial_dot[1];
-      __syncthreads();
-      float dot[2];
-#pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        float acc = 0.0f;
-#pragma unroll
-        for (int w = 0; w < kWarps; ++w) {
-          acc += smem_partial[w][lane * 2 + i];
-        }
-        dot[i] = acc;
-      }
-
-      const float2 vin =
-          *reinterpret_cast<const float2*>(&smem_v[t][lane * 2]);
-      float delta[2];
-      delta[0] = (vin.x - dot[0]) * beta_t;
-      delta[1] = (vin.y - dot[1]) * beta_t;
-
-#pragma unroll
-      for (int row = 0; row < kRowsPerWarp; ++row) {
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-          h[row][i] += krow[row] * delta[i];
-          out_acc[t][i] += h[row][i] * qrow[row];
-        }
-      }
-
-      const int32_t dst_slot =
-          state_indices[request * s.si_req + t * s.si_tok];
-      if (dst_slot >= 0) {
-        state_t* dst_state = state +
-            static_cast<int64_t>(dst_slot) * s.state_slot + hv * s.state_h;
-        gdn_mtp_v2_store_kchunk(h, dst_state, pass, warp, lane);
-      }
-    }
-    if (pass + 1 < kPasses) {
-#pragma unroll
-      for (int row = 0; row < kRowsPerWarp; ++row) {
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-          h[row][i] = h_next[row][i];
-        }
-      }
-    }
+    gdn_mtp_v2_load_kchunk(h_all[pass], source_state, pass, warp, lane);
   }
-
-  // Reduce the per-warp output partials across warps for lane's two values.
-  __syncthreads();
 #pragma unroll
   for (int t = 0; t < kMaxTokens; ++t) {
     if (t >= num_tokens) {
       continue;
     }
-    smem_partial[warp][lane * 2] = out_acc[t][0];
-    smem_partial[warp][lane * 2 + 1] = out_acc[t][1];
+    const float decay = smem_decay[t];
+    const float beta_t = smem_beta[t];
+    const int64_t token = bos + t;
+    const int32_t dst_slot =
+        state_indices[request * s.si_req + t * s.si_tok];
+
+    // Full-k dot for lane's two values: apply decay and sum this warp's
+    // share over all passes, then exchange one partial per lane.
+    float warp_dot[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int pass = 0; pass < kPasses; ++pass) {
+#pragma unroll
+      for (int row = 0; row < kRowsPerWarp; ++row) {
+        const int k_idx = pass * 32 + warp + row * kWarps;
+        const float k_val = smem_k[t][k_idx];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          h_all[pass][row][i] *= decay;
+          warp_dot[i] += h_all[pass][row][i] * k_val;
+        }
+      }
+    }
+    __syncthreads();
+    smem_partial[warp][lane * 2] = warp_dot[0];
+    smem_partial[warp][lane * 2 + 1] = warp_dot[1];
+    __syncthreads();
+    float dot[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      float acc = 0.0f;
+#pragma unroll
+      for (int w = 0; w < kWarps; ++w) {
+        acc += smem_partial[w][lane * 2 + i];
+      }
+      dot[i] = acc;
+    }
+
+    const float2 vin =
+        *reinterpret_cast<const float2*>(&smem_v[t][lane * 2]);
+    float delta[2];
+    delta[0] = (vin.x - dot[0]) * beta_t;
+    delta[1] = (vin.y - dot[1]) * beta_t;
+
+    // Update this warp's k rows and accumulate the output partials.
+    float warp_out[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int pass = 0; pass < kPasses; ++pass) {
+#pragma unroll
+      for (int row = 0; row < kRowsPerWarp; ++row) {
+        const int k_idx = pass * 32 + warp + row * kWarps;
+        const float k_val = smem_k[t][k_idx];
+        const float q_val = smem_q[t][k_idx];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          h_all[pass][row][i] += k_val * delta[i];
+          warp_out[i] += h_all[pass][row][i] * q_val;
+        }
+      }
+    }
+
+    if (dst_slot >= 0) {
+      state_t* dst_state = state +
+          static_cast<int64_t>(dst_slot) * s.state_slot + hv * s.state_h;
+#pragma unroll
+      for (int pass = 0; pass < kPasses; ++pass) {
+        gdn_mtp_v2_store_kchunk(h_all[pass], dst_state, pass, warp, lane);
+      }
+    }
+
+    // Cross-warp output reduction for lane's two values.
+    __syncthreads();
+    smem_partial[warp][lane * 2] = warp_out[0];
+    smem_partial[warp][lane * 2 + 1] = warp_out[1];
     __syncthreads();
     float o0 = 0.0f;
     float o1 = 0.0f;
@@ -930,14 +926,10 @@ void fused_sigmoid_gating_delta_rule_gfx906_mtp_v2_kernel(
       o0 += smem_partial[w][lane * 2];
       o1 += smem_partial[w][lane * 2 + 1];
     }
-    const int32_t dst_slot =
-        state_indices[request * s.si_req + t * s.si_tok];
-    const float o_v0 = dst_slot >= 0 ? o0 : 0.0f;
-    const float o_v1 = dst_slot >= 0 ? o1 : 0.0f;
-    out[(bos + t) * s.out_t + hv * s.out_h + lane * 2] =
-        static_cast<scalar_t>(o_v0);
-    out[(bos + t) * s.out_t + hv * s.out_h + lane * 2 + 1] =
-        static_cast<scalar_t>(o_v1);
+    out[token * s.out_t + hv * s.out_h + lane * 2] = static_cast<scalar_t>(
+        dst_slot >= 0 ? o0 : 0.0f);
+    out[token * s.out_t + hv * s.out_h + lane * 2 + 1] =
+        static_cast<scalar_t>(dst_slot >= 0 ? o1 : 0.0f);
     __syncthreads();
   }
 }
@@ -2705,7 +2697,8 @@ torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
                 cu_seqlens.data_ptr<int32_t>(),                          \
                 num_accepted_tokens.data_ptr<ACCEPTED_TYPE>(),           \
                 out.data_ptr<scalar_t>(), max_query_len, heads, beta,    \
-                threshold, scale, use_qk_l2norm_in_kernel, strides);     \
+                threshold, scale, use_qk_l2norm_in_kernel,               \
+                /*use_tiled_qk_head_mapping=*/false, strides);          \
       })
     if (num_accepted_tokens.scalar_type() == at::ScalarType::Long) {
       if (state.scalar_type() == at::ScalarType::Float) {
@@ -2861,6 +2854,142 @@ torch::Tensor fused_recurrent_gated_delta_rule_gfx906_packed_decode(
       use_transposed_state ? state.stride(3) : state.stride(2);
   const int64_t state_stride_k =
       use_transposed_state ? state.stride(2) : state.stride(3);
+  // Warp-cooperative single-token decode path (same decomposition as the
+  // MTP v2 kernel above): grid = (kv_heads, 1), 256 threads. q/k/v pointers
+  // are carved out of the packed mixed_qkv rows; the token's own slot serves
+  // as both source and destination (in-place update). Falls back to the
+  // serial per-column kernels otherwise or via VLLM_GFX906_GDN_DEC_V2=0.
+  static const bool dec_v2_enabled = [] {
+    const char* env = std::getenv("VLLM_GFX906_GDN_DEC_V2");
+    return env == nullptr || std::atoi(env) != 0;
+  }();
+  const bool dec_v2_shape_ok =
+      tokens == 1 && key_dim == 128 && value_dim == 128 &&
+      kv_heads % heads == 0 && mixed_qkv.stride(1) == 1 &&
+      a.stride(1) == 1 && b.stride(1) == 1 && out.stride(3) == 1 &&
+      out.stride(1) == out.stride(2) * kv_heads &&
+      state_stride_v == 1 && state_stride_k == value_dim &&
+      state_indices.stride(0) == 1;
+  static const bool dec_v2_debug = [] {
+    const char* env = std::getenv("VLLM_GFX906_GDN_DEC_V2_DEBUG");
+    return env != nullptr && std::atoi(env) != 0;
+  }();
+  if (dec_v2_debug) {
+    static bool dec_reported = false;
+    if (!dec_reported) {
+      dec_reported = true;
+      std::fprintf(
+          stderr,
+          "GFX906_GDN_DEC_V2 %s: tokens=%ld heads=%ld kv_heads=%ld sv=%ld "
+          "sk=%ld tiled_map=%d transposed=%d\n",
+          (dec_v2_enabled && dec_v2_shape_ok) ? "HIT" : "MISS",
+          static_cast<long>(tokens), static_cast<long>(heads),
+          static_cast<long>(kv_heads), static_cast<long>(state_stride_v),
+          static_cast<long>(state_stride_k), use_tiled_qk_head_mapping ? 1 : 0,
+          use_transposed_state ? 1 : 0);
+    }
+  }
+  if (dec_v2_enabled && dec_v2_shape_ok) {
+    static torch::Tensor dec_cu_seqlens;
+    static torch::Tensor dec_num_accepted;
+    if (!dec_cu_seqlens.defined()) {
+      auto opts = state_indices.options();
+      dec_cu_seqlens = torch::tensor({0, 1}, opts);
+      dec_num_accepted = torch::tensor({1}, opts);
+    }
+    // Optional per-call CUDA-event timing (VLLM_GFX906_GDN_DEC_V2_TIME=1).
+    static const bool dec_v2_time = [] {
+      const char* env = std::getenv("VLLM_GFX906_GDN_DEC_V2_TIME");
+      return env != nullptr && std::atoi(env) != 0;
+    }();
+    constexpr int kDecEventRing = 128;
+    static cudaEvent_t dec_time_start[kDecEventRing];
+    static cudaEvent_t dec_time_stop[kDecEventRing];
+    static bool dec_time_ready = false;
+    static int dec_time_idx = 0;
+    static int dec_time_calls = 0;
+    static double dec_time_total_ms = 0.0;
+    static int dec_time_samples = 0;
+    if (dec_v2_time && !dec_time_ready) {
+      for (int i = 0; i < kDecEventRing; ++i) {
+        cudaEventCreate(&dec_time_start[i]);
+        cudaEventCreate(&dec_time_stop[i]);
+      }
+      dec_time_ready = true;
+    }
+    if (dec_v2_time) {
+      cudaEventRecord(dec_time_start[dec_time_idx], stream);
+    }
+    GdnMtpV2Strides st;
+    st.q_t = mixed_qkv.stride(0);
+    st.q_h = key_dim;
+    st.k_t = mixed_qkv.stride(0);
+    st.k_h = key_dim;
+    st.v_t = mixed_qkv.stride(0);
+    st.v_h = value_dim;
+    st.a_t = a.stride(0);
+    st.a_h = a.stride(1);
+    st.b_t = b.stride(0);
+    st.b_h = b.stride(1);
+    st.state_slot = state.stride(0);
+    st.state_h = state.stride(1);
+    st.out_t = out.stride(0);
+    st.out_h = out.stride(2);
+    st.si_req = 1;
+    st.si_tok = 0;
+    const dim3 dec_grid(static_cast<unsigned>(kv_heads), 1);
+#define VLLM_GFX906_DEC_V2_LAUNCH(STATE_TYPE)                            \
+  VLLM_DISPATCH_FLOATING_TYPES(                                          \
+      mixed_qkv.scalar_type(),                                           \
+      "fused_recurrent_gated_delta_rule_gfx906_dec_v2", [&] {            \
+        const scalar_t* q_ptr = mixed_qkv.data_ptr<scalar_t>();          \
+        const scalar_t* k_ptr = q_ptr + heads * key_dim;                 \
+        const scalar_t* v_ptr = q_ptr + 2 * heads * key_dim;             \
+        fused_sigmoid_gating_delta_rule_gfx906_mtp_v2_kernel<            \
+            scalar_t, STATE_TYPE, int32_t>                               \
+            <<<dec_grid, 256, 0, stream>>>(                              \
+                A_log.data_ptr<scalar_t>(), a.data_ptr<scalar_t>(),      \
+                b.data_ptr<scalar_t>(), dt_bias.data_ptr<scalar_t>(),    \
+                q_ptr, k_ptr, v_ptr, state.data_ptr<STATE_TYPE>(),       \
+                state_indices.data_ptr<int32_t>(),                       \
+                dec_cu_seqlens.data_ptr<int32_t>(),                      \
+                dec_num_accepted.data_ptr<int32_t>(),                    \
+                out.data_ptr<scalar_t>(), /*max_query_len=*/1, heads,    \
+                /*beta=*/1.0, /*threshold=*/20.0, scale,                 \
+                use_qk_l2norm_in_kernel, use_tiled_qk_head_mapping, st); \
+      })
+    if (state.scalar_type() == at::ScalarType::Float) {
+      VLLM_GFX906_DEC_V2_LAUNCH(float);
+    } else if (state.scalar_type() == at::ScalarType::Half) {
+      VLLM_GFX906_DEC_V2_LAUNCH(at::Half);
+    } else {
+      VLLM_GFX906_DEC_V2_LAUNCH(at::BFloat16);
+    }
+#undef VLLM_GFX906_DEC_V2_LAUNCH
+    if (dec_v2_time) {
+      cudaEventRecord(dec_time_stop[dec_time_idx], stream);
+      dec_time_idx = (dec_time_idx + 1) % kDecEventRing;
+      ++dec_time_calls;
+      if (dec_time_calls % 64 == 0) {
+        for (int j = 0; j < 64; ++j) {
+          const int drained =
+              (dec_time_idx + kDecEventRing - 64 + j) % kDecEventRing;
+          cudaEventSynchronize(dec_time_stop[drained]);
+          float ms = 0.0f;
+          cudaEventElapsedTime(&ms, dec_time_start[drained],
+                               dec_time_stop[drained]);
+          dec_time_total_ms += ms;
+          ++dec_time_samples;
+        }
+        std::fprintf(stderr,
+                     "GFX906_GDN_DEC_V2_TIME avg %.1f us over %d calls\n",
+                     dec_time_total_ms * 1000.0 / dec_time_samples,
+                     dec_time_samples);
+      }
+    }
+    return out;
+  }
+
   const bool use_specialized_tiled128 =
       gfx906_gdn_specialized_packed_decode_enabled() &&
       use_qk_l2norm_in_kernel && use_tiled_qk_head_mapping &&
