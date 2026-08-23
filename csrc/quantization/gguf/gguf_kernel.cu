@@ -788,11 +788,11 @@ static void ggml_mul_mat_vec_q8_dispatch(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
       break;
     case 8:
-      if (vecs == 1 && row >= q8_0_row_tile_min_rows() &&
+      if (vecs >= 1 && vecs <= 4 && row >= q8_0_row_tile_min_rows() &&
           q8_0_row_tile() == 2) {
         mul_mat_vec_q8_0_q8_1_row_tile_cuda<scalar_t, 2>(
             W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      } else if (vecs == 1 && row >= q8_0_row_tile_min_rows() &&
+      } else if (vecs >= 1 && vecs <= 4 && row >= q8_0_row_tile_min_rows() &&
                  q8_0_row_tile() == 4) {
         mul_mat_vec_q8_0_q8_1_row_tile_cuda<scalar_t, 4>(
             W, quant_X, dst, col, row, vecs, stream, dst_stride);
@@ -815,7 +815,7 @@ static void ggml_mul_mat_vec_q8_dispatch(
         const char* env = std::getenv("VLLM_GGUF_Q4_K_COL2560_FAST");
         return env == nullptr || env[0] != '0';
       }();
-      if (q4_k_fixed_cols_fast && vecs == 1 && col != 2560) {
+      if (q4_k_fixed_cols_fast && vecs >= 1 && vecs <= 4 && col != 2560) {
         switch (col) {
           case 2048:
             mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 2048>(
@@ -865,7 +865,7 @@ static void ggml_mul_mat_vec_q8_dispatch(
         const char* env = std::getenv("VLLM_GGUF_Q5_K_COL2560_FAST");
         return env == nullptr || env[0] != '0';
       }();
-      if (q5_k_fixed_cols_fast && vecs == 1 && col != 2560) {
+      if (q5_k_fixed_cols_fast && vecs >= 1 && vecs <= 4 && col != 2560) {
         switch (col) {
           case 5120:
             if (q5_k_5120_6144_fast) {
@@ -912,8 +912,8 @@ static void ggml_mul_mat_vec_q8_dispatch(
         const char* env = std::getenv("VLLM_GGUF_Q6_K_COL2560_FAST");
         return env == nullptr || env[0] != '0';
       }();
-      if (q6_k_fixed_cols_fast_enabled() && vecs == 1 && col == 5120 &&
-          row >= q6_k_fixed_cols_min_rows()) {
+      if (q6_k_fixed_cols_fast_enabled() && vecs >= 1 && vecs <= 4 &&
+          col == 5120 && row >= q6_k_fixed_cols_min_rows()) {
         mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
             W, quant_X, dst, row, vecs, stream, dst_stride);
       } else if (q6_k_col2560_fast && col == 2560 && row > 65536) {
@@ -1033,45 +1033,66 @@ static __global__ void mul_mat_vec_q_grouped_same_type(
   const int nrows_y = (ncols + 512 - 1) / 512 * 512;
   const block_q_t* x = (const block_q_t*)vx;
   const block_q8_1* y = (const block_q8_1*)vy;
-  float tmp = 0.0f;
+  const bool combine_vecs = gguf_mmvq_combine_vecs(nvecs);
+  const int vec_count = combine_vecs ? nvecs : 1;
+  float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
   for (int i = threadIdx.x / (qi / vdr); i < blocks_per_row;
        i += blocks_per_warp) {
     const int ibx = local_row * blocks_per_row + i;
-    const int iby = vec * (nrows_y / QK8_1) + i * (qk / QK8_1);
     const int iqs = vdr * (threadIdx.x % (qi / vdr));
-    tmp += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+#pragma unroll
+    for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+      if (vec_offset >= vec_count) {
+        break;
+      }
+      const int iby =
+          (vec + vec_offset) * (nrows_y / QK8_1) + i * (qk / QK8_1);
+      tmp[vec_offset] += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+    }
   }
 
   constexpr int warp_size = WARP_SIZE;
   constexpr int num_warps = BLOCK_SIZE / warp_size;
 #pragma unroll
   for (int mask = warp_size / 2; mask > 0; mask >>= 1) {
-    tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+#pragma unroll
+    for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+      if (vec_offset >= vec_count) {
+        break;
+      }
+      tmp[vec_offset] += VLLM_SHFL_XOR_SYNC(tmp[vec_offset], mask);
+    }
   }
 
   if constexpr (num_warps == 1) {
     if (threadIdx.x == 0) {
-      dst[vec * dst_stride + row] = tmp;
+#pragma unroll
+      for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+        if (vec_offset >= vec_count) {
+          break;
+        }
+        dst[(vec + vec_offset) * dst_stride + row] = tmp[vec_offset];
+      }
     }
   } else {
     const int lane = threadIdx.x % warp_size;
     const int warp = threadIdx.x / warp_size;
     __shared__ float shared_sum[GGML_CUDA_MMV_Y][num_warps];
     if (lane == 0) {
-      shared_sum[threadIdx.y][warp] = tmp;
+      shared_sum[threadIdx.y][warp] = tmp[0];
     }
     __syncthreads();
     if (warp != 0) {
       return;
     }
-    tmp = lane < num_warps ? shared_sum[threadIdx.y][lane] : 0.0f;
+    tmp[0] = lane < num_warps ? shared_sum[threadIdx.y][lane] : 0.0f;
 #pragma unroll
     for (int mask = warp_size / 2; mask > 0; mask >>= 1) {
-      tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+      tmp[0] += VLLM_SHFL_XOR_SYNC(tmp[0], mask);
     }
     if (lane == 0) {
-      dst[vec * dst_stride + row] = tmp;
+      dst[vec * dst_stride + row] = tmp[0];
     }
   }
 }
@@ -1086,7 +1107,7 @@ static void mul_mat_vec_q_grouped_same_type_cuda(
     const int n2, const int n3, const int n4, const int n5, const int n6,
     const int n7, const int dst_stride = -1) {
   const int block_num_y = (total_rows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-  const dim3 block_nums(block_num_y, nvecs, 1);
+  const dim3 block_nums(block_num_y, gguf_mmvq_grid_vecs(nvecs), 1);
   const dim3 block_dims(BLOCK_SIZE, GGML_CUDA_MMV_Y, 1);
   mul_mat_vec_q_grouped_same_type<scalar_t, qk, qi, block_q_t, vdr,
                                   vec_dot_q_cuda>
@@ -1158,45 +1179,66 @@ static __global__ void mul_mat_vec_q_grouped_same_type_col2560(
 
   const block_q_t* x = (const block_q_t*)vx;
   const block_q8_1* y = (const block_q8_1*)vy;
-  float tmp = 0.0f;
+  const bool combine_vecs = gguf_mmvq_combine_vecs(nvecs);
+  const int vec_count = combine_vecs ? nvecs : 1;
+  float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
   for (int i = threadIdx.x / (qi / vdr); i < blocks_per_row;
        i += blocks_per_warp) {
     const int ibx = local_row * blocks_per_row + i;
-    const int iby = vec * q8_blocks_per_vec + i * (qk / QK8_1);
     const int iqs = vdr * (threadIdx.x % (qi / vdr));
-    tmp += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+#pragma unroll
+    for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+      if (vec_offset >= vec_count) {
+        break;
+      }
+      const int iby = (vec + vec_offset) * q8_blocks_per_vec +
+          i * (qk / QK8_1);
+      tmp[vec_offset] += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+    }
   }
 
   constexpr int warp_size = WARP_SIZE;
   constexpr int num_warps = BLOCK_SIZE / warp_size;
 #pragma unroll
   for (int mask = warp_size / 2; mask > 0; mask >>= 1) {
-    tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+#pragma unroll
+    for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+      if (vec_offset >= vec_count) {
+        break;
+      }
+      tmp[vec_offset] += VLLM_SHFL_XOR_SYNC(tmp[vec_offset], mask);
+    }
   }
 
   if constexpr (num_warps == 1) {
     if (threadIdx.x == 0) {
-      dst[vec * dst_stride + row] = tmp;
+#pragma unroll
+      for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+        if (vec_offset >= vec_count) {
+          break;
+        }
+        dst[(vec + vec_offset) * dst_stride + row] = tmp[vec_offset];
+      }
     }
   } else {
     const int lane = threadIdx.x % warp_size;
     const int warp = threadIdx.x / warp_size;
     __shared__ float shared_sum[num_warps];
     if (lane == 0) {
-      shared_sum[warp] = tmp;
+      shared_sum[warp] = tmp[0];
     }
     __syncthreads();
     if (warp != 0) {
       return;
     }
-    tmp = lane < num_warps ? shared_sum[lane] : 0.0f;
+    tmp[0] = lane < num_warps ? shared_sum[lane] : 0.0f;
 #pragma unroll
     for (int mask = warp_size / 2; mask > 0; mask >>= 1) {
-      tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+      tmp[0] += VLLM_SHFL_XOR_SYNC(tmp[0], mask);
     }
     if (lane == 0) {
-      dst[vec * dst_stride + row] = tmp;
+      dst[vec * dst_stride + row] = tmp[0];
     }
   }
 }
@@ -1210,7 +1252,7 @@ static void mul_mat_vec_q_grouped_same_type_col2560_cuda(
     cudaStream_t stream, const int n0, const int n1, const int n2,
     const int n3, const int n4, const int n5, const int n6, const int n7,
     const int dst_stride = -1) {
-  const dim3 block_nums(total_rows, nvecs, 1);
+  const dim3 block_nums(total_rows, gguf_mmvq_grid_vecs(nvecs), 1);
   const dim3 block_dims(BLOCK_SIZE, 1, 1);
   mul_mat_vec_q_grouped_same_type_col2560<scalar_t, qk, qi, block_q_t, vdr,
                                           vec_dot_q_cuda>

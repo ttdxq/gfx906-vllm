@@ -405,9 +405,18 @@ class EagleProposer:
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
         common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
-        common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+        # query_start_loc_cpu is invariant across draft iterations (batch_size
+        # does not change); build it once instead of once per iteration, as in
+        # upstream llm_base_proposer.
+        query_start_loc_cpu = torch.from_numpy(
             self.token_arange_np[: batch_size + 1]
         ).clone()
+        common_attn_metadata.query_start_loc_cpu = query_start_loc_cpu
+        # Keep a private seq_lens_cpu buffer so each iteration can advance it
+        # in place instead of allocating a new tensor, without mutating the
+        # original tensor (same contract as upstream's lazily cached
+        # _seq_lens_cpu).
+        seq_lens_cpu = common_attn_metadata.seq_lens_cpu.clone()
         for token_index in range(self.num_speculative_tokens - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
@@ -440,8 +449,10 @@ class EagleProposer:
             # of main model.
             # Increment the sequence lengths.
             common_attn_metadata.seq_lens += 1
-            # This is an out-of-place operation to avoid modifying the original tensor.
-            common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu + 1
+            # Advance our private CPU copy in place; the original tensor is
+            # left untouched because seq_lens_cpu was cloned above.
+            seq_lens_cpu += 1
+            common_attn_metadata.seq_lens_cpu = seq_lens_cpu
             # For the requests that exceed the max model length, we set the
             # sequence length to 1 to minimize their overheads in attention.
 

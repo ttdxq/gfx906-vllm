@@ -508,7 +508,7 @@ __global__ void fused_sigmoid_gating_delta_rule_gfx906_mtp_update_kernel(
     const int32_t* __restrict__ state_indices,
     const int32_t* __restrict__ cu_seqlens,
     const accepted_t* __restrict__ num_accepted_tokens,
-    scalar_t* __restrict__ out, int64_t requests, int64_t token_position,
+    scalar_t* __restrict__ out, int64_t requests, int64_t max_query_len,
     int64_t heads, int64_t kv_heads, int64_t key_dim, int64_t value_dim,
     int64_t q_stride_t, int64_t q_stride_h, int64_t q_stride_k,
     int64_t k_stride_t, int64_t k_stride_h, int64_t k_stride_k,
@@ -531,33 +531,45 @@ __global__ void fused_sigmoid_gating_delta_rule_gfx906_mtp_update_kernel(
   const int64_t request_idx = linear_idx / (value_dim * kv_heads);
   const int64_t seq_start = cu_seqlens[request_idx];
   const int64_t seq_end = cu_seqlens[request_idx + 1];
-  if (token_position >= seq_end - seq_start) {
-    return;
-  }
+  const int64_t seq_len = seq_end - seq_start;
 
-  const int64_t token_idx = seq_start + token_position;
-  const int64_t initial_position =
-      static_cast<int64_t>(num_accepted_tokens[request_idx]) - 1;
-  const int64_t source_position =
-      token_position == 0 ? initial_position : token_position - 1;
-  const int64_t source_state_idx =
-      source_position >= 0
-          ? state_indices[request_idx * indices_stride_req +
-                          source_position * indices_stride_tok]
-          : -1;
-  const int64_t destination_state_idx =
-      state_indices[request_idx * indices_stride_req +
-                    token_position * indices_stride_tok];
-  if (source_state_idx < 0 || destination_state_idx < 0) {
-    out[token_idx * out_stride_t + hv_idx * out_stride_h +
-        value_idx * out_stride_v] = static_cast<scalar_t>(0.0f);
-    return;
-  }
-
+  // Walk the whole speculative token chain inside one launch. The previous
+  // per-token launcher issued max_query_len sequential kernel launches on the
+  // same stream; each launch had to drain before the next could start (state
+  // dependency), tripling the launch/drain cost and shrinking the active
+  // grid. Here each thread processes its (request, head, value) column
+  // through the chain; token t > 0 reads the state slot that token t - 1 of
+  // the same thread just wrote, so the source column stays hot in L1.
   const int64_t head_ratio = kv_heads / heads;
   const int64_t q_head_idx = hv_idx / head_ratio;
-  float q_norm = 1.0f;
-  float k_norm = 1.0f;
+  const int64_t initial_position =
+      static_cast<int64_t>(num_accepted_tokens[request_idx]) - 1;
+
+  for (int64_t token_position = 0; token_position < max_query_len;
+       ++token_position) {
+    if (token_position >= seq_len) {
+      break;
+    }
+
+    const int64_t token_idx = seq_start + token_position;
+    const int64_t source_position =
+        token_position == 0 ? initial_position : token_position - 1;
+    const int64_t source_state_idx =
+        source_position >= 0
+            ? state_indices[request_idx * indices_stride_req +
+                            source_position * indices_stride_tok]
+            : -1;
+    const int64_t destination_state_idx =
+        state_indices[request_idx * indices_stride_req +
+                      token_position * indices_stride_tok];
+    if (source_state_idx < 0 || destination_state_idx < 0) {
+      out[token_idx * out_stride_t + hv_idx * out_stride_h +
+          value_idx * out_stride_v] = static_cast<scalar_t>(0.0f);
+      continue;
+    }
+
+    float q_norm = 1.0f;
+    float k_norm = 1.0f;
   if (use_qk_l2norm_in_kernel) {
     float q_norm_sq = 0.0f;
     float k_norm_sq = 0.0f;
@@ -628,8 +640,9 @@ __global__ void fused_sigmoid_gating_delta_rule_gfx906_mtp_update_kernel(
         q_norm * static_cast<float>(scale);
     out_val += new_state * q_val;
   }
-  out[token_idx * out_stride_t + hv_idx * out_stride_h +
-      value_idx * out_stride_v] = static_cast<scalar_t>(out_val);
+    out[token_idx * out_stride_t + hv_idx * out_stride_h +
+        value_idx * out_stride_v] = static_cast<scalar_t>(out_val);
+  }
 }
 
 template <typename scalar_t, typename state_t, typename index_t>
@@ -2299,29 +2312,27 @@ torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
   VLLM_DISPATCH_HALF_TYPES(                                             \
       q.scalar_type(),                                                  \
       "fused_sigmoid_gating_delta_rule_gfx906_mtp_update", [&] {       \
-        for (int64_t token_position = 0; token_position < max_query_len; \
-             ++token_position) {                                       \
-          fused_sigmoid_gating_delta_rule_gfx906_mtp_update_kernel<    \
-              scalar_t, STATE_TYPE, ACCEPTED_TYPE>                      \
-              <<<blocks, threads, 0, stream>>>(                         \
-              A_log.data_ptr<scalar_t>(), a_view.data_ptr<scalar_t>(),  \
-              b_view.data_ptr<scalar_t>(), dt_bias.data_ptr<scalar_t>(),\
-              q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(),           \
-              v.data_ptr<scalar_t>(), state.data_ptr<STATE_TYPE>(),     \
-              state_indices.data_ptr<int32_t>(),                        \
-              cu_seqlens.data_ptr<int32_t>(),                           \
-              num_accepted_tokens.data_ptr<ACCEPTED_TYPE>(),            \
-              out.data_ptr<scalar_t>(), requests, token_position, heads,\
-              kv_heads, key_dim, value_dim, q.stride(1), q.stride(2),   \
-              q.stride(3), k.stride(1), k.stride(2), k.stride(3),       \
-              v.stride(1), v.stride(2), v.stride(3), a_view.stride(0),  \
-              a_view.stride(1), b_view.stride(0), b_view.stride(1),     \
-              state.stride(0), state.stride(1), state.stride(2),        \
-              state.stride(3), state_indices.stride(0),                 \
-              state_indices.stride(1), out.stride(0), out.stride(1),    \
-              out.stride(2), beta, threshold, scale,                    \
-              use_qk_l2norm_in_kernel);                                 \
-        }                                                               \
+        fused_sigmoid_gating_delta_rule_gfx906_mtp_update_kernel<      \
+            scalar_t, STATE_TYPE, ACCEPTED_TYPE>                        \
+            <<<blocks, threads, 0, stream>>>(                           \
+                A_log.data_ptr<scalar_t>(), a_view.data_ptr<scalar_t>(),\
+                b_view.data_ptr<scalar_t>(),                            \
+                dt_bias.data_ptr<scalar_t>(), q.data_ptr<scalar_t>(),   \
+                k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),         \
+                state.data_ptr<STATE_TYPE>(),                           \
+                state_indices.data_ptr<int32_t>(),                      \
+                cu_seqlens.data_ptr<int32_t>(),                         \
+                num_accepted_tokens.data_ptr<ACCEPTED_TYPE>(),          \
+                out.data_ptr<scalar_t>(), requests, max_query_len,      \
+                heads, kv_heads, key_dim, value_dim, q.stride(1),       \
+                q.stride(2), q.stride(3), k.stride(1), k.stride(2),     \
+                k.stride(3), v.stride(1), v.stride(2), v.stride(3),     \
+                a_view.stride(0), a_view.stride(1), b_view.stride(0),   \
+                b_view.stride(1), state.stride(0), state.stride(1),     \
+                state.stride(2), state.stride(3),                       \
+                state_indices.stride(0), state_indices.stride(1),       \
+                out.stride(0), out.stride(1), out.stride(2), beta,      \
+                threshold, scale, use_qk_l2norm_in_kernel);             \
       })
 
   if (num_accepted_tokens.scalar_type() == at::ScalarType::Long) {
