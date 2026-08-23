@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
+#include <cstdio>
 #include <cstdlib>
 
 #include "../dispatch_utils.h"
@@ -642,6 +643,302 @@ __global__ void fused_sigmoid_gating_delta_rule_gfx906_mtp_update_kernel(
   }
     out[token_idx * out_stride_t + hv_idx * out_stride_h +
         value_idx * out_stride_v] = static_cast<scalar_t>(out_val);
+  }
+}
+
+// Warp-cooperative MTP update for gfx906, targeting the transposed state
+// pool layout the server actually uses: state[slot][head][v][k] with v stride
+// 1 and k stride value_dim, i.e. physically [slot][head][k][v] where v is
+// contiguous. Decomposition (adapted from the mainline fused_gdn_decode
+// kernel): grid = (kv_heads, requests), 256 threads = 4 warps x 64 lanes.
+// Warps take turns preparing each token (q/k l2norm via full-wave reduce, v,
+// decay/beta) into shared memory; the token chain then advances in registers
+// with keys chunked 32 at a time (8 k rows per warp, each lane holding two
+// contiguous v elements) while the next chunk is prefetched. The per-value
+// dot products sum each thread's k rows locally and exchange one partial per
+// lane through shared memory, so the whole step is shuffle-free and every
+// state load/store is a coalesced float2. key_dim and value_dim are fixed at
+// 128 by the launcher guard.
+struct GdnMtpV2Strides {
+  int64_t q_t;
+  int64_t q_h;
+  int64_t k_t;
+  int64_t k_h;
+  int64_t v_t;
+  int64_t v_h;
+  int64_t a_t;
+  int64_t a_h;
+  int64_t b_t;
+  int64_t b_h;
+  int64_t state_slot;
+  int64_t state_h;
+  int64_t out_t;
+  int64_t out_h;
+  int64_t si_req;
+  int64_t si_tok;
+};
+
+__device__ __forceinline__ float2 gdn_mtp_v2_reduce_pair(float x, float y) {
+#pragma unroll
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    x += __shfl_xor_sync(0xffffffffffffffffull, x, offset);
+    y += __shfl_xor_sync(0xffffffffffffffffull, y, offset);
+  }
+  return make_float2(x, y);
+}
+
+// Loads/stores 8 k rows of one 32-key chunk. In the transposed pool the
+// (k, v) element lives at k * value_dim + v, so a lane's v pair is a
+// contiguous float2.
+template <typename state_t>
+__device__ __forceinline__ void gdn_mtp_v2_load_kchunk(
+    float (&h)[8][2], const state_t* __restrict__ state_head_base, int pass,
+    int warp, int lane) {
+#pragma unroll
+  for (int row = 0; row < 8; ++row) {
+    const state_t* src =
+        state_head_base + (pass * 32 + warp + row * 4) * 128 + lane * 2;
+    if constexpr (std::is_same<state_t, float>::value) {
+      const float2 packed = *reinterpret_cast<const float2*>(src);
+      h[row][0] = packed.x;
+      h[row][1] = packed.y;
+    } else {
+      h[row][0] = static_cast<float>(src[0]);
+      h[row][1] = static_cast<float>(src[1]);
+    }
+  }
+}
+
+template <typename state_t>
+__device__ __forceinline__ void gdn_mtp_v2_store_kchunk(
+    const float (&h)[8][2], state_t* __restrict__ state_head_base, int pass,
+    int warp, int lane) {
+#pragma unroll
+  for (int row = 0; row < 8; ++row) {
+    state_t* dst =
+        state_head_base + (pass * 32 + warp + row * 4) * 128 + lane * 2;
+    if constexpr (std::is_same<state_t, float>::value) {
+      *reinterpret_cast<float2*>(dst) = make_float2(h[row][0], h[row][1]);
+    } else {
+      dst[0] = static_cast<state_t>(h[row][0]);
+      dst[1] = static_cast<state_t>(h[row][1]);
+    }
+  }
+}
+
+template <typename scalar_t, typename state_t, typename accepted_t>
+__global__ __launch_bounds__(256, 2)
+void fused_sigmoid_gating_delta_rule_gfx906_mtp_v2_kernel(
+    const scalar_t* __restrict__ A_log, const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b, const scalar_t* __restrict__ dt_bias,
+    const scalar_t* __restrict__ q, const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v, state_t* __restrict__ state,
+    const int32_t* __restrict__ state_indices,
+    const int32_t* __restrict__ cu_seqlens,
+    const accepted_t* __restrict__ num_accepted_tokens,
+    scalar_t* __restrict__ out, int64_t max_query_len, int64_t heads,
+    double beta, double threshold, double scale, bool use_qk_l2norm_in_kernel,
+    GdnMtpV2Strides s) {
+  constexpr int kThreads = 256;
+  constexpr int kWaveSize = 64;  // gfx906 GCN wave64
+  constexpr int kWarps = kThreads / kWaveSize;
+  constexpr int kRowsPerWarp = 32 / kWarps;  // 8 k rows per warp per pass
+  constexpr int kPasses = 128 / 32;          // key_dim / keys-per-pass
+  constexpr int kMaxTokens = 4;              // launcher caps max_query_len
+  constexpr int kDimV = 128;
+
+  const int hv = blockIdx.x;
+  const int request = blockIdx.y;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int lane = tid % kWaveSize;
+  const int warp = tid / kWaveSize;
+  const int head_ratio = static_cast<int>(gridDim.x / heads);
+  const int q_head = hv / head_ratio;
+
+  const int bos = cu_seqlens[request];
+  const int eos = cu_seqlens[request + 1];
+  const int num_tokens = eos - bos;
+  if (num_tokens <= 0) {
+    return;
+  }
+
+  const int initial_position =
+      static_cast<int>(num_accepted_tokens[request]) - 1;
+  const int source_slot =
+      initial_position >= 0 &&
+              initial_position < static_cast<int>(max_query_len)
+          ? state_indices[request * s.si_req + initial_position * s.si_tok]
+          : -1;
+  if (source_slot < 0 || num_tokens > kMaxTokens) {
+    for (int linear = tid; linear < num_tokens * kDimV; linear += kThreads) {
+      const int t = linear >> 7;
+      const int value = linear & (kDimV - 1);
+      out[(bos + t) * s.out_t + hv * s.out_h + value] =
+          static_cast<scalar_t>(0.0f);
+    }
+    return;
+  }
+
+  __shared__ float smem_q[kMaxTokens][128];
+  __shared__ float smem_k[kMaxTokens][128];
+  __shared__ float smem_v[kMaxTokens][128];
+  __shared__ float smem_decay[kMaxTokens];
+  __shared__ float smem_beta[kMaxTokens];
+  __shared__ float smem_partial[kWarps][128];
+
+  for (int t = warp; t < num_tokens; t += kWarps) {
+    const int64_t token = bos + t;
+    const scalar_t* q_src = q + token * s.q_t + q_head * s.q_h + lane * 2;
+    const scalar_t* k_src = k + token * s.k_t + q_head * s.k_h + lane * 2;
+    const float q0 = static_cast<float>(q_src[0]);
+    const float q1 = static_cast<float>(q_src[1]);
+    const float k0 = static_cast<float>(k_src[0]);
+    const float k1 = static_cast<float>(k_src[1]);
+    const float2 qk = gdn_mtp_v2_reduce_pair(q0 * q0 + q1 * q1, k0 * k0 + k1 * k1);
+    float q_scale = static_cast<float>(scale);
+    float k_scale = 1.0f;
+    if (use_qk_l2norm_in_kernel) {
+      q_scale = rsqrtf(qk.x + 1e-6f) * static_cast<float>(scale);
+      k_scale = rsqrtf(qk.y + 1e-6f);
+    }
+    *reinterpret_cast<float2*>(&smem_q[t][lane * 2]) =
+        make_float2(q0 * q_scale, q1 * q_scale);
+    *reinterpret_cast<float2*>(&smem_k[t][lane * 2]) =
+        make_float2(k0 * k_scale, k1 * k_scale);
+    const scalar_t* v_src = v + token * s.v_t + hv * s.v_h + lane * 2;
+    *reinterpret_cast<float2*>(&smem_v[t][lane * 2]) =
+        make_float2(static_cast<float>(v_src[0]),
+                    static_cast<float>(v_src[1]));
+    if (lane == 0) {
+      const float x = static_cast<float>(a[token * s.a_t + hv * s.a_h]) +
+                      static_cast<float>(dt_bias[hv]);
+      const float beta_x = static_cast<float>(beta) * x;
+      const float softplus_x =
+          beta_x <= static_cast<float>(threshold)
+              ? static_cast<float>(1.0 / beta) * log1pf(expf(beta_x))
+              : x;
+      smem_decay[t] =
+          expf(-expf(static_cast<float>(A_log[hv])) * softplus_x);
+      smem_beta[t] = 1.0f /
+                     (1.0f + expf(-static_cast<float>(
+                                  b[token * s.b_t + hv * s.b_h])));
+    }
+  }
+  __syncthreads();
+
+  const state_t* source_state = state +
+      static_cast<int64_t>(source_slot) * s.state_slot + hv * s.state_h;
+  float h[kRowsPerWarp][2];
+  float h_next[kRowsPerWarp][2];
+  float out_acc[kMaxTokens][2] = {};
+  gdn_mtp_v2_load_kchunk(h, source_state, 0, warp, lane);
+#pragma unroll
+  for (int pass = 0; pass < kPasses; ++pass) {
+    if (pass + 1 < kPasses) {
+      gdn_mtp_v2_load_kchunk(h_next, source_state, pass + 1, warp, lane);
+    }
+#pragma unroll
+    for (int t = 0; t < kMaxTokens; ++t) {
+      if (t >= num_tokens) {
+        continue;
+      }
+      const float decay = smem_decay[t];
+      const float beta_t = smem_beta[t];
+
+      float krow[kRowsPerWarp];
+      float qrow[kRowsPerWarp];
+#pragma unroll
+      for (int row = 0; row < kRowsPerWarp; ++row) {
+        const int k_idx = pass * 32 + warp + row * kWarps;
+        krow[row] = smem_k[t][k_idx];
+        qrow[row] = smem_q[t][k_idx];
+      }
+
+      float partial_dot[2] = {0.0f, 0.0f};
+#pragma unroll
+      for (int row = 0; row < kRowsPerWarp; ++row) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          h[row][i] *= decay;
+          partial_dot[i] += h[row][i] * krow[row];
+        }
+      }
+
+      __syncthreads();
+      smem_partial[warp][lane * 2] = partial_dot[0];
+      smem_partial[warp][lane * 2 + 1] = partial_dot[1];
+      __syncthreads();
+      float dot[2];
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) {
+          acc += smem_partial[w][lane * 2 + i];
+        }
+        dot[i] = acc;
+      }
+
+      const float2 vin =
+          *reinterpret_cast<const float2*>(&smem_v[t][lane * 2]);
+      float delta[2];
+      delta[0] = (vin.x - dot[0]) * beta_t;
+      delta[1] = (vin.y - dot[1]) * beta_t;
+
+#pragma unroll
+      for (int row = 0; row < kRowsPerWarp; ++row) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          h[row][i] += krow[row] * delta[i];
+          out_acc[t][i] += h[row][i] * qrow[row];
+        }
+      }
+
+      const int32_t dst_slot =
+          state_indices[request * s.si_req + t * s.si_tok];
+      if (dst_slot >= 0) {
+        state_t* dst_state = state +
+            static_cast<int64_t>(dst_slot) * s.state_slot + hv * s.state_h;
+        gdn_mtp_v2_store_kchunk(h, dst_state, pass, warp, lane);
+      }
+    }
+    if (pass + 1 < kPasses) {
+#pragma unroll
+      for (int row = 0; row < kRowsPerWarp; ++row) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          h[row][i] = h_next[row][i];
+        }
+      }
+    }
+  }
+
+  // Reduce the per-warp output partials across warps for lane's two values.
+  __syncthreads();
+#pragma unroll
+  for (int t = 0; t < kMaxTokens; ++t) {
+    if (t >= num_tokens) {
+      continue;
+    }
+    smem_partial[warp][lane * 2] = out_acc[t][0];
+    smem_partial[warp][lane * 2 + 1] = out_acc[t][1];
+    __syncthreads();
+    float o0 = 0.0f;
+    float o1 = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) {
+      o0 += smem_partial[w][lane * 2];
+      o1 += smem_partial[w][lane * 2 + 1];
+    }
+    const int32_t dst_slot =
+        state_indices[request * s.si_req + t * s.si_tok];
+    const float o_v0 = dst_slot >= 0 ? o0 : 0.0f;
+    const float o_v1 = dst_slot >= 0 ? o1 : 0.0f;
+    out[(bos + t) * s.out_t + hv * s.out_h + lane * 2] =
+        static_cast<scalar_t>(o_v0);
+    out[(bos + t) * s.out_t + hv * s.out_h + lane * 2 + 1] =
+        static_cast<scalar_t>(o_v1);
+    __syncthreads();
   }
 }
 
@@ -2307,6 +2604,145 @@ torch::Tensor fused_sigmoid_gating_delta_rule_gfx906_mtp_update(
   const int64_t total = requests * kv_heads * value_dim;
   const int blocks = static_cast<int>((total + threads - 1) / threads);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+  // Warp-cooperative path (see the v2 kernel above). Falls back to the serial
+  // per-column kernel for shapes it does not cover or when explicitly
+  // disabled via VLLM_GFX906_GDN_MTP_V2=0.
+  static const bool mtp_v2_enabled = [] {
+    const char* env = std::getenv("VLLM_GFX906_GDN_MTP_V2");
+    return env == nullptr || std::atoi(env) != 0;
+  }();
+  // v2 targets the transposed state pool ([slot][head][key][value] with v
+  // contiguous); other layouts fall back to the generic serial kernel.
+  const bool mtp_v2_shape_ok =
+      key_dim == 128 && value_dim == 128 && max_query_len <= 4 &&
+      kv_heads % heads == 0 && q.stride(3) == 1 && k.stride(3) == 1 &&
+      v.stride(3) == 1 && state.stride(2) == 1 &&
+      state.stride(3) == value_dim && a_view.stride(1) == 1 &&
+      b_view.stride(1) == 1;
+  static const bool mtp_v2_debug = [] {
+    const char* env = std::getenv("VLLM_GFX906_GDN_MTP_V2_DEBUG");
+    return env != nullptr && std::atoi(env) != 0;
+  }();
+  if (mtp_v2_debug) {
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      std::fprintf(
+          stderr,
+          "GFX906_MTP_V2 %s: key_dim=%ld value_dim=%ld maxq=%ld kv_heads=%ld "
+          "heads=%ld q_s3=%ld k_s3=%ld v_s3=%ld state_s3=%ld state_s2=%ld "
+          "a_s1=%ld b_s1=%ld\n",
+          (mtp_v2_enabled && mtp_v2_shape_ok) ? "HIT" : "MISS",
+          static_cast<long>(key_dim), static_cast<long>(value_dim),
+          static_cast<long>(max_query_len), static_cast<long>(kv_heads),
+          static_cast<long>(heads), static_cast<long>(q.stride(3)),
+          static_cast<long>(k.stride(3)), static_cast<long>(v.stride(3)),
+          static_cast<long>(state.stride(3)),
+          static_cast<long>(state.stride(2)),
+          static_cast<long>(a_view.stride(1)),
+          static_cast<long>(b_view.stride(1)));
+    }
+  }
+  if (mtp_v2_enabled && mtp_v2_shape_ok) {
+    // Optional per-call CUDA-event timing (VLLM_GFX906_GDN_MTP_V2_TIME=1):
+    // drains a 64-call-old event ring so the sync never stalls the GPU.
+    static const bool mtp_v2_time = [] {
+      const char* env = std::getenv("VLLM_GFX906_GDN_MTP_V2_TIME");
+      return env != nullptr && std::atoi(env) != 0;
+    }();
+    constexpr int kEventRing = 128;
+    static cudaEvent_t time_start[kEventRing];
+    static cudaEvent_t time_stop[kEventRing];
+    static bool time_events_ready = false;
+    static int time_ring_idx = 0;
+    static int time_calls = 0;
+    static double time_total_ms = 0.0;
+    static int time_samples = 0;
+    if (mtp_v2_time && !time_events_ready) {
+      for (int i = 0; i < kEventRing; ++i) {
+        cudaEventCreate(&time_start[i]);
+        cudaEventCreate(&time_stop[i]);
+      }
+      time_events_ready = true;
+    }
+    if (mtp_v2_time) {
+      cudaEventRecord(time_start[time_ring_idx], stream);
+    }
+    GdnMtpV2Strides strides;
+    strides.q_t = q.stride(1);
+    strides.q_h = q.stride(2);
+    strides.k_t = k.stride(1);
+    strides.k_h = k.stride(2);
+    strides.v_t = v.stride(1);
+    strides.v_h = v.stride(2);
+    strides.a_t = a_view.stride(0);
+    strides.a_h = a_view.stride(1);
+    strides.b_t = b_view.stride(0);
+    strides.b_h = b_view.stride(1);
+    strides.state_slot = state.stride(0);
+    strides.state_h = state.stride(1);
+    strides.out_t = out.stride(0);
+    strides.out_h = out.stride(1);
+    strides.si_req = state_indices.stride(0);
+    strides.si_tok = state_indices.stride(1);
+    const dim3 v2_grid(static_cast<unsigned>(kv_heads),
+                       static_cast<unsigned>(requests));
+#define VLLM_GFX906_MTP_V2_LAUNCH(STATE_TYPE, ACCEPTED_TYPE)              \
+  VLLM_DISPATCH_HALF_TYPES(                                              \
+      q.scalar_type(),                                                   \
+      "fused_sigmoid_gating_delta_rule_gfx906_mtp_v2", [&] {             \
+        fused_sigmoid_gating_delta_rule_gfx906_mtp_v2_kernel<            \
+            scalar_t, STATE_TYPE, ACCEPTED_TYPE>                         \
+            <<<v2_grid, 256, 0, stream>>>(                               \
+                A_log.data_ptr<scalar_t>(),                              \
+                a_view.data_ptr<scalar_t>(),                             \
+                b_view.data_ptr<scalar_t>(),                             \
+                dt_bias.data_ptr<scalar_t>(), q.data_ptr<scalar_t>(),    \
+                k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),          \
+                state.data_ptr<STATE_TYPE>(),                            \
+                state_indices.data_ptr<int32_t>(),                       \
+                cu_seqlens.data_ptr<int32_t>(),                          \
+                num_accepted_tokens.data_ptr<ACCEPTED_TYPE>(),           \
+                out.data_ptr<scalar_t>(), max_query_len, heads, beta,    \
+                threshold, scale, use_qk_l2norm_in_kernel, strides);     \
+      })
+    if (num_accepted_tokens.scalar_type() == at::ScalarType::Long) {
+      if (state.scalar_type() == at::ScalarType::Float) {
+        VLLM_GFX906_MTP_V2_LAUNCH(float, int64_t);
+      } else if (state.scalar_type() == at::ScalarType::Half) {
+        VLLM_GFX906_MTP_V2_LAUNCH(at::Half, int64_t);
+      } else {
+        VLLM_GFX906_MTP_V2_LAUNCH(at::BFloat16, int64_t);
+      }
+    } else if (state.scalar_type() == at::ScalarType::Float) {
+      VLLM_GFX906_MTP_V2_LAUNCH(float, int32_t);
+    } else if (state.scalar_type() == at::ScalarType::Half) {
+      VLLM_GFX906_MTP_V2_LAUNCH(at::Half, int32_t);
+    } else {
+      VLLM_GFX906_MTP_V2_LAUNCH(at::BFloat16, int32_t);
+    }
+#undef VLLM_GFX906_MTP_V2_LAUNCH
+    if (mtp_v2_time) {
+      cudaEventRecord(time_stop[time_ring_idx], stream);
+      time_ring_idx = (time_ring_idx + 1) % kEventRing;
+      ++time_calls;
+      if (time_calls % 64 == 0) {
+        for (int j = 0; j < 64; ++j) {
+          const int drained =
+              (time_ring_idx + kEventRing - 64 + j) % kEventRing;
+          cudaEventSynchronize(time_stop[drained]);
+          float ms = 0.0f;
+          cudaEventElapsedTime(&ms, time_start[drained], time_stop[drained]);
+          time_total_ms += ms;
+          ++time_samples;
+        }
+        std::fprintf(stderr, "GFX906_MTP_V2_TIME avg %.1f us over %d calls\n",
+                     time_total_ms * 1000.0 / time_samples, time_samples);
+      }
+    }
+    return out;
+  }
 
 #define VLLM_GFX906_MTP_LAUNCH(STATE_TYPE, ACCEPTED_TYPE)               \
   VLLM_DISPATCH_HALF_TYPES(                                             \
