@@ -550,6 +550,7 @@ class EngineArgs:
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
+    gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
@@ -1138,6 +1139,12 @@ class EngineArgs:
         )
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
+        )
+        vllm_group.add_argument(
+            "--gdn-prefill-backend",
+            choices=["flashinfer", "triton"],
+            default=None,
+            help="Select the GDN prefill backend.",
         )
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
@@ -1750,6 +1757,10 @@ class EngineArgs:
             compilation_config.max_cudagraph_capture_size = (
                 self.max_cudagraph_capture_size
             )
+        additional_config = dict(self.additional_config)
+        if self.gdn_prefill_backend is not None:
+            additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1765,7 +1776,7 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             ec_transfer_config=self.ec_transfer_config,
-            additional_config=self.additional_config,
+            additional_config=additional_config,
             optimization_level=self.optimization_level,
         )
 
