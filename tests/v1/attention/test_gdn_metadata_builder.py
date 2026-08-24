@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import Mock
+
 import torch
 from transformers import LlamaConfig
 
@@ -16,6 +18,23 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+def test_decode_does_not_transfer_context_lens():
+    builder = object.__new__(GDNAttentionMetadataBuilder)
+    builder.use_spec_decode = False
+    builder.use_full_cuda_graph = False
+
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[1, 1])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    context_lens_to = Mock(wraps=common.num_computed_tokens_cpu.to)
+    common.num_computed_tokens_cpu.to = context_lens_to
+
+    meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    context_lens_to.assert_not_called()
+    assert meta.num_prefills == 0
+    assert meta.has_initial_state is None
 
 
 def test_full_cudagraph_spec_metadata_uses_request_count(tmp_path):

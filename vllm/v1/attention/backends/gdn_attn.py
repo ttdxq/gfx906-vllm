@@ -145,8 +145,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
-        context_lens = m.num_computed_tokens_cpu
-        context_lens_tensor = context_lens.to(query_start_loc.device)
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
 
         if (
@@ -252,6 +250,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_state_indices = None
         prefill_has_initial_state = None
         if num_prefills > 0:
+            context_lens_tensor = m.num_computed_tokens_cpu.to(query_start_loc.device)
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks]
