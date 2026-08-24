@@ -558,6 +558,227 @@ static void mul_mat_vec_q5_K_q8_1_col2560_cuda(const void * vx, const void * vy,
         vx, vy, dst, nrows, nvecs, stream, dst_stride);
 }
 
+#if defined(USE_ROCM)
+// Software-pipelined q5_K fixed-cols variant. Same mapping, same math and same
+// accumulation order as mul_mat_vec_q5_K_q8_1_fixed_cols above (bit-exact
+// output), but each thread issues the next iteration's weight loads before
+// running the unpack/dot math of the current one, keeping more HBM requests in
+// flight. Measured on gfx906: 454 -> 604 GB/s on the 5120x17408 shape
+// (docs gemv-plateau/bench3). All fragment state is held in named scalar
+// registers behind reference-inline helpers; struct-by-value returns spill on
+// gfx906 and must not be reintroduced.
+struct Gfx906Q5KWtFrag {
+    int ql0, ql1;
+    int qh0w, qh1w;  // raw qh words, bq8_offset shift applied in compute
+    int sw0, sw1, sw2;  // scales[0..11]
+    half2 dm;
+};
+
+struct Gfx906Q5KActFrag {
+    int u0, u1, u2, u3;  // u[2*i + {0,1}] for i = 0, 1
+    float d80, d81;
+};
+
+static __device__ __forceinline__ void gfx906_q5k_ld_wt(
+    Gfx906Q5KWtFrag & f, const block_q5_K * __restrict__ bq,
+    const int iqs, const int bq8_offset) {
+    const int * ql = (const int *)(bq->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int * qh = (const int *)(bq->qh + 4 * ((iqs/2)%4));
+    f.ql0 = ql[0];
+    f.ql1 = ql[4];
+    f.qh0w = qh[0];
+    f.qh1w = qh[4];
+    f.sw0 = *(const int *)&bq->scales[0];
+    f.sw1 = *(const int *)&bq->scales[4];
+    f.sw2 = *(const int *)&bq->scales[8];
+    f.dm = bq->dm;
+}
+
+static __device__ __forceinline__ void gfx906_q5k_ld_act(
+    Gfx906Q5KActFrag & f, const block_q8_1 * __restrict__ y,
+    const int vec, const int q8_blocks_per_vec, const int i,
+    const int bq8_offset, const int iqs) {
+    const block_q8_1 * yb = y + vec * q8_blocks_per_vec + i * (QK_K / QK8_1) + bq8_offset;
+    f.d80 = __low2float(yb[0].ds);
+    f.d81 = __low2float(yb[1].ds);
+    const int * q8a = (const int *)yb[0].qs + ((iqs/2)%4);
+    const int * q8b = (const int *)yb[1].qs + ((iqs/2)%4);
+    f.u0 = q8a[0];
+    f.u1 = q8a[4];
+    f.u2 = q8b[0];
+    f.u3 = q8b[4];
+}
+
+// Scalar re-derivation of the 6-bit scale/min bytes; must stay value-identical
+// to the uint16 path in vec_dot_q5_K_q8_1 / mmvq_prepare_q5_K.
+static __device__ __forceinline__ void gfx906_q5k_scales(
+    const Gfx906Q5KWtFrag & f, const int bq8_offset,
+    int & sc0, int & sc1, int & m0, int & m1) {
+    const unsigned s0 = (unsigned)f.sw0 & 0xffffu;
+    const unsigned s1 = ((unsigned)f.sw0 >> 16) & 0xffffu;
+    const unsigned s2 = (unsigned)f.sw1 & 0xffffu;
+    const unsigned s3 = ((unsigned)f.sw1 >> 16) & 0xffffu;
+    const unsigned s4 = (unsigned)f.sw2 & 0xffffu;
+    const unsigned s5 = ((unsigned)f.sw2 >> 16) & 0xffffu;
+    unsigned a0, a1;
+    const int j = bq8_offset / 2;
+    if (j < 2) {
+        const unsigned sa = j == 0 ? s0 : s1;
+        const unsigned sb = j == 0 ? s2 : s3;
+        a0 = sa & 0x3f3fu;
+        a1 = sb & 0x3f3fu;
+    } else {
+        const unsigned sh = j == 2 ? s4 : s5;
+        const unsigned sl = j == 2 ? s0 : s1;
+        const unsigned sm = j == 2 ? s2 : s3;
+        a0 = (sh & 0x0f0fu) | ((sl & 0xc0c0u) >> 2);
+        a1 = ((sh >> 4) & 0x0f0fu) | ((sm & 0xc0c0u) >> 2);
+    }
+    sc0 = (int)(a0 & 0xffu);
+    sc1 = (int)((a0 >> 8) & 0xffu);
+    m0 = (int)(a1 & 0xffu);
+    m1 = (int)((a1 >> 8) & 0xffu);
+}
+
+static __device__ __forceinline__ float gfx906_q5k_comp(
+    const Gfx906Q5KWtFrag & f, const int bq8_offset,
+    const int u0, const int u1, const int u2, const int u3,
+    const float d80, const float d81) {
+    int sc0, sc1, m0, m1;
+    gfx906_q5k_scales(f, bq8_offset, sc0, sc1, m0, m1);
+    const int vh0 = f.qh0w >> bq8_offset;
+    const int vh1 = f.qh1w >> bq8_offset;
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+    const int v0_0 = ((f.ql0 >> 0) & 0x0F0F0F0F) | (((vh0 >> 0) << 4) & 0x10101010);
+    const int v1_0 = ((f.ql1 >> 0) & 0x0F0F0F0F) | (((vh1 >> 0) << 4) & 0x10101010);
+    const int v0_1 = ((f.ql0 >> 4) & 0x0F0F0F0F) | (((vh0 >> 1) << 4) & 0x10101010);
+    const int v1_1 = ((f.ql1 >> 4) & 0x0F0F0F0F) | (((vh1 >> 1) << 4) & 0x10101010);
+    const int d0 = __dp4a(v0_0, u0, __dp4a(v1_0, u1, 0));
+    const int e0 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
+    const int d1 = __dp4a(v0_1, u2, __dp4a(v1_1, u3, 0));
+    const int e1 = __dp4a(0x01010101, u2, __dp4a(0x01010101, u3, 0));
+    sumf_d += d80 * (d0 * sc0);
+    sumf_m += d80 * (e0 * m0);
+    sumf_d += d81 * (d1 * sc1);
+    sumf_m += d81 * (e1 * m1);
+    const float2 dm5f = __half22float2(f.dm);
+    return dm5f.x*sumf_d - dm5f.y*sumf_m;
+}
+
+template <typename scalar_t, int ncols, bool PREPARED = false>
+static __global__ void mul_mat_vec_q5_K_q8_1_fixed_cols_pipe(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    scalar_t * __restrict__ dst, const int nrows, const int nvecs,
+    const int dst_stride) {
+    constexpr int blocks_per_row = ncols / QK_K;
+    constexpr int q8_blocks_per_vec = ncols / QK8_1;
+    constexpr int blocks_per_warp = VDR_Q5_K_Q8_1_MMVQ * BLOCK_SIZE / QI5_K;
+
+    const int row = blockIdx.x;
+    const bool combine_vecs = gguf_mmvq_combine_vecs(nvecs);
+    const int first_vec = combine_vecs ? 0 : blockIdx.y;
+    const int vec_count = combine_vecs ? nvecs : 1;
+    if (row >= nrows || first_vec >= nvecs) {
+        return;
+    }
+
+    const block_q5_K * x = (const block_q5_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const int iqs = VDR_Q5_K_Q8_1_MMVQ * (threadIdx.x % (QI5_K / VDR_Q5_K_Q8_1_MMVQ));
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+    const int i0 = threadIdx.x / (QI5_K / VDR_Q5_K_Q8_1_MMVQ);
+
+    // Only the weight fragment is software-pipelined: weights stream from HBM
+    // while activations are L2-hot, and double-buffering them too measurably
+    // regresses short-row shapes (bpr <= 24) on gfx906.
+    Gfx906Q5KWtFrag wa, wb;
+    bool have_a = i0 < blocks_per_row;
+    if (have_a) {
+        gfx906_q5k_ld_wt(wa, &x[row * blocks_per_row + i0], iqs, bq8_offset);
+    }
+    int i = i0;
+    while (have_a) {
+        const int in = i + blocks_per_warp;
+        const bool have_b = in < blocks_per_row;
+        if (have_b) {
+            gfx906_q5k_ld_wt(wb, &x[row * blocks_per_row + in], iqs, bq8_offset);
+        }
+#pragma unroll
+        for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+            if (vec_offset >= vec_count) {
+                break;
+            }
+            Gfx906Q5KActFrag af;
+            gfx906_q5k_ld_act(af, y, first_vec + vec_offset, q8_blocks_per_vec, i, bq8_offset, iqs);
+            tmp[vec_offset] += gfx906_q5k_comp(wa, bq8_offset, af.u0, af.u1, af.u2, af.u3, af.d80, af.d81);
+        }
+        i = in;
+        wa = wb;
+        have_a = have_b;
+    }
+
+    constexpr int warp_size = WARP_SIZE;
+    constexpr int num_warps = BLOCK_SIZE / warp_size;
+#pragma unroll
+    for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+#pragma unroll
+        for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+            if (vec_offset >= vec_count) {
+                break;
+            }
+            tmp[vec_offset] += VLLM_SHFL_XOR_SYNC(tmp[vec_offset], mask);
+        }
+    }
+
+    if constexpr (num_warps == 1) {
+        if (threadIdx.x == 0) {
+#pragma unroll
+            for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+                if (vec_offset >= vec_count) {
+                    break;
+                }
+                dst[(first_vec + vec_offset)*dst_stride + row] = tmp[vec_offset];
+            }
+        }
+    } else {
+        const int lane = threadIdx.x % warp_size;
+        const int warp = threadIdx.x / warp_size;
+        __shared__ float shared_sum[num_warps];
+        if (lane == 0) {
+            shared_sum[warp] = tmp[0];
+        }
+        __syncthreads();
+        if (warp != 0) {
+            return;
+        }
+        tmp[0] = lane < num_warps ? shared_sum[lane] : 0.0f;
+#pragma unroll
+        for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+            tmp[0] += VLLM_SHFL_XOR_SYNC(tmp[0], mask);
+        }
+        if (lane == 0) {
+            dst[first_vec*dst_stride + row] = tmp[0];
+        }
+    }
+}
+
+template<typename scalar_t, int ncols>
+static void mul_mat_vec_q5_K_q8_1_fixed_cols_pipe_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    const dim3 block_nums(nrows, gguf_mmvq_grid_vecs(nvecs), 1);
+    const dim3 block_dims(BLOCK_SIZE, 1, 1);
+    if (nvecs >= 2) {
+        mul_mat_vec_q5_K_q8_1_fixed_cols_pipe<scalar_t, ncols, true>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+    } else {
+        mul_mat_vec_q5_K_q8_1_fixed_cols_pipe<scalar_t, ncols, false>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+    }
+}
+#endif  // USE_ROCM
+
 template<typename scalar_t>
 static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;

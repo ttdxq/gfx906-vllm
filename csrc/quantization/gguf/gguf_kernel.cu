@@ -718,6 +718,30 @@ static bool q5_k_fixed_cols_fast_enabled() {
   return enabled;
 }
 
+static bool q5_k_pipe_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q5_K_PIPE");
+    if (env != nullptr) {
+      return env[0] != '0';
+    }
+#if defined(USE_ROCM)
+    const auto* properties = at::cuda::getCurrentDeviceProperties();
+    return std::string(properties->gcnArchName).find("gfx906") == 0;
+#else
+    return false;
+#endif
+  }();
+  return enabled;
+}
+
+static bool q5_k_pipe_debug() {
+  static const bool debug = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q5_K_PIPE_DEBUG");
+    return env != nullptr;
+  }();
+  return debug;
+}
+
 static bool q6_k_fixed_cols_fast_enabled() {
   static const bool enabled = [] {
     const char* env = std::getenv("VLLM_GGUF_Q6_K_FIXED_COLS_FAST");
@@ -869,8 +893,20 @@ static void ggml_mul_mat_vec_q8_dispatch(
         switch (col) {
           case 5120:
             if (q5_k_5120_6144_fast) {
-              mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
-                  W, quant_X, dst, row, vecs, stream, dst_stride);
+              if (q5_k_pipe_enabled()) {
+            if (q5_k_pipe_debug()) {
+              static std::once_flag once;
+              std::call_once(once, [row, vecs] {
+                fprintf(stderr, "GFX906_Q5K_PIPE HIT ncols=%d rows=%d vecs=%d\n",
+                        5120, row, vecs);
+              });
+            }
+            mul_mat_vec_q5_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 5120>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+          } else {
+            mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+          }
             } else {
               mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
                   W, quant_X, dst, col, row, vecs, stream, dst_stride);
@@ -878,20 +914,56 @@ static void ggml_mul_mat_vec_q8_dispatch(
             break;
           case 6144:
             if (q5_k_5120_6144_fast) {
-              mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 6144>(
-                  W, quant_X, dst, row, vecs, stream, dst_stride);
+              if (q5_k_pipe_enabled()) {
+            if (q5_k_pipe_debug()) {
+              static std::once_flag once;
+              std::call_once(once, [row, vecs] {
+                fprintf(stderr, "GFX906_Q5K_PIPE HIT ncols=%d rows=%d vecs=%d\n",
+                        6144, row, vecs);
+              });
+            }
+            mul_mat_vec_q5_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 6144>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+          } else {
+            mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 6144>(
+                W, quant_X, dst, row, vecs, stream, dst_stride);
+          }
             } else {
               mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
                   W, quant_X, dst, col, row, vecs, stream, dst_stride);
             }
             break;
           case 9216:
-            mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 9216>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q5_k_pipe_enabled()) {
+              if (q5_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q5K_PIPE HIT ncols=%d rows=%d vecs=%d\n",
+                          9216, row, vecs);
+                });
+              }
+              mul_mat_vec_q5_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 9216>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 9216>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           case 17408:
-            mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 17408>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q5_k_pipe_enabled()) {
+              if (q5_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q5K_PIPE HIT ncols=%d rows=%d vecs=%d\n",
+                          17408, row, vecs);
+                });
+              }
+              mul_mat_vec_q5_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 17408>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q5_K_q8_1_fixed_cols_cuda<scalar_t, 17408>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           default:
             mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
