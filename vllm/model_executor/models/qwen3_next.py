@@ -12,7 +12,7 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
-from vllm.attention.backends.abstract import AttentionMetadata
+from vllm.attention.backends.abstract import AttentionMetadata, AttentionType
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
@@ -1336,6 +1336,11 @@ class Qwen3NextAttention(nn.Module):
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
 
+        attn_type = (
+            AttentionType.DECODER
+            if getattr(config, "is_causal", True)
+            else AttentionType.ENCODER_ONLY
+        )
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -1344,6 +1349,7 @@ class Qwen3NextAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            attn_type=attn_type,
             **{
                 "layer_idx": extract_layer_index(prefix),
                 "dual_chunk_attention_config": self.dual_chunk_attention_config,

@@ -274,6 +274,45 @@ class Qwen3_5ForCausalLMConfig(Qwen3_5ForConditionalGenerationConfig):
             logger.info("Using qwen3_5 reasoning parser for Qwen3.5 GGUF model.")
 
 
+class ColQwen3_5Config(Qwen3_5ForConditionalGenerationConfig):
+    """Apply the retrieval attention contract declared by the checkpoint."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+        model_config = vllm_config.model_config
+        configs = {
+            id(config): config
+            for config in (model_config.hf_config, model_config.hf_text_config)
+        }
+        declarations = [
+            contract
+            for config in configs.values()
+            if (contract := getattr(config, "retrieval_attention_contract", None))
+            is not None
+        ]
+        supported = {"causal", "bidirectional"}
+        if not declarations:
+            raise ValueError(
+                "ColQwen3.5 checkpoints must declare "
+                "retrieval_attention_contract as 'causal' or 'bidirectional'"
+            )
+        if (
+            any(not isinstance(contract, str) for contract in declarations)
+            or any(contract not in supported for contract in declarations)
+            or len(set(declarations)) != 1
+        ):
+            raise ValueError(
+                "unsupported or conflicting ColQwen3.5 "
+                f"retrieval_attention_contract declarations: {declarations!r}"
+            )
+
+        is_causal = declarations[0] == "causal"
+        for config in configs.values():
+            config.is_causal = is_causal
+
+
 class JinaVLForSequenceClassificationConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -572,6 +611,7 @@ class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
 
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
+    "ColQwen3_5": ColQwen3_5Config,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewModel": GteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,

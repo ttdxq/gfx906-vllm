@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Math utility functions for vLLM."""
 
+# Best FP32 approximation of 1 / ln(2), used for log/exp base conversion.
+RCP_LN2 = 1.4426950216
+
 
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""

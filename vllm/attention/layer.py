@@ -407,10 +407,12 @@ class Attention(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Block size may get updated after model loading, refresh it
         block_size = vllm_config.cache_config.block_size
-        # Should not be called for enc-dec or encoder-only attention.
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return None
+        # Should not be called for encoder-decoder attention.
         assert self.attn_type == AttentionType.DECODER
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
