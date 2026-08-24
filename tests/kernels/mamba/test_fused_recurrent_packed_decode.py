@@ -1,5 +1,7 @@
+import pytest
 import torch
 
+import vllm.model_executor.layers.fla.ops.fused_recurrent as fused_recurrent_ops
 from vllm.model_executor.layers.fla.ops.fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
@@ -117,6 +119,51 @@ def _packed_decode_transposed_state_ref(
             state[head_idx] = state_head
         final_state[state_idx] = state.to(final_state.dtype)
     return output, final_state
+
+
+@pytest.mark.parametrize(
+    ("batch", "heads", "value_heads"),
+    [
+        pytest.param(2, 2, 4, id="unsplit-grid"),
+        pytest.param(1024, 8, 64, id="split-grid"),
+    ],
+)
+def test_packed_decode_batch_head_grid(
+    monkeypatch: pytest.MonkeyPatch,
+    batch: int,
+    heads: int,
+    value_heads: int,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("Need CUDA device")
+
+    monkeypatch.setattr(fused_recurrent_ops, "_is_gfx906_rocm", lambda: False)
+    device = torch.device("cuda")
+    key_dim = value_dim = 1
+    gates = torch.zeros((batch, value_heads), device=device)
+    params = torch.zeros((value_heads,), device=device)
+    out = torch.full(
+        (batch, 1, value_heads, value_dim),
+        torch.nan,
+        device=device,
+    )
+
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=torch.zeros(
+            (batch, 2 * heads * key_dim + value_heads * value_dim),
+            device=device,
+        ),
+        a=gates,
+        b=gates,
+        A_log=params,
+        dt_bias=params,
+        scale=1.0,
+        initial_state=torch.zeros((1, value_heads, value_dim, key_dim), device=device),
+        out=out,
+        ssm_state_indices=torch.full((batch,), -1, device=device, dtype=torch.int32),
+    )
+
+    assert torch.count_nonzero(out).item() == 0
 
 
 def test_gfx906_packed_decode_matches_reference():
