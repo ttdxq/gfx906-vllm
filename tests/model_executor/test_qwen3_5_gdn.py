@@ -322,6 +322,63 @@ def test_qwen3_5_split_gdn_calls_core_with_b_then_a(monkeypatch):
     assert torch.equal(captured["a"], a)
 
 
+def test_qwen3_5_quantized_gdn_reuses_shared_core():
+    assert issubclass(Qwen3_5GatedDeltaNet, GatedDeltaNetAttention)
+    assert GatedDeltaNetAttention._uses_transposed_temporal_state(
+        SimpleNamespace(use_transposed_state_for_packed_decode=False)
+    ) is False
+
+
+def test_shared_gdn_forwards_packed_decode_layout_policy(monkeypatch):
+    module = object.__new__(GatedDeltaNetAttention)
+    torch.nn.Module.__init__(module)
+    module.kv_cache = (
+        torch.zeros((1, 1, 1)),
+        torch.zeros((1, 1, 1, 1)),
+    )
+    module.conv1d = SimpleNamespace(weight=torch.ones((1, 1, 1)), bias=None)
+    module.activation = "silu"
+    module.A_log = torch.zeros(1)
+    module.dt_bias = torch.zeros(1)
+    module.head_k_dim = 1
+    module.enable_combined_packed_decode = True
+    module.use_qk_l2norm_in_kernel_for_gdn = False
+    module.use_transposed_state_for_packed_decode = True
+    module._use_tiled_qk_head_mapping_for_packed_decode = lambda: True
+
+    monkeypatch.setattr(
+        gdn_linear_attn,
+        "get_forward_context",
+        lambda: SimpleNamespace(virtual_engine=0),
+    )
+    captured = {}
+
+    def fake_combined_decode(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        gdn_linear_attn,
+        "causal_conv1d_recurrent_gated_delta_rule_packed_decode",
+        fake_combined_decode,
+    )
+
+    metadata = SimpleNamespace(
+        non_spec_state_indices_tensor=torch.tensor([0], dtype=torch.int32),
+        num_actual_tokens=1,
+    )
+    module._forward_core_decode_non_spec(
+        mixed_qkv=torch.zeros((1, 1)),
+        b=torch.zeros((1, 1)),
+        a=torch.zeros((1, 1)),
+        core_attn_out=torch.empty((1, 1, 1)),
+        attn_metadata=metadata,
+    )
+
+    assert captured["use_qk_l2norm_in_kernel"] is False
+    assert captured["use_tiled_qk_head_mapping"] is True
+    assert captured["use_transposed_state"] is True
+
+
 def test_shared_gdn_calls_registered_core_op(monkeypatch):
     module = object.__new__(GatedDeltaNetAttention)
     torch.nn.Module.__init__(module)
@@ -525,10 +582,12 @@ def _run_speculative_gate_selection(
         tp_size=1,
         head_k_dim=1,
         head_v_dim=1,
+        _expand_qk_heads_for_gdn=lambda query, key: (query, key),
         chunk_gated_delta_rule=lambda **kwargs: (
             kwargs["q"].transpose(1, 2),
             torch.zeros((1, 1, 1)),
         ),
+        _uses_transposed_temporal_state=lambda: False,
     )
     mixed_qkv = torch.arange(num_tokens, dtype=torch.float32).unsqueeze(1)
     a = torch.arange(10, 10 + num_tokens, dtype=torch.float32).unsqueeze(1)

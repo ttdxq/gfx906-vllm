@@ -266,6 +266,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         vllm_config: VllmConfig,
         prefix: str = "",
         create_in_proj_qkvz: bool = True,
+        create_in_proj_ba: bool = True,
         gqa_interleaved_layout=False,
     ) -> None:
         super().__init__()
@@ -329,12 +330,28 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj_z",
             )
-        self.in_proj_ba = self.create_ba_proj(
-            hidden_size=self.hidden_size,
-            num_v_heads=self.num_v_heads,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_ba",
-        )
+        if create_in_proj_ba:
+            self.in_proj_ba = self.create_ba_proj(
+                hidden_size=self.hidden_size,
+                num_v_heads=self.num_v_heads,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_ba",
+            )
+        else:
+            self.in_proj_b = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.num_v_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_b",
+            )
+            self.in_proj_a = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.num_v_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_a",
+            )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -395,6 +412,9 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 "yes",
                 "on",
             }
+        # Quantized split-projection models opt into the gfx906 KxV packed
+        # state layout explicitly. Keep the shared Qwen3Next path conservative.
+        self.use_transposed_state_for_packed_decode = False
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -504,6 +524,19 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         )
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
+
+    def _use_tiled_qk_head_mapping_for_packed_decode(self) -> bool:
+        return False
+
+    def _expand_qk_heads_for_gdn(
+        self,
+        query: torch.Tensor | None,
+        key: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return query, key
+
+    def _uses_transposed_temporal_state(self) -> bool:
+        return self.use_transposed_state_for_packed_decode
 
     def _can_use_empty_core_attn_out(self, num_tokens: int) -> bool:
         if not ENABLE_QWEN35_EMPTY_CORE_ATTN_OUT:
@@ -839,6 +872,15 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             else:
                 query_non_spec = key_non_spec = value_non_spec = None
 
+        query_spec, key_spec = self._expand_qk_heads_for_gdn(query_spec, key_spec)
+        query_decode, key_decode = self._expand_qk_heads_for_gdn(
+            query_decode, key_decode
+        )
+        if attn_metadata.num_prefills == 0:
+            query_non_spec, key_non_spec = self._expand_qk_heads_for_gdn(
+                query_non_spec, key_non_spec
+            )
+
         g_non_spec: torch.Tensor | None = None
         beta_non_spec: torch.Tensor | None = None
 
@@ -878,6 +920,9 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
             value_non_spec = value_non_spec.unsqueeze(0)
+            query_non_spec, key_non_spec = self._expand_qk_heads_for_gdn(
+                query_non_spec, key_non_spec
+            )
             g_non_spec = g_non_spec.unsqueeze(0)
             beta_non_spec = beta_non_spec.unsqueeze(0)
 
@@ -940,11 +985,10 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 else:
                     a_non_spec = a
                     b_non_spec = b
-                initial_state = (
-                    ssm_state[prefill_state_indices]
-                    .transpose(-1, -2)
-                    .contiguous()
-                )
+                initial_state = ssm_state[prefill_state_indices]
+                if self._uses_transposed_temporal_state():
+                    initial_state = initial_state.transpose(-1, -2)
+                initial_state = initial_state.contiguous()
                 initial_state[~prefill_has_initial_state, ...] = 0
                 if _gdn_runtime_debug_enabled():
                     _append_gdn_runtime_debug(
@@ -966,9 +1010,11 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     ssm_state_indices=None,
                     use_qk_l2norm_in_kernel=False,
                 )
-                ssm_state[prefill_state_indices] = last_recurrent_state.transpose(
-                    -1, -2
-                ).to(ssm_state.dtype)
+                if self._uses_transposed_temporal_state():
+                    last_recurrent_state = last_recurrent_state.transpose(-1, -2)
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
             else:
                 assert g_non_spec is not None
                 assert beta_non_spec is not None
@@ -1099,7 +1145,13 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     ssm_state_indices=state_indices,
                     pad_slot_id=PAD_SLOT_ID,
                     silu_activation=self.activation in ("silu", "swish"),
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=getattr(
+                        self, "use_qk_l2norm_in_kernel_for_gdn", True
+                    ),
+                    use_tiled_qk_head_mapping=(
+                        self._use_tiled_qk_head_mapping_for_packed_decode()
+                    ),
+                    use_transposed_state=self._uses_transposed_temporal_state(),
                 )
                 return
             except (AttributeError, RuntimeError) as exc:
@@ -1135,7 +1187,13 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             initial_state=ssm_state,
             out=out_buf,
             ssm_state_indices=state_indices,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=getattr(
+                self, "use_qk_l2norm_in_kernel_for_gdn", True
+            ),
+            use_tiled_qk_head_mapping=(
+                self._use_tiled_qk_head_mapping_for_packed_decode()
+            ),
+            use_transposed_state=self._uses_transposed_temporal_state(),
         )
 
 

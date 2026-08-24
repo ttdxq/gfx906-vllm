@@ -60,7 +60,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.gguf import (
     try_gguf_rms_norm_gated_out_proj_mmvq,
     try_grouped_gguf_linear_mmvq,
@@ -232,32 +231,32 @@ class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
         return self.ctx.get_hf_config((Qwen3_5MoeConfig, Qwen3_5MoeTextConfig))
 
 
-class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
+class Qwen3_5GatedDeltaNet(GatedDeltaNetAttention):
     def __init__(
         self,
         config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig,
-        model_config=None,
-        cache_config=None,
-        quant_config: QuantizationConfig | None = None,
-        speculative_config=None,
+        vllm_config: VllmConfig,
         split_projections: bool = False,
         prefix: str = "",
     ) -> None:
+        self.split_projections = split_projections
         super().__init__(
             config=config,
-            model_config=model_config,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            speculative_config=speculative_config,
+            vllm_config=vllm_config,
             prefix=prefix,
+            create_in_proj_qkvz=not split_projections,
+            create_in_proj_ba=not split_projections,
+            gqa_interleaved_layout=False,
         )
+
         def _env_bool(name: str, default: bool) -> bool:
             raw = os.getenv(name)
             if raw is None:
                 return default
             return raw.lower() in {"1", "true", "yes", "on"}
 
-        self.split_projections = split_projections
+        quant_config = vllm_config.quant_config
+        self.quant_config = quant_config
         capability = current_platform.get_device_capability()
         self._qwen35_is_gfx906_rocm = (
             current_platform.is_rocm()
@@ -300,38 +299,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             "VLLM_QWEN35_TILED_QK_EXPAND", self.split_projections
         )
         self.call_b_first = os.getenv("VLLM_QWEN35_CALL_ORDER", "ba").lower() != "ab"
-        if self.split_projections:
-            del self.in_proj_qkvz
-            del self.in_proj_ba
-            self.in_proj_qkv = MergedColumnParallelLinear(
-                input_size=self.hidden_size,
-                output_sizes=[self.key_dim, self.key_dim, self.value_dim],
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.in_proj_qkv",
-            )
-            self.in_proj_z = ColumnParallelLinear(
-                input_size=self.hidden_size,
-                output_size=self.value_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.in_proj_z",
-            )
-            self.in_proj_b = ColumnParallelLinear(
-                input_size=self.hidden_size,
-                output_size=self.num_v_heads,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.in_proj_b",
-            )
-            self.in_proj_a = ColumnParallelLinear(
-                input_size=self.hidden_size,
-                output_size=self.num_v_heads,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.in_proj_a",
-            )
-        else:
+        self.use_shared_gdn_core = _env_bool("VLLM_QWEN35_SHARED_GDN_CORE", True)
+        if not self.split_projections:
             self.in_proj_qkvz.output_sizes = [
                 self.key_dim,
                 self.key_dim,
@@ -356,6 +325,26 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             "VLLM_QWEN35_GGUF_DEBUG_LAYER", "model.layers.0.linear_attn"
         )
         self._qwen35_gguf_debug_file = os.getenv("VLLM_QWEN35_GGUF_DEBUG_FILE")
+
+    def _forward_core(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ) -> None:
+        if self.use_shared_gdn_core:
+            return GatedDeltaNetAttention._forward_core(
+                self, mixed_qkv, b, a, core_attn_out
+            )
+        return Qwen3NextGatedDeltaNet._forward_core(
+            self, mixed_qkv, b, a, core_attn_out
+        )
+
+    def _forward_core_decode_packed_gfx906(self, *args, **kwargs):
+        return Qwen3NextGatedDeltaNet._forward_core_decode_packed_gfx906(
+            self, *args, **kwargs
+        )
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         capability = current_platform.get_device_capability()
@@ -736,8 +725,6 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        speculative_config = vllm_config.speculative_config
-
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
 
@@ -748,10 +735,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             }:
                 self.linear_attn = Qwen3_5GatedDeltaNet(
                     config,
-                    model_config=model_config,
-                    cache_config=cache_config,
-                    quant_config=quant_config,
-                    speculative_config=speculative_config,
+                    vllm_config=vllm_config,
                     split_projections=True,
                     prefix=f"{prefix}.linear_attn",
                 )
