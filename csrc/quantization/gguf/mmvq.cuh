@@ -611,15 +611,15 @@ static __device__ __forceinline__ void gfx906_q5k_ld_act(
 
 // Scalar re-derivation of the 6-bit scale/min bytes; must stay value-identical
 // to the uint16 path in vec_dot_q5_K_q8_1 / mmvq_prepare_q5_K.
-static __device__ __forceinline__ void gfx906_q5k_scales(
-    const Gfx906Q5KWtFrag & f, const int bq8_offset,
+static __device__ __forceinline__ void gfx906_kq_scales(
+    const int sw0, const int sw1, const int sw2, const int bq8_offset,
     int & sc0, int & sc1, int & m0, int & m1) {
-    const unsigned s0 = (unsigned)f.sw0 & 0xffffu;
-    const unsigned s1 = ((unsigned)f.sw0 >> 16) & 0xffffu;
-    const unsigned s2 = (unsigned)f.sw1 & 0xffffu;
-    const unsigned s3 = ((unsigned)f.sw1 >> 16) & 0xffffu;
-    const unsigned s4 = (unsigned)f.sw2 & 0xffffu;
-    const unsigned s5 = ((unsigned)f.sw2 >> 16) & 0xffffu;
+    const unsigned s0 = (unsigned)sw0 & 0xffffu;
+    const unsigned s1 = ((unsigned)sw0 >> 16) & 0xffffu;
+    const unsigned s2 = (unsigned)sw1 & 0xffffu;
+    const unsigned s3 = ((unsigned)sw1 >> 16) & 0xffffu;
+    const unsigned s4 = (unsigned)sw2 & 0xffffu;
+    const unsigned s5 = ((unsigned)sw2 >> 16) & 0xffffu;
     unsigned a0, a1;
     const int j = bq8_offset / 2;
     if (j < 2) {
@@ -645,7 +645,7 @@ static __device__ __forceinline__ float gfx906_q5k_comp(
     const int u0, const int u1, const int u2, const int u3,
     const float d80, const float d81) {
     int sc0, sc1, m0, m1;
-    gfx906_q5k_scales(f, bq8_offset, sc0, sc1, m0, m1);
+    gfx906_kq_scales(f.sw0, f.sw1, f.sw2, bq8_offset, sc0, sc1, m0, m1);
     const int vh0 = f.qh0w >> bq8_offset;
     const int vh1 = f.qh1w >> bq8_offset;
     float sumf_d = 0.0f;
@@ -777,6 +777,314 @@ static void mul_mat_vec_q5_K_q8_1_fixed_cols_pipe_cuda(const void * vx, const vo
             <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
     }
 }
+
+// ---- q4_K pipe variant (same scheme as the q5_K pipe above) ----
+struct Gfx906Q4KWtFrag {
+    int q0, q1;
+    int sw0, sw1, sw2;
+    half2 dm;
+};
+
+static __device__ __forceinline__ void gfx906_q4k_ld_wt(
+    Gfx906Q4KWtFrag & f, const block_q4_K * __restrict__ bq,
+    const int iqs, const int bq8_offset) {
+    const int * q4 = (const int *)(bq->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    f.q0 = q4[0];
+    f.q1 = q4[4];
+    f.sw0 = *(const int *)&bq->scales[0];
+    f.sw1 = *(const int *)&bq->scales[4];
+    f.sw2 = *(const int *)&bq->scales[8];
+    f.dm = bq->dm;
+}
+
+// activation fragment and loader are shared with q5_K (identical layout)
+
+static __device__ __forceinline__ float gfx906_q4k_comp(
+    const Gfx906Q4KWtFrag & f, const int bq8_offset,
+    const int u0, const int u1, const int u2, const int u3,
+    const float d80, const float d81) {
+    int sc0, sc1, m0, m1;
+    gfx906_kq_scales(f.sw0, f.sw1, f.sw2, bq8_offset, sc0, sc1, m0, m1);
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+    const int v0_0 = (f.q0 >> 0) & 0x0F0F0F0F;
+    const int v1_0 = (f.q1 >> 0) & 0x0F0F0F0F;
+    const int v0_1 = (f.q0 >> 4) & 0x0F0F0F0F;
+    const int v1_1 = (f.q1 >> 4) & 0x0F0F0F0F;
+    const int d0 = __dp4a(v1_0, u1, __dp4a(v0_0, u0, 0));
+    const int e0 = __dp4a(0x01010101, u1, __dp4a(0x01010101, u0, 0));
+    const int d1 = __dp4a(v1_1, u3, __dp4a(v0_1, u2, 0));
+    const int e1 = __dp4a(0x01010101, u3, __dp4a(0x01010101, u2, 0));
+    sumf_d += d80 * (d0 * sc0);
+    sumf_m += d80 * (e0 * m0);
+    sumf_d += d81 * (d1 * sc1);
+    sumf_m += d81 * (e1 * m1);
+    const float2 dm4f = __half22float2(f.dm);
+    return dm4f.x*sumf_d - dm4f.y*sumf_m;
+}
+
+template <typename scalar_t, int ncols, bool PREPARED = false>
+static __global__ void mul_mat_vec_q4_K_q8_1_fixed_cols_pipe(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    scalar_t * __restrict__ dst, const int nrows, const int nvecs,
+    const int dst_stride) {
+    constexpr int blocks_per_row = ncols / QK_K;
+    constexpr int q8_blocks_per_vec = ncols / QK8_1;
+    constexpr int blocks_per_warp = VDR_Q4_K_Q8_1_MMVQ * BLOCK_SIZE / QI4_K;
+
+    const int row = blockIdx.x;
+    const bool combine_vecs = gguf_mmvq_combine_vecs(nvecs);
+    const int first_vec = combine_vecs ? 0 : blockIdx.y;
+    const int vec_count = combine_vecs ? nvecs : 1;
+    if (row >= nrows || first_vec >= nvecs) {
+        return;
+    }
+
+    const block_q4_K * x = (const block_q4_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const int iqs = VDR_Q4_K_Q8_1_MMVQ * (threadIdx.x % (QI4_K / VDR_Q4_K_Q8_1_MMVQ));
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int i0 = threadIdx.x / (QI4_K / VDR_Q4_K_Q8_1_MMVQ);
+
+    Gfx906Q4KWtFrag wa, wb;
+    bool have_a = i0 < blocks_per_row;
+    if (have_a) {
+        gfx906_q4k_ld_wt(wa, &x[row * blocks_per_row + i0], iqs, bq8_offset);
+    }
+    int i = i0;
+    while (have_a) {
+        const int in = i + blocks_per_warp;
+        const bool have_b = in < blocks_per_row;
+        if (have_b) {
+            gfx906_q4k_ld_wt(wb, &x[row * blocks_per_row + in], iqs, bq8_offset);
+        }
+#pragma unroll
+        for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+            if (vec_offset >= vec_count) {
+                break;
+            }
+            Gfx906Q5KActFrag af;
+            gfx906_q5k_ld_act(af, y, first_vec + vec_offset, q8_blocks_per_vec, i, bq8_offset, iqs);
+            tmp[vec_offset] += gfx906_q4k_comp(wa, bq8_offset, af.u0, af.u1, af.u2, af.u3, af.d80, af.d81);
+        }
+        i = in;
+        wa = wb;
+        have_a = have_b;
+    }
+
+    constexpr int warp_size = WARP_SIZE;
+    constexpr int num_warps = BLOCK_SIZE / warp_size;
+#pragma unroll
+    for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+#pragma unroll
+        for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+            if (vec_offset >= vec_count) {
+                break;
+            }
+            tmp[vec_offset] += VLLM_SHFL_XOR_SYNC(tmp[vec_offset], mask);
+        }
+    }
+
+    if constexpr (num_warps == 1) {
+        if (threadIdx.x == 0) {
+#pragma unroll
+            for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+                if (vec_offset >= vec_count) {
+                    break;
+                }
+                dst[(first_vec + vec_offset)*dst_stride + row] = tmp[vec_offset];
+            }
+        }
+    } else {
+        const int lane = threadIdx.x % warp_size;
+        const int warp = threadIdx.x / warp_size;
+        __shared__ float shared_sum[num_warps];
+        if (lane == 0) {
+            shared_sum[warp] = tmp[0];
+        }
+        __syncthreads();
+        if (warp != 0) {
+            return;
+        }
+        tmp[0] = lane < num_warps ? shared_sum[lane] : 0.0f;
+#pragma unroll
+        for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+            tmp[0] += VLLM_SHFL_XOR_SYNC(tmp[0], mask);
+        }
+        if (lane == 0) {
+            dst[first_vec*dst_stride + row] = tmp[0];
+        }
+    }
+}
+
+template<typename scalar_t, int ncols>
+static void mul_mat_vec_q4_K_q8_1_fixed_cols_pipe_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+  const dim3 block_nums(nrows, gguf_mmvq_grid_vecs(nvecs), 1);
+  const dim3 block_dims(BLOCK_SIZE, 1, 1);
+  if (nvecs >= 2) {
+    mul_mat_vec_q4_K_q8_1_fixed_cols_pipe<scalar_t, ncols, true>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+  } else {
+    mul_mat_vec_q4_K_q8_1_fixed_cols_pipe<scalar_t, ncols, false>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+  }
+}
+
+// ---- q6_K pipe variant ----
+struct Gfx906Q6KWtFrag {
+    int vl, vhraw;   // raw ql/qh words, vh_shift applied in compute
+    int sc0, sc1;    // sign-extended int8 scales
+    half d;
+};
+
+struct Gfx906Q6KActFrag {
+    int u0, u1;      // u[i] for i = 0, 1
+    float d80, d81;
+};
+
+static __device__ __forceinline__ void gfx906_q6k_ld_wt(
+    Gfx906Q6KWtFrag & f, const block_q6_K * __restrict__ bq, const int iqs) {
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    f.vl = get_int_from_uint8(bq->ql, iqs);
+    f.vhraw = get_int_from_uint8(bq->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4));
+    f.sc0 = bq->scales[scale_offset];
+    f.sc1 = bq->scales[scale_offset + 4];
+    f.d = bq->d;
+}
+
+static __device__ __forceinline__ void gfx906_q6k_ld_act(
+    Gfx906Q6KActFrag & f, const block_q8_1 * __restrict__ y,
+    const int vec, const int q8_blocks_per_vec, const int i,
+    const int bq8_offset, const int iqs) {
+    const block_q8_1 * yb = y + vec * q8_blocks_per_vec + i * (QK_K / QK8_1);
+    const block_q8_1 * b0 = yb + bq8_offset;
+    const block_q8_1 * b1 = yb + bq8_offset + 2;
+    f.d80 = __low2float(b0->ds);
+    f.d81 = __low2float(b1->ds);
+    f.u0 = get_int_from_int8_aligned(b0->qs, iqs % QI8_1);
+    f.u1 = get_int_from_int8_aligned(b1->qs, iqs % QI8_1);
+}
+
+static __device__ __forceinline__ float gfx906_q6k_comp(
+    const Gfx906Q6KWtFrag & f, const int vh_shift,
+    const int u0, const int u1, const float d80, const float d81) {
+    const int vh = f.vhraw >> vh_shift;
+    const int vi0 = __vsubss4(((f.vl >> 0) & 0x0F0F0F0F) | (((vh >> 0) << 4) & 0x30303030), 0x20202020);
+    const int vi1 = __vsubss4(((f.vl >> 4) & 0x0F0F0F0F) | (((vh >> 4) << 4) & 0x30303030), 0x20202020);
+    float sumf = 0.0f;
+    sumf += d80 * (__dp4a(vi0, u0, 0) * f.sc0);
+    sumf += d81 * (__dp4a(vi1, u1, 0) * f.sc1);
+    return __half2float(f.d) * sumf;
+}
+
+template <typename scalar_t, int ncols, bool PREPARED = false>
+static __global__ void mul_mat_vec_q6_K_q8_1_fixed_cols_pipe(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    scalar_t * __restrict__ dst, const int nrows, const int nvecs,
+    const int dst_stride) {
+    constexpr int blocks_per_row = ncols / QK_K;
+    constexpr int q8_blocks_per_vec = ncols / QK8_1;
+    constexpr int blocks_per_warp = VDR_Q6_K_Q8_1_MMVQ * BLOCK_SIZE / QI6_K;
+
+    const int row = blockIdx.x;
+    const bool combine_vecs = gguf_mmvq_combine_vecs(nvecs);
+    const int first_vec = combine_vecs ? 0 : blockIdx.y;
+    const int vec_count = combine_vecs ? nvecs : 1;
+    if (row >= nrows || first_vec >= nvecs) {
+        return;
+    }
+
+    const block_q6_K * x = (const block_q6_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const int iqs = threadIdx.x % QI6_K;
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    const int i0 = threadIdx.x / QI6_K;
+
+    Gfx906Q6KWtFrag wa, wb;
+    const int iters = (blocks_per_row - 1 - i0) / blocks_per_warp + 1;
+    gfx906_q6k_ld_wt(wa, &x[row * blocks_per_row + i0], iqs);
+#pragma unroll 2
+    for (int k = 0; k < iters; ++k) {
+        const int i = i0 + k * blocks_per_warp;
+        const int in = i + blocks_per_warp;
+        if (in < blocks_per_row) {
+            gfx906_q6k_ld_wt(wb, &x[row * blocks_per_row + in], iqs);
+        }
+#pragma unroll
+        for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+            if (vec_offset >= vec_count) {
+                break;
+            }
+            Gfx906Q6KActFrag af;
+            gfx906_q6k_ld_act(af, y, first_vec + vec_offset, q8_blocks_per_vec, i, bq8_offset, iqs);
+            tmp[vec_offset] += gfx906_q6k_comp(wa, vh_shift, af.u0, af.u1, af.d80, af.d81);
+        }
+        wa = wb;
+    }
+
+    constexpr int warp_size = WARP_SIZE;
+    constexpr int num_warps = BLOCK_SIZE / warp_size;
+#pragma unroll
+    for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+#pragma unroll
+        for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+            if (vec_offset >= vec_count) {
+                break;
+            }
+            tmp[vec_offset] += VLLM_SHFL_XOR_SYNC(tmp[vec_offset], mask);
+        }
+    }
+
+    if constexpr (num_warps == 1) {
+        if (threadIdx.x == 0) {
+#pragma unroll
+            for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+                if (vec_offset >= vec_count) {
+                    break;
+                }
+                dst[(first_vec + vec_offset)*dst_stride + row] = tmp[vec_offset];
+            }
+        }
+    } else {
+        const int lane = threadIdx.x % warp_size;
+        const int warp = threadIdx.x / warp_size;
+        __shared__ float shared_sum[num_warps];
+        if (lane == 0) {
+            shared_sum[warp] = tmp[0];
+        }
+        __syncthreads();
+        if (warp != 0) {
+            return;
+        }
+        tmp[0] = lane < num_warps ? shared_sum[lane] : 0.0f;
+#pragma unroll
+        for (int mask = warp_size/2; mask > 0; mask >>= 1) {
+            tmp[0] += VLLM_SHFL_XOR_SYNC(tmp[0], mask);
+        }
+        if (lane == 0) {
+            dst[first_vec*dst_stride + row] = tmp[0];
+        }
+    }
+}
+
+template<typename scalar_t, int ncols>
+static void mul_mat_vec_q6_K_q8_1_fixed_cols_pipe_cuda(const void * vx, const void * vy, scalar_t * dst, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+  const dim3 block_nums(nrows, gguf_mmvq_grid_vecs(nvecs), 1);
+  const dim3 block_dims(BLOCK_SIZE, 1, 1);
+  if (nvecs >= 2) {
+    mul_mat_vec_q6_K_q8_1_fixed_cols_pipe<scalar_t, ncols, true>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+  } else {
+    mul_mat_vec_q6_K_q8_1_fixed_cols_pipe<scalar_t, ncols, false>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
+  }
+}
+
 #endif  // USE_ROCM
 
 template<typename scalar_t>

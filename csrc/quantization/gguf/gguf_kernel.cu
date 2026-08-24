@@ -742,6 +742,59 @@ static bool q5_k_pipe_debug() {
   return debug;
 }
 
+static bool gguf_kq_pipe_enabled(const char* var) {
+  static thread_local int cached = -1;
+  if (cached >= 0) {
+    return cached != 0;
+  }
+  const char* env = std::getenv(var);
+  if (env != nullptr) {
+    cached = env[0] != '0' ? 1 : 0;
+    return cached != 0;
+  }
+#if defined(USE_ROCM)
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  cached =
+      std::string(properties->gcnArchName).find("gfx906") == 0 ? 1 : 0;
+#else
+  cached = 0;
+#endif
+  return cached != 0;
+}
+
+static bool q4_k_pipe_enabled() {
+  return gguf_kq_pipe_enabled("VLLM_GGUF_Q4_K_PIPE");
+}
+
+static bool q6_k_pipe_enabled() {
+  // Opt-in only: the q6_K pipe variant measured 0.80-0.93x across
+  // (6144/17408 M=3, 5120 lm_head M=1) on gfx906 -- its per-iteration weight
+  // loads are six small fragments (~8B), which the simple original loop
+  // already schedules well and the double buffer only adds pressure for.
+  static const bool enabled = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q6_K_PIPE");
+    return env != nullptr && env[0] != '0';
+  }();
+  return enabled;
+}
+
+static bool gguf_kq_pipe_debug(const char* var) {
+  static thread_local int cached = -1;
+  if (cached >= 0) {
+    return cached != 0;
+  }
+  cached = std::getenv(var) != nullptr ? 1 : 0;
+  return cached != 0;
+}
+
+static bool q4_k_pipe_debug() {
+  return gguf_kq_pipe_debug("VLLM_GGUF_Q4_K_PIPE_DEBUG");
+}
+
+static bool q6_k_pipe_debug() {
+  return gguf_kq_pipe_debug("VLLM_GGUF_Q6_K_PIPE_DEBUG");
+}
+
 static bool q6_k_fixed_cols_fast_enabled() {
   static const bool enabled = [] {
     const char* env = std::getenv("VLLM_GGUF_Q6_K_FIXED_COLS_FAST");
@@ -842,28 +895,94 @@ static void ggml_mul_mat_vec_q8_dispatch(
       if (q4_k_fixed_cols_fast && vecs >= 1 && vecs <= 4 && col != 2560) {
         switch (col) {
           case 2048:
-            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 2048>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q4_k_pipe_enabled()) {
+              if (q4_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q4_K_PIPE HIT ncols=2048 rows=%d vecs=%d\n", row, vecs);
+                });
+              }
+              mul_mat_vec_q4_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 2048>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 2048>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           case 4096:
-            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 4096>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q4_k_pipe_enabled()) {
+              if (q4_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q4_K_PIPE HIT ncols=4096 rows=%d vecs=%d\n", row, vecs);
+                });
+              }
+              mul_mat_vec_q4_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 4096>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 4096>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           case 5120:
-            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q4_k_pipe_enabled()) {
+              if (q4_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q4_K_PIPE HIT ncols=5120 rows=%d vecs=%d\n", row, vecs);
+                });
+              }
+              mul_mat_vec_q4_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 5120>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           case 6144:
-            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 6144>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q4_k_pipe_enabled()) {
+              if (q4_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q4_K_PIPE HIT ncols=6144 rows=%d vecs=%d\n", row, vecs);
+                });
+              }
+              mul_mat_vec_q4_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 6144>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 6144>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           case 9216:
-            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 9216>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q4_k_pipe_enabled()) {
+              if (q4_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q4_K_PIPE HIT ncols=9216 rows=%d vecs=%d\n", row, vecs);
+                });
+              }
+              mul_mat_vec_q4_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 9216>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 9216>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           case 17408:
-            mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 17408>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q4_k_pipe_enabled()) {
+              if (q4_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q4_K_PIPE HIT ncols=17408 rows=%d vecs=%d\n", row, vecs);
+                });
+              }
+              mul_mat_vec_q4_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 17408>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q4_K_q8_1_fixed_cols_cuda<scalar_t, 17408>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           default:
             mul_mat_vec_q4_K_q8_1_cuda<scalar_t>(
@@ -986,8 +1105,19 @@ static void ggml_mul_mat_vec_q8_dispatch(
       }();
       if (q6_k_fixed_cols_fast_enabled() && vecs >= 1 && vecs <= 4 &&
           col == 5120 && row >= q6_k_fixed_cols_min_rows()) {
-        mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
-            W, quant_X, dst, row, vecs, stream, dst_stride);
+        if (q6_k_pipe_enabled()) {
+          if (q6_k_pipe_debug()) {
+            static std::once_flag once;
+            std::call_once(once, [row, vecs] {
+              fprintf(stderr, "GFX906_Q6_K_PIPE HIT ncols=5120 rows=%d vecs=%d\n", row, vecs);
+            });
+          }
+          mul_mat_vec_q6_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 5120>(
+              W, quant_X, dst, row, vecs, stream, dst_stride);
+        } else {
+          mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 5120>(
+              W, quant_X, dst, row, vecs, stream, dst_stride);
+        }
       } else if (q6_k_fixed_cols_fast_enabled() && vecs >= 2 && vecs <= 4 &&
                  col != 5120) {
         // The prepared-weight fixed-cols kernel re-uses the weight unpack
@@ -997,16 +1127,49 @@ static void ggml_mul_mat_vec_q8_dispatch(
         // matrices run faster on the 2-rows-per-block generic kernel.
         switch (col) {
           case 6144:
-            mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 6144>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q6_k_pipe_enabled()) {
+              if (q6_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q6_K_PIPE HIT ncols=6144 rows=%d vecs=%d\n", row, vecs);
+                });
+              }
+              mul_mat_vec_q6_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 6144>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 6144>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           case 9216:
-            mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 9216>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q6_k_pipe_enabled()) {
+              if (q6_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q6_K_PIPE HIT ncols=9216 rows=%d vecs=%d\n", row, vecs);
+                });
+              }
+              mul_mat_vec_q6_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 9216>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 9216>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           case 17408:
-            mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 17408>(
-                W, quant_X, dst, row, vecs, stream, dst_stride);
+            if (q6_k_pipe_enabled()) {
+              if (q6_k_pipe_debug()) {
+                static std::once_flag once;
+                std::call_once(once, [row, vecs] {
+                  fprintf(stderr, "GFX906_Q6_K_PIPE HIT ncols=17408 rows=%d vecs=%d\n", row, vecs);
+                });
+              }
+              mul_mat_vec_q6_K_q8_1_fixed_cols_pipe_cuda<scalar_t, 17408>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            } else {
+              mul_mat_vec_q6_K_q8_1_fixed_cols_cuda<scalar_t, 17408>(
+                  W, quant_X, dst, row, vecs, stream, dst_stride);
+            }
             break;
           default:
             mul_mat_vec_q6_K_q8_1_cuda<scalar_t>(
