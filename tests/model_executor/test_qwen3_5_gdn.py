@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import torch
 
 import vllm.model_executor.layers.fla.ops.fused_sigmoid_gating as gating_module
+import vllm.model_executor.layers.mamba.gdn_linear_attn as gdn_linear_attn
 import vllm.model_executor.models.qwen3_5 as qwen3_5_module
+from vllm.model_executor.layers.mamba.gdn_linear_attn import (
+    GatedDeltaNetAttention,
+)
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForCausalLMBase,
     Qwen3_5GatedDeltaNet,
@@ -14,7 +18,10 @@ from vllm.model_executor.models.qwen3_next import (
     _gdn_convert_state_layout,
     _gdn_recurrent_state_to_cache,
 )
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    GDNAttentionMetadataBuilder,
+)
 
 
 def test_gfx906_mtp_gdn_uses_custom_update(monkeypatch):
@@ -348,3 +355,148 @@ def test_qwen3_5_non_gguf_gdn_keeps_grouped_qk_expansion():
 
     assert expanded_query.flatten().tolist() == [10.0, 10.0, 20.0, 20.0]
     assert expanded_key.flatten().tolist() == [30.0, 30.0, 40.0, 40.0]
+
+
+def _run_speculative_gate_selection(
+    monkeypatch,
+    *,
+    num_prefills: int,
+    spec_token_indx: torch.Tensor,
+    non_spec_token_indx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = 4
+    num_spec_tokens = spec_token_indx.numel()
+    metadata = GDNAttentionMetadata(
+        num_prefills=num_prefills,
+        num_prefill_tokens=non_spec_token_indx.numel(),
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=1,
+        num_spec_decode_tokens=num_spec_tokens,
+        num_actual_tokens=num_tokens,
+        has_initial_state=torch.zeros(1, dtype=torch.bool),
+        prefill_query_start_loc=torch.tensor([0, non_spec_token_indx.numel()]),
+        prefill_state_indices=torch.tensor([0]),
+        prefill_has_initial_state=torch.zeros(1, dtype=torch.bool),
+        spec_query_start_loc=torch.tensor([0, num_spec_tokens]),
+        non_spec_query_start_loc=torch.tensor([0, non_spec_token_indx.numel()]),
+        spec_state_indices_tensor=torch.zeros(
+            (1, num_spec_tokens), dtype=torch.long
+        ),
+        non_spec_state_indices_tensor=torch.zeros(
+            non_spec_token_indx.numel(), dtype=torch.long
+        ),
+        spec_sequence_masks=torch.tensor([True]),
+        spec_token_indx=spec_token_indx,
+        non_spec_token_indx=non_spec_token_indx,
+        num_accepted_tokens=torch.ones(1, dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        gdn_linear_attn,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={"layer": metadata}, virtual_engine=0
+        ),
+    )
+    monkeypatch.setattr(
+        gdn_linear_attn,
+        "causal_conv1d_update",
+        lambda value, *args, **kwargs: value,
+    )
+    monkeypatch.setattr(
+        gdn_linear_attn,
+        "causal_conv1d_fn",
+        lambda value, *args, **kwargs: value,
+    )
+    monkeypatch.setattr(gdn_linear_attn, "_is_gfx906_rocm", lambda: False)
+
+    captured_gates = []
+
+    def fake_recurrent_update(
+        *, a: torch.Tensor, b: torch.Tensor, q: torch.Tensor, **kwargs
+    ):
+        captured_gates.append((a.clone(), b.clone()))
+        return q, torch.zeros((1, 1, 1))
+
+    monkeypatch.setattr(
+        gdn_linear_attn,
+        "fused_sigmoid_gating_delta_rule_update",
+        fake_recurrent_update,
+    )
+
+    def fake_post_conv_prep(*, conv_output: torch.Tensor, **kwargs):
+        output = conv_output.unsqueeze(1)
+        gate = torch.zeros((conv_output.size(0), 1))
+        return output, output, output, gate, gate
+
+    monkeypatch.setattr(
+        gdn_linear_attn, "fused_post_conv_prep", fake_post_conv_prep
+    )
+
+    def rearrange(value):
+        if value is None:
+            return None, None, None
+        output = value.unsqueeze(0).unsqueeze(2)
+        return output, output, output
+
+    layer = SimpleNamespace(
+        _log_projection_debug_once=lambda: None,
+        prefix="layer",
+        enable_packed_recurrent_decode=False,
+        kv_cache=(torch.zeros((1, 1, 1)), torch.zeros((1, 1, 1))),
+        conv1d=SimpleNamespace(weight=torch.ones((1, 1, 1)), bias=None),
+        activation="silu",
+        rearrange_mixed_qkv=rearrange,
+        A_log=torch.ones(1),
+        dt_bias=torch.ones(1),
+        num_k_heads=1,
+        tp_size=1,
+        head_k_dim=1,
+        head_v_dim=1,
+        chunk_gated_delta_rule=lambda **kwargs: (
+            kwargs["q"].transpose(1, 2),
+            torch.zeros((1, 1, 1)),
+        ),
+    )
+    mixed_qkv = torch.arange(num_tokens, dtype=torch.float32).unsqueeze(1)
+    a = torch.arange(10, 10 + num_tokens, dtype=torch.float32).unsqueeze(1)
+    b = torch.arange(20, 20 + num_tokens, dtype=torch.float32).unsqueeze(1)
+    core_attn_out = torch.empty((num_tokens, 1, 1))
+
+    GatedDeltaNetAttention._forward_core(
+        layer, mixed_qkv, b, a, core_attn_out
+    )
+
+    assert len(captured_gates) == 1
+    actual_a, actual_b = captured_gates[0]
+    torch.testing.assert_close(actual_a, a.index_select(0, spec_token_indx))
+    torch.testing.assert_close(actual_b, b.index_select(0, spec_token_indx))
+    return actual_a, actual_b
+
+
+def test_qwen3_5_all_speculative_tokens_keep_all_gates(monkeypatch):
+    spec_token_indx = torch.arange(4)
+
+    actual_a, actual_b = _run_speculative_gate_selection(
+        monkeypatch,
+        num_prefills=0,
+        spec_token_indx=spec_token_indx,
+        non_spec_token_indx=torch.empty(0, dtype=torch.long),
+    )
+
+    assert actual_a.shape[0] == 4
+    assert actual_b.shape[0] == 4
+
+
+def test_qwen3_5_mixed_batch_selects_speculative_gates(monkeypatch):
+    spec_token_indx = torch.tensor([1, 3])
+
+    actual_a, actual_b = _run_speculative_gate_selection(
+        monkeypatch,
+        num_prefills=1,
+        spec_token_indx=spec_token_indx,
+        non_spec_token_indx=torch.tensor([0, 2]),
+    )
+
+    assert actual_a.flatten().tolist() == [11.0, 13.0]
+    assert actual_b.flatten().tolist() == [21.0, 23.0]
