@@ -76,6 +76,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5TextConfig,
@@ -1748,8 +1749,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
-    # Qwen3.5 does not support multimodal pruning (EVS).
-    supports_multimodal_pruning = False
+    supports_multimodal_pruning = True
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping
 
@@ -1769,13 +1769,32 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         )
 
         self.config = config
+        self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config if enable_multimodal else None
         self.use_data_parallel = (
             enable_multimodal
             and multimodal_config.mm_encoder_tp_mode == "data"
         )
-        # Qwen3.5 does not support multimodal pruning (EVS).
-        self.is_multimodal_pruning_enabled = False
+        self.is_multimodal_pruning_enabled = (
+            enable_multimodal
+            and multimodal_config.is_multimodal_pruning_enabled()
+        )
+        self.video_pruning_rate = (
+            multimodal_config.video_pruning_rate if enable_multimodal else None
+        )
+
+        if self.is_multimodal_pruning_enabled:
+            self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+
+        # Attributes used by EVS methods inherited from Qwen3-VL.
+        self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")
+        self.deepstack_num_level = (
+            len(config.vision_config.deepstack_visual_indexes)
+            if self.use_deepstack
+            else 0
+        )
+        self.visual_dim = config.vision_config.out_hidden_size
+        self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         if enable_multimodal:
             with self._mark_tower_model(vllm_config, {"image", "video"}):
@@ -1824,12 +1843,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         )
 
         return inputs_embeds
-
-    def recompute_mrope_positions(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Qwen3.5 does not support multimodal pruning (EVS). "
-            "recompute_mrope_positions should never be called."
-        )
 
     def get_mrope_input_positions(
         self,
@@ -2029,13 +2042,32 @@ class Qwen3_5MoeForConditionalGeneration(
         )
 
         self.config = config
+        self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config if enable_multimodal else None
         self.use_data_parallel = (
             enable_multimodal
             and multimodal_config.mm_encoder_tp_mode == "data"
         )
-        # Qwen3.5 does not support multimodal pruning (EVS).
-        self.is_multimodal_pruning_enabled = False
+        self.is_multimodal_pruning_enabled = (
+            enable_multimodal
+            and multimodal_config.is_multimodal_pruning_enabled()
+        )
+        self.video_pruning_rate = (
+            multimodal_config.video_pruning_rate if enable_multimodal else None
+        )
+
+        if self.is_multimodal_pruning_enabled:
+            self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+
+        # Attributes used by EVS methods inherited from Qwen3-VL.
+        self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")
+        self.deepstack_num_level = (
+            len(config.vision_config.deepstack_visual_indexes)
+            if self.use_deepstack
+            else 0
+        )
+        self.visual_dim = config.vision_config.out_hidden_size
+        self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         if enable_multimodal:
             with self._mark_tower_model(vllm_config, {"image", "video"}):
