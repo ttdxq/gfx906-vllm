@@ -409,9 +409,14 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> MergedColumnParallelLinear:
+        output_sizes = (
+            [key_dim * 2 + value_dim * 2]
+            if self.gqa_interleaved_layout
+            else [key_dim, key_dim, value_dim, value_dim]
+        )
         return MergedColumnParallelLinear(
             input_size=hidden_size,
-            output_sizes=[key_dim, key_dim, value_dim, value_dim],
+            output_sizes=output_sizes,
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
@@ -424,9 +429,14 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> MergedColumnParallelLinear:
+        output_sizes = (
+            [num_v_heads * 2]
+            if self.gqa_interleaved_layout
+            else [num_v_heads, num_v_heads]
+        )
         return MergedColumnParallelLinear(
             input_size=hidden_size,
-            output_sizes=[num_v_heads, num_v_heads],
+            output_sizes=output_sizes,
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
@@ -586,11 +596,12 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 device=hidden_states.device,
             )
 
-        self._forward_core(
-            mixed_qkv=mixed_qkv,
-            b=b,
-            a=a,
-            core_attn_out=core_attn_out,
+        torch.ops.vllm.gdn_attention_core(
+            mixed_qkv,
+            b,
+            a,
+            core_attn_out,
+            self.prefix,
         )
 
         if ENABLE_QWEN35_FORCE_Z_ONES:

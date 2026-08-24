@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import vllm.model_executor.layers.fla.ops.fused_sigmoid_gating as gating_module
@@ -319,6 +320,77 @@ def test_qwen3_5_split_gdn_calls_core_with_b_then_a(monkeypatch):
     assert torch.equal(captured["mixed_qkv"], mixed_qkv)
     assert torch.equal(captured["b"], b)
     assert torch.equal(captured["a"], a)
+
+
+def test_shared_gdn_calls_registered_core_op(monkeypatch):
+    module = object.__new__(GatedDeltaNetAttention)
+    torch.nn.Module.__init__(module)
+
+    module.gqa_interleaved_layout = False
+    module.key_dim = 4
+    module.value_dim = 4
+    module.tp_size = 1
+    module.head_v_dim = 2
+    module.num_v_heads = 2
+    module.prefix = "model.layers.0.linear_attn"
+    module.in_proj_qkv = _FakeLinear(torch.randn(3, 12))
+    module.in_proj_z = _FakeLinear(torch.randn(3, 4))
+    module.in_proj_ba = _FakeLinear(torch.randn(3, 4))
+    module.norm = _IdentityNorm()
+    module.out_proj = _FakeOutProj()
+    module._can_use_empty_core_attn_out = lambda _: False
+
+    captured: dict[str, object] = {}
+
+    def fake_gdn_attention_core(
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        layer_name: str,
+    ) -> None:
+        captured["mixed_qkv"] = mixed_qkv
+        captured["b"] = b
+        captured["a"] = a
+        captured["layer_name"] = layer_name
+        core_attn_out.zero_()
+
+    monkeypatch.setattr(torch.ops.vllm, "gdn_attention_core", fake_gdn_attention_core)
+
+    module.forward(torch.randn(3, 8), torch.empty(3, 4))
+
+    assert isinstance(captured["mixed_qkv"], torch.Tensor)
+    assert isinstance(captured["b"], torch.Tensor)
+    assert isinstance(captured["a"], torch.Tensor)
+    assert captured["layer_name"] == module.prefix
+
+
+@pytest.mark.parametrize(
+    ("interleaved", "expected_qkvz", "expected_ba"),
+    [
+        (False, [4, 4, 8, 8], [6, 6]),
+        (True, [24], [12]),
+    ],
+)
+def test_shared_gdn_projection_shards(
+    monkeypatch, interleaved, expected_qkvz, expected_ba
+):
+    captured: list[list[int]] = []
+
+    def fake_merged_column_parallel_linear(*, output_sizes, **kwargs):
+        captured.append(output_sizes)
+        return object()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.gdn_linear_attn.MergedColumnParallelLinear",
+        fake_merged_column_parallel_linear,
+    )
+    module = SimpleNamespace(gqa_interleaved_layout=interleaved)
+
+    GatedDeltaNetAttention.create_qkvz_proj(module, 16, 4, 8, None, "qkvz")
+    GatedDeltaNetAttention.create_ba_proj(module, 16, 6, None, "ba")
+
+    assert captured == [expected_qkvz, expected_ba]
 
 
 def test_qwen3_5_gguf_split_gdn_expands_qk_in_tiled_v_head_order():
