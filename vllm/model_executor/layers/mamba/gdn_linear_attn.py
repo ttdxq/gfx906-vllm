@@ -363,8 +363,13 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         )
 
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads // self.tp_size))
+        # A_log/dt_bias must follow the model dtype (fp16 for GGUF Qwen3.5).
+        # The gfx906 packed-decode kernels read these scalars with fp16
+        # element size; a forced fp32 A_log makes them misread the decay
+        # rate, so the recurrent state grows unbounded (-> inf) and decode
+        # output degenerates.
         self.A_log = nn.Parameter(
-            torch.empty(divide(self.num_v_heads, self.tp_size), dtype=torch.float32)
+            torch.empty(divide(self.num_v_heads, self.tp_size))
         )
 
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})

@@ -299,7 +299,13 @@ class Qwen3_5GatedDeltaNet(GatedDeltaNetAttention):
             "VLLM_QWEN35_TILED_QK_EXPAND", self.split_projections
         )
         self.call_b_first = os.getenv("VLLM_QWEN35_CALL_ORDER", "ba").lower() != "ab"
-        self.use_shared_gdn_core = _env_bool("VLLM_QWEN35_SHARED_GDN_CORE", True)
+        # The shared GatedDeltaNetAttention core still corrupts long
+        # generations on gfx906 GGUF (deterministic token salad near the
+        # tail even with the A_log dtype fix); the specialized
+        # Qwen3NextGatedDeltaNet core is the verified path. Opt back in
+        # with VLLM_QWEN35_SHARED_GDN_CORE=1 once the shared core passes
+        # full generation checks.
+        self.use_shared_gdn_core = _env_bool("VLLM_QWEN35_SHARED_GDN_CORE", False)
         if not self.split_projections:
             self.in_proj_qkvz.output_sizes = [
                 self.key_dim,
