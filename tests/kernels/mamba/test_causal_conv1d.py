@@ -128,16 +128,20 @@ def causal_conv1d_update_ref(
 )
 @pytest.mark.parametrize("accepted_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("num_accepted", [1, 2, 3])
+@pytest.mark.parametrize("conv_state_layout", ["SD", "DS"])
 def test_gfx906_causal_conv1d_mtp_update(
-    dtype, state_dtype, accepted_dtype, num_accepted
+    dtype, state_dtype, accepted_dtype, num_accepted, conv_state_layout
 ):
     torch.manual_seed(7)
     query_len, dim, width, state_len = 3, 37, 4, 5
     x = torch.randn(query_len, dim, device="cuda", dtype=dtype)
-    state_storage = torch.randn(
-        2, state_len, dim, device="cuda", dtype=state_dtype
-    )
-    conv_state = state_storage.transpose(1, 2)
+    if conv_state_layout == "SD":
+        state_storage = torch.randn(
+            2, state_len, dim, device="cuda", dtype=state_dtype
+        )
+        conv_state = state_storage.transpose(1, 2)
+    else:
+        conv_state = torch.randn(2, dim, state_len, device="cuda", dtype=state_dtype)
     initial_state = conv_state.clone()
     weight = torch.randn(dim, width, device="cuda", dtype=dtype)
     bias = torch.randn(dim, device="cuda", dtype=dtype)

@@ -24,6 +24,7 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
+    is_conv_state_dim_first,
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -249,7 +250,11 @@ class MambaMixer(MambaBase, CustomOp):
             query_start_loc_p = attn_metadata.query_start_loc_p
             state_indices_tensor = attn_metadata.state_indices_tensor
             self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-            conv_state = self_kv_cache[0].transpose(-1, -2)
+            conv_state = (
+                self_kv_cache[0]
+                if is_conv_state_dim_first()
+                else self_kv_cache[0].transpose(-1, -2)
+            )
             ssm_state = self_kv_cache[1]
             has_initial_states_p = attn_metadata.has_initial_states_p
             num_padded_decodes = attn_metadata.num_padded_decodes
