@@ -932,6 +932,16 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             beta_non_spec = beta_non_spec.unsqueeze(0)
 
         if spec_sequence_masks is not None:
+            # The gfx906 MTP update kernel has no use_transposed_state
+            # flag: the layout is defined by the tensor passed in. Quantized
+            # split-projection models keep the persistent ssm cache in KxV
+            # order, so hand the kernel the transposed view exactly like the
+            # specialized Qwen3NextGatedDeltaNet core does; passing the raw
+            # cache corrupts the spec-token step and the in-place state
+            # write-back.
+            spec_state = ssm_state
+            if self._uses_transposed_temporal_state():
+                spec_state = ssm_state.transpose(-1, -2)
             core_attn_out_spec, last_recurrent_state = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log,
                 a=a_spec,
@@ -940,7 +950,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 q=query_spec,
                 k=key_spec,
                 v=value_spec,
-                initial_state=ssm_state,
+                initial_state=spec_state,
                 inplace_final_state=True,
                 cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
                 ssm_state_indices=spec_state_indices_tensor,
