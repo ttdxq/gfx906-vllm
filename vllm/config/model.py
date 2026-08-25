@@ -1789,7 +1789,13 @@ class ModelConfig:
             "qwen3_5_text",
             "qwen35",
         ):
-            diff_sampling_param.setdefault("repetition_penalty", 1.2)
+            # Only inject the Qwen-recommended penalty under the "auto"
+            # (model defaults) semantics. With --generation-config vllm the
+            # neutral defaults must stay clean: the injected penalty makes
+            # every default request hit the spec-decode penalty guard on
+            # MTP deployments.
+            if self.generation_config == "auto":
+                diff_sampling_param.setdefault("repetition_penalty", 1.2)
             eos_ids: list[int] = []
             generation_eos = config.get("eos_token_id")
             if isinstance(generation_eos, int):

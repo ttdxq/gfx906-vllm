@@ -589,6 +589,10 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        # Per-request real draft ids (indexed by previous batch position),
+        # snapshotted during _prepare_input_ids under async scheduling when
+        # penalties/bad_words need them at rejection-sample time.
+        self._async_draft_token_ids_cpu: list[list[int]] | None = None
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -1363,6 +1367,32 @@ class GPUModelRunner(
             index=draft_tokens_index_tensor,
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
         )
+
+        # Under async scheduling the scheduler books spec_token_ids as -1
+        # placeholders and expects the worker to backfill the real draft ids
+        # (upstream #30495). The rejection sampler needs them when penalties
+        # or bad_words are active, so snapshot the per-request draft ids now,
+        # indexed by previous batch position for
+        # InputBatch.update_async_spec_token_ids().
+        self._async_draft_token_ids_cpu = None
+        sampling_metadata = self.input_batch.sampling_metadata
+        if self.use_async_scheduling and (
+            sampling_metadata.output_token_ids
+            or sampling_metadata.bad_words_token_ids
+        ):
+            snapshot: list[list[int]] = [
+                [] for _ in range(len(prev_req_id_to_index))
+            ]
+            draft_flat = draft_token_ids.detach().flatten().cpu().tolist()
+            for req_id in self.input_batch.req_ids:
+                prev_index = prev_req_id_to_index.get(req_id)
+                if prev_index is None:
+                    continue
+                draft_len = len(scheduled_spec_tokens.get(req_id, ()))
+                if draft_len:
+                    start = prev_index * self.num_spec_tokens
+                    snapshot[prev_index] = draft_flat[start : start + draft_len]
+            self._async_draft_token_ids_cpu = snapshot
 
     def _try_prepare_single_decode_inputs(
         self,
@@ -2808,6 +2838,15 @@ class GPUModelRunner(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+
+        # Async scheduling: replace the -1 spec_token_ids placeholders with
+        # the real draft ids snapshotted in _prepare_input_ids before the
+        # rejection sampler combines them for penalties/bad_words.
+        if self.use_async_scheduling and self._async_draft_token_ids_cpu is not None:
+            self.input_batch.update_async_spec_token_ids(
+                self._async_draft_token_ids_cpu
+            )
+            self._async_draft_token_ids_cpu = None
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
         sampler_output = self.rejection_sampler(
