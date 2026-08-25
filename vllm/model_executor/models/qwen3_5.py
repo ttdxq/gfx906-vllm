@@ -51,6 +51,7 @@ from vllm.model_executor.layers.layernorm import (
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
@@ -1515,14 +1516,61 @@ class Qwen3_5Model(Qwen3NextModel):
                         if getattr(param, "is_gguf_weight_type", False):
                             param.weight_type = loaded_weight.item()
                         else:
-                            output_dim = getattr(param, "output_dim", 0)
                             tp_size = get_tensor_model_parallel_world_size()
                             tp_rank = get_tensor_model_parallel_rank()
-                            local_shard = loaded_weight.size(output_dim) // tp_size
-                            start_idx = tp_rank * local_shard
-                            loaded_weight = loaded_weight.narrow(
-                                output_dim, start_idx, local_shard
-                            )
+                            module_name, _, _ = name.rpartition(".")
+                            module = modules_dict[module_name]
+                            if isinstance(module, RowParallelLinear):
+                                # Row-parallel GGUF weights (GDN out_proj,
+                                # attention o_proj, MLP down_proj) keep the
+                                # full output dim and are sharded along the
+                                # packed input dim, mirroring
+                                # RowParallelLinear.weight_loader: the raw
+                                # quant layout is block-linear in the input
+                                # dim, so halving it halves the block count
+                                # per rank. Narrowing dim 0 (the column
+                                # convention) instead silently produces a
+                                # half-width unreduced output and crashes the
+                                # first TP>1 forward.
+                                shard_dim = getattr(param, "input_dim", 1)
+                                local_shard = (
+                                    loaded_weight.size(shard_dim) // tp_size
+                                )
+                                loaded_weight = loaded_weight.narrow(
+                                    shard_dim,
+                                    tp_rank * local_shard,
+                                    local_shard,
+                                )
+                            elif isinstance(module, MergedColumnParallelLinear):
+                                # A fused GGUF tensor feeding a merged column
+                                # layer (GDN in_proj_qkv = [q|k|v]) must be
+                                # sharded per logical section; a contiguous
+                                # dim-0 halving would hand rank 0 all of
+                                # q,k plus half of v while the forward
+                                # unpacks [q/2|k/2|v/2] per rank.
+                                shards = []
+                                offset = 0
+                                for section in module.output_sizes:
+                                    local_shard = section // tp_size
+                                    shards.append(
+                                        loaded_weight.narrow(
+                                            0,
+                                            offset + tp_rank * local_shard,
+                                            local_shard,
+                                        )
+                                    )
+                                    offset += section
+                                loaded_weight = torch.cat(shards, dim=0)
+                            else:
+                                output_dim = getattr(param, "output_dim", 0)
+                                local_shard = (
+                                    loaded_weight.size(output_dim) // tp_size
+                                )
+                                loaded_weight = loaded_weight.narrow(
+                                    output_dim,
+                                    tp_rank * local_shard,
+                                    local_shard,
+                                )
                             loaded_weight = loaded_weight.to(device=param.device)
                             loaded_param = torch.nn.Parameter(
                                 loaded_weight.contiguous(), requires_grad=False
