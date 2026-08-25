@@ -168,16 +168,25 @@ class InputProcessor:
         # very long generations (>~1800 tokens) naturally drift into token
         # salad because all frequent tokens get penalized; (2) with spec
         # decode, penalties apply only to the target distribution, so draft
-        # acceptance decays as the penalized history grows. Structured
-        # outputs under spec decode remain gated until the upstream FSM
-        # window fix (#43388) is synced and verified.
+        # acceptance decays as the penalized history grows.
+        # Structured outputs remain gated under ASYNC scheduling + spec
+        # decode: the async scheduler books spec_token_ids as -1
+        # placeholders and grammar_bitmask() feeds them to xgrammar, which
+        # rejects -1 and crashes the request (assert in
+        # StructuredOutputManager.grammar_bitmask). Upstream avoids this
+        # with a draft-ids CPU copy for structured requests; this fork's
+        # draft tensor is consumed by the input scatter, so the backfill
+        # path has to be ported first.
         if (
             self.vllm_config.speculative_config is not None
+            and self.vllm_config.scheduler_config.async_scheduling
             and params.structured_outputs
         ):
             raise ValueError(
                 "structured outputs are not yet supported together with "
-                "speculative decoding on this build."
+                "async scheduling + speculative decoding on this build; "
+                "use --no-async-scheduling or retry without "
+                "structured_outputs."
             )
 
     def _validate_params(
