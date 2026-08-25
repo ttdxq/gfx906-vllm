@@ -131,6 +131,57 @@ vllm serve Qwen/Qwen3.5-0.8B \
   --reasoning-parser qwen3_5
 ```
 
+### Dual-GPU Tensor Parallelism (TP=2)
+
+> Prerequisite: `--tensor-parallel-size 2` requires replacing RCCL. The official AMD RCCL
+> (including the one in the ROCm 7.2 repository) contains no gfx906 device kernels, so
+> startup fails during initialization with `invalid kernel file` / `invalid device
+> function` and similar errors. Install the gfx906-built RCCL drop-in (same 2.27.7
+> source as official, built for gfx906 only); it targets torch `+rocm7.2` wheels.
+
+**1. Install the gfx906 RCCL** (download `rccl-gfx906-2.27.7-rocm7.2.4.tar.gz` from Releases and extract):
+
+```bash
+# conda / venv environment (activate it first)
+conda activate <your-env>
+./install.sh
+HIP_VISIBLE_DEVICES=0,1 python rccl_probe.py
+# Expected output ALLREDUCE_OK: [2.0, 2.0, 2.0, 2.0] means success; roll back with ./install.sh --rollback
+
+# uv project environment (--no-sync is mandatory: an implicit sync can break the custom torch)
+uv run --no-sync ./install.sh
+```
+
+If no prebuilt package is available, build it yourself (~25 minutes):
+
+```bash
+git clone --depth 1 --branch rocm-7.2.4 https://github.com/ROCm/rccl
+cd rccl && mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm -DGPU_TARGETS="gfx906" -G Ninja
+ninja -j$(nproc)
+# Replace the librccl inside torch/lib with build/librccl.so.1.0 the same way install.sh does
+```
+
+**2. Start the TP=2 server**:
+
+```bash
+HIP_VISIBLE_DEVICES=0,1 \
+vllm serve /path/to/Qwen3.8-27B-UD-Q6_K_XL.gguf \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --max-model-len 32768 \
+  --reasoning-parser qwen3_5 \
+  --limit-mm-per-prompt '{"image": 0, "video": 0}'
+```
+
+Notes:
+
+- TP=1 does not go through RCCL at all; single-GPU deployments need none of the above
+  and are unaffected.
+- Under TP=2, greedy output may diverge from TP=1 at occasional near-tie tokens
+  (floating-point summation order differences). This is expected and not an
+  installation or weight problem.
+
 ### Qwen3.5 Family Multimodal GGUF Support
 
 Place the main model and its matching `mmproj` file in the same directory and use recognizable paired filenames.

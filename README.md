@@ -127,6 +127,54 @@ vllm serve Qwen/Qwen3.5-0.8B \
   --reasoning-parser qwen3_5
 ```
 
+### 双卡张量并行（TP=2）
+
+> 前置条件：`--tensor-parallel-size 2` 需要替换 RCCL。AMD 官方 RCCL（含 ROCm 7.2 官方仓版本）
+> 不包含 gfx906 设备内核，直接启动会在初始化阶段以 `invalid kernel file` /
+> `invalid device function` 等错误失败。需安装 gfx906 构建的 RCCL 替换库（与官方
+> 2.27.7 同源，仅构建目标为 gfx906），适用于 torch `+rocm7.2` 轮子。
+
+**1. 安装 gfx906 RCCL**（从 Releases 下载 `rccl-gfx906-2.27.7-rocm7.2.4.tar.gz` 解压后）：
+
+```bash
+# conda / venv 环境（先激活）
+conda activate <你的环境>
+./install.sh
+HIP_VISIBLE_DEVICES=0,1 python rccl_probe.py
+# 预期输出 ALLREDUCE_OK: [2.0, 2.0, 2.0, 2.0] 即安装成功；回滚用 ./install.sh --rollback
+
+# uv 项目环境（--no-sync 必须带，防止隐式 sync 破坏定制 torch）
+uv run --no-sync ./install.sh
+```
+
+若无预编译包，可自行构建（约 25 分钟）：
+
+```bash
+git clone --depth 1 --branch rocm-7.2.4 https://github.com/ROCm/rccl
+cd rccl && mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm -DGPU_TARGETS="gfx906" -G Ninja
+ninja -j$(nproc)
+# 用 build/librccl.so.1.0 按上述 install.sh 同样方式替换 torch/lib 内的 librccl
+```
+
+**2. 启动 TP=2 服务**：
+
+```bash
+HIP_VISIBLE_DEVICES=0,1 \
+vllm serve /path/to/Qwen3.8-27B-UD-Q6_K_XL.gguf \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --max-model-len 32768 \
+  --reasoning-parser qwen3_5 \
+  --limit-mm-per-prompt '{"image": 0, "video": 0}'
+```
+
+说明：
+
+- 单卡（TP=1）不经过 RCCL，无需上述替换，不受任何影响。
+- 双卡下贪心输出与单卡可能在个别"近平局"token 上分岔（浮点求和顺序差异），
+  属正常现象，不是安装或权重问题。
+
 ### Qwen3.5系列 多模态 GGUF支持
 
 主模型和对应 `mmproj` 应放在同一目录，并保持可识别的配对命名。
