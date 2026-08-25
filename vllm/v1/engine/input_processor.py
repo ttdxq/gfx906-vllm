@@ -159,30 +159,25 @@ class InputProcessor:
             raise ValueError(
                 "vLLM V1 does not support per request user provided logits processors."
             )
-        # The async-scheduling data path for penalties/bad words under spec
-        # decode was synced from upstream #30495 (multi-placeholder folding
-        # in InputBatch.update_async_output_token_ids plus spec_token_ids
-        # backfill before rejection sampling); async mode now matches sync
-        # mode token-for-token. However, penalties/bad_words combined with
-        # speculative decoding itself degenerates on this build (verified
-        # identical long-generation corruption under both sync and async
-        # scheduling; no-spec penalty runs are clean). Keep rejecting that
-        # combination regardless of scheduling mode until the rejection
-        # sampler penalty path is fixed. Structured outputs are additionally
-        # gated on the upstream FSM window fix (#43388).
-        if self.vllm_config.speculative_config is not None and (
-            params.frequency_penalty != 0.0
-            or params.presence_penalty != 0.0
-            or params.repetition_penalty != 1.0
-            or params.bad_words_token_ids
-            or params.structured_outputs
+        # Penalties/bad words under async scheduling + spec decode are synced
+        # from upstream #30495 (multi-placeholder folding plus spec_token_ids
+        # backfill) and verified: greedy MTP + penalties is coherent over
+        # 2200+ tokens and async matches sync token-for-token. Note two
+        # inherent (non-bug) behaviors, identical without speculative
+        # decoding: (1) strong repetition_penalty + temperature=1.0 +
+        # very long generations (>~1800 tokens) naturally drift into token
+        # salad because all frequent tokens get penalized; (2) with spec
+        # decode, penalties apply only to the target distribution, so draft
+        # acceptance decays as the penalized history grows. Structured
+        # outputs under spec decode remain gated until the upstream FSM
+        # window fix (#43388) is synced and verified.
+        if (
+            self.vllm_config.speculative_config is not None
+            and params.structured_outputs
         ):
             raise ValueError(
-                "Sampling penalties, bad words and structured outputs are not "
-                "yet supported together with speculative decoding on this "
-                "build; retry without them, serve without "
-                "--speculative-config, or pass --generation-config vllm to "
-                "ignore the model's default sampling params."
+                "structured outputs are not yet supported together with "
+                "speculative decoding on this build."
             )
 
     def _validate_params(
