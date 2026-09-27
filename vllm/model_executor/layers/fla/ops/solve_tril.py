@@ -17,7 +17,12 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import make_tensor_descriptor
-from .utils import input_guard, is_amd, is_tma_supported
+from .utils import (
+    GFX906_GDN_TRITON_PREFILL_ENABLED,
+    input_guard,
+    is_amd,
+    is_tma_supported,
+)
 
 FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
 ALLOWED_TRIL_PRECISIONS = ["ieee", "tf32"] if is_amd else ["ieee", "tf32", "tf32x3"]
@@ -582,7 +587,7 @@ def solve_tril(
     )
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
-    if _is_gfx906_rocm():
+    if _is_gfx906_rocm() and not GFX906_GDN_TRITON_PREFILL_ENABLED:
         return _solve_tril_eager(A=A, cu_seqlens=cu_seqlens, output_dtype=output_dtype)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)

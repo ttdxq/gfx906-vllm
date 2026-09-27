@@ -21,7 +21,11 @@ from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
-from .utils import SUPPRESS_LEVEL, input_guard
+from .utils import (
+    GFX906_GDN_TRITON_PREFILL_ENABLED,
+    SUPPRESS_LEVEL,
+    input_guard,
+)
 from .wy_fast import recompute_w_u_fwd
 
 
@@ -390,7 +394,7 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    if _is_gfx906_rocm():
+    if _is_gfx906_rocm() and not GFX906_GDN_TRITON_PREFILL_ENABLED:
         o, final_state = _chunk_gated_delta_rule_gfx906_eager(
             q=q,
             k=k,

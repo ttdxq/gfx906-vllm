@@ -28,6 +28,13 @@ FLA_GDN_FIX_BT = os.getenv("FLA_GDN_FIX_BT", "0") == "1"
 
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
+# gfx906 escape hatch: set VLLM_GFX906_GDN_TRITON_PREFILL=0 to route the
+# chunked gated-delta-rule prefill (and its building blocks) through the
+# PyTorch-eager fallbacks instead of the FLA Triton kernels.
+GFX906_GDN_TRITON_PREFILL_ENABLED = os.getenv(
+    "VLLM_GFX906_GDN_TRITON_PREFILL", "1"
+).lower() in {"1", "true", "yes", "on"}
+
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
