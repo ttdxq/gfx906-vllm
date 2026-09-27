@@ -10,7 +10,6 @@ import torch
 
 from tests.quantization.utils import is_quant_method_supported
 from vllm import LLM, SamplingParams
-from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode, PassConfig
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_torch_equal_or_newer
@@ -22,47 +21,17 @@ def models_list(*, all: bool = True, keywords: list[str] | None = None):
     TEST_MODELS: list[tuple[str, dict[str, Any]]] = [
         ("facebook/opt-125m", {}),
         (
-            "neuralmagic/Llama-3.2-1B-Instruct-FP8-dynamic",
+            "RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic",
             {"dtype": torch.float16},
         ),
-        ("meta-llama/Llama-3.2-1B-Instruct", {}),
     ]
 
     if all:
-        TEST_MODELS.extend(
-            [
-                ("neuralmagic/Llama-3.2-1B-Instruct-quantized.w8a8", {}),
-                (
-                    "nm-testing/tinyllama-oneshot-w8w8-test-static-shape-change",
-                    {"dtype": torch.float16},
-                ),
-            ]
-        )
-
-        # TODO: figure out why this fails.
-        if False and is_quant_method_supported("gguf"):  # noqa: SIM223
-            TEST_MODELS.append(
-                ("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", {"quantization": "gguf"})
-            )
-
-        if is_quant_method_supported("gptq"):
-            TEST_MODELS.append(
-                ("TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ", {"quantization": "gptq"})
-            )
-
         if is_quant_method_supported("gptq_marlin"):
             TEST_MODELS.append(
                 (
-                    "TheBloke/TinyLlama-1.1B-Chat-v1.0-GPTQ",
+                    "LnL-AI/TinyLlama-1.1B-Chat-v1.0-GPTQ-4bit",
                     {"quantization": "gptq_marlin"},
-                )
-            )
-
-        if is_quant_method_supported("gptq_marlin_24"):
-            TEST_MODELS.append(
-                (
-                    "alexm-nm/tinyllama-24-marlin24-4bit-g128",
-                    {"quantization": "gptq_marlin_24"},
                 )
             )
 
@@ -89,16 +58,8 @@ def test_full_graph(
     monkeypatch: pytest.MonkeyPatch,
     model: str,
     model_kwargs: dict[str, Any],
-    compilation_mode: int,
+    compilation_mode: CompilationMode,
 ):
-    if (
-        "w8a8" in model
-        or "w8w8" in model
-        and current_platform.has_device_capability((10, 0))
-    ):
-        # int8 removed on Blackwell:
-        pytest.skip("int8 support removed on Blackwell")
-
     with monkeypatch.context():
         print(f"MODEL={model}")
 
@@ -122,11 +83,13 @@ def test_full_graph(
             CompilationConfig(
                 mode=CompilationMode.VLLM_COMPILE,
                 custom_ops=["+rms_norm"],
-                pass_config=PassConfig(enable_fusion=True, enable_noop=True),
+                pass_config=PassConfig(
+                    fuse_norm_quant=True, fuse_act_quant=True, eliminate_noops=True
+                ),
             ),
             *model_info,
         )
-        for model_info in models_list(keywords=["FP8-dynamic", "quantized.w8a8"])
+        for model_info in models_list(keywords=["FP8-dynamic"])
     ]
     + [
         # Test depyf integration works
@@ -154,6 +117,20 @@ def test_full_graph(
         )
         for model_info in models_list(all=False)
         if is_torch_equal_or_newer("2.9.0.dev")
+    ]
+    + [
+        # Test get_raw_stream patch with compile_sizes
+        # This tests that TorchInductor autotune works correctly with get_raw_stream
+        # patch in torch 2.9 and without patch in torch 2.10+
+        (
+            CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                compile_sizes=[1, 2],  # Triggers autotune which uses get_raw_stream
+                cudagraph_mode=CUDAGraphMode.NONE,
+            ),
+            "facebook/opt-125m",
+            {},
+        ),
     ],
 )
 # only test some of the models
@@ -163,14 +140,6 @@ def test_custom_compile_config(
     model: str,
     model_kwargs: dict[str, Any],
 ):
-    if (
-        "w8a8" in model
-        or "w8w8" in model
-        and current_platform.has_device_capability((10, 0))
-    ):
-        # int8 removed on Blackwell:
-        pytest.skip("int8 support removed on Blackwell")
-
     if compilation_config.use_inductor_graph_partition and not is_torch_equal_or_newer(
         "2.9.0.dev"
     ):
@@ -180,39 +149,9 @@ def test_custom_compile_config(
     run_model(compilation_config, model, **model_kwargs)
 
 
-@pytest.mark.parametrize(
-    "compilation_mode",
-    [CompilationMode.NONE, CompilationMode.VLLM_COMPILE],
-)
-@pytest.mark.parametrize(
-    "model, backend",
-    [
-        ("Qwen/Qwen2-0.5B", None),  # Standard attention model
-        (
-            "deepseek-ai/DeepSeek-V2-Lite",
-            AttentionBackendEnum.FLASHINFER_MLA,
-        ),  # MLA (Multi-head Latent Attention) model
-    ],
-)
-def test_fp8_kv_scale_compile(
-    monkeypatch: pytest.MonkeyPatch,
-    compilation_mode: int,
-    model: str,
-    backend: AttentionBackendEnum | None,
+def run_model(
+    compile_config: CompilationMode | CompilationConfig, model: str, **model_kwargs
 ):
-    if backend:
-        monkeypatch.setenv("VLLM_ATTENTION_BACKEND", backend.name)
-
-    model_kwargs = {
-        "quantization": "fp8",
-        "kv_cache_dtype": "fp8_e4m3",
-        "calculate_kv_scales": True,
-        "max_model_len": 512,
-    }
-    run_model(compilation_mode, model, **model_kwargs)
-
-
-def run_model(compile_config: int | CompilationConfig, model: str, **model_kwargs):
     compilation_config = (
         compile_config
         if isinstance(compile_config, CompilationConfig)

@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Run `pytest tests/entrypoints/openai/test_embedding_dimensions.py`.
-"""
+"""Run `pytest tests/entrypoints/openai/test_embedding_dimensions.py`."""
 
 import openai
 import pytest
@@ -10,14 +8,8 @@ import pytest
 from tests.conftest import HfRunner
 from tests.models.language.pooling.embed_utils import run_embedding_correctness_test
 from tests.models.utils import EmbedModelInfo
-from tests.utils import RemoteOpenAIServer
+from tests.utils import ROCM_EXTRA_ARGS, RemoteOpenAIServer
 from vllm.entrypoints.pooling.embed.protocol import EmbeddingResponse
-from vllm.platforms import current_platform
-
-if current_platform.is_rocm():
-    pytest.skip(
-        "Encoder self-attention is not implemented on ROCm.", allow_module_level=True
-    )
 
 MODELS = [
     EmbedModelInfo("intfloat/multilingual-e5-small", is_matryoshka=False),
@@ -54,7 +46,7 @@ def server(model_info, dtype: str):
         "--enforce-eager",
         "--max-model-len",
         "512",
-    ]
+    ] + ROCM_EXTRA_ARGS
 
     if model_info.name == "Snowflake/snowflake-arctic-embed-m-v1.5":
         # Manually enable Matryoshka Embeddings

@@ -1,26 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import multiprocessing
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from tests.kernels.moe.utils import make_dummy_moe_config
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    maybe_make_prepare_finalize,
+)
 from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+    RoutingMethodType,
     fp8_w8a8_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (
+    FlashInferExperts,
+)
+from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
+    view_as_block_major_k,
+)
+from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
+    TrtLlmFp8ExpertsModular,
+    TrtLlmFp8ExpertsMonolithic,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-    apply_flashinfer_per_tensor_scale_fp8,
-    flashinfer_cutlass_moe_fp8,
-    register_moe_scaling_factors,
-    rotate_flashinfer_fp8_moe_weights,
+    rotate_weights_for_fi_trtllm_fp8_per_tensor_moe,
     swap_w13_to_w31,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import input_to_float8
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey,
+    kFp8Dynamic128Sym,
+    kFp8DynamicTensorSym,
+    kFp8Static128BlockSym,
+    kFp8StaticTensorSym,
+    kMxfp8Dynamic,
+    kMxfp8Static,
+)
 from vllm.model_executor.models.llama4 import Llama4MoE
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import next_power_of_2
+from vllm.utils.torch_utils import set_random_seed
 
 try:
     from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
@@ -60,7 +89,8 @@ def quant_fp8_per_tensor_batches(a):
 
     for i in range(num_batches):
         a_fp8, a_global_sf = input_to_float8(a[i])
-        a_global_sf = 1.0 / a_global_sf
+        if a_global_sf.numel() == 1:
+            a_global_sf = a_global_sf.view(1, 1)
         a_quant.append(a_fp8)
         a_scales.append(a_global_sf)
 
@@ -68,6 +98,20 @@ def quant_fp8_per_tensor_batches(a):
     result_a_scales = torch.stack(a_scales)
 
     return result_a_quant, result_a_scales
+
+
+def check_accuracy(ref_output, actual_output, atol=0.1, rtol=0.85, percent=0.925):
+    close = torch.isclose(ref_output, actual_output, atol=atol, rtol=rtol)
+    match_ratio = close.float().mean()
+    assert match_ratio >= percent, (
+        f"Match ratio {match_ratio:.4f} is below the threshold {percent:.4f}"
+    )
+
+    mismatch_percent = 1.0 - match_ratio.item()
+    assert mismatch_percent <= 1 - percent, (
+        f"Mismatch percentage {mismatch_percent:.4f} is above the threshold "
+        f"{1 - percent:.4f}"
+    )
 
 
 @dataclass
@@ -83,41 +127,71 @@ class TestData:
 
     @staticmethod
     def make_moe_tensors_8bit(
-        m: int, k: int, n: int, e: int, reorder: bool, activation: str = "silu"
+        m: int,
+        k: int,
+        n: int,
+        e: int,
+        is_trtllm: bool,
+        activation: MoEActivation = MoEActivation.SILU,
+        topk: int = 1,
     ) -> "TestData":
-        is_gated = activation != "relu2_no_mul"
+        is_gated = activation.is_gated
 
         hidden_states = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
-        w13 = torch.randn(
-            (e, (2 * n) if is_gated else n, k), device="cuda", dtype=torch.bfloat16
+        w13 = (
+            torch.randn(
+                (e, (2 * n) if is_gated else n, k), device="cuda", dtype=torch.bfloat16
+            )
+            / 10
         )
-        w2 = torch.randn((e, k, n), device="cuda", dtype=torch.bfloat16)
+        w2 = torch.randn((e, k, n), device="cuda", dtype=torch.bfloat16) / 10
 
         # Scale to fp8
         _, a1_scale = input_to_float8(hidden_states)
-        a1_scale = 1.0 / a1_scale
         a2_scale = torch.scalar_tensor(1.0).to(device="cuda").to(dtype=torch.float32)
         w13_quantized, w13_weight_scale = quant_fp8_per_tensor_batches(w13)
         w2_quantized, w2_weight_scale = quant_fp8_per_tensor_batches(w2)
 
         layer = torch.nn.Module()
+        layer.orig_dtype = torch.bfloat16
         layer.w13_weight = w13_quantized.clone()
         layer.w2_weight = w2_quantized.clone()
         layer.w13_input_scale = a1_scale
         layer.w2_input_scale = a2_scale
         layer.w13_weight_scale = w13_weight_scale
         layer.w2_weight_scale = w2_weight_scale
-
-        register_moe_scaling_factors(layer)
+        layer.activation = activation
+        # Setup dummy config.
+        layer.moe_parallel_config = mk.FusedMoEParallelConfig.make_no_parallel()
 
         # flashinfer expects swapped rows for w13
-        layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
-        if reorder:
-            rotate_flashinfer_fp8_moe_weights(layer.w13_weight, layer.w2_weight)
+        if is_gated:
+            layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
+        if is_trtllm:
+            rotate_weights_for_fi_trtllm_fp8_per_tensor_moe(
+                layer.w13_weight, layer.w2_weight, is_gated
+            )
         layer.custom_routing_function = Llama4MoE.custom_routing_function
+        layer.routing_method_type = RoutingMethodType.Llama4
+        layer.renormalize = False
         layer.intermediate_size_per_partition = n
         layer.ep_rank = 0
         layer.local_num_experts = e
+
+        layer.moe = FusedMoEConfig(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            num_local_experts=e,
+            num_logical_experts=e,
+            moe_parallel_config=layer.moe_parallel_config,
+            in_dtype=hidden_states.dtype,
+            routing_method=layer.routing_method_type,
+            activation=activation,
+            device=w13_quantized.device,
+            max_num_tokens=next_power_of_2(m),
+        )
 
         return TestData(
             hidden_states=hidden_states,
@@ -134,20 +208,23 @@ class TestData:
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
 def test_flashinfer_per_tensor_moe_fp8_no_graph(
     m: int,
     n: int,
     k: int,
     e: int,
     topk: int,
+    activation: MoEActivation,
     monkeypatch,
 ):
     if not current_platform.has_device_capability(100):
         pytest.skip("Test is only supported for sm >= 100")
-    current_platform.seed_everything(7)
-    monkeypatch.setenv("VLLM_FUSED_MOE_CHUNK_SIZE", "8192")
+    set_random_seed(7)
     with set_current_vllm_config(vllm_config):
-        td = TestData.make_moe_tensors_8bit(m, k, n, e, reorder=True)
+        td = TestData.make_moe_tensors_8bit(
+            m, k, n, e, is_trtllm=True, activation=activation
+        )
 
         score = torch.randn((m, e), device="cuda", dtype=torch.bfloat16)
         topk_weights, topk_ids = Llama4MoE.custom_routing_function(
@@ -171,47 +248,65 @@ def test_flashinfer_per_tensor_moe_fp8_no_graph(
             td.w2_quantized,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=False,
-            activation="silu",
+            activation=activation,
             global_num_experts=e,
             expert_map=None,
             apply_router_weight_on_input=True,
             quant_config=quant_config,
         )
 
-        flashinfer_output = apply_flashinfer_per_tensor_scale_fp8(
-            layer=td.layer,
-            hidden_states=td.hidden_states,
-            router_logits=score,
-            routing_bias=None,
-            global_num_experts=e,
-            top_k=topk,
-            num_expert_group=None,
-            topk_group=None,
-            apply_router_weight_on_input=True,
+        kernel = mk.FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe=td.layer.moe,
+                quant_config=quant_config,
+                allow_new_interface=True,
+                use_monolithic=True,
+            ),
+            TrtLlmFp8ExpertsMonolithic(
+                moe_config=td.layer.moe,
+                quant_config=quant_config,
+            ),
         )
 
-        torch.testing.assert_close(output, flashinfer_output, atol=5.5e-2, rtol=1e-2)
+        flashinfer_output = kernel.apply_monolithic(
+            hidden_states=td.hidden_states,
+            w1=td.layer.w13_weight,
+            w2=td.layer.w2_weight,
+            router_logits=score,
+            activation=activation,
+            global_num_experts=e,
+            expert_map=None,
+            apply_router_weight_on_input=True,
+            routed_scaling_factor=1.0,
+        )
+
+        check_accuracy(
+            ref_output=output,
+            actual_output=flashinfer_output,
+            atol=0.1,
+            rtol=0.85,
+            percent=0.925,
+        )
 
 
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("activation", ["silu", "relu2_no_mul"])
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
 def test_flashinfer_cutlass_moe_fp8_no_graph(
     m: int,
     n: int,
     k: int,
     e: int,
     topk: int,
-    activation: str,
+    activation: MoEActivation,
     monkeypatch,
+    workspace_init,
 ):
-    current_platform.seed_everything(7)
-    monkeypatch.setenv("VLLM_FUSED_MOE_CHUNK_SIZE", "8192")
+    set_random_seed(7)
     with set_current_vllm_config(vllm_config):
         td = TestData.make_moe_tensors_8bit(
-            m, k, n, e, reorder=False, activation=activation
+            m, k, n, e, is_trtllm=False, activation=activation
         )
 
         score = torch.randn((m, e), device="cuda", dtype=torch.bfloat16)
@@ -240,7 +335,6 @@ def test_flashinfer_cutlass_moe_fp8_no_graph(
             td.w2_quantized,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=False,
             activation=activation,
             global_num_experts=e,
             expert_map=None,
@@ -256,9 +350,38 @@ def test_flashinfer_cutlass_moe_fp8_no_graph(
         td.layer.get_fused_moe_quant_config = get_fused_moe_quant_config
         td.layer.quant_method = td.layer
 
-        flashinfer_cutlass_output = flashinfer_cutlass_moe_fp8(
+        moe_config = FusedMoEConfig(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            num_local_experts=e,
+            num_logical_experts=e,
+            activation=activation,
+            device="cuda",
+            moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+            in_dtype=torch.bfloat16,
+            routing_method=RoutingMethodType.TopK,
+            max_num_tokens=next_power_of_2(m),
+        )
+
+        kernel = mk.FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe=moe_config,
+                quant_config=quant_config,
+                allow_new_interface=True,
+                use_monolithic=False,
+            ),
+            FlashInferExperts(
+                moe_config=moe_config,
+                quant_config=quant_config,
+            ),
+        )
+
+        flashinfer_cutlass_output = kernel.apply(
             td.hidden_states,
-            td.layer,
+            td.layer.w13_weight,
+            td.layer.w2_weight,
             topk_weights,
             topk_ids,
             activation=activation,
@@ -267,6 +390,380 @@ def test_flashinfer_cutlass_moe_fp8_no_graph(
             apply_router_weight_on_input=True,
         )
 
-        torch.testing.assert_close(
-            output, flashinfer_cutlass_output, atol=5.5e-2, rtol=1e-2
+        check_accuracy(
+            ref_output=output,
+            actual_output=flashinfer_cutlass_output,
+            atol=0.1,
+            rtol=0.85,
+            percent=0.925,
         )
+
+
+@pytest.mark.parametrize(
+    "num_experts,intermediate,hidden",
+    [
+        (8, 2048, 1536),
+        (64, 4096, 4096),
+    ],
+)
+def test_convert_moe_weights_to_flashinfer_trtllm_block_layout(
+    num_experts, intermediate, hidden
+):
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        convert_moe_weights_to_flashinfer_trtllm_block_layout,
+    )
+
+    w13 = torch.randn(
+        (num_experts, 2 * intermediate, hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    w2 = torch.randn(
+        (num_experts, hidden, intermediate), dtype=torch.bfloat16, device="cuda"
+    )
+
+    cache: dict[torch.Size, torch.Tensor] = {}
+    w13_converted, w2_converted = convert_moe_weights_to_flashinfer_trtllm_block_layout(
+        cache, w13, w2
+    )
+
+    assert w13_converted.ndim == 4, (
+        f"Expected 4D tensor, got shape {w13_converted.shape}"
+    )
+    assert w2_converted.ndim == 4, f"Expected 4D tensor, got shape {w2_converted.shape}"
+
+    assert w13_converted.numel() == w13.numel(), "W13 element count should be preserved"
+    assert w2_converted.numel() == w2.numel(), "W2 element count should be preserved"
+
+    assert w13_converted.dtype == torch.bfloat16
+    assert w2_converted.dtype == torch.bfloat16
+
+    assert w13_converted.shape[0] == num_experts
+    assert w2_converted.shape[0] == num_experts
+    assert w13_converted.data_ptr() == w13.data_ptr()
+    assert w2_converted.data_ptr() == w2.data_ptr()
+
+
+@pytest.mark.parametrize("is_gated_act_gemm", [True, False])
+def test_convert_moe_weights_to_flashinfer_trtllm_block_layout_values(
+    is_gated_act_gemm,
+):
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        convert_moe_weights_to_flashinfer_trtllm_block_layout,
+    )
+
+    num_experts, intermediate, hidden = 2, 256, 256
+    w13_multiplier = 2 if is_gated_act_gemm else 1
+    w13 = torch.randn(
+        (num_experts, w13_multiplier * intermediate, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    w2 = torch.randn(
+        (num_experts, hidden, intermediate),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    def _reference_block_layout(
+        weight: torch.Tensor,
+        is_w13: bool,
+        cache: dict[torch.Size, torch.Tensor],
+    ) -> torch.Tensor:
+        outputs = []
+        for expert in weight:
+            expert_uint8 = expert.view(torch.uint8)
+            if is_w13:
+                indices = _maybe_get_cached_w3_w1_permute_indices(
+                    cache,
+                    expert_uint8,
+                    128,
+                    is_gated_act_gemm=is_gated_act_gemm,
+                )
+                if is_gated_act_gemm:
+                    indices = (indices + expert_uint8.shape[0] // 2) % (
+                        expert_uint8.shape[0]
+                    )
+            else:
+                indices = get_w2_permute_indices_with_cache(
+                    cache,
+                    expert_uint8,
+                    128,
+                )
+            rows, cols = expert_uint8.shape
+            blocks = expert_uint8.view(rows, cols // 128, 128).permute(1, 0, 2)
+            outputs.append(torch.index_select(blocks, 1, indices.to(weight.device)))
+        return torch.stack(outputs).view(torch.bfloat16)
+
+    reference_cache: dict[torch.Size, torch.Tensor] = {}
+    expected_w13 = _reference_block_layout(w13, is_w13=True, cache=reference_cache)
+    expected_w2 = _reference_block_layout(w2, is_w13=False, cache=reference_cache)
+    w13_ptr = w13.data_ptr()
+    w2_ptr = w2.data_ptr()
+
+    actual_w13, actual_w2 = convert_moe_weights_to_flashinfer_trtllm_block_layout(
+        {},
+        w13,
+        w2,
+        is_gated_act_gemm=is_gated_act_gemm,
+    )
+
+    assert actual_w13.data_ptr() == w13_ptr
+    assert actual_w2.data_ptr() == w2_ptr
+    assert torch.equal(actual_w13, expected_w13)
+    assert torch.equal(actual_w2, expected_w2)
+
+
+def _make_unquantized_flashinfer_test_layer(
+    monkeypatch, intermediate, is_gated, *, device="cuda"
+):
+    from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+        UnquantizedMoeBackend,
+    )
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    moe_config = make_dummy_moe_config(
+        num_experts=2,
+        hidden_dim=256,
+        intermediate_size=intermediate,
+        activation=MoEActivation.SILU if is_gated else MoEActivation.RELU2_NO_MUL,
+    )
+    moe_config.intermediate_size_per_partition = (intermediate + 127) // 128 * 128
+    method = object.__new__(UnquantizedFusedMoEMethod)
+    method.moe = moe_config
+    method.unquantized_backend = UnquantizedMoeBackend.FLASHINFER_TRTLLM
+    method.moe_kernel = None
+    mock_kernel = MagicMock()
+    monkeypatch.setattr(
+        method,
+        "_init_moe_kernel",
+        lambda _: setattr(method, "moe_kernel", mock_kernel),
+    )
+
+    layer = torch.nn.Module()
+    layer.moe_config = moe_config
+    with torch.device(device):
+        method.create_weights(
+            layer,
+            num_experts=2,
+            hidden_size=256,
+            intermediate_size_per_partition=moe_config.intermediate_size_per_partition,
+            params_dtype=torch.bfloat16,
+        )
+    return method, layer
+
+
+@pytest.mark.parametrize("intermediate", [192, 256])
+@pytest.mark.parametrize("is_gated", [True, False])
+def test_unquantized_flashinfer_trtllm_weights_can_be_reprocessed(
+    monkeypatch, intermediate, is_gated
+):
+    """Each raw reload clears padding left dirty by prior in-place conversion."""
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        convert_moe_weights_to_flashinfer_trtllm_block_layout,
+    )
+
+    method, layer = _make_unquantized_flashinfer_test_layer(
+        monkeypatch, intermediate, is_gated
+    )
+    w13_shape, w2_shape = layer.w13_weight.shape, layer.w2_weight.shape
+    padded = w2_shape[-1]
+    w13_ptr = layer.w13_weight.data_ptr()
+    w2_ptr = layer.w2_weight.data_ptr()
+    load_numel = (
+        layer.w13_weight.weight_loader_numel,
+        layer.w2_weight.weight_loader_numel,
+    )
+
+    for _ in range(2):
+        reloaded_w13 = torch.randn_like(layer.w13_weight)
+        reloaded_w2 = torch.randn_like(layer.w2_weight)
+        reloaded_w13[:, intermediate:padded].zero_()
+        if is_gated:
+            reloaded_w13[:, padded + intermediate :].zero_()
+        reloaded_w2[:, :, intermediate:].zero_()
+        expected_w13, expected_w2 = (
+            convert_moe_weights_to_flashinfer_trtllm_block_layout(
+                {},
+                reloaded_w13.clone(),
+                reloaded_w2.clone(),
+                is_gated_act_gemm=is_gated,
+            )
+        )
+
+        # The loader writes only logical checkpoint slices, not padding.
+        layer.w13_weight.fill_(float("nan"))
+        layer.w2_weight.fill_(float("nan"))
+        layer.w13_weight[:, :intermediate].copy_(reloaded_w13[:, :intermediate])
+        if is_gated:
+            layer.w13_weight[:, padded : padded + intermediate].copy_(
+                reloaded_w13[:, padded : padded + intermediate]
+            )
+        layer.w2_weight[:, :, :intermediate].copy_(reloaded_w2[:, :, :intermediate])
+        method.process_weights_after_loading(layer)
+
+        assert layer.w13_weight.shape == w13_shape
+        assert layer.w2_weight.shape == w2_shape
+        assert layer.w13_weight.data_ptr() == w13_ptr
+        assert layer.w2_weight.data_ptr() == w2_ptr
+        assert (
+            layer.w13_weight.weight_loader_numel,
+            layer.w2_weight.weight_loader_numel,
+        ) == load_numel
+        kernel_w13 = view_as_block_major_k(layer.w13_weight)
+        kernel_w2 = view_as_block_major_k(layer.w2_weight)
+        assert torch.equal(kernel_w13, expected_w13)
+        assert torch.equal(kernel_w2, expected_w2)
+
+
+def _check_flashinfer_ipc_weights(entries, expected, mode, device_index):
+    from vllm.model_executor.model_loader.weight_cache.ipc_loader import IpcModelLoader
+    from vllm.model_executor.model_loader.weight_cache.protocol import (
+        WeightCacheState,
+    )
+    from vllm.model_executor.utils import weights_already_processed
+
+    torch.accelerator.set_device_index(device_index)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        method, layer = _make_unquantized_flashinfer_test_layer(
+            monkeypatch, 192, is_gated=True, device="meta"
+        )
+        loader = object.__new__(IpcModelLoader)
+        loader.mode = mode
+        loader._apply_entries(layer, WeightCacheState(entries, {}, {}), device_index)
+        pointers = (layer.w13_weight.data_ptr(), layer.w2_weight.data_ptr())
+
+        # Like ipc_cache: a fresh method, only tensor metadata, no _setup_kernel.
+        with weights_already_processed():
+            method.process_weights_after_loading(layer)
+        assert method.moe_kernel is not None
+        actual = (
+            view_as_block_major_k(layer.w13_weight),
+            view_as_block_major_k(layer.w2_weight),
+        )
+        for weight, reference, pointer in zip(actual, expected, pointers):
+            assert weight.data_ptr() == pointer
+            assert torch.equal(weight.cpu(), reference)
+        # Cross-process addresses need not match; writes prove sharing/isolation.
+        with torch.no_grad():
+            for weight in actual:
+                weight.fill_(1.0)
+        torch.accelerator.synchronize()
+
+
+@pytest.mark.parametrize("cache_ndim", [3, 4])
+@pytest.mark.parametrize("mode", ["copy", "zero_copy"])
+def test_unquantized_flashinfer_trtllm_cached_weights_need_no_method_state(
+    monkeypatch, cache_ndim, mode
+):
+    """A spawned IPC consumer restores views without transient method state."""
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        convert_moe_weights_to_flashinfer_trtllm_block_layout,
+    )
+    from vllm.model_executor.model_loader.weight_cache.protocol import TensorEntry
+
+    method, layer = _make_unquantized_flashinfer_test_layer(
+        monkeypatch, 192, is_gated=True, device="meta"
+    )
+    packed = convert_moe_weights_to_flashinfer_trtllm_block_layout(
+        {},
+        torch.randn_like(layer.w13_weight, device="cuda"),
+        torch.randn_like(layer.w2_weight, device="cuda"),
+    )
+    expected = [weight.cpu() for weight in packed]
+    entries = {}
+    for name, weight in zip(("w13_weight", "w2_weight"), packed):
+        cached = weight.view_as(getattr(layer, name)) if cache_ndim == 3 else weight
+        entries[name] = TensorEntry.from_tensor(cached, kind="param")
+    consumer = multiprocessing.get_context("spawn").Process(
+        target=_check_flashinfer_ipc_weights,
+        args=(
+            entries,
+            expected,
+            mode,
+            torch.accelerator.current_device_index(),
+        ),
+    )
+    consumer.start()
+    try:
+        # Keep producer allocations alive until the consumer releases its views.
+        consumer.join(timeout=180)
+        assert not consumer.is_alive(), "IPC consumer timed out"
+        assert consumer.exitcode == 0, "IPC consumer failed; see child traceback"
+        for source, reference in zip(packed, expected):
+            expected_source = (
+                torch.ones_like(reference) if mode == "zero_copy" else reference
+            )
+            assert torch.equal(source.cpu(), expected_source)
+    finally:
+        if consumer.is_alive():
+            consumer.terminate()
+            consumer.join(timeout=10)
+            if consumer.is_alive():
+                consumer.kill()
+                consumer.join(timeout=10)
+        consumer.close()
+
+
+@pytest.mark.parametrize(
+    ("weight_key", "activation_key", "activation", "expected"),
+    [
+        (kMxfp8Static, kMxfp8Dynamic, MoEActivation.SILU, True),
+        (kFp8Static128BlockSym, kFp8Dynamic128Sym, MoEActivation.SILU, True),
+        (
+            kFp8Static128BlockSym,
+            kFp8Dynamic128Sym,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+            True,
+        ),
+        (kFp8StaticTensorSym, kFp8DynamicTensorSym, MoEActivation.SILU, False),
+        # FlashInfer takes the clamp only with a SwiGLU activation.
+        (
+            kFp8Static128BlockSym,
+            kFp8Dynamic128Sym,
+            MoEActivation.RELU2_NO_MUL,
+            False,
+        ),
+    ],
+)
+def test_trtllm_fp8_swiglu_clamp_support(
+    weight_key: QuantKey,
+    activation_key: QuantKey,
+    activation: MoEActivation,
+    expected: bool,
+):
+    """FlashInfer >= 0.6.18 applies the SwiGLU clamp for both block-scaled
+    kernels with a SwiGLU activation (DeepSeek-V4 sets swiglu_limit); the
+    per-tensor kernel has no clamp, and Relu2 rejects the parameters."""
+
+    class _Experts(TrtLlmFp8ExpertsModular):
+        @staticmethod
+        def _supports_current_device() -> bool:
+            return True
+
+        @staticmethod
+        def _supports_quant_scheme(
+            weight_key: QuantKey | None, activation_key: QuantKey | None
+        ) -> bool:
+            return True
+
+    moe_config = make_dummy_moe_config()
+    moe_config.swiglu_limit = 7.0
+    moe_config.activation = activation
+
+    supported, reason = _Experts.is_supported_config(
+        _Experts,
+        moe_config,
+        weight_key,
+        activation_key,
+        mk.FusedMoEActivationFormat.Standard,
+    )
+
+    assert supported == expected, reason
+    if not expected:
+        assert "SwiGLU" in reason

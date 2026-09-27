@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, overload
 
 if TYPE_CHECKING:
     from transformers import BatchEncoding
@@ -20,6 +21,9 @@ class TokenizerLike(Protocol):
         download_dir: str | None = None,
         **kwargs,
     ) -> "TokenizerLike":
+        raise NotImplementedError
+
+    def num_special_tokens_to_add(self) -> int:
         raise NotImplementedError
 
     @property
@@ -98,18 +102,29 @@ class TokenizerLike(Protocol):
         messages: list["ChatCompletionMessageParam"],
         tools: list[dict[str, Any]] | None = None,
         **kwargs,
-    ) -> list[int]:
+    ) -> str | list[int]:
+        raise NotImplementedError
+
+    @overload
+    def convert_tokens_to_ids(self, tokens: str) -> int: ...
+
+    @overload
+    def convert_tokens_to_ids(self, tokens: list[str]) -> list[int]: ...
+
+    def convert_tokens_to_ids(self, tokens: str | list[str]) -> int | list[int]:
         raise NotImplementedError
 
     def convert_tokens_to_string(self, tokens: list[str]) -> str:
         raise NotImplementedError
 
-    def decode(self, ids: list[int] | int, skip_special_tokens: bool = False) -> str:
+    def decode(
+        self, ids: Sequence[int] | int, skip_special_tokens: bool = False
+    ) -> str:
         raise NotImplementedError
 
     def convert_ids_to_tokens(
         self,
-        ids: list[int],
+        ids: Sequence[int],
         skip_special_tokens: bool = False,
     ) -> list[str]:
         raise NotImplementedError

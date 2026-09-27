@@ -5,22 +5,21 @@ from typing import Annotated, Literal, TypeAlias
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn import LayerNorm
 from transformers.models.qwen2_vl import Qwen2VLProcessor
 
-from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.layer import (
-    maybe_get_vit_flash_attn_backend,
-)
 from vllm.config import VllmConfig
-from vllm.config.multimodal import BaseDummyOptions
+from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.distributed import utils as dist_utils
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.attention import (
+    MMEncoderAttention,
+)
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -30,7 +29,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.layers.rotary_embedding.common import (
+    ApplyRotaryEmb,
+)
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsLoRA,
@@ -53,23 +54,23 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.models.vision import get_vit_attn_backend
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalDataDict
+from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.dotsocr import DotsOCRConfig, DotsVisionConfig
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from .vision import run_dp_sharded_mrope_vision_model
+from .vision import is_vit_use_data_parallel, run_dp_sharded_mrope_vision_model
 
 IMAGE_TOKEN = "<|imgpad|>"
 
 
 class DotsOCRImagePixelInputs(TensorSchema):
-    """
-    Dimensions:
-        - np: The total number of patches over each image over each prompt in
-              the batch
-        - ni: Number of images
-        - cps: Number of channels * patch_size * patch_size
+    """Dimensions:
+    - np: The total number of patches over each image over each prompt in
+          the batch
+    - ni: Number of images
+    - cps: Number of channels * patch_size * patch_size
     """
 
     type: Literal["pixel_values"]
@@ -79,11 +80,10 @@ class DotsOCRImagePixelInputs(TensorSchema):
 
 
 class DotsOCRImageEmbeddingInputs(TensorSchema):
-    """
-    Dimensions:
-        - nf: Number of image features
-        - hs: Hidden size
-        - ni: Number of images
+    """Dimensions:
+    - nf: Number of image features
+    - hs: Hidden size
+    - ni: Number of images
     """
 
     type: Literal["image_embeds"]
@@ -104,21 +104,16 @@ class DotsOCRDummyInputsBuilder(Qwen2VLDummyInputsBuilder):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
-        num_images = mm_counts.get("image", 0)
-
-        target_width, target_height = self.info.get_image_size_with_most_features(  # noqa: E501
-        )
-
-        image_overrides = mm_options.get("image") if mm_options else None
+        target_width, target_height = self.info.get_image_size_with_most_features()
 
         return {
             "image": self._get_dummy_images(
                 width=target_width,
                 height=target_height,
-                num_images=num_images,
-                overrides=image_overrides,
+                num_images=mm_counts.get("image", 0),
+                overrides=mm_options.get("image"),
             ),
         }
 
@@ -149,7 +144,7 @@ class DotsOCRProcessingInfo(Qwen2VLProcessingInfo):
         self,
         **kwargs: object,
     ) -> Qwen2VLProcessor:
-        self.get_tokenizer().image_token = IMAGE_TOKEN  # Ensure image token is set
+        setattr(self.get_tokenizer(), "image_token", IMAGE_TOKEN)  # noqa: B010
         processor = self.ctx.get_hf_processor(
             Qwen2VLProcessor,
             **kwargs,
@@ -157,32 +152,6 @@ class DotsOCRProcessingInfo(Qwen2VLProcessingInfo):
         processor.image_token = IMAGE_TOKEN
         processor.video_token = "<|video_pad|>"
         return processor
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb_vision(
-    tensor: torch.Tensor, freqs: torch.Tensor
-) -> torch.Tensor:
-    orig_dtype = tensor.dtype
-    tensor = tensor.float()
-
-    cos = freqs.cos()
-    sin = freqs.sin()
-
-    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-
-    output = (tensor * cos) + (rotate_half(tensor) * sin)
-
-    output = output.to(orig_dtype)
-
-    return output
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -207,9 +176,9 @@ class PatchMerger(nn.Module):
         spatial_merge_size: int = 2,
         pre_norm="layernorm",
         prefix: str = "",
-        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
+        use_data_parallel = is_vit_use_data_parallel()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.pre_norm = pre_norm
         if self.pre_norm == "layernorm":
@@ -255,10 +224,9 @@ class DotsVisionAttention(nn.Module):
         *,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
-        attn_backend_override: AttentionBackendEnum | None = None,
     ) -> None:
         super().__init__()
+        use_data_parallel = is_vit_use_data_parallel()
 
         self.embed_dim = dim
         self.tp_size = (
@@ -287,31 +255,18 @@ class DotsVisionAttention(nn.Module):
             prefix=f"{prefix}.proj",
             disable_tp=use_data_parallel,
         )
-        # Select attention backend
-        self.attn_backend = get_vit_attn_backend(
-            self.hidden_size_per_attention_head,
-            torch.get_default_dtype(),
-            attn_backend_override=attn_backend_override,
+
+        self.attn = MMEncoderAttention(
+            num_heads=self.num_attention_heads_per_partition,
+            head_size=self.hidden_size_per_attention_head,
+            scale=self.hidden_size_per_attention_head**-0.5,
+            prefix=f"{prefix}.attn",
         )
 
-        self.attn_backend, self.flash_attn_varlen_func = (
-            maybe_get_vit_flash_attn_backend(
-                self.attn_backend,
-                attn_backend_override=attn_backend_override,
-            )
+        self.apply_rotary_emb = ApplyRotaryEmb(
+            enforce_enable=True,
+            enable_fp32_compute=True,
         )
-        if self.attn_backend not in {
-            AttentionBackendEnum.FLASH_ATTN,
-            AttentionBackendEnum.TORCH_SDPA,
-            AttentionBackendEnum.ROCM_AITER_FA,
-        }:
-            raise RuntimeError(
-                f"Unsupported vision attention backend: {self.attn_backend}"
-            )
-        self.is_flash_attn_backend = self.attn_backend in {
-            AttentionBackendEnum.FLASH_ATTN,
-            AttentionBackendEnum.ROCM_AITER_FA,
-        }
 
     def forward(
         self,
@@ -319,7 +274,7 @@ class DotsVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb: torch.Tensor | None = None,
         *,
-        max_seqlen: int | None = None,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # [S, C] -> [S, B=1, C]
         x = hidden_states.unsqueeze(1)
@@ -333,44 +288,20 @@ class DotsVisionAttention(nn.Module):
 
         if rotary_pos_emb is not None:
             qk_concat = torch.cat([q, k], dim=0)
-            qk_rotated = apply_rotary_pos_emb_vision(qk_concat, rotary_pos_emb)
+            qk_rotated = self.apply_rotary_emb(
+                qk_concat,
+                rotary_pos_emb.cos(),
+                rotary_pos_emb.sin(),
+            )
             q, k = torch.chunk(qk_rotated, 2, dim=0)
 
-        if self.is_flash_attn_backend:
-            q_ = q.reshape(bs * q.shape[1], q.shape[2], q.shape[3])
-            k_ = k.reshape(bs * k.shape[1], k.shape[2], k.shape[3])
-            v_ = v.reshape(bs * v.shape[1], v.shape[2], v.shape[3])
-            output = self.flash_attn_varlen_func(
-                q_,
-                k_,
-                v_,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                dropout_p=0.0,
-                causal=False,
-            )
-            context_layer = output.view(
-                bs,
-                -1,
-                self.num_attention_heads_per_partition,
-                self.hidden_size_per_attention_head,
-            )
-        elif self.attn_backend == AttentionBackendEnum.TORCH_SDPA:
-            outputs = []
-            for i in range(1, len(cu_seqlens)):
-                s = int(cu_seqlens[i - 1])
-                e = int(cu_seqlens[i])
-                q_i = q[:, s:e].permute(0, 2, 1, 3)
-                k_i = k[:, s:e].permute(0, 2, 1, 3)
-                v_i = v[:, s:e].permute(0, 2, 1, 3)
-                out_i = F.scaled_dot_product_attention(q_i, k_i, v_i, dropout_p=0.0)
-                out_i = out_i.permute(0, 2, 1, 3)
-                outputs.append(out_i)
-            context_layer = torch.cat(outputs, dim=1) if outputs else q[:, :0]
-        else:
-            raise RuntimeError("Unsupported attention backend")
+        context_layer = self.attn(
+            query=q,
+            key=k,
+            value=v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
 
         # [B,S,H,D] -> [S,B,H*D] -> [S, C]
         context_layer = context_layer.permute(1, 0, 2, 3).contiguous()
@@ -386,13 +317,13 @@ class DotsSwiGLUFFN(nn.Module):
         *,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ):
         super().__init__()
         hidden_features = config.intermediate_size
         in_features = config.embed_dim
         bias = config.use_bias
 
+        use_data_parallel = is_vit_use_data_parallel()
         # Referenced aimv2.py AIMv2SwiGLUFFN
         self.fc13 = MergedColumnParallelLinear(
             in_features,
@@ -417,36 +348,6 @@ class DotsSwiGLUFFN(nn.Module):
         x = self.act_fn(x)
         x, _ = self.fc2(x)
         return x
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("fc13", "fc1", 0),
-            ("fc13", "fc3", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
 
 class DotsPatchEmbed(nn.Module):
@@ -499,8 +400,6 @@ class DotsVisionBlock(nn.Module):
         *,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
-        attn_backend_override: AttentionBackendEnum | None = None,
     ):
         super().__init__()
 
@@ -511,15 +410,12 @@ class DotsVisionBlock(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
-            use_data_parallel=use_data_parallel,
-            attn_backend_override=attn_backend_override,
         )
         self.norm1 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
         self.mlp = DotsSwiGLUFFN(
             config,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
-            use_data_parallel=use_data_parallel,
         )
         self.norm2 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
 
@@ -529,7 +425,7 @@ class DotsVisionBlock(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         rotary_pos_emb: torch.Tensor,
-        max_seqlen: int | None = None,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
@@ -550,8 +446,6 @@ class DotsVisionTransformer(nn.Module):
         num_hidden_layers_override: int | None = None,
         require_post_norm: bool | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
-        attn_backend_override: AttentionBackendEnum | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -564,7 +458,6 @@ class DotsVisionTransformer(nn.Module):
         self.attn_backend = get_vit_attn_backend(
             head_size=head_dim,
             dtype=torch.get_default_dtype(),
-            attn_backend_override=attn_backend_override,
         )
         self.out_hidden_size = config.hidden_size
         # Keep blocks for compatibility with other vision towers
@@ -579,14 +472,13 @@ class DotsVisionTransformer(nn.Module):
                     config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.blocks.{i}",
-                    use_data_parallel=use_data_parallel,
-                    attn_backend_override=attn_backend_override,
                 )
                 for i in range(num_layers)
             ]
         )
         if require_post_norm is None:
             require_post_norm = len(self.blocks) == config.num_hidden_layers
+        self.post_trunk_norm: RMSNorm | None
         if require_post_norm and self.config.post_norm:
             self.post_trunk_norm = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
         else:
@@ -596,7 +488,6 @@ class DotsVisionTransformer(nn.Module):
             dim=config.hidden_size,
             context_dim=config.embed_dim,
             spatial_merge_size=config.spatial_merge_size,
-            use_data_parallel=use_data_parallel,
         )
 
     @property
@@ -641,13 +532,14 @@ class DotsVisionTransformer(nn.Module):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
-    def compute_attn_mask_seqlen(self, cu_seqlens: torch.Tensor) -> int | None:
+    def compute_attn_mask_seqlen(self, cu_seqlens: torch.Tensor) -> torch.Tensor | None:
         max_seqlen = None
-        if (
-            self.attn_backend == AttentionBackendEnum.FLASH_ATTN
-            or self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA
-        ):
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        if self.attn_backend in {
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.ROCM_AITER_FA,
+            AttentionBackendEnum.TRITON_ATTN,
+        }:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         return max_seqlen
 
     def forward(
@@ -656,15 +548,17 @@ class DotsVisionTransformer(nn.Module):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         # Convert grid_thw to tensor (always expecting list format now)
-        grid_thw = torch.tensor(grid_thw, device=hidden_states.device, dtype=torch.long)
+        grid_thw_tensor = torch.tensor(
+            grid_thw, device=hidden_states.device, dtype=torch.long
+        )
         hidden_states = hidden_states.to(self.dtype)
-        hidden_states = self.patch_embed(hidden_states, grid_thw)
+        hidden_states = self.patch_embed(hidden_states, grid_thw_tensor)
 
         cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+            grid_thw_tensor[:, 1] * grid_thw_tensor[:, 2], grid_thw_tensor[:, 0]
         ).cumsum(
             dim=0,
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            dtype=grid_thw_tensor.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
@@ -690,12 +584,14 @@ class DotsVisionTransformer(nn.Module):
     dummy_inputs=DotsOCRDummyInputsBuilder,
 )
 class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
-    merge_by_field_config = True
-
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={
             ".attn.qkv_proj.": ".attn.qkv.",
             ".attn.out_proj.": ".attn.proj.",
+        },
+        orig_to_new_stacked={
+            ".fc1.": (".fc13.", 0),
+            ".fc3.": (".fc13.", 1),
         },
         orig_to_new_prefix={
             "lm_head.": "language_model.lm_head.",
@@ -717,11 +613,13 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
         "fc13": ["fc1", "fc3"],
     }
     supports_encoder_tp_data = True
+    supports_tower_connector_lora = True
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
             return "<|img|><|imgpad|><|endofimg|>"
+        return None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -729,30 +627,28 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
         self.config: DotsOCRConfig = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        assert multimodal_config is not None
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         if isinstance(self.config.vision_config, dict):
             vision_config = DotsVisionConfig(**self.config.vision_config)
             self.config.vision_config = vision_config
         else:
             vision_config = self.config.vision_config
-        attn_backend_override = (
-            multimodal_config.mm_encoder_attn_backend
-            if multimodal_config is not None
-            else None
-        )
-        self.vision_tower = DotsVisionTransformer(
-            vision_config,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "vision_tower"),
-            use_data_parallel=self.use_data_parallel,
-            attn_backend_override=attn_backend_override,
-        )
-        self.language_model: Qwen2ForCausalLM = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=self.config,
-            prefix=maybe_prefix(prefix, "language_model"),
-            architectures=["Qwen2ForCausalLM"],
-        )
+
+        with self._mark_tower_model(vllm_config, "image"):
+            self.vision_tower = DotsVisionTransformer(
+                vision_config,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )
+
+        with self._mark_language_model(vllm_config):
+            self.language_model: Qwen2ForCausalLM = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=self.config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=["Qwen2ForCausalLM"],
+            )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
@@ -781,6 +677,8 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
                 image_embeds=image_embeds,
                 image_grid_thw=image_grid_thw,
             )
+
+        raise AssertionError
 
     def _process_image_input(
         self, image_input: DotsOCRImageInputs
@@ -815,8 +713,16 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
 
         return image_embeds.split(sizes)
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
+    def get_mm_lora_token_counts(
+        self,
+        *,
+        modality: str,
+        mm_kwargs: MultiModalKwargsItem | None,
+        num_mm_embeds: int,
+    ) -> tuple[int, int | None]:
+        del modality, mm_kwargs
+        merge_size = self.vision_tower.spatial_merge_size
+        return num_mm_embeds * (merge_size**2), num_mm_embeds
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
@@ -827,7 +733,7 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -835,14 +741,6 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
     ) -> torch.Tensor | IntermediateTensors:
         if intermediate_tensors is not None:
             inputs_embeds = None
-        elif inputs_embeds is None:
-            vision_embeddings = self.embed_multimodal(**kwargs)
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                vision_embeddings,
-                is_multimodal=input_ids == self.config.image_token_id,
-            )
-            input_ids = None
 
         hidden_states = self.language_model(
             input_ids=input_ids,
@@ -864,9 +762,7 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
-        """
-        Get the module prefix in multimodal models
-        """
+        """Get the module prefix in multimodal models."""
         return MultiModelKeys.from_string_field(
             language_model="language_model",
             connector="vision_tower.merger",

@@ -33,7 +33,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -43,12 +42,16 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import FatreluAndMul, SiluAndMul
-from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (
+    GateLinear,
+    fused_experts,
+    fused_topk,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -63,7 +66,13 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
+from .interfaces import (
+    EagleModelMixin,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsPP,
+)
 from .utils import (
     AutoWeightsLoader,
     is_pp_missing_parameter,
@@ -90,6 +99,7 @@ class MiniCPMMoE(nn.Module):
         intermediate_size: int,
         params_dtype: torch.dtype | None = None,
         tp_size: int | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = tp_size or get_tensor_model_parallel_world_size()
@@ -102,12 +112,11 @@ class MiniCPMMoE(nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
 
-        self.gate = ReplicatedLinear(
+        self.gate = GateLinear(
             self.hidden_size,
             self.num_total_experts,
-            bias=False,
             params_dtype=self.params_dtype,
-            quant_config=None,
+            prefix=f"{prefix}.gate",
         )
 
         self.ws = nn.Parameter(
@@ -173,7 +182,7 @@ class MiniCPMMoE(nn.Module):
         )
 
         final_hidden_states = fused_experts(
-            hidden_states, self.ws, self.w2s, topk_weights, topk_ids, inplace=True
+            hidden_states, self.ws, self.w2s, topk_weights, topk_ids
         )
 
         if self.tp_size > 1:
@@ -277,7 +286,6 @@ class MiniCPMAttention(nn.Module):
 
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
             rope_parameters=rope_parameters,
         )
@@ -299,10 +307,7 @@ class MiniCPMAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        orig_dtype = q.dtype
-        q, k = q.float(), k.float()
         q, k = self.rotary_emb(positions, q, k)
-        q, k = q.to(orig_dtype), k.to(orig_dtype)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -353,6 +358,7 @@ class MiniCPMDecoderLayer(nn.Module):
                 hidden_act=self.config.hidden_act,
                 hidden_act_param=getattr(self.config, "hidden_act_param", 0.0),
                 quant_config=self.quant_config,
+                prefix=f"{self.prefix}.mlp",
             )
         else:
             self.mlp = MiniCPMMoE(
@@ -360,6 +366,7 @@ class MiniCPMDecoderLayer(nn.Module):
                 top_k=self.config.num_experts_per_tok,
                 hidden_size=self.config.hidden_size,
                 intermediate_size=self.config.intermediate_size,
+                prefix=f"{self.prefix}.mlp",
             )
 
     def forward(
@@ -391,7 +398,7 @@ class MiniCPMDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class MiniCPMModel(nn.Module):
+class MiniCPMModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -412,8 +419,6 @@ class MiniCPMModel(nn.Module):
         self.num_experts = getattr(self.config, "num_experts", 0)
         self._init_layers(prefix, config, cache_config, quant_config)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.aux_hidden_state_layers = tuple[int, ...]()
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
@@ -440,7 +445,7 @@ class MiniCPMModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -452,21 +457,21 @@ class MiniCPMModel(nn.Module):
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
         else:
+            assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
-            if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, idx + 1, hidden_states, residual
             )
 
         if not get_pp_group().is_last_rank:
@@ -550,7 +555,9 @@ class MiniCPMModel(nn.Module):
         return loaded_params
 
 
-class MiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
+class MiniCPMForCausalLM(
+    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
+):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -611,16 +618,9 @@ class MiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = layers
-
-    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        num_layers = len(self.model.layers)
-        return (2, num_layers // 2, num_layers - 3)
-
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -650,8 +650,5 @@ class MiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

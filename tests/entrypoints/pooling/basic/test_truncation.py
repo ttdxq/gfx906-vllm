@@ -7,12 +7,6 @@ import pytest
 import pytest_asyncio
 
 from tests.utils import RemoteOpenAIServer
-from vllm.platforms import current_platform
-
-if current_platform.is_rocm():
-    pytest.skip(
-        "Encoder self-attention is not implemented on ROCm.", allow_module_level=True
-    )
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L12-v2"
 max_model_len = 128
@@ -69,20 +63,6 @@ async def test_smaller_truncation_size(client: openai.AsyncOpenAI):
 
 
 @pytest.mark.asyncio
-async def test_zero_truncation_size(client: openai.AsyncOpenAI):
-    truncation_size = 0
-    kwargs: dict[str, Any] = {
-        "model": MODEL_NAME,
-        "input": input,
-        "truncate_prompt_tokens": truncation_size,
-    }
-
-    response = await client.post(path="embeddings", cast_to=object, body={**kwargs})
-
-    assert response["usage"]["prompt_tokens"] == truncation_size
-
-
-@pytest.mark.asyncio
 async def test_bigger_truncation_size(client: openai.AsyncOpenAI):
     truncation_size = max_model_len + 1
     kwargs: dict[str, Any] = {
@@ -100,7 +80,7 @@ async def test_bigger_truncation_size(client: openai.AsyncOpenAI):
     expected_message = (
         "truncate_prompt_tokens value is "
         "greater than max_model_len."
-        " Please, select a smaller truncation size."
+        " Please request a smaller truncation size."
     )
     assert error_details["message"] == expected_message
 

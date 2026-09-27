@@ -22,6 +22,7 @@ def multi_image_multi_aspect_ratio_inputs(formatter: Callable[[str], str]):
 
     Args:
         formatter: model-specific prompt formatter.
+
     """
     stop_sign = IMAGE_ASSETS[0].pil_image
     cherry_blossom = IMAGE_ASSETS[1].pil_image
@@ -65,6 +66,7 @@ def multi_video_multi_aspect_ratio_inputs(
 
     Args:
         formatter: model-specific prompt formatter.
+
     """
     video = sample_frames_from_video(VIDEO_ASSETS[0].np_ndarrays, num_frames)
     # Apply the selected formatter to the base prompts
@@ -140,7 +142,7 @@ def video_with_metadata_glm4_1v():
     metadata = VIDEO_ASSETS[0].metadata
     question = "Describe the video."
     video_prompt = "<|begin_of_video|><|video|><|end_of_video|>"
-    formatted_prompt = f"<|user|>\n{video_prompt}{question}<|assistant|>\n"
+    formatted_prompt = f"[gMASK]<|user|>\n{video_prompt}{question}<|assistant|>\n"
 
     scales = [0.1, 0.2, 0.25]
     video_input = [

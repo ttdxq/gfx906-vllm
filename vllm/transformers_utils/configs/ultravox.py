@@ -8,8 +8,7 @@ import transformers
 
 
 class UltravoxConfig(transformers.PretrainedConfig):
-    r"""
-    This is the configuration class to store the configuration of a
+    r"""This is the configuration class to store the configuration of a
     [`UltravoxForConditionalGeneration`]. It is used to instantiate an
     Ultravox model according to the specified arguments, defining the model
     architecture.
@@ -41,9 +40,9 @@ class UltravoxConfig(transformers.PretrainedConfig):
             Whether to apply layer normalization at the middle of the
             projector or at the end. Versions v0.4.1 and below
             use `False`, but v0.5 and above use `True`.
+
     """
 
-    wrapped_model_config: transformers.PretrainedConfig
     model_type = "ultravox"
     audio_token = "<|audio|>"
     is_composition = False
@@ -61,6 +60,7 @@ class UltravoxConfig(transformers.PretrainedConfig):
         norm_init: float = 0.4,
         projector_act: str = "swiglu",
         projector_ln_mid: bool = False,
+        num_projector_layers: int = 0,
         **kwargs,
     ):
         self.ignore_index = ignore_index
@@ -71,8 +71,10 @@ class UltravoxConfig(transformers.PretrainedConfig):
         self.norm_init = norm_init
         self.projector_act = projector_act
         self.projector_ln_mid = projector_ln_mid
+        self.num_projector_layers = num_projector_layers
 
         # N.B. May set the wrapped_model_config below.
+        self.wrapped_model_config: transformers.PretrainedConfig
         self.text_model_id = text_model_id
         if text_model_id is None:
             text_config = text_config or {}

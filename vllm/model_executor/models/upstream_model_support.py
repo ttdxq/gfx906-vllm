@@ -1,6 +1,6 @@
 """Model registry entries imported from the upstream model-support window.
 
-The legacy pre-refactor registry layout is kept, so these entries are
+The GPU1 branch keeps the pre-refactor registry layout, so these entries are
 kept separate from the local tables.  The registry merges them after its
 legacy entries and preserves the local Qwen3.5/Qwen3.8 mappings.
 """

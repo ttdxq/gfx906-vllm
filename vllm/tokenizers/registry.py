@@ -1,69 +1,77 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import importlib.util
-from collections.abc import Callable
+import contextlib
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar, overload
+from typing import TYPE_CHECKING
 
 import huggingface_hub
-from typing_extensions import assert_never
+import transformers
+from packaging.version import Version
+from transformers.models.auto.tokenization_auto import (
+    TOKENIZER_MAPPING_NAMES as _HF_TOKENIZER_MAPPING_NAMES,
+)
+from transformers.utils.import_utils import is_mistral_common_available
+from typing_extensions import TypeVar, assert_never
 
-import vllm.envs as envs
+from vllm import envs
 from vllm.logger import init_logger
-from vllm.transformers_utils.gguf_utils import get_gguf_file_path_from_hf
-from vllm.transformers_utils.repo_utils import list_filtered_repo_files
-from vllm.transformers_utils.utils import (
-    check_gguf_file,
-    is_gguf,
-    is_remote_gguf,
-    split_remote_gguf,
+from vllm.transformers_utils.config import _maybe_register_hf_config, get_config
+from vllm.transformers_utils.repo_utils import (
+    any_pattern_in_repo_files,
+    is_mistral_model_repo,
 )
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
+from .hf import CachedHfTokenizer
 from .protocol import TokenizerLike
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig
+    from vllm.config.model import ModelConfig, RunnerType
 
 logger = init_logger(__name__)
 
-_T = TypeVar("_T", bound=type[TokenizerLike])
+_MIN_TRANSFORMERS_VERSION_FOR_HF_MISTRAL = Version("5.15.0")
 
 
-class TokenizerRegistry:
-    # Tokenizer name -> tokenizer_cls or (tokenizer module, tokenizer class)
-    REGISTRY: dict[str, type[TokenizerLike] | tuple[str, str]] = {}
+# Model types whose hub tokenizer_class is incorrect and should be overridden with
+# TokenizersBackend (the generic fast tokenizer). Adding a model type here is always a
+# temporary workaround and better long term solutions are:
+# - Add model type to MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS in transformers (better)
+# - Fix tokenizer_class on the hub for the affected models (best)
+_MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS: set[str] = {
+    "internlm2",
+    "step3_vl",
+    "step3p7",
+    "unlimited-ocr",
+}
 
-    # In-tree tokenizers
-    @staticmethod
-    @overload
-    def register(tokenizer_mode: str) -> Callable[[_T], _T]: ...
+_VLLM_TOKENIZERS = {
+    # ``cohere`` mode uses the standard cached HF tokenizer; only the
+    # renderer (template stage) is replaced with a melody-based one.
+    "cohere": ("hf", "CachedHfTokenizer"),
+    "deepseek_v32": ("deepseek_v32", "DeepseekV32Tokenizer"),
+    "deepseek_v4": ("deepseek_v4", "DeepseekV4Tokenizer"),
+    "deepseek_v41": ("deepseek_v41", "DeepseekV41Tokenizer"),
+    "hf": ("hf", "CachedHfTokenizer"),
+    "kimi_audio": ("kimi_audio", "KimiAudioTokenizer"),
+    "kimi_k3": ("hf", "CachedHfTokenizer"),
+    "mistral": ("mistral", "MistralTokenizer"),
+    # Inkling uses the plain HF tokenizer for token operations; the "inkling"
+    # mode exists to select the InklingRenderer, which renders chat to
+    # token ids natively (Inkling has no Jinja chat template).
+    "inkling": ("hf", "CachedHfTokenizer"),
+}
 
-    # OOT tokenizers
-    @staticmethod
-    @overload
-    def register(tokenizer_mode: str, module: str, class_name: str) -> None: ...
 
-    @staticmethod
-    def register(
-        tokenizer_mode: str,
-        module: str | None = None,
-        class_name: str | None = None,
-    ) -> Callable[[_T], _T] | None:
-        # In-tree tokenizers
-        if module is None or class_name is None:
+@dataclass
+class _TokenizerRegistry:
+    # Tokenizer mode ->  (tokenizer module, tokenizer class)
+    tokenizers: dict[str, tuple[str, str]] = field(default_factory=dict)
 
-            def wrapper(tokenizer_cls: _T) -> _T:
-                assert tokenizer_mode not in TokenizerRegistry.REGISTRY
-                TokenizerRegistry.REGISTRY[tokenizer_mode] = tokenizer_cls
-
-                return tokenizer_cls
-
-            return wrapper
-
-        # OOT tokenizers
-        if tokenizer_mode in TokenizerRegistry.REGISTRY:
+    def register(self, tokenizer_mode: str, module: str, class_name: str) -> None:
+        if tokenizer_mode in self.tokenizers:
             logger.warning(
                 "%s.%s is already registered for tokenizer_mode=%r. "
                 "It is overwritten by the new one.",
@@ -72,36 +80,40 @@ class TokenizerRegistry:
                 tokenizer_mode,
             )
 
-        TokenizerRegistry.REGISTRY[tokenizer_mode] = (module, class_name)
+        self.tokenizers[tokenizer_mode] = (module, class_name)
 
-        return None
-
-    @staticmethod
-    def get_tokenizer(tokenizer_mode: str, *args, **kwargs) -> "TokenizerLike":
-        if tokenizer_mode not in TokenizerRegistry.REGISTRY:
+    def load_tokenizer_cls(self, tokenizer_mode: str) -> type[TokenizerLike]:
+        if tokenizer_mode not in self.tokenizers:
             raise ValueError(f"No tokenizer registered for {tokenizer_mode=!r}.")
 
-        item = TokenizerRegistry.REGISTRY[tokenizer_mode]
-        if isinstance(item, type):
-            return item.from_pretrained(*args, **kwargs)
-
-        module, class_name = item
+        module, class_name = self.tokenizers[tokenizer_mode]
         logger.debug_once(f"Loading {class_name} for {tokenizer_mode=!r}")
 
-        class_ = resolve_obj_by_qualname(f"{module}.{class_name}")
-        return class_.from_pretrained(*args, **kwargs)
+        return resolve_obj_by_qualname(f"{module}.{class_name}")
+
+    def load_tokenizer(self, tokenizer_mode: str, *args, **kwargs) -> TokenizerLike:
+        tokenizer_cls = self.load_tokenizer_cls(tokenizer_mode)
+        return tokenizer_cls.from_pretrained(*args, **kwargs)
 
 
-def get_tokenizer(
+TokenizerRegistry = _TokenizerRegistry(
+    {
+        mode: (f"vllm.tokenizers.{mod_relname}", cls_name)
+        for mode, (mod_relname, cls_name) in _VLLM_TOKENIZERS.items()
+    }
+)
+
+
+def resolve_tokenizer_args(
     tokenizer_name: str | Path,
     *args,
+    runner_type: "RunnerType" = "generate",
     tokenizer_mode: str = "auto",
-    trust_remote_code: bool = False,
-    revision: str | None = None,
-    download_dir: str | None = None,
     **kwargs,
-) -> TokenizerLike:
-    """Gets a tokenizer for the given model name via HuggingFace or ModelScope."""
+):
+    revision: str | None = kwargs.get("revision")
+    download_dir: str | None = kwargs.get("download_dir")
+
     if envs.VLLM_USE_MODELSCOPE:
         # download model from ModelScope hub,
         # lazy import so that modelscope is not required for normal use.
@@ -125,6 +137,14 @@ def get_tokenizer(
                 )
                 tokenizer_name = tokenizer_path
 
+    if "truncation_side" not in kwargs:
+        if runner_type == "generate" or runner_type == "draft":
+            kwargs["truncation_side"] = "left"
+        elif runner_type == "pooling":
+            kwargs["truncation_side"] = "right"
+        else:
+            assert_never(runner_type)
+
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
@@ -132,102 +152,170 @@ def get_tokenizer(
         tokenizer_mode = "hf"
         kwargs["use_fast"] = False
 
-    if "truncation_side" not in kwargs:
-        kwargs["truncation_side"] = "left"
-
-    # Separate model folder from file path for GGUF models
-    if is_gguf(tokenizer_name):
-        if check_gguf_file(tokenizer_name):
-            kwargs["gguf_file"] = Path(tokenizer_name).name
-            tokenizer_name = Path(tokenizer_name).parent
-        elif is_remote_gguf(tokenizer_name):
-            tokenizer_name, quant_type = split_remote_gguf(tokenizer_name)
-            # Get the HuggingFace Hub path for the GGUF file
-            gguf_file = get_gguf_file_path_from_hf(
-                tokenizer_name,
-                quant_type,
-                revision=revision,
-            )
-            kwargs["gguf_file"] = gguf_file
-
     # Try to use official Mistral tokenizer if possible
-    if tokenizer_mode == "auto" and importlib.util.find_spec("mistral_common"):
-        allow_patterns = ["tekken.json", "tokenizer.model.v*"]
-        files_list = list_filtered_repo_files(
+    if (
+        tokenizer_mode == "auto"
+        and is_mistral_model_repo(
             model_name_or_path=str(tokenizer_name),
-            allow_patterns=allow_patterns,
             revision=revision,
+            token=kwargs.get("token"),
         )
-        if len(files_list) > 0:
-            tokenizer_mode = "mistral"
+        and any_pattern_in_repo_files(
+            model_name_or_path=str(tokenizer_name),
+            allow_patterns=["tekken.json", "tokenizer.model.v*"],
+            revision=revision,
+            token=kwargs.get("token"),
+        )
+    ):
+        tokenizer_mode = "mistral"
 
     # Fallback to HF tokenizer
     if tokenizer_mode == "auto":
         tokenizer_mode = "hf"
 
-    tokenizer_args = (tokenizer_name, *args)
-    tokenizer_kwargs = dict(
+    if tokenizer_mode == "hf":
+        if kwargs.pop("mistral_format", False):
+            raise ValueError(
+                "mistral_format=True is not supported with tokenizer_mode='hf'"
+            )
+        kwargs["mistral_format"] = False
+
+    return tokenizer_mode, tokenizer_name, args, kwargs
+
+
+cached_resolve_tokenizer_args = lru_cache(resolve_tokenizer_args)
+
+
+def tokenizer_args_from_config(config: "ModelConfig", **kwargs):
+    return cached_resolve_tokenizer_args(
+        config.tokenizer,
+        runner_type=config.runner_type,
+        tokenizer_mode=config.tokenizer_mode,
+        revision=config.tokenizer_revision,
+        trust_remote_code=config.trust_remote_code,
+        **kwargs,
+    )
+
+
+_T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
+
+
+def get_tokenizer(
+    tokenizer_name: str | Path,
+    *args,
+    tokenizer_cls: type[_T] = TokenizerLike,  # type: ignore[assignment]
+    trust_remote_code: bool = False,
+    revision: str | None = None,
+    download_dir: str | None = None,
+    **kwargs,
+) -> _T:
+    """Gets a tokenizer for the given model name via HuggingFace or ModelScope."""
+    if envs.VLLM_USE_FASTOKENS:
+        # Process-global, idempotent patch that swaps the Rust BPE backend
+        # of any HF fast tokenizer loaded afterwards. No-op for non-HF modes.
+        from .fastokens import apply_fastokens_patch
+
+        apply_fastokens_patch()
+
+    tokenizer_mode, tokenizer_name, args, kwargs = cached_resolve_tokenizer_args(
+        tokenizer_name,
+        *args,
         trust_remote_code=trust_remote_code,
         revision=revision,
         download_dir=download_dir,
         **kwargs,
     )
 
-    if tokenizer_mode == "custom":
-        logger.warning_once(
-            "TokenizerRegistry now uses `tokenizer_mode` as the registry key "
-            "instead of `tokenizer_name`. "
-            "Please update the definition of `.from_pretrained` in "
-            "your custom tokenizer to accept `args=%s`, `kwargs=%s`. "
-            "Then, you can pass `tokenizer_mode=%r` instead of "
-            "`tokenizer_mode='custom'` when initializing vLLM.",
-            tokenizer_args,
-            str(tokenizer_kwargs),
-            tokenizer_mode,
+    if tokenizer_cls == TokenizerLike:
+        tokenizer_cls_ = TokenizerRegistry.load_tokenizer_cls(tokenizer_mode)
+    else:
+        tokenizer_cls_ = tokenizer_cls
+
+    # Ensure that, if the config were to come from vllm.transformers_utils.config, it is
+    # registered with AutoConfig before the tokenizer is loaded. This is necessary since
+    # tokenizer_cls_.from_pretrained will call AutoConfig.from_pretrained internally.
+    # This may fail for paths that don't have a model config (e.g. LoRA adapters),
+    # which is fine — those don't need custom config registration.
+    # HF-backed tokenizers must receive the HF config. In a dual-format Mistral
+    # repository, auto detection intentionally prefers params.json, but passing
+    # that generic config to AutoTokenizer can select the wrong tokenizer class.
+    config_format = "hf" if tokenizer_cls_ is CachedHfTokenizer else "auto"
+    config = None
+    with contextlib.suppress(ValueError, OSError):
+        config = get_config(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            config_format=config_format,
+            token=kwargs.get("token"),
         )
 
-        tokenizer_mode = str(tokenizer_name)
+    # TODO: delete when Transformers version dependency is bumped >= 5.15.0
+    if (
+        tokenizer_mode == "hf"
+        and Version(transformers.__version__) < _MIN_TRANSFORMERS_VERSION_FOR_HF_MISTRAL
+        and is_mistral_common_available()
+        and _HF_TOKENIZER_MAPPING_NAMES.get(getattr(config, "model_type", None))
+        == "MistralCommonBackend"
+        and any_pattern_in_repo_files(
+            model_name_or_path=str(tokenizer_name),
+            allow_patterns=["tekken.json", "tokenizer.model.v*"],
+            revision=revision,
+            token=kwargs.get("token"),
+        )
+    ):
+        raise ValueError(
+            "Loading Mistral models with tokenizer_mode='hf' requires "
+            f"transformers>={_MIN_TRANSFORMERS_VERSION_FOR_HF_MISTRAL}. "
+            "Please upgrade transformers or delete Mistral tokenizer files."
+        )
 
-    tokenizer = TokenizerRegistry.get_tokenizer(
-        tokenizer_mode,
-        *tokenizer_args,
-        **tokenizer_kwargs,
-    )
+    # Some models have an incorrect tokenizer_class on the hub.
+    # For these model types, bypass AutoTokenizer and use TokenizersBackend directly.
+    model_type = getattr(config, "model_type", None) if config else None
+    if model_type in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS:
+        from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+        logger.debug(
+            "Overriding tokenizer_class to TokenizersBackend for model_type=%r",
+            model_type,
+        )
+        tokenizer_cls_ = TokenizersBackend
+
+    if config is not None and tokenizer_cls_ is CachedHfTokenizer:
+        # AutoTokenizer otherwise reloads config.json internally. Reuse the
+        # config that get_config just loaded successfully so a concurrent Hub
+        # cache refresh cannot invalidate the file between the two reads.
+        kwargs.setdefault("config", config)
+
+    tokenizer = tokenizer_cls_.from_pretrained(tokenizer_name, *args, **kwargs)
+    if model_type in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS:
+        from vllm.tokenizers.hf import get_cached_tokenizer
+
+        tokenizer = get_cached_tokenizer(tokenizer)
     if not tokenizer.is_fast:
         logger.warning(
             "Using a slow tokenizer. This might cause a significant "
             "slowdown. Consider using a fast tokenizer instead."
         )
 
-    return tokenizer
+    return tokenizer  # type: ignore
 
 
 cached_get_tokenizer = lru_cache(get_tokenizer)
 
 
 def cached_tokenizer_from_config(model_config: "ModelConfig", **kwargs):
+    if model_config.skip_tokenizer_init:
+        return None
+
+    _maybe_register_hf_config(getattr(model_config, "hf_config", None))
+
     return cached_get_tokenizer(
         model_config.tokenizer,
+        runner_type=model_config.runner_type,
         tokenizer_mode=model_config.tokenizer_mode,
         revision=model_config.tokenizer_revision,
         trust_remote_code=model_config.trust_remote_code,
         **kwargs,
-    )
-
-
-def init_tokenizer_from_config(model_config: "ModelConfig"):
-    runner_type = model_config.runner_type
-    if runner_type == "generate" or runner_type == "draft":
-        truncation_side = "left"
-    elif runner_type == "pooling":
-        truncation_side = "right"
-    else:
-        assert_never(runner_type)
-
-    return get_tokenizer(
-        model_config.tokenizer,
-        tokenizer_mode=model_config.tokenizer_mode,
-        trust_remote_code=model_config.trust_remote_code,
-        revision=model_config.tokenizer_revision,
-        truncation_side=truncation_side,
     )

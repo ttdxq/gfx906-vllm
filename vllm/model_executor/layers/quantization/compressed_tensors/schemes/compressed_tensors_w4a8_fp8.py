@@ -4,15 +4,15 @@
 from collections.abc import Callable
 
 import torch
-from compressed_tensors.quantization import ActivationOrdering
 
+from vllm.distributed.utils import verify_group_size_divides_partition
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
-)
-from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
+from vllm.model_executor.kernels.linear import (
     MPLinearLayerConfig,
     choose_mp_linear_kernel,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsScheme,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_repeat_scales_on_all_ranks,
@@ -31,7 +31,6 @@ __all__ = ["CompressedTensorsW4A8Fp8"]
 W4A8_SUPPORTED_TYPES_MAP = {
     4: scalar_types.int4,
 }
-W4A8_SUPPORTED_BITS = list(W4A8_SUPPORTED_TYPES_MAP.keys())
 
 
 class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
@@ -43,13 +42,11 @@ class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
         num_bits: int,
         group_size: int | None = None,
         symmetric: bool | None = True,
-        actorder: ActivationOrdering | None = None,
     ):
         self.pack_factor = 32 // num_bits
         self.strategy = strategy
         self.symmetric = symmetric
         self.group_size = -1 if group_size is None else group_size
-        self.has_g_idx = actorder == ActivationOrdering.GROUP
 
         if self.group_size != 128 or self.strategy != "group":
             raise ValueError(
@@ -92,7 +89,6 @@ class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
             act_type=torch.float8_e4m3fn,  # always use fp8(e4m3)
             group_size=self.group_size,
             zero_points=not self.symmetric,
-            has_g_idx=self.has_g_idx,
             out_type=params_dtype,
         )
 
@@ -106,13 +102,13 @@ class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
         group_size = self.group_size if self.group_size != -1 else input_size
         row_parallel = input_size != input_size_per_partition
         partition_scales = not marlin_repeat_scales_on_all_ranks(
-            self.has_g_idx, self.group_size, row_parallel
+            self.group_size, row_parallel
         )
 
         scales_and_zp_size = input_size // group_size
 
         if partition_scales:
-            assert input_size_per_partition % group_size == 0
+            verify_group_size_divides_partition(input_size_per_partition, group_size)
             scales_and_zp_size = input_size_per_partition // group_size
 
         weight = PackedvLLMParameter(
@@ -128,14 +124,15 @@ class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
             ),
         )
 
-        # TODO(czhu): allocate the packed fp8 scales memory here?
-        # the scales will be expanded by 8x via `cutlass_pack_scale_fp8`
+        # After loading, we will transform bf16 -> fp8 ->
+        # expand by 8x via `cutlass_pack_scale_fp8`
+        # and construct per-channel fp32 scales.
         weight_scale_args = {
             "weight_loader": weight_loader,
             "data": torch.empty(
                 output_size_per_partition,
                 scales_and_zp_size,
-                dtype=torch.float8_e4m3fn,
+                dtype=params_dtype,
             ),
         }
 
@@ -152,24 +149,15 @@ class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
             data=torch.empty(2, dtype=torch.int64), weight_loader=weight_loader
         )
 
-        # per-channel scales
-        weight_chan_scale = ChannelQuantScaleParameter(
-            data=torch.empty((output_size_per_partition, 1), dtype=torch.float32),
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-
         layer.register_parameter("weight_packed", weight)
         layer.register_parameter("weight_scale", weight_scale)
         layer.register_parameter("weight_shape", weight_shape)
-        layer.register_parameter("weight_chan_scale", weight_chan_scale)
 
         self.kernel = kernel_type(
             mp_linear_kernel_config,
             w_q_param_name="weight_packed",
             w_s_param_name="weight_scale",
             w_zp_param_name="weight_zero_point",
-            w_gidx_param_name="weight_g_idx",
         )
 
     # Checkpoints are serialized in compressed-tensors format, which is

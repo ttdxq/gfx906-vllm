@@ -29,9 +29,9 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -120,7 +120,6 @@ class MiniCPM3Attention(nn.Module):
 
         self.rotary_emb = get_rope(
             self.qk_rope_head_dim,
-            rotary_dim=self.qk_rope_head_dim,
             max_position=max_position_embeddings,
             rope_parameters=config.rope_parameters,
         )
@@ -147,7 +146,7 @@ class MiniCPM3Attention(nn.Module):
         latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
-        kv_a = self.kv_a_layernorm(kv_a.contiguous())
+        kv_a = self.kv_a_layernorm(kv_a)
         kv, _ = self.kv_b_proj(kv_a)
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)

@@ -29,11 +29,10 @@ import torch
 from torch import nn
 from transformers import Glm4Config
 
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -41,11 +40,12 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .llama import LlamaMLP as Glm4MLP
 from .llama import LlamaModel
-from .utils import AutoWeightsLoader, PPMissingLayer, maybe_prefix
+from .utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
 
 
 class Glm4Attention(nn.Module):
@@ -78,10 +78,17 @@ class Glm4Attention(nn.Module):
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+
+        rope_params = getattr(config, "rope_parameters", None)
+        if isinstance(rope_params, dict) and "partial_rotary_factor" in rope_params:
+            config.rope_parameters.setdefault(
+                "partial_rotary_factor", rope_params["partial_rotary_factor"]
+            )
+        else:
+            config.rope_parameters.setdefault("partial_rotary_factor", 0.5)
+
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
-        self.rotary_dim = self.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -103,10 +110,8 @@ class Glm4Attention(nn.Module):
         )
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.rotary_dim,
             max_position=max_position,
             rope_parameters=config.rope_parameters,
-            partial_rotary_factor=partial_rotary_factor,
             is_neox_style=False,
         )
         self.attn = Attention(
@@ -226,11 +231,8 @@ class Glm4Model(LlamaModel):
 
 class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -246,15 +248,14 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         )
 
         if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
             if config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "lm_head"),
-                )
+                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:
             self.lm_head = PPMissingLayer()
 
@@ -264,12 +265,22 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.model.make_empty_intermediate_tensors
         )
 
+        # Drop the speculative (MTP) layers, which are loaded by the draft
+        # model instead. They are appended after the main decoder layers.
+        num_nextn_layers = getattr(config, "num_nextn_predict_layers", 0)
+        self.hf_to_vllm_mapper = WeightsMapper(
+            orig_to_new_prefix={
+                f"model.layers.{config.num_hidden_layers + i}.": None
+                for i in range(num_nextn_layers)
+            }
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -287,8 +298,5 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
-        return loader.load_weights(weights)
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

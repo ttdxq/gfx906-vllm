@@ -26,12 +26,12 @@ import torch
 from torch import nn
 from transformers import GemmaConfig
 
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import GeluAndMul
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -41,14 +41,16 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsLoRA, SupportsPP
+from .interfaces import SupportsLoRA, SupportsPP, SupportsQuant
 from .utils import (
     AutoWeightsLoader,
-    is_pp_missing_parameter,
+    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -174,7 +176,6 @@ class GemmaAttention(nn.Module):
 
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
             rope_parameters=rope_parameters,
             is_neox_style=True,
@@ -294,11 +295,11 @@ class GemmaModel(nn.Module):
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        return self.embed_tokens(input_ids) * self.normalizer
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
@@ -308,9 +309,9 @@ class GemmaModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states *= self.normalizer
             residual = None
         else:
+            assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -326,56 +327,21 @@ class GemmaModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
 
-        return loaded_params
-
-
-class GemmaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
+class GemmaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsQuant):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            # weight_name: (param_name, shard_id)
+            ".q_proj": (".qkv_proj", "q"),
+            ".k_proj": (".qkv_proj", "k"),
+            ".v_proj": (".qkv_proj", "v"),
+            ".gate_proj": (".gate_up_proj", 0),
+            ".up_proj": (".gate_up_proj", 1),
+        }
+    )
+    packed_modules_mapping: dict[str, list[str]] = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -384,13 +350,19 @@ class GemmaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         quant_config = vllm_config.quant_config
 
         self.config = config
-        # currently all existing Gemma models have `tie_word_embeddings` enabled
-        assert config.tie_word_embeddings
 
         self.quant_config = quant_config
         self.model = GemmaModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        if config.tie_word_embeddings:
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -401,7 +373,7 @@ class GemmaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -415,12 +387,9 @@ class GemmaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.model.embed_tokens, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
-        return loader.load_weights(weights)
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

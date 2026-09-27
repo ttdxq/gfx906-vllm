@@ -1,8 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
+    AiterInt8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
+    Fp8BlockScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
+    CPUFp8BlockScaledMMKernel,
+    CPUFp8PerTensorScaledMMLinearKernel,
+    CPUFP8W8A8ScaledMMLinearKernel,
     CPUInt8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+    CutlassFP8ScaledMMLinearKernel,
+    CutlassInt8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+    FlashInferFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+    MarlinFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     ChannelWiseTorchFP8ScaledMMLinearKernel,
@@ -18,38 +37,16 @@ from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
     ScaledMMLinearKernel,
-    ScaledMMLinearLayerConfig,
 )
-
-try:
-    from vllm.model_executor.kernels.linear.scaled_mm.triton import (
-        TritonInt8ScaledMMLinearKernel,
-    )
-except ImportError:
-    TritonInt8ScaledMMLinearKernel = None
-
-try:
-    from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
-        AiterInt8ScaledMMLinearKernel,
-    )
-except ImportError:
-    AiterInt8ScaledMMLinearKernel = None
-
-try:
-    from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
-        CutlassFP8ScaledMMLinearKernel,
-        CutlassInt8ScaledMMLinearKernel,
-    )
-except ImportError:
-    CutlassFP8ScaledMMLinearKernel = None
-    CutlassInt8ScaledMMLinearKernel = None
-
-try:
-    from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
-        FlashInferFP8ScaledMMLinearKernel,
-    )
-except ImportError:
-    FlashInferFP8ScaledMMLinearKernel = None
+from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+    TritonInt8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
+    XPUFp8BlockScaledMMKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.zentorch import (
+    ZentorchInt8ScaledMMLinearKernel,
+)
 
 __all__ = [
     "FP8ScaledMMLinearKernel",
@@ -58,20 +55,21 @@ __all__ = [
     "Int8ScaledMMLinearLayerConfig",
     "ScaledMMLinearKernel",
     "ScaledMMLinearLayerConfig",
+    "AiterInt8ScaledMMLinearKernel",
     "CPUInt8ScaledMMLinearKernel",
+    "CutlassFP8ScaledMMLinearKernel",
+    "CutlassInt8ScaledMMLinearKernel",
+    "FlashInferFP8ScaledMMLinearKernel",
+    "MarlinFP8ScaledMMLinearKernel",
     "ChannelWiseTorchFP8ScaledMMLinearKernel",
     "PerTensorTorchFP8ScaledMMLinearKernel",
     "RowWiseTorchFP8ScaledMMLinearKernel",
     "ROCmFP8ScaledMMLinearKernel",
+    "TritonInt8ScaledMMLinearKernel",
+    "ZentorchInt8ScaledMMLinearKernel",
+    "Fp8BlockScaledMMLinearKernel",
+    "CPUFp8BlockScaledMMKernel",
+    "CPUFp8PerTensorScaledMMLinearKernel",
+    "CPUFP8W8A8ScaledMMLinearKernel",
+    "XPUFp8BlockScaledMMKernel",
 ]
-
-if AiterInt8ScaledMMLinearKernel is not None:
-    __all__.append("AiterInt8ScaledMMLinearKernel")
-if CutlassFP8ScaledMMLinearKernel is not None:
-    __all__.append("CutlassFP8ScaledMMLinearKernel")
-if CutlassInt8ScaledMMLinearKernel is not None:
-    __all__.append("CutlassInt8ScaledMMLinearKernel")
-if FlashInferFP8ScaledMMLinearKernel is not None:
-    __all__.append("FlashInferFP8ScaledMMLinearKernel")
-if TritonInt8ScaledMMLinearKernel is not None:
-    __all__.append("TritonInt8ScaledMMLinearKernel")

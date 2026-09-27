@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING
 
 from transformers import PreTrainedTokenizerBase
 
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, DeltaMessage
-from vllm.logger import init_logger
+from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.reasoning import ReasoningParser
 
-logger = init_logger(__name__)
+if TYPE_CHECKING:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 
 class IdentityReasoningParser(ReasoningParser):
-    """
-    Identity reasoning parser.
+    """Identity reasoning parser.
 
     This parser does not attempt to parse or strip out reasoning tokens.
     It treats the entire model output as content and ignores reasoning.
@@ -28,8 +29,21 @@ class IdentityReasoningParser(ReasoningParser):
                 "constructor during construction."
             )
 
-    def is_reasoning_end(self, input_ids: list[int]) -> bool:
+    @property
+    def reasoning_start_str(self) -> str | None:
+        return None
+
+    @property
+    def reasoning_end_str(self) -> str | None:
+        return None
+
+    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         # Always return True, since we never treat reasoning specially
+        return True
+
+    def is_reasoning_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
         return True
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
@@ -51,7 +65,7 @@ class IdentityReasoningParser(ReasoningParser):
         return None
 
     def extract_reasoning(
-        self, model_output: str, request: ChatCompletionRequest
+        self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> tuple[str | None, str | None]:
         # No reasoning separation: return None for reasoning,
         # and full model_output as content

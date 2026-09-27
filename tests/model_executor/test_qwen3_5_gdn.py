@@ -79,6 +79,9 @@ def test_gdn_mixed_batch_builds_prefill_only_metadata():
     builder = object.__new__(GDNAttentionMetadataBuilder)
     builder.use_spec_decode = False
     builder.use_full_cuda_graph = False
+    # Mirror __init__: build() consults this flag to keep capture batches
+    # decode-only; this fixture bypasses __init__ via object.__new__.
+    builder._building_for_capture = False
 
     query_start_loc = torch.tensor([0, 1, 2, 5], dtype=torch.int32)
     common = SimpleNamespace(

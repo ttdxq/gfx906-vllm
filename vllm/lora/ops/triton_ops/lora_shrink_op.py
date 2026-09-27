@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Based on:
+"""Based on:
 Chen, L., Ye, Z., Wu, Y., Zhuo, D., Ceze, L., & Krishnamurthy, A. (2023).
 Punica: Multi-Tenant LoRA Serving.
 https://arxiv.org/abs/2310.18547
@@ -9,12 +8,15 @@ https://arxiv.org/abs/2310.18547
 
 import torch
 
+from vllm import envs
 from vllm.lora.ops.triton_ops.kernel_utils import do_shrink_kernel
-from vllm.lora.ops.triton_ops.utils import _get_lora_a_ptr, get_lora_op_configs
+from vllm.lora.ops.triton_ops.utils import (
+    _get_lora_a_ptr,
+    get_lora_op_configs,
+    supports_pdl,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
-
-from .utils import supports_pdl
 
 
 @triton.jit
@@ -136,31 +138,34 @@ def _lora_shrink(
     lora_token_start_loc: torch.Tensor,  # shape [max-loras + 2]
     lora_ids: torch.Tensor,  # shape [max-loras + 1]
     no_lora_flag_cpu: torch.Tensor,  # shape [1]
+    num_active_loras: torch.Tensor,  # CPU tensor [1], number of active LoRAs
     scaling: float,
 ) -> None:
-    """
-    Args:
-        inputs (torch.Tensor): Input tensor
-        lora_a_weights (list[torch.Tensor]): LoRA weights
-        output_tensor (torch.Tensor): output tensor
-        token_lora_mapping (torch.Tensor): A tensor mapping each input token
-            to the lora-id related to that token. A value of -1 indicates that
-            LoRA doesn't apply to that token.
-        token_indices_sorted_by_lora_ids (torch.Tensor): Row/Token indices from
-            the A matrix grouped by LoRA IDs.
-        num_tokens_per_lora (torch.Tensor): num_tokens_per_lora[i] is the number
-            of tokens that are to be processed by LoRA ID lora_ids[i]
-        lora_token_start_loc (torch.Tensor): A cumulative sum of
-            num_tokens_per_lora. lora_token_start_loc[0] is always 0 so that
-            lora_token_start_loc[i], along with num_tokens_per_lora[i]
-            identifies the region in token_indices_sorted_by_lora_ids that
-            LoRA lora_ids[i] should process.
-        lora_ids (torch.Tensor): LoRA ids to process.
-        no_lora_flag_cpu (torch.Tensor): A CPU tensor of size 1, that indicates
-            if there are any requests that require LoRA.
-        scaling (float): Scaling factor.
-    """
+    """Args:
+    inputs (torch.Tensor): Input tensor
+    lora_a_weights (list[torch.Tensor]): LoRA weights
+    output_tensor (torch.Tensor): output tensor
+    token_lora_mapping (torch.Tensor): A tensor mapping each input token
+        to the lora-id related to that token. A value of -1 indicates that
+        LoRA doesn't apply to that token.
+    token_indices_sorted_by_lora_ids (torch.Tensor): Row/Token indices from
+        the A matrix grouped by LoRA IDs.
+    num_tokens_per_lora (torch.Tensor): num_tokens_per_lora[i] is the number
+        of tokens that are to be processed by LoRA ID lora_ids[i]
+    lora_token_start_loc (torch.Tensor): A cumulative sum of
+        num_tokens_per_lora. lora_token_start_loc[0] is always 0 so that
+        lora_token_start_loc[i], along with num_tokens_per_lora[i]
+        identifies the region in token_indices_sorted_by_lora_ids that
+        LoRA lora_ids[i] should process.
+    lora_ids (torch.Tensor): LoRA ids to process.
+    no_lora_flag_cpu (torch.Tensor): A CPU tensor of size 1, that indicates
+        if there are any requests that require LoRA.
+    num_active_loras (torch.Tensor): A CPU tensor of size 1, containing the
+        number of active LoRAs. Stored as a tensor (not int) so
+        torch.compile treats it as dynamic rather than a constant.
+    scaling (float): Scaling factor.
 
+    """
     assert no_lora_flag_cpu.numel() == 1
     if no_lora_flag_cpu.item():
         # None of the inputs require LoRA.
@@ -172,7 +177,7 @@ def _lora_shrink(
         assert weight.dtype in [torch.float16, torch.bfloat16]
 
     assert inputs.size(1) == lora_a_weights[0].size(-1)
-    assert inputs.is_contiguous()
+    inputs = inputs.contiguous()
     assert output_tensor.is_contiguous()
 
     # metadata sanity check
@@ -216,12 +221,11 @@ def _lora_shrink(
     grid = (
         SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
         NUM_SLICES,
-        # Each LoRA receives its own set of thread blocks for output
-        # computation. If some LoRA doesn't have any tokens to process, its
-        # thread blocks exit early.
-        MAX_LORAS,
+        num_active_loras.item(),
     )
-    use_gdc = supports_pdl(inputs.device)
+
+    # PDL only works when dual-stream is being used.
+    use_gdc = supports_pdl(inputs.device) and envs.VLLM_LORA_ENABLE_DUAL_STREAM
     _lora_shrink_kernel[grid](
         inputs,
         lora_ptr_tensor,
@@ -259,27 +263,11 @@ def _lora_shrink(
     return
 
 
-def _lora_shrink_fake(
-    inputs: torch.Tensor,
-    lora_a_weights: list[torch.Tensor],
-    output_tensor: torch.Tensor,
-    token_lora_mapping: torch.Tensor,
-    token_indices_sorted_by_lora_ids: torch.Tensor,
-    num_tokens_per_lora: torch.Tensor,
-    lora_token_start_loc: torch.Tensor,
-    lora_ids: torch.Tensor,
-    no_lora_flag_cpu: torch.Tensor,
-    scaling: float,
-) -> None:
-    return
-
-
 try:
     direct_register_custom_op(
         op_name="lora_shrink",
         op_func=_lora_shrink,
         mutates_args=["output_tensor"],
-        fake_impl=_lora_shrink_fake,
     )
     lora_shrink = torch.ops.vllm.lora_shrink
 

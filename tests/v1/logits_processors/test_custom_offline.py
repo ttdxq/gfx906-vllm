@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import random
-import sys
+import importlib.metadata
 from typing import Any
 
 import pytest
 
-from tests.utils import create_new_process_for_each_test
+import tests.v1.logits_processors.utils as logitproc_test_utils
+from tests.utils import create_new_process_for_each_test, set_random_seed
 from tests.v1.logits_processors.utils import (
     DUMMY_LOGITPROC_ARG,
     DUMMY_LOGITPROC_FQCN,
-    DUMMY_LOGITPROC_MODULE,
     MAX_TOKENS,
     MODEL_NAME,
     POOLING_MODEL_NAME,
@@ -18,10 +17,9 @@ from tests.v1.logits_processors.utils import (
     CustomLogitprocSource,
     DummyLogitsProcessor,
     WrappedPerReqLogitsProcessor,
-    dummy_module,
     prompts,
+    setup_fake_entrypoint,
 )
-from tests.v1.logits_processors.utils import entry_points as fake_entry_points
 from vllm import LLM, SamplingParams
 from vllm.v1.sample.logits_processor import (
     STR_POOLING_REJECTS_LOGITSPROCS,
@@ -46,6 +44,32 @@ sampling_params_list = [
 ]
 
 
+def test_fake_entrypoint_preserves_other_groups(monkeypatch):
+    other_group_entrypoints = object()
+    monkeypatch.setattr(
+        importlib.metadata,
+        "entry_points",
+        lambda **kwargs: other_group_entrypoints,
+    )
+    monkeypatch.setattr(
+        logitproc_test_utils, "requires_spawn_multiprocessing", lambda: False
+    )
+
+    setup_fake_entrypoint(monkeypatch)
+
+    logitproc_entrypoints = importlib.metadata.entry_points(
+        group=logitproc_test_utils.LOGITSPROCS_GROUP
+    )
+    assert logitproc_entrypoints.names == [
+        logitproc_test_utils.DUMMY_LOGITPROC_ENTRYPOINT
+    ]
+    assert (
+        importlib.metadata.entry_points(group="another.entrypoint.group")
+        is other_group_entrypoints
+    )
+    assert importlib.metadata.entry_points() is other_group_entrypoints
+
+
 def _run_test(kwargs: dict, logitproc_loaded: bool) -> None:
     """Compare `LLM` instance initialized with specified `kwargs` against
     reference `LLM` instance.
@@ -62,8 +86,8 @@ def _run_test(kwargs: dict, logitproc_loaded: bool) -> None:
     Args:
       kwargs: `LLM` constructor kwargs
       logitproc_loaded: server has loaded dummy logitproc if True
-    """
 
+    """
     # Create a vLLM instance and load custom logitproc
     llm_logitproc = LLM(
         model=MODEL_NAME,
@@ -107,7 +131,7 @@ def _run_test(kwargs: dict, logitproc_loaded: bool) -> None:
 @create_new_process_for_each_test()
 @pytest.mark.parametrize("logitproc_source", list(CustomLogitprocSource))
 def test_custom_logitsprocs(monkeypatch, logitproc_source: CustomLogitprocSource):
-    """Test offline Python interface for passing custom logitsprocs
+    """Test offline Python interface for passing custom logitsprocs.
 
     Construct an `LLM` instance which loads a custom logitproc that has a
     well-defined behavior (mask out all tokens except one `target_token`)
@@ -134,11 +158,14 @@ def test_custom_logitsprocs(monkeypatch, logitproc_source: CustomLogitprocSource
       logitproc_source: what source (entrypoint, fully-qualified class name
                         (FQCN), class object, or None) the user pulls the
                         logitproc from
-    """
 
+    """
     # Test that logitproc info is passed to workers
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
-    random.seed(40)
+    # These tests exercise the V1-interface logits processor; Model Runner V2
+    # rejects V1-interface processors at load time by design.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    set_random_seed(40)
 
     # Choose LLM args based on logitproc source
     if logitproc_source == CustomLogitprocSource.LOGITPROC_SOURCE_NONE:
@@ -149,21 +176,15 @@ def test_custom_logitsprocs(monkeypatch, logitproc_source: CustomLogitprocSource
 
     if logitproc_source == CustomLogitprocSource.LOGITPROC_SOURCE_ENTRYPOINT:
         # Scenario: vLLM loads a logitproc from a preconfigured entrypoint
-        # To that end, mock a dummy logitproc entrypoint
-        import importlib.metadata
-
-        importlib.metadata.entry_points = fake_entry_points  # type: ignore
-
-        # fork is required for workers to see entrypoint patch
-        monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+        # To that end, register a real dist-info package so spawned
+        # workers can discover the entrypoint via PYTHONPATH
+        setup_fake_entrypoint(monkeypatch)
         _run_test({}, logitproc_loaded=True)
         return
 
     kwargs: dict[str, list[str | type[LogitsProcessor]]] = {}
     if logitproc_source == CustomLogitprocSource.LOGITPROC_SOURCE_FQCN:
         # Scenario: load logitproc based on fully-qualified class name (FQCN)
-        # Inject dummy module which defines logitproc
-        sys.modules[DUMMY_LOGITPROC_MODULE] = dummy_module
         kwargs["logits_processors"] = [DUMMY_LOGITPROC_FQCN]
     elif logitproc_source == CustomLogitprocSource.LOGITPROC_SOURCE_CLASS:
         # Scenario: load logitproc from provided class object
@@ -174,7 +195,7 @@ def test_custom_logitsprocs(monkeypatch, logitproc_source: CustomLogitprocSource
 
 @create_new_process_for_each_test()
 def test_custom_logitsprocs_req(monkeypatch):
-    """Test passing request-level logits processor to offline Python interface
+    """Test passing request-level logits processor to offline Python interface.
 
     Wrap a request-level logits processor to create a batch level logits
     processor that has a well-defined behavior (mask out all tokens except one
@@ -195,11 +216,14 @@ def test_custom_logitsprocs_req(monkeypatch):
 
     Args:
       monkeypatch: for setting env vars
-    """
 
+    """
     # Test that logitproc info is passed to workers
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
-    random.seed(40)
+    # These tests exercise the V1-interface logits processor; Model Runner V2
+    # rejects V1-interface processors at load time by design.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    set_random_seed(40)
     _run_test(
         {"logits_processors": [WrappedPerReqLogitsProcessor]}, logitproc_loaded=True
     )
@@ -240,9 +264,13 @@ def test_rejects_custom_logitsprocs(
       logitproc_source: what source (entrypoint, fully-qualified class name
                         (FQCN), or class object) the user pulls the
                         logitproc from
+
     """
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    random.seed(40)
+    # These tests exercise V1-interface rejection and V1 runner internals;
+    # Model Runner V2 rejects V1-interface processors at load time by design.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    set_random_seed(40)
 
     test_params: dict[str, dict[str, Any]] = {
         "pooling": {
@@ -272,19 +300,17 @@ def test_rejects_custom_logitsprocs(
         # Scenario: vLLM loads a model and ignores a logitproc that is
         # available at a preconfigured entrypoint
 
-        # Patch in dummy logitproc entrypoint
-        import importlib.metadata
-
-        importlib.metadata.entry_points = fake_entry_points  # type: ignore
-
-        # fork is required for entrypoint patch to be visible to workers,
-        # although they should ignore the entrypoint patch anyway
-        monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+        # Register real dist-info package so spawned workers can
+        # discover the entrypoint via PYTHONPATH (spawn-compatible)
+        setup_fake_entrypoint(monkeypatch)
 
         llm = LLM(**llm_kwargs)
-        # Require that no logitsprocs have been loaded
+        # Require that no custom logitsprocs have been loaded
+        # (built-in processors may exist: MinTokensLogitsProcessor,
+        # LogitBiasLogitsProcessor, MinPLogitsProcessor)
         worker = llm.llm_engine.model_executor.driver_worker.worker
-        assert sum([1 for _ in worker.model_runner.input_batch.logitsprocs.all]) == 0
+        for proc in worker.model_runner.input_batch.logitsprocs.all:
+            assert not isinstance(proc, DummyLogitsProcessor)
         return
 
     if logitproc_source == CustomLogitprocSource.LOGITPROC_SOURCE_FQCN:

@@ -39,7 +39,7 @@ class TileGemm82 {
 
   template <int32_t M>
   static void gemm_micro(DEFINE_CPU_MICRO_GEMM_PARAMS) {
-    static_assert(0 < M <= 8);
+    static_assert(0 < M && M <= 8);
     using load_vec_t = typename cpu_utils::VecTypeTrait<scalar_t>::vec_t;
 
     scalar_t* __restrict__ curr_b_0 = b_ptr;
@@ -71,8 +71,7 @@ class TileGemm82 {
       scalar_t* __restrict__ curr_m_a = curr_a;
       vec_op::unroll_loop<int32_t, M>([&](int32_t i) {
         scalar_t v = *curr_m_a;
-        load_vec_t a_reg_original(v);
-        vec_op::FP32Vec16 a_reg(a_reg_original);
+        vec_op::FP32Vec16 a_reg(static_cast<float>(v));
         c_regs[i * 2] = c_regs[i * 2] + a_reg * fp32_b_0_reg;
         c_regs[i * 2 + 1] = c_regs[i * 2 + 1] + a_reg * fp32_b_1_reg;
 
@@ -104,10 +103,31 @@ class MicroGemm<cpu_utils::ISA::VEC, scalar_t> {
  public:
   static constexpr int32_t MaxMSize = 8;
   static constexpr int32_t NSize = 32;
+  static constexpr int32_t WeightOCGroupSize = 16;
+  static constexpr bool PackA = false;
 
  public:
   void gemm(DEFINE_CPU_MICRO_GEMM_PARAMS) {
     TileGemm82<scalar_t>::gemm(CPU_MICRO_GEMM_PARAMS);
+  }
+
+  // Note: pack contiguous weight [output_size, input_size] as contiguous
+  // packed weight [output_size / 16, input_size, 16]
+  static void pack_weight(const scalar_t* __restrict__ weight,
+                          scalar_t* __restrict__ packed_weight,
+                          const int32_t output_size, const int32_t input_size) {
+    TORCH_CHECK_EQ(output_size % 16, 0);
+    for (int32_t o_idx = 0; o_idx < output_size; ++o_idx) {
+      const scalar_t* __restrict__ curr_weight = weight + o_idx * input_size;
+      scalar_t* __restrict__ curr_packed_weight =
+          packed_weight + (o_idx / 16) * (16 * input_size) + o_idx % 16;
+      for (int32_t i_idx = 0; i_idx < input_size; ++i_idx) {
+        *curr_packed_weight = *curr_weight;
+
+        curr_packed_weight += 16;
+        ++curr_weight;
+      }
+    }
   }
 };
 }  // namespace cpu_micro_gemm

@@ -6,6 +6,7 @@ from typing import Annotated, Literal, TypeAlias
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import (
     BatchFeature,
     Blip2Config,
@@ -14,44 +15,46 @@ from transformers import (
 )
 
 from vllm.config import CacheConfig, VllmConfig
-from vllm.config.multimodal import BaseDummyOptions
+from vllm.config.multimodal import MultiModalDummyOptions
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
+    MultiModalKwargsItem,
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptIndexTargets,
     PromptInsertion,
     PromptUpdate,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from .blip import BlipVisionModel
+from .blip import BlipVisionModel, get_blip_num_patches
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
 )
+from .module_mapping import MultiModelKeys
 from .utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
 
 
 class Blip2ImagePixelInputs(TensorSchema):
-    """
-    Dimensions:
-        - bn: Batch size * number of images
-        - c: Number of channels (3)
-        - h: Height of each image
-        - w: Width of each image
+    """Dimensions:
+    - bn: Batch size * number of images
+    - c: Number of channels (3)
+    - h: Height of each image
+    - w: Width of each image
     """
 
     type: Literal["pixel_values"]
@@ -59,11 +62,10 @@ class Blip2ImagePixelInputs(TensorSchema):
 
 
 class Blip2ImageEmbeddingInputs(TensorSchema):
-    """
-    Dimensions:
-        - bn: Batch size * number of images
-        - f: Image feature size
-        - h: Hidden size (must match the hidden size of language model backbone)
+    """Dimensions:
+    - bn: Batch size * number of images
+    - f: Image feature size
+    - h: Hidden size (must match the hidden size of language model backbone)
     """
 
     type: Literal["image_embeds"]
@@ -71,6 +73,7 @@ class Blip2ImageEmbeddingInputs(TensorSchema):
 
 
 Blip2ImageInputs: TypeAlias = Blip2ImagePixelInputs | Blip2ImageEmbeddingInputs
+"""Alias for supported BLIP-2 image input types."""
 
 
 class Blip2QFormerMultiHeadAttention(nn.Module):
@@ -138,14 +141,13 @@ class Blip2QFormerMultiHeadAttention(nn.Module):
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-        attention_probs = torch.softmax(attention_scores * self.scaling, dim=-1)
-
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs_dropped = self.dropout(attention_probs)
-
-        context_layer = torch.matmul(attention_probs_dropped, value_layer)
+        context_layer = F.scaled_dot_product_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            scale=self.scaling,
+        )
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         context_layer = context_layer.view(
@@ -442,47 +444,24 @@ class Blip2DummyInputsBuilder(BaseDummyInputsBuilder[Blip2ProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
         hf_config = self.info.get_hf_config()
         vision_config = hf_config.vision_config
 
         max_image_size = vision_config.image_size
-        num_images = mm_counts.get("image", 0)
-
-        image_overrides = mm_options.get("image") if mm_options else None
 
         return {
             "image": self._get_dummy_images(
                 width=max_image_size,
                 height=max_image_size,
-                num_images=num_images,
-                overrides=image_overrides,
+                num_images=mm_counts.get("image", 0),
+                overrides=mm_options.get("image"),
             )
         }
 
 
 class Blip2MultiModalProcessor(BaseMultiModalProcessor[Blip2ProcessingInfo]):
-    def _call_hf_processor(
-        self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        if not mm_data:
-            # HF processor always adds placeholders even when there's no image
-            tokenizer = self.info.get_tokenizer()
-            prompt_ids = tokenizer.encode(prompt)
-            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
-
-        return super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
-        )
-
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
@@ -521,9 +500,9 @@ class Blip2MultiModalProcessor(BaseMultiModalProcessor[Blip2ProcessingInfo]):
     dummy_inputs=Blip2DummyInputsBuilder,
 )
 class Blip2ForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant
+    nn.Module, SupportsLoRA, SupportsMultiModal, SupportsPP, SupportsQuant
 ):
-    merge_by_field_config = True
+    supports_tower_connector_lora = True
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -540,32 +519,40 @@ class Blip2ForConditionalGeneration(
         multimodal_config = vllm_config.model_config.multimodal_config
         self.config = config
         self.multimodal_config = multimodal_config
-
-        # TODO: Optionally initializes this for supporting embeddings.
-        self.vision_model = BlipVisionModel(config.vision_config, quant_config)
-
-        self.query_tokens = nn.Parameter(
-            torch.zeros(1, config.num_query_tokens, config.qformer_config.hidden_size)
+        vision_config = config.vision_config
+        self._vision_tokens_per_image = (
+            get_blip_num_patches(
+                image_size=vision_config.image_size,
+                patch_size=vision_config.patch_size,
+            )
+            + 1  # include class token
         )
 
-        self.qformer = Blip2QFormerModel(
-            config.qformer_config,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qformer",
-        )
+        with self._mark_tower_model(vllm_config, "image"):
+            self.vision_model = BlipVisionModel(vision_config, quant_config)
+            self.query_tokens = nn.Parameter(
+                torch.zeros(
+                    1, config.num_query_tokens, config.qformer_config.hidden_size
+                )
+            )
+            self.qformer = Blip2QFormerModel(
+                config.qformer_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "qformer"),
+            )
+            self.language_projection = nn.Linear(
+                config.qformer_config.hidden_size,
+                config.text_config.hidden_size,
+                bias=True,
+            )
 
-        self.language_projection = nn.Linear(
-            config.qformer_config.hidden_size,
-            config.text_config.hidden_size,
-            bias=True,
-        )
-
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=config.text_config,
-            prefix=maybe_prefix(prefix, "language_model"),
-        )
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
@@ -606,17 +593,14 @@ class Blip2ForConditionalGeneration(
         return image_features
 
     def _process_image_pixels(self, inputs: Blip2ImagePixelInputs) -> torch.Tensor:
-        assert self.vision_model is not None
-
         pixel_values = inputs["data"]
 
         return self._image_pixels_to_features(self.vision_model, pixel_values)
 
     def _process_image_input(self, image_input: Blip2ImageInputs) -> torch.Tensor:
-        if image_input["type"] == "image_embeds":
-            return image_input["data"]
+        if image_input.type == "image_embeds":
+            return image_input.data
 
-        assert self.vision_model is not None
         image_features = self._process_image_pixels(image_input)
 
         query_tokens = self.query_tokens.expand(image_features.shape[0], -1, -1)
@@ -627,9 +611,6 @@ class Blip2ForConditionalGeneration(
 
         return self.language_projection(query_output)
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
-
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
@@ -639,7 +620,7 @@ class Blip2ForConditionalGeneration(
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -670,11 +651,15 @@ class Blip2ForConditionalGeneration(
         Args:
             input_ids: Flattened (concatenated) input_ids corresponding to a
                 batch.
+            positions: Flattened (concatenated) position ids corresponding to a
+                batch.
+            intermediate_tensors: Intermediate tensors from prior forward pass.
+            inputs_embeds: Optional tensor of input embeddings.
 
         Info:
             [`Blip2ImageInputs`][vllm.model_executor.models.blip2.Blip2ImageInputs]
-        """
 
+        """
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -693,3 +678,30 @@ class Blip2ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        return MultiModelKeys.from_string_field(
+            language_model="language_model",
+            connector=["qformer", "language_projection"],
+            tower_model="vision_model",
+        )
+
+    def get_mm_lora_token_counts(
+        self,
+        *,
+        modality: str,
+        mm_kwargs: MultiModalKwargsItem | None,
+        num_mm_embeds: int,
+    ) -> tuple[int, int | None]:
+        del modality, mm_kwargs
+        if num_mm_embeds <= 0:
+            return 0, 0
+        assert num_mm_embeds % self.config.num_query_tokens == 0, (
+            "The number of image tokens must be a multiple of "
+            "the number of query tokens."
+        )
+        num_images = num_mm_embeds // self.config.num_query_tokens
+        return (
+            num_images * self._vision_tokens_per_image,
+            num_images * self.config.num_query_tokens,
+        )

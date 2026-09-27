@@ -18,9 +18,7 @@ logger.setLevel(logging.DEBUG)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Lifespan context manager to handle startup and shutdown events.
-    """
+    """Lifespan context manager to handle startup and shutdown events."""
     # Startup: Initialize client pools for prefiller and decoder services
     app.state.prefill_clients = []
     app.state.decode_clients = []
@@ -30,7 +28,14 @@ async def lifespan(app: FastAPI):
         prefiller_base_url = f"http://{host}:{port}/v1"
         app.state.prefill_clients.append(
             {
-                "client": httpx.AsyncClient(timeout=None, base_url=prefiller_base_url),
+                "client": httpx.AsyncClient(
+                    timeout=None,
+                    base_url=prefiller_base_url,
+                    limits=httpx.Limits(
+                        max_connections=None,
+                        max_keepalive_connections=None,
+                    ),
+                ),
                 "host": host,
                 "port": port,
                 "id": i,
@@ -42,7 +47,14 @@ async def lifespan(app: FastAPI):
         decoder_base_url = f"http://{host}:{port}/v1"
         app.state.decode_clients.append(
             {
-                "client": httpx.AsyncClient(timeout=None, base_url=decoder_base_url),
+                "client": httpx.AsyncClient(
+                    timeout=None,
+                    base_url=decoder_base_url,
+                    limits=httpx.Limits(
+                        max_connections=None,
+                        max_keepalive_connections=None,
+                    ),
+                ),
                 "host": host,
                 "port": port,
                 "id": i,
@@ -118,8 +130,7 @@ def parse_args():
 
 
 def get_next_client(app, service_type: str):
-    """
-    Get the next client in round-robin fashion.
+    """Get the next client in round-robin fashion.
 
     Args:
         app: The FastAPI app instance
@@ -127,6 +138,7 @@ def get_next_client(app, service_type: str):
 
     Returns:
         The next client to use
+
     """
     if service_type == "prefill":
         client_idx = next(app.state.prefill_iterator)
@@ -141,9 +153,7 @@ def get_next_client(app, service_type: str):
 async def send_request_to_service(
     client_info: dict, endpoint: str, req_data: dict, request_id: str
 ):
-    """
-    Send a request to a service using a client from the pool.
-    """
+    """Send a request to a service using a client from the pool."""
     req_data = req_data.copy()
     req_data["kv_transfer_params"] = {
         "do_remote_decode": True,
@@ -159,6 +169,9 @@ async def send_request_to_service(
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
         del req_data["stream_options"]
+    # These args are not supported for P
+    min_tokens = req_data.pop("min_tokens", None)
+    min_completion_tokens = req_data.pop("min_completion_tokens", None)
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
@@ -169,15 +182,21 @@ async def send_request_to_service(
     )
     response.raise_for_status()
 
+    # read/consume the response body to release the connection
+    # otherwise, it would http.ReadError
+    await response.aread()
+
+    # Add back the min_tokens and min_completion_tokens so D can use them
+    req_data["min_tokens"] = min_tokens
+    req_data["min_completion_tokens"] = min_completion_tokens
+
     return response
 
 
 async def stream_service_response(
     client_info: dict, endpoint: str, req_data: dict, request_id: str
 ):
-    """
-    Asynchronously stream response from a service using a client from the pool.
-    """
+    """Asynchronously stream response from a service using a client from the pool."""
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
@@ -206,6 +225,7 @@ async def _handle_completions(api: str, request: Request):
 
         # Extract the needed fields
         response_json = response.json()
+        await response.aclose()  # CRITICAL: Release connection back to pool
         kv_transfer_params = response_json.get("kv_transfer_params", {})
         if kv_transfer_params:
             req_data["kv_transfer_params"] = kv_transfer_params

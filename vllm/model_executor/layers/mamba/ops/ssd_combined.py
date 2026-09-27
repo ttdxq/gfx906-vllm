@@ -107,18 +107,15 @@ def _mamba_chunk_scan_combined_fwd(
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
-    # - for handling chunked prefill, this requires i) initial_states and
-    #   ii) seq_idx to be all specified.
-    # - When a new seq_idx is detected, we will stop passing the prev_state
-    #   and switch accordingly to the init_state corresponding to the new seq_idx.
+    # - parallelized across sequences using last_chunk_indices to derive
+    #   per-sequence chunk ranges. Each sequence's state passing runs independently.
     states = _state_passing_fwd(
         rearrange(states, "... p n -> ... (p n)"),
         dA_cumsum,  # (nheads, nchunks, chunk_size)
-        cu_chunk_seqlens,
+        last_chunk_indices,
         initial_states=rearrange(initial_states, "... p n -> ... (p n)")
         if initial_states is not None
         else None,  # (batch, nheads, headdim*dstate)
-        seq_idx=seq_idx,
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
     )
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
@@ -178,8 +175,7 @@ def mamba_chunk_scan_combined_varlen(
     return_intermediate_states=False,
     state_dtype=None,
 ):
-    """
-    Argument:
+    """Argument:
         x: (seqlen, nheads, headdim)
         dt: (seqlen, nheads)
         A: (nheads)
@@ -201,7 +197,6 @@ def mamba_chunk_scan_combined_varlen(
     Return:
         varlen_states: (batch, nheads, headdim, dstate)
     """
-
     assert cu_seqlens is not None, "cu_seqlens must be provided assuming varlen input"
     assert seq_idx is not None
 
@@ -228,3 +223,11 @@ def mamba_chunk_scan_combined_varlen(
     )
 
     return varlen_states
+
+
+from vllm.platforms import current_platform  # noqa: E402
+
+if current_platform.is_cpu():
+    import vllm.model_executor.layers.mamba.ops.cpu.mamba_ssm as cpu_mamba_ssm
+
+    _mamba_chunk_scan_combined_fwd = cpu_mamba_ssm._mamba_chunk_scan_combined_fwd_cpu  # type: ignore

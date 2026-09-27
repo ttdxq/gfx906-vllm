@@ -19,17 +19,18 @@ from collections.abc import Iterable
 from itertools import islice
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import Gemma3TextConfig
 
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import GeluAndMul
+from vllm.model_executor.layers.activation import get_act_and_mul_fn
+from vllm.model_executor.layers.attention import (
+    Attention,
+    EncoderOnlyAttention,
+)
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -39,19 +40,18 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backend import AttentionType
 
-from ...attention.layers.encoder_only_attention import EncoderOnlyAttention
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
+    WeightsMapper,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -84,13 +84,7 @@ class Gemma3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
-        if hidden_activation != "gelu_pytorch_tanh":
-            raise ValueError(
-                "Gemma3 uses `gelu_pytorch_tanh` as the hidden activation "
-                "function. Please set `hidden_act` and `hidden_activation` to "
-                "`gelu_pytorch_tanh`."
-            )
-        self.act_fn = GeluAndMul(approximate="tanh")
+        self.act_fn = get_act_and_mul_fn(hidden_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
@@ -176,7 +170,6 @@ class Gemma3Attention(nn.Module):
 
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
             rope_parameters=rope_parameters,
             is_neox_style=True,
@@ -224,76 +217,8 @@ class Gemma3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
-
-        if not kwargs.get("has_images", False):
-            # Fast path for text-only inputs. The performance for the text-only
-            # inputs are not affected by the naive attention below.
-            output, _ = self.o_proj(attn_output)
-            return output
-
-        # NOTE(woosuk): Gemma3 uses bidirectional attention between image tokens
-        # that correspond to the same image while using causal attention
-        # otherwise. Current attention backends cannot handle this pattern, so
-        # we temporarily use a naive attention implementation with mask tensors.
-
-        # We intentionally keep the attention backend as-is and only override
-        # `attn_output` with the naive implementation's output. This minimizes
-        # changes to existing model runners and attention backends. The call to
-        # `self.attn(q, k, v)` is only used to populate the KV cache - its
-        # output is discarded and overwritten below. While this duplicates
-        # computation, it maintains compatibility.
-        # TODO(woosuk): Optimize by implementing custom attention kernels.
-        attn_output = self.naive_attn_with_masks(q, k, v, out=attn_output, **kwargs)
         output, _ = self.o_proj(attn_output)
         return output
-
-    def naive_attn_with_masks(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        out: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        # NOTE(woosuk): As described in the comment above, this code is not
-        # meant to be performant. It is only meant to be correct.
-        q = q.view(-1, self.num_heads, self.head_dim)
-        # Expand the key and value to handle GQA.
-        num_queries_per_kv = self.num_heads // self.num_kv_heads
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        k = k.repeat_interleave(num_queries_per_kv, dim=-2)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.repeat_interleave(num_queries_per_kv, dim=-2)
-
-        if self.is_sliding:
-            attn_masks = kwargs["local_attn_masks"]
-        else:
-            attn_masks = kwargs["global_attn_masks"]
-
-        seq_lens = kwargs["seq_lens"]
-        start_idx = 0
-        for seq_len, attn_mask in zip(seq_lens, attn_masks):
-            end_idx = start_idx + seq_len
-            query = q[start_idx:end_idx].unsqueeze(0)
-            key = k[start_idx:end_idx].unsqueeze(0)
-            value = v[start_idx:end_idx].unsqueeze(0)
-
-            # Transpose.
-            query = query.transpose(1, 2)
-            key = key.transpose(1, 2)
-            value = value.transpose(1, 2)
-
-            output = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask,
-                self.scaling,
-            )
-            output = output.transpose(1, 2).flatten(-2, -1)
-            out[start_idx:end_idx] = output
-            start_idx = end_idx
-        return out
 
 
 class Gemma3DecoderLayer(nn.Module):
@@ -366,6 +291,17 @@ class Gemma3DecoderLayer(nn.Module):
 
 @support_torch_compile
 class Gemma3Model(nn.Module):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            # weight_name: (param_name, shard_id)
+            ".q_proj": (".qkv_proj", "q"),
+            ".k_proj": (".qkv_proj", "k"),
+            ".v_proj": (".qkv_proj", "v"),
+            ".gate_proj": (".gate_up_proj", 0),
+            ".up_proj": (".gate_up_proj", 1),
+        }
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -408,7 +344,7 @@ class Gemma3Model(nn.Module):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
@@ -437,84 +373,12 @@ class Gemma3Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            # Revert +1 during llama.cpp conversion
-            # see: https://github.com/ggml-org/llama.cpp/blob/be7c3034108473beda214fd1d7c98fd6a7a3bdf5/convert_hf_to_gguf.py#L3397-L3400
-            if (
-                self.quant_config
-                and self.quant_config.get_name() == "gguf"
-                and name.endswith("norm.weight")
-            ):
-                loaded_weight -= 1
-
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
-
-            # Check if this is a scale parameter that needs remapping first
-            if name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
-                # Try to remap the scale name first
-                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-                if remapped_name is not None and remapped_name in params_dict:
-                    # Successfully remapped, use the remapped name
-                    param = params_dict[remapped_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(remapped_name)
-                    continue
-                # If remapping failed, continue with normal processing
-
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale.
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+    hf_to_vllm_mapper = Gemma3Model.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -533,12 +397,20 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
         super().__init__()
         self.config = config
-        # currently all existing Gemma models have `tie_word_embeddings` enabled
-        assert config.tie_word_embeddings
         self.quant_config = quant_config
         self.model = Gemma3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        if config.tie_word_embeddings:
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+
         self.logits_processor = LogitsProcessor(
             config.vocab_size, soft_cap=config.final_logit_softcapping
         )
@@ -551,7 +423,7 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -566,12 +438,9 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.model.embed_tokens, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
-        return loader.load_weights(weights)
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

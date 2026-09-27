@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # adapted from https://github.com/deepseek-ai/DeepSeek-OCR/blob/main/DeepSeek-OCR-master/DeepSeek-OCR-vllm/process/image_process.py
+# and https://github.com/deepseek-ai/DeepSeek-OCR-2/blob/main/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/process/image_process.py
 import math
+from typing import Literal
 
 import torch
 import torchvision.transforms as T
 from PIL import Image, ImageOps
-from transformers import AutoProcessor, BatchFeature, LlamaTokenizerFast
+from transformers import BatchFeature, LlamaTokenizerFast
 from transformers.processing_utils import ProcessorMixin
 
 # TODO(Isotr0py): change modes for variants
@@ -156,10 +158,21 @@ class DeepseekOCRProcessor(ProcessorMixin):
         sft_format: str = "deepseek",
         mask_prompt: bool = True,
         ignore_id: int = -100,
+        image_size: int = IMAGE_SIZE,
+        base_size: int = BASE_SIZE,
+        strategy: Literal["v1", "v2"] = "v1",
+        max_crops: int = MAX_CROPS,
         **kwargs,
     ):
-        self.image_size = IMAGE_SIZE
-        self.base_size = BASE_SIZE
+        self.image_size = image_size
+        self.base_size = base_size
+        self.max_crops = max_crops
+
+        # image token calculation strategy for
+        # Deepseek-OCR and Deepseek-OCR-2
+        self.strategy = strategy
+        assert strategy in ["v1", "v2"], "Only 'v1' and 'v2' strategies are supported."
+
         self.patch_size = 16
         self.image_mean = image_mean
         self.image_std = image_std
@@ -221,9 +234,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         images: list[Image.Image],
         crop_mode: bool = CROP_MODE,
     ):
-        """
-
-        Args:
+        """Args:
             prompt (str): the formatted prompt;
             images (List[ImageType]): the list of images;
             crop_mode (bool): if True, then crop the image;
@@ -235,11 +246,10 @@ class DeepseekOCRProcessor(ProcessorMixin):
                 - pixel_values (torch.FloatTensor): [n_patches, 3, H, W]
                 - image_id (int): the id of the image token
                 - num_image_tokens (List[int]): the number of image tokens
-        """
 
-        assert prompt is not None and images is not None, (
-            "prompt and images must be used at the same time."
-        )
+        """
+        if prompt is None or images is None:
+            raise ValueError("prompt and images must be used at the same time.")
 
         sft_format = prompt
 
@@ -297,8 +307,13 @@ class DeepseekOCRProcessor(ProcessorMixin):
         cropping: bool = True,
     ):
         """Tokenize text with <image> tags."""
-
-        assert conversation.count(self.image_token) == len(images)
+        num_image_tags = conversation.count(self.image_token)
+        if num_image_tags != len(images):
+            raise ValueError(
+                f"Number of {self.image_token!r} tokens in prompt "
+                f"({num_image_tags}) does not match number of images "
+                f"({len(images)})."
+            )
         text_splits = conversation.split(self.image_token)
         images_list, images_crop_list, images_seq_mask, images_spatial_crop = (
             [],
@@ -317,16 +332,16 @@ class DeepseekOCRProcessor(ProcessorMixin):
             image_shapes.append(image.size)
 
             images_crop_raw = []
-            if image.size[0] <= 640 and image.size[1] <= 640:
+            if image.size[0] <= self.image_size and image.size[1] <= self.image_size:
                 crop_ratio = [1, 1]
             elif cropping:
                 images_crop_raw, crop_ratio = dynamic_preprocess(
-                    image, image_size=IMAGE_SIZE
+                    image, image_size=self.image_size, max_num=self.max_crops
                 )
             else:
                 crop_ratio = [1, 1]
 
-            if self.image_size <= 640 and not cropping:
+            if not cropping:
                 image = image.resize((self.image_size, self.image_size))
 
             global_view = ImageOps.pad(
@@ -350,12 +365,21 @@ class DeepseekOCRProcessor(ProcessorMixin):
                 (self.base_size // self.patch_size) / self.downsample_ratio
             )
 
-            tokenized_image = (
-                [self.image_token_id] * num_queries_base + [self.image_token_id]
-            ) * num_queries_base
+            num_tokens_base = (
+                (num_queries_base * (num_queries_base + 1))
+                if self.strategy == "v1"
+                else num_queries_base * num_queries_base
+            )
+            tokenized_image = [self.image_token_id] * num_tokens_base
+
             tokenized_image += [self.image_token_id]
             if num_width_tiles > 1 or num_height_tiles > 1:
-                local_row = [self.image_token_id] * (num_queries * num_width_tiles + 1)
+                num_tokens_per_row = (
+                    num_queries * num_width_tiles + 1
+                    if self.strategy == "v1"
+                    else num_queries * num_width_tiles
+                )
+                local_row = [self.image_token_id] * num_tokens_per_row
                 tokenized_image += local_row * (num_queries * num_height_tiles)
             tokenized_str += tokenized_image
             images_seq_mask += [True] * len(tokenized_image)
@@ -433,6 +457,3 @@ class DeepseekOCRProcessor(ProcessorMixin):
             num_image_tokens,
             image_shapes,
         )
-
-
-AutoProcessor.register("DeepseekOCRProcessor", DeepseekOCRProcessor)

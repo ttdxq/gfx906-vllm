@@ -5,18 +5,19 @@ import ipaddress
 import os
 import socket
 import sys
+import tempfile
 import warnings
 from collections.abc import (
     Iterator,
     Sequence,
 )
 from typing import Any
-from urllib.parse import urlparse
 from uuid import uuid4
 
 import psutil
 import zmq
 import zmq.asyncio
+from urllib3.util import parse_url
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -64,7 +65,7 @@ def get_ip() -> str:
         pass
 
     warnings.warn(
-        "Failed to get the IP address, using 0.0.0.0 by default."
+        "Failed to get the IP address, using 0.0.0.0 by default. "
         "The value can be set by the environment variable"
         " VLLM_HOST_IP or HOST_IP.",
         stacklevel=2,
@@ -131,6 +132,21 @@ def get_distributed_init_method(ip: str, port: int) -> str:
     return get_tcp_uri(ip, port)
 
 
+def get_file_store_init_method() -> str:
+    return f"file://{tempfile.gettempdir()}/vllm_dist_{uuid4().hex}"
+
+
+def aiter_requires_tcp_store() -> bool:
+    """AITER custom all-reduce requires a pure-TCP default store (its IPC
+    metadata exchange asserts on ``TCPStore``); the file:// rendezvous yields a
+    ``FileStore`` and trips that assertion. Prefer the TCP rendezvous
+    (pre-#50999) for ROCm + AITER custom AR until AITER accepts FileStore.
+    """
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    return rocm_aiter_ops.is_custom_all_reduce_enabled()
+
+
 def get_tcp_uri(ip: str, port: int) -> str:
     if is_valid_ipv6_address(ip):
         return f"tcp://[{ip}]:{port}"
@@ -147,36 +163,63 @@ def get_open_zmq_inproc_path() -> str:
     return f"inproc://{uuid4()}"
 
 
+def _get_reserved_port_range() -> range:
+    """Ports reserved for the data parallel master process (empty if unset)."""
+    if "VLLM_DP_MASTER_PORT" not in os.environ:
+        return range(0)
+    dp_master_port = envs.VLLM_DP_MASTER_PORT
+    return range(dp_master_port, dp_master_port + 10)
+
+
 def get_open_port() -> int:
-    """
-    Get an open port for the vLLM process to listen on.
+    """Get an open port for the vLLM process to listen on.
     An edge case to handle, is when we run data parallel,
     we need to avoid ports that are potentially used by
     the data parallel master process.
     Right now we reserve 10 ports for the data parallel master
     process. Currently it uses 2 ports.
     """
-    if "VLLM_DP_MASTER_PORT" in os.environ:
-        dp_master_port = envs.VLLM_DP_MASTER_PORT
-        reserved_port_range = range(dp_master_port, dp_master_port + 10)
-        while True:
-            candidate_port = _get_open_port()
-            if candidate_port not in reserved_port_range:
-                return candidate_port
-    return _get_open_port()
+    reserved_port_range = _get_reserved_port_range()
+    port = _get_open_port()
+    if port in reserved_port_range:
+        port = _get_open_port(start_port=reserved_port_range.stop, max_attempts=1000)
+    return port
 
 
 def get_open_ports_list(count: int = 5) -> list[int]:
-    """Get a list of open ports."""
-    ports = set[int]()
-    while len(ports) < count:
-        ports.add(get_open_port())
-    return list(ports)
+    """Get a list of unique open ports.
+
+    When VLLM_PORT is set, scans upward from that port, advancing
+    the start position after each find so every port is unique.
+    """
+    ports_set = set[int]()
+    if envs.VLLM_PORT is not None:
+        reserved_port_range = _get_reserved_port_range()
+        next_port = envs.VLLM_PORT
+        for _ in range(count):
+            port = _get_open_port(start_port=next_port, max_attempts=1000)
+            if port in reserved_port_range:
+                port = _get_open_port(
+                    start_port=reserved_port_range.stop, max_attempts=1000
+                )
+            ports_set.add(port)
+            next_port = port + 1
+        return list(ports_set)
+    else:
+        while len(ports_set) < count:
+            ports_set.add(get_open_port())
+
+    return list(ports_set)
 
 
-def _get_open_port() -> int:
-    port = envs.VLLM_PORT
+def _get_open_port(
+    start_port: int | None = None,
+    max_attempts: int | None = None,
+) -> int:
+    start_port = start_port if start_port is not None else envs.VLLM_PORT
+    port = start_port
     if port is not None:
+        attempts = 0
         while True:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -185,6 +228,12 @@ def _get_open_port() -> int:
             except OSError:
                 port += 1  # Increment port number if already in use
                 logger.info("Port %d is already in use, trying port %d", port - 1, port)
+            attempts += 1
+            if max_attempts is not None and attempts >= max_attempts:
+                raise RuntimeError(
+                    f"Could not find open port after {max_attempts} "
+                    f"attempts starting from port {start_port}"
+                )
     # try ipv4
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -217,13 +266,15 @@ def find_process_using_port(port: int) -> psutil.Process | None:
 
 def split_zmq_path(path: str) -> tuple[str, str, str]:
     """Split a zmq path into its parts."""
-    parsed = urlparse(path)
+    parsed = parse_url(path)
     if not parsed.scheme:
         raise ValueError(f"Invalid zmq path: {path}")
 
     scheme = parsed.scheme
     host = parsed.hostname or ""
-    port = str(parsed.port or "")
+    port = "" if parsed.port is None else str(parsed.port)
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]  # Remove brackets for IPv6 address
 
     if scheme == "tcp" and not all((host, port)):
         # The host and port fields are required for tcp
@@ -246,6 +297,7 @@ def make_zmq_path(scheme: str, host: str, port: int | None = None) -> str:
 
     Returns:
         A properly formatted ZMQ path string.
+
     """
     if port is None:
         return f"{scheme}://{host}"
@@ -262,9 +314,9 @@ def make_zmq_socket(
     bind: bool | None = None,
     identity: bytes | None = None,
     linger: int | None = None,
+    router_handover: bool = False,
 ) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
     """Make a ZMQ socket with the proper bind/connect semantics."""
-
     mem = psutil.virtual_memory()
     socket = ctx.socket(socket_type)
 
@@ -287,6 +339,10 @@ def make_zmq_socket(
     if socket_type in (zmq.PUSH, zmq.DEALER, zmq.ROUTER):
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
+
+    if socket_type == zmq.ROUTER and router_handover:
+        # Let a new connection take over an identity left behind by a dead one.
+        socket.setsockopt(zmq.ROUTER_HANDOVER, 1)
 
     if identity is not None:
         socket.setsockopt(zmq.IDENTITY, identity)
@@ -318,12 +374,19 @@ def zmq_socket_ctx(
     bind: bool | None = None,
     linger: int = 0,
     identity: bytes | None = None,
+    router_handover: bool = False,
 ) -> Iterator[zmq.Socket]:
-    """Context manager for a ZMQ socket"""
-
+    """Context manager for a ZMQ socket."""
     ctx = zmq.Context()  # type: ignore[attr-defined]
     try:
-        yield make_zmq_socket(ctx, path, socket_type, bind=bind, identity=identity)
+        yield make_zmq_socket(
+            ctx,
+            path,
+            socket_type,
+            bind=bind,
+            identity=identity,
+            router_handover=router_handover,
+        )
     except KeyboardInterrupt:
         logger.debug("Got Keyboard Interrupt.")
 

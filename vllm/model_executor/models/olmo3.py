@@ -410,7 +410,7 @@ class Olmo3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=(
+            ignore_unexpected_prefixes=(
                 ["lm_head.weight"] if self.config.tie_word_embeddings else None
             ),
         )

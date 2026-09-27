@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Micro benchmark comparing built-in hash(), SHA-256, and xxHash.
+"""Micro benchmark comparing built-in hash(), SHA-256, and xxHash.
 
 This focuses on a single test payload shaped like the prefix-cache hash input:
     (32-byte bytes object, 32-int tuple)
@@ -18,12 +17,7 @@ import statistics
 import time
 from collections.abc import Callable, Iterable
 
-from vllm.utils.hashing import sha256
-
-try:
-    from vllm.utils.hashing import xxhash
-except ImportError:
-    xxhash = None
+from vllm.utils.hashing import sha256, xxhash
 
 
 def _generate_test_data(seed: int) -> tuple[bytes, tuple[int, ...]]:
@@ -87,9 +81,11 @@ def main() -> None:
     args = parser.parse_args()
 
     data = _generate_test_data(args.seed)
-    benchmarks = [("SHA256 (pickle)", sha256), ("built-in hash()", builtin_hash)]
-    if xxhash is not None:
-        benchmarks.insert(1, ("xxHash (pickle)", xxhash))
+    benchmarks = (
+        ("SHA256 (pickle)", sha256),
+        ("xxHash (pickle)", xxhash),
+        ("built-in hash()", builtin_hash),
+    )
 
     print("=" * 60)
     print("HASH FUNCTION MICRO BENCHMARK")

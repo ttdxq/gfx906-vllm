@@ -1,37 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import contextlib
-import os
-import weakref
 from contextlib import ExitStack
 
 import pytest
 
-from tests.utils import wait_for_gpu_memory_to_clear
+from tests.utils import create_new_process_for_each_test
 from tests.v1.attention.utils import full_cg_backend_configs as backend_configs
 from vllm import LLM
 from vllm.config import CompilationConfig, CompilationMode
 from vllm.platforms import current_platform
-
-
-@contextlib.contextmanager
-def temporary_environ(env_vars):
-    """
-    Temporarily set environment variables and restore them afterward.
-    We have to do this vs monkeypatch because monkeypatch doesn't work
-    with "module" scoped fixtures.
-    """
-    original_env = {k: os.environ.get(k) for k in env_vars}
-    try:
-        os.environ.update(env_vars)
-        yield
-    finally:
-        for k, v in original_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
 
 # test attention backend and cudagraph_mode combo
 # (backend_name, cudagraph_mode, supported)
@@ -54,6 +31,7 @@ else:
 
 
 @pytest.mark.parametrize("backend_name, cudagraph_mode, supported", combo_cases_1)
+@create_new_process_for_each_test("spawn")
 def test_backend_and_cudagraph_mode_combo(backend_name, cudagraph_mode, supported):
     if backend_name == "FlashInfer":
         try:
@@ -68,9 +46,9 @@ def test_backend_and_cudagraph_mode_combo(backend_name, cudagraph_mode, supporte
     ):
         pytest.skip("Only Hopper GPUs support FA3 and FlashMLA")
 
-    env_vars = backend_configs[backend_name].env_vars
+    attention_config = backend_config.attention_config
 
-    with temporary_environ(env_vars), ExitStack() as stack:
+    with ExitStack() as stack:
         if not supported:
             stack.enter_context(pytest.raises(Exception))
 
@@ -80,63 +58,43 @@ def test_backend_and_cudagraph_mode_combo(backend_name, cudagraph_mode, supporte
             trust_remote_code=True,
             gpu_memory_utilization=0.45,
             max_model_len=1024,
+            attention_config=attention_config,
             compilation_config=CompilationConfig(
                 mode=CompilationMode.VLLM_COMPILE, cudagraph_mode=cudagraph_mode
             ),
         )
         llm.generate(["Hello, my name is"] * 10)
-    # when above code raises, `llm` may be undefined, so we need to catch that
-    try:
-        llm = weakref.proxy(llm)
-        del llm
-    except UnboundLocalError:
-        pass
-
-    wait_for_gpu_memory_to_clear(
-        devices=[0],
-        threshold_ratio=0.1,
-    )
 
 
 # test cudagraph_mode with different compilation mode.
 # (backend_name, cudagraph_mode, compilation_mode, supported)
-if current_platform.is_rocm():
-    combo_cases_2 = [
-        ("RocmAttn", "FULL", CompilationMode.NONE, True),
-        ("RocmAttn", "FULL", CompilationMode.VLLM_COMPILE, True),
-        ("RocmAttn", "PIECEWISE", CompilationMode.NONE, False),
-        ("RocmAttn", "PIECEWISE", CompilationMode.VLLM_COMPILE, True),
-        ("RocmAttn", "FULL_AND_PIECEWISE", CompilationMode.NONE, False),
-        ("RocmAttn", "FULL_AND_PIECEWISE", CompilationMode.VLLM_COMPILE, True),
-        ("RocmAttn", "FULL_DECODE_ONLY", CompilationMode.NONE, True),
-        ("RocmAttn", "FULL_DECODE_ONLY", CompilationMode.VLLM_COMPILE, True),
-        ("RocmAttn", "NONE", CompilationMode.NONE, True),
-        ("RocmAttn", "NONE", CompilationMode.VLLM_COMPILE, True),
-    ]
-else:
-    combo_cases_2 = [
-        ("FA2", "FULL", CompilationMode.NONE, True),
-        ("FA2", "FULL", CompilationMode.VLLM_COMPILE, True),
-        ("FA2", "PIECEWISE", CompilationMode.NONE, True),
-        ("FA2", "PIECEWISE", CompilationMode.VLLM_COMPILE, True),
-        ("FA2", "FULL_AND_PIECEWISE", CompilationMode.NONE, True),
-        ("FA2", "FULL_AND_PIECEWISE", CompilationMode.VLLM_COMPILE, True),
-        ("FA2", "FULL_DECODE_ONLY", CompilationMode.NONE, True),
-        ("FA2", "FULL_DECODE_ONLY", CompilationMode.VLLM_COMPILE, True),
-        ("FA2", "NONE", CompilationMode.NONE, True),
-        ("FA2", "NONE", CompilationMode.VLLM_COMPILE, True),
-    ]
+attn_backend = "RocmAttn" if current_platform.is_rocm() else "FA2"
+
+combo_cases_2 = [
+    (attn_backend, "FULL", CompilationMode.NONE, True),
+    (attn_backend, "FULL", CompilationMode.VLLM_COMPILE, True),
+    (attn_backend, "PIECEWISE", CompilationMode.NONE, True),
+    (attn_backend, "PIECEWISE", CompilationMode.VLLM_COMPILE, True),
+    (attn_backend, "FULL_AND_PIECEWISE", CompilationMode.NONE, True),
+    (attn_backend, "FULL_AND_PIECEWISE", CompilationMode.VLLM_COMPILE, True),
+    (attn_backend, "FULL_DECODE_ONLY", CompilationMode.NONE, True),
+    (attn_backend, "FULL_DECODE_ONLY", CompilationMode.VLLM_COMPILE, True),
+    (attn_backend, "NONE", CompilationMode.NONE, True),
+    (attn_backend, "NONE", CompilationMode.VLLM_COMPILE, True),
+]
 
 
 @pytest.mark.parametrize(
     "backend_name,cudagraph_mode,compilation_mode,supported", combo_cases_2
 )
+@create_new_process_for_each_test("spawn")
 def test_cudagraph_compilation_combo(
     backend_name, cudagraph_mode, compilation_mode, supported
 ):
-    env_vars = backend_configs[backend_name].env_vars
+    backend_config = backend_configs[backend_name]
+    attention_config = backend_config.attention_config
 
-    with temporary_environ(env_vars), ExitStack() as stack:
+    with ExitStack() as stack:
         if not supported:
             stack.enter_context(pytest.raises(Exception))
 
@@ -146,19 +104,9 @@ def test_cudagraph_compilation_combo(
             trust_remote_code=True,
             gpu_memory_utilization=0.45,
             max_model_len=1024,
+            attention_config=attention_config,
             compilation_config=CompilationConfig(
                 mode=compilation_mode, cudagraph_mode=cudagraph_mode
             ),
         )
         llm.generate(["Hello, my name is"] * 10)
-    # when above code raises, `llm` may be undefined, so we need to catch that
-    try:
-        llm = weakref.proxy(llm)
-        del llm
-    except UnboundLocalError:
-        pass
-    finally:
-        wait_for_gpu_memory_to_clear(
-            devices=[0],
-            threshold_ratio=0.1,
-        )

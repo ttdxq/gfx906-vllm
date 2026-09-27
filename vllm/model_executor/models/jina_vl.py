@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
-from transformers import BatchFeature
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
-from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
+from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalKwargsItems
+from vllm.multimodal.processing.processor import (
+    MultiModalProcessingResult,
+    ProcessorInputs,
+    TimingContext,
+)
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsCrossEncoding, SupportsMultiModal, SupportsScoreTemplate
@@ -27,15 +32,23 @@ logger = init_logger(__name__)
 
 
 class JinaVLScorer(nn.Module):
-    def __init__(self, model_config: "ModelConfig"):
+    def __init__(self, model_config: "ModelConfig", prefix: str = ""):
         super().__init__()
         config = model_config.hf_config.get_text_config()
         head_dtype = model_config.head_dtype
         self.dense = ColumnParallelLinear(
-            config.hidden_size, config.hidden_size, params_dtype=head_dtype, bias=True
+            config.hidden_size,
+            config.hidden_size,
+            params_dtype=head_dtype,
+            bias=True,
+            prefix=f"{prefix}.dense",
         )
         self.out_proj = RowParallelLinear(
-            config.hidden_size, config.num_labels, params_dtype=head_dtype, bias=True
+            config.hidden_size,
+            config.num_labels,
+            params_dtype=head_dtype,
+            bias=True,
+            prefix=f"{prefix}.out_proj",
         )
 
     def forward(self, x, **kwargs):
@@ -46,20 +59,41 @@ class JinaVLScorer(nn.Module):
 
 
 class JinaVLMultiModalProcessor(Qwen2VLMultiModalProcessor):
-    def _call_hf_processor(
+    def _cached_apply_hf_processor(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        # NOTE: We should reverse the order of the mm_data because the
-        # query prompt is placed after the document prompt in the score
-        # template for JinaVLForRanking model, but in mm_data they are
-        # stored in the opposite order (query first, then document).
-        for _, value in mm_data.items():
-            value.reverse()
-        return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> MultiModalProcessingResult:
+        mm_res = super()._cached_apply_hf_processor(inputs, timing_ctx)
+
+        # Score inputs are query-first, while the prompt template is document-first.
+        mm_kwargs = MultiModalKwargsItems(
+            {
+                modality: list(reversed(items))
+                for modality, items in mm_res.kwargs.items()
+            }
+        )
+        mm_hashes = {
+            modality: list(reversed(hashes))
+            for modality, hashes in mm_res.hashes.items()
+        }
+        mm_prompt_updates = {
+            modality: [
+                [
+                    self._recompute_cached_prompt_update(update, item_idx)
+                    for update in updates
+                ]
+                for item_idx, updates in enumerate(reversed(item_updates))
+            ]
+            for modality, item_updates in mm_res.prompt_updates.items()
+        }
+
+        return MultiModalProcessingResult(
+            prompt_ids=mm_res.prompt_ids,
+            kwargs=mm_kwargs,
+            hashes=mm_hashes,
+            prompt_updates=mm_prompt_updates,
+        )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -94,20 +128,10 @@ class JinaVLForSequenceClassification(
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
 
-        self.score = JinaVLScorer(vllm_config.model_config)
-        self.pooler = DispatchPooler(
-            {
-                "token_classify": Pooler.for_token_classify(
-                    pooler_config, classifier=self.score
-                ),
-                "classify": Pooler.for_classify(
-                    pooler_config, classifier=self.score, act_fn="classify"
-                ),
-                "score": Pooler.for_classify(
-                    pooler_config, classifier=self.score, act_fn="score"
-                ),
-            }
+        self.score = JinaVLScorer(
+            vllm_config.model_config, prefix=maybe_prefix(prefix, "score")
         )
+        self.pooler = DispatchPooler.for_seq_cls(pooler_config, classifier=self.score)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -127,7 +151,7 @@ class JinaVLForSequenceClassification(
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

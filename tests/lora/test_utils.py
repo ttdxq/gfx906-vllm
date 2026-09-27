@@ -3,7 +3,7 @@
 
 from collections import OrderedDict
 from typing import NamedTuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from huggingface_hub.utils import HfHubHTTPError
@@ -175,7 +175,7 @@ def test_get_adapter_absolute_path_local_existing(mock_abspath, mock_exist):
     assert get_adapter_absolute_path(path) == absolute_path
 
 
-@patch("huggingface_hub.snapshot_download")
+@patch("huggingface_hub.HfApi.snapshot_download")
 @patch("os.path.exists")
 def test_get_adapter_absolute_path_huggingface(mock_exist, mock_snapshot_download):
     # Hugging Face model identifier
@@ -186,7 +186,7 @@ def test_get_adapter_absolute_path_huggingface(mock_exist, mock_snapshot_downloa
     assert get_adapter_absolute_path(path) == absolute_path
 
 
-@patch("huggingface_hub.snapshot_download")
+@patch("huggingface_hub.HfApi.snapshot_download")
 @patch("os.path.exists")
 def test_get_adapter_absolute_path_huggingface_error(
     mock_exist, mock_snapshot_download
@@ -194,5 +194,8 @@ def test_get_adapter_absolute_path_huggingface_error(
     # Hugging Face model identifier with download error
     path = "org/repo"
     mock_exist.return_value = False
-    mock_snapshot_download.side_effect = HfHubHTTPError("failed to query model info")
+    mock_snapshot_download.side_effect = HfHubHTTPError(
+        "failed to query model info",
+        response=MagicMock(),
+    )
     assert get_adapter_absolute_path(path) == path

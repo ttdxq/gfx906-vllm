@@ -12,9 +12,9 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
-from vllm.attention.backends.abstract import AttentionMetadata, AttentionType
 from vllm.attention.backends.utils import PAD_SLOT_ID
-from vllm.attention.layer import Attention
+from vllm.model_executor.layers.attention import Attention
+from vllm.v1.attention.backend import AttentionMetadata, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -41,7 +41,7 @@ from vllm.model_executor.layers.fla.ops import (
     fused_sigmoid_gating_delta_rule_update,
     fused_sigmoid_gating_delta_rule_update_kv_cache_gfx906,
 )
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
 from vllm.model_executor.layers.layernorm import (
@@ -199,7 +199,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             self.shared_expert = None
 
-        self.experts = SharedFusedMoE(
+        self.experts = FusedMoEFactory(
             shared_experts=self.shared_expert,
             gate=self.gate,
             num_experts=self.n_routed_experts,
@@ -637,7 +637,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         assert non_spec_state_indices_tensor is not None
 
         forward_context = get_forward_context()
-        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+        # bind_kv_cache installs the (conv, ssm) state tuple directly; the
+        # per-VE list only exists as the pre-bind placeholder.
+        self_kv_cache = self.kv_cache
+        if isinstance(self_kv_cache, list):
+            self_kv_cache = self_kv_cache[0]
         conv_state = (
             self_kv_cache[0]
             if is_conv_state_dim_first()
@@ -857,7 +861,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
-        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+        # bind_kv_cache installs the (conv, ssm) state tuple directly; the
+        # per-VE list only exists as the pre-bind placeholder.
+        self_kv_cache = self.kv_cache
+        if isinstance(self_kv_cache, list):
+            self_kv_cache = self_kv_cache[0]
         conv_state = (
             self_kv_cache[0]
             if is_conv_state_dim_first()
@@ -1338,10 +1346,8 @@ class Qwen3NextAttention(nn.Module):
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=config.max_position_embeddings,
             rope_parameters=config.rope_parameters,
-            partial_rotary_factor=config.partial_rotary_factor,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
 
@@ -1681,7 +1687,11 @@ class Qwen3NextModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        return SharedFusedMoE.make_expert_params_mapping(
+        # SharedFusedMoE inherited FusedMoE.make_expert_params_mapping;
+        # upstream renamed it into RoutedExperts.build_expert_params_mapping.
+        # An empty routed_experts_prefix and no LoRA prefix keep the returned
+        # tuples identical to the old format.
+        return RoutedExperts.build_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -1689,6 +1699,7 @@ class Qwen3NextModel(nn.Module):
             if hasattr(self.config, "num_experts")
             else 0,
             num_redundant_experts=self.num_redundant_experts,
+            routed_experts_prefix="",
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1921,7 +1932,7 @@ class Qwen3NextForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["mtp."],
+            ignore_unexpected_prefixes=["mtp."],
         )
         return loader.load_weights(weights)
 

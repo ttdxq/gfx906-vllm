@@ -21,7 +21,7 @@ def test_get_kv_connector_cache_layout_without_kv_connector():
     with set_current_vllm_config(vllm_config):
         # Test with default settings
         layout = get_kv_connector_cache_layout()
-        assert layout == "NHD"
+        assert layout is None
 
 
 def test_get_kv_connector_cache_layout_with_lmcache_connector():
@@ -35,7 +35,7 @@ def test_get_kv_connector_cache_layout_with_lmcache_connector():
     with set_current_vllm_config(vllm_config):
         # Test with default settings
         layout = get_kv_connector_cache_layout()
-        assert layout == "NHD"
+        assert layout is None
 
 
 def test_get_kv_connector_cache_layout_with_nixl_connector():
@@ -52,7 +52,7 @@ def test_get_kv_connector_cache_layout_with_nixl_connector():
     with set_current_vllm_config(vllm_config):
         # Test with default settings
         layout = get_kv_connector_cache_layout()
-        assert layout == "HND"
+        assert layout == "LBHNC"
 
 
 def test_get_kv_connector_cache_layout_with_multi_connector():
@@ -61,7 +61,7 @@ def test_get_kv_connector_cache_layout_with_multi_connector():
         kv_role="kv_both",
         kv_connector_extra_config={
             "connectors": [
-                {"kv_connector": "SharedStorageConnector", "kv_role": "kv_both"},
+                {"kv_connector": "ExampleConnector", "kv_role": "kv_both"},
                 {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
             ]
         },
@@ -75,4 +75,4 @@ def test_get_kv_connector_cache_layout_with_multi_connector():
     with set_current_vllm_config(vllm_config):
         # Test with default settings
         layout = get_kv_connector_cache_layout()
-        assert layout == "HND"
+        assert layout == "LBHNC"

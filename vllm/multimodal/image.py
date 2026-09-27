@@ -1,29 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from io import BytesIO
-from pathlib import Path
+import contextlib
 
-import pybase64
-import torch
-from PIL import Image
-
-from vllm import envs
-
-from .base import MediaIO
-
-_DEFAULT_MAX_IMAGE_PIXELS = 178_956_970
-
-
-def _check_image_pixel_limit(width: int, height: int) -> None:
-    max_pixels = getattr(envs, "VLLM_MAX_IMAGE_PIXELS", _DEFAULT_MAX_IMAGE_PIXELS)
-    num_pixels = width * height
-    if max_pixels > 0 and num_pixels > max_pixels:
-        raise ValueError(
-            f"Image dimensions {width}x{height} ({num_pixels} pixels) exceed "
-            f"the maximum of {max_pixels} pixels. Set VLLM_MAX_IMAGE_PIXELS "
-            "to increase this limit."
-        )
+from PIL import Image, ImageOps
 
 
 def rescale_image_size(
@@ -38,6 +18,13 @@ def rescale_image_size(
     return image
 
 
+def normalize_image(image: Image.Image) -> Image.Image:
+    """Normalize EXIF orientation so the pixel data matches visual display."""
+    with contextlib.suppress(Exception):
+        image = ImageOps.exif_transpose(image)
+    return image
+
+
 def rgba_to_rgb(
     image: Image.Image,
     background_color: tuple[int, int, int] | list[int] = (255, 255, 255),
@@ -49,99 +36,25 @@ def rgba_to_rgb(
     return converted
 
 
-def convert_image_mode(image: Image.Image, to_mode: str):
+def _has_transparency(image: Image.Image) -> bool:
+    """Detect whether an image carries transparency data (RGBA, LA, PA,
+    or tRNS chunk in P/L/RGB PNGs)."""
+    if image.mode in ("RGBA", "LA", "PA"):
+        return True
+    return "transparency" in getattr(image, "info", {})
+
+
+def convert_image_mode(
+    image: Image.Image,
+    to_mode: str,
+    background_color: tuple[int, int, int] | list[int] = (255, 255, 255),
+) -> Image.Image:
     if image.mode == to_mode:
         return image
-    elif image.mode == "RGBA" and to_mode == "RGB":
-        return rgba_to_rgb(image)
-    else:
-        return image.convert(to_mode)
 
+    if to_mode == "RGB" and _has_transparency(image):
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+        return rgba_to_rgb(image, background_color)
 
-class ImageMediaIO(MediaIO[Image.Image]):
-    def __init__(self, image_mode: str = "RGB", **kwargs) -> None:
-        super().__init__()
-
-        self.image_mode = image_mode
-        # `kwargs` contains custom arguments from
-        # --media-io-kwargs for this modality.
-        # They can be passed to the underlying
-        # media loaders (e.g. custom implementations)
-        # for flexible control.
-        self.kwargs = kwargs
-
-        # Extract RGBA background color from kwargs if provided
-        # Default to white background for backward compatibility
-        rgba_bg = kwargs.get("rgba_background_color", (255, 255, 255))
-        # Convert list to tuple for consistency
-        if isinstance(rgba_bg, list):
-            rgba_bg = tuple(rgba_bg)
-
-        # Validate rgba_background_color format
-        if not (
-            isinstance(rgba_bg, tuple)
-            and len(rgba_bg) == 3
-            and all(isinstance(c, int) and 0 <= c <= 255 for c in rgba_bg)
-        ):
-            raise ValueError(
-                "rgba_background_color must be a list or tuple of 3 integers "
-                "in the range [0, 255]."
-            )
-        self.rgba_background_color = rgba_bg
-
-    def _convert_image_mode(self, image: Image.Image) -> Image.Image:
-        """Convert image mode with custom background color."""
-        if image.mode == self.image_mode:
-            return image
-        elif image.mode == "RGBA" and self.image_mode == "RGB":
-            return rgba_to_rgb(image, self.rgba_background_color)
-        else:
-            return convert_image_mode(image, self.image_mode)
-
-    def load_bytes(self, data: bytes) -> Image.Image:
-        image = Image.open(BytesIO(data))
-        _check_image_pixel_limit(*image.size)
-        image.load()
-        return self._convert_image_mode(image)
-
-    def load_base64(self, media_type: str, data: str) -> Image.Image:
-        return self.load_bytes(pybase64.b64decode(data, validate=True))
-
-    def load_file(self, filepath: Path) -> Image.Image:
-        image = Image.open(filepath)
-        _check_image_pixel_limit(*image.size)
-        image.load()
-        return self._convert_image_mode(image)
-
-    def encode_base64(
-        self,
-        media: Image.Image,
-        *,
-        image_format: str = "JPEG",
-    ) -> str:
-        image = media
-
-        with BytesIO() as buffer:
-            image = self._convert_image_mode(image)
-            image.save(buffer, image_format)
-            data = buffer.getvalue()
-
-        return pybase64.b64encode(data).decode("utf-8")
-
-
-class ImageEmbeddingMediaIO(MediaIO[torch.Tensor]):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def load_bytes(self, data: bytes) -> torch.Tensor:
-        buffer = BytesIO(data)
-        return torch.load(buffer, weights_only=True)
-
-    def load_base64(self, media_type: str, data: str) -> torch.Tensor:
-        return self.load_bytes(pybase64.b64decode(data, validate=True))
-
-    def load_file(self, filepath: Path) -> torch.Tensor:
-        return torch.load(filepath, weights_only=True)
-
-    def encode_base64(self, media: torch.Tensor) -> str:
-        return pybase64.b64encode(media.numpy()).decode("utf-8")
+    return image.convert(to_mode)

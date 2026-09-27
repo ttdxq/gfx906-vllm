@@ -19,8 +19,7 @@ class NewLineFormatter(logging.Formatter):
 
     def format(self, record):
         def shrink_path(relpath: Path) -> str:
-            """
-            Shortens a file path for logging display:
+            """Shortens a file path for logging display:
             - Removes leading 'vllm' folder if present.
             - If path starts with 'v1',
             keeps the first two and last two levels,
@@ -33,13 +32,13 @@ class NewLineFormatter(logging.Formatter):
             model_executor/.../quantization/utils/fp8_utils.py
             vllm/model_executor/layers/quantization/awq.py ->
             model_executor/layers/quantization/awq.py
-            vllm/v1/attention/backends/mla/common.py ->
-            v1/attention/backends/mla/common.py
 
             Args:
                 relpath (Path): The relative path to be shortened.
+
             Returns:
                 str: The shortened path string for display.
+
             """
             parts = list(relpath.parts)
             new_parts = []

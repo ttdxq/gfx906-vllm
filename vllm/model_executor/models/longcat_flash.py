@@ -46,11 +46,14 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEFactory,
+    GateLinear,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -66,6 +69,7 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
+    AutoWeightsLoader,
     PPMissingLayer,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
@@ -78,6 +82,8 @@ logger = init_logger(__name__)
 
 class FlashConfig(PretrainedConfig):
     """Flash model configuration."""
+
+    moe_intermediate_size: int
 
     model_type = "longcat_flash"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -179,7 +185,7 @@ class FlashConfig(PretrainedConfig):
         self.intermediate_size = (
             self.ffn_hidden_size
             if hasattr(self, "ffn_hidden_size")
-            else self.intermediate_size
+            else intermediate_size
         )
         if hasattr(self, "moe_intermediate_size"):
             self.moe_intermediate_size = self.moe_intermediate_size
@@ -236,9 +242,9 @@ class FlashMLP(nn.Module):
 class LongcatRouter(nn.Module):
     def __init__(
         self,
-        config,
-        zero_expert_num=0,
-        rounter_params_dtype=torch.bfloat16,
+        config: FlashConfig,
+        zero_expert_num: int,
+        router_params_dtype: torch.dtype,
         prefix: str = "",
     ):
         super().__init__()
@@ -248,16 +254,16 @@ class LongcatRouter(nn.Module):
             else config.num_experts[0]
         )
         self.n_routed_experts = self.n_routed_experts + zero_expert_num
-        self.classifier = ReplicatedLinear(
+        self.classifier = GateLinear(
             config.hidden_size,
             self.n_routed_experts,
             bias=config.router_bias,
-            params_dtype=rounter_params_dtype,
-            quant_config=None,
+            out_dtype=router_params_dtype,
+            params_dtype=router_params_dtype,
             prefix=f"{prefix}.classifier",
         )
         self.e_score_correction_bias = nn.Parameter(
-            torch.zeros((self.n_routed_experts), dtype=rounter_params_dtype)
+            torch.zeros((self.n_routed_experts), dtype=router_params_dtype)
         )
 
     def forward(self, hidden_states):
@@ -280,47 +286,64 @@ class LongcatMoe(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.zero_expert_num = config.zero_expert_num
-        self.zero_expert_type = config.zero_expert_type
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.enable_eplb = enable_eplb
         # Gate always runs at half / full precision for now.
-        self.rounter_params_dtype = params_dtype
+        self.router_params_dtype = params_dtype
         if config.router_dtype == "float32":
-            self.rounter_params_dtype = torch.float32
+            self.router_params_dtype = torch.float32
 
         self.router = LongcatRouter(
             config=config,
-            zero_expert_num=self.zero_expert_num,
-            rounter_params_dtype=self.rounter_params_dtype,
+            zero_expert_num=config.zero_expert_num,
+            router_params_dtype=self.router_params_dtype,
             prefix=f"{prefix}.gate",
         )
 
-        self.experts = FusedMoE(
+        assert config.zero_expert_type is not None
+        self.experts = FusedMoEFactory(
+            zero_expert_type=config.zero_expert_type,
+            e_score_correction_bias=self.router.e_score_correction_bias,
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            reduce_results=True,
             params_dtype=params_dtype,
-            e_score_correction_bias=self.router.e_score_correction_bias,
             renormalize=False,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
-            zero_expert_num=self.zero_expert_num,
-            zero_expert_type=self.zero_expert_type,
-            enable_eplb=self.enable_eplb,
+            enable_eplb=enable_eplb,
             routed_scaling_factor=config.routed_scaling_factor,
+            router_logits_dtype=self.router_params_dtype,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        router_logits = self.router(hidden_states.to(self.rounter_params_dtype))
+        # Align to MoERunner padded hidden size to avoid dim mismatch
+        padded_hidden = self.experts.moe_config.hidden_dim
+        if hidden_dim < padded_hidden:
+            hidden_states_padded = torch.nn.functional.pad(
+                hidden_states,
+                (0, padded_hidden - hidden_dim),
+                mode="constant",
+                value=0.0,
+            )
+        else:
+            hidden_states_padded = hidden_states
+
+        router_logits_full = self.router(hidden_states_padded)
+
+        # MoERunner handles routing memoization and zero expert computation
+        # internally. Pass full router_logits (including zero experts) so that
+        # zero experts can be properly identified in routing.
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states_padded,
+            router_logits=router_logits_full,  # Full logits (includes zero experts)
         )
+
+        # Crop back to original hidden dimension if padded earlier
+        if padded_hidden != hidden_dim:
+            final_hidden_states = final_hidden_states[..., :hidden_dim]
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -419,6 +442,7 @@ class FlashDecoderLayer(nn.Module):
         hidden_states = self.self_attn[0](
             positions=positions,
             hidden_states=hidden_states,
+            llama_4_scaling=None,
         )
 
         hidden_states, residual = self.post_attention_layernorm[0](
@@ -438,6 +462,7 @@ class FlashDecoderLayer(nn.Module):
         hidden_states = self.self_attn[1](
             positions=positions,
             hidden_states=hidden_states,
+            llama_4_scaling=None,
         )
         hidden_states, residual = self.post_attention_layernorm[1](
             hidden_states, residual
@@ -461,8 +486,8 @@ class FlashModel(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.quant_config = quant_config
 
-        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
         if get_pp_group().is_first_rank:
@@ -497,7 +522,7 @@ class FlashModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -527,6 +552,162 @@ class FlashModel(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        return fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts
+            if hasattr(self.config, "n_routed_experts")
+            else self.config.num_experts[0],
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            ("fused_qkv_a_proj", "q_a_proj", 0),
+            ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+
+        expert_params_mapping = self.get_expert_mapping()
+        loaded_params: set[str] = set()
+
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                if "mlp" in name and "mlps" not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if (
+                    name.endswith(".bias") or name.endswith("_bias")
+                ) and name not in params_dict:
+                    continue
+                # Skip mtp
+                if ".mtp." in name:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                is_expert_weight = False
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, expert_shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    is_expert_weight = True
+                    name_mapped = name.replace(weight_name, param_name)
+                    # Skip mtp
+                    if ".mtp." in name_mapped:
+                        continue
+                    if (
+                        name_mapped.endswith(".bias") or name_mapped.endswith("_bias")
+                    ) and name not in params_dict:
+                        continue
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    param = params_dict[name_mapped]
+                    weight_loader = param.weight_loader
+                    weight_loader = typing.cast(
+                        Callable[..., bool], param.weight_loader
+                    )
+                    success = weight_loader(
+                        param,
+                        loaded_weight,
+                        name_mapped,
+                        shard_id=expert_shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+                    if success:
+                        name = name_mapped
+                        break
+                else:
+                    if is_expert_weight:
+                        # We've checked that this is an expert weight
+                        # However it's not mapped locally to this rank
+                        # So we simply skip it
+                        continue
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip loading kv_scale from ckpts towards new design.
+                    if name.endswith(".kv_scale") and name not in params_dict:
+                        continue
+                    # Skip mtp
+                    if ".mtp." in name:
+                        continue
+                    if name is None:
+                        continue
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        for layer_id in range(self.config.num_hidden_layers):
+            for i in range(2):
+                if isinstance(self.layers[layer_id], PPMissingLayer):
+                    continue
+                self_attn = self.layers[layer_id].self_attn[i]
+                if (
+                    self.quant_config is not None
+                    and hasattr(self.quant_config, "weight_block_size")
+                    and self_attn.kv_b_proj.weight.dtype
+                    in (
+                        torch.float8_e4m3fn,
+                        torch.float8_e4m3fnuz,
+                    )
+                ):
+                    weight_block_size = self.quant_config.weight_block_size
+                    if weight_block_size is not None:
+                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                        dtype = torch.get_default_dtype()
+                        w = block_dequant(
+                            self_attn.kv_b_proj.weight,
+                            self_attn.kv_b_proj.weight_scale_inv,
+                            weight_block_size,
+                        ).to(dtype)
+                else:
+                    w = self_attn.kv_b_proj.weight
+
+                w_kc, w_vc = w.unflatten(
+                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+                # Guard against compounding on incremental load_weights calls:
+                # the in-place ``*=`` would otherwise re-apply the MLA LoRA
+                # scaling to the layernorm weights on each pass.
+                if self.config.mla_scale_q_lora and not getattr(
+                    self_attn, "_mla_q_lora_scaled", False
+                ):
+                    self_attn.q_a_layernorm.weight.data *= (
+                        self.config.hidden_size / self.config.q_lora_rank
+                    ) ** 0.5
+                    self_attn._mla_q_lora_scaled = True
+                if self.config.mla_scale_kv_lora and not getattr(
+                    self_attn, "_mla_kv_lora_scaled", False
+                ):
+                    self_attn.kv_a_layernorm.weight.data *= (
+                        self.config.hidden_size / self.config.kv_lora_rank
+                    ) ** 0.5
+                    self_attn._mla_kv_lora_scaled = True
+        return loaded_params
 
 
 class LongcatFlashForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
@@ -582,7 +763,7 @@ class LongcatFlashForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -600,144 +781,8 @@ class LongcatFlashForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         return logits
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts
-            if hasattr(self.config, "n_routed_experts")
-            else self.config.num_experts[0],
-        )
+        return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("fused_qkv_a_proj", "q_a_proj", 0),
-            ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-
-        expert_params_mapping = self.get_expert_mapping()
-        loaded_params: set[str] = set()
-
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if "mlp" in name and "mlps" not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if (
-                    name.endswith(".bias") or name.endswith("_bias")
-                ) and name not in params_dict:
-                    continue
-                # Skip mtp
-                if ".mtp." in name:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                is_expert_weight = False
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    is_expert_weight = True
-                    name_mapped = name.replace(weight_name, param_name)
-                    # Skip mtp
-                    if ".mtp." in name_mapped:
-                        continue
-                    if (
-                        name_mapped.endswith(".bias") or name_mapped.endswith("_bias")
-                    ) and name not in params_dict:
-                        continue
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    param = params_dict[name_mapped]
-                    weight_loader = param.weight_loader
-                    weight_loader = typing.cast(
-                        Callable[..., bool], param.weight_loader
-                    )
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        name = name_mapped
-                        break
-                else:
-                    if is_expert_weight:
-                        # We've checked that this is an expert weight
-                        # However it's not mapped locally to this rank
-                        # So we simply skip it
-                        continue
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    # Skip loading kv_scale from ckpts towards new design.
-                    if name.endswith(".kv_scale") and name not in params_dict:
-                        continue
-                    # Skip mtp
-                    if ".mtp." in name:
-                        continue
-                    if name is None:
-                        continue
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        for layer_id in range(self.config.num_hidden_layers):
-            for i in range(2):
-                if isinstance(self.model.layers[layer_id], PPMissingLayer):
-                    continue
-                self_attn = self.model.layers[layer_id].self_attn[i]
-                if hasattr(
-                    self.quant_config, "weight_block_size"
-                ) and self_attn.kv_b_proj.weight.dtype in (
-                    torch.float8_e4m3fn,
-                    torch.float8_e4m3fnuz,
-                ):
-                    weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        dtype = torch.get_default_dtype()
-                        w = block_dequant(
-                            self_attn.kv_b_proj.weight,
-                            self_attn.kv_b_proj.weight_scale_inv,
-                            weight_block_size,
-                        ).to(dtype)
-                else:
-                    w = self_attn.kv_b_proj.weight
-
-                w_kc, w_vc = w.unflatten(
-                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-                if self.config.mla_scale_q_lora:
-                    self_attn.q_a_layernorm.weight.data *= (
-                        self.config.hidden_size / self.config.q_lora_rank
-                    ) ** 0.5
-                if self.config.mla_scale_kv_lora:
-                    self_attn.kv_a_layernorm.weight.data *= (
-                        self.config.hidden_size / self.config.kv_lora_rank
-                    ) ** 0.5
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)

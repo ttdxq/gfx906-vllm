@@ -3,15 +3,15 @@
 from .hasher import MultiModalHasher
 from .inputs import (
     BatchedTensorInputs,
-    ModalityData,
-    MultiModalDataBuiltins,
-    MultiModalDataDict,
-    MultiModalKwargs,
     MultiModalKwargsItems,
-    MultiModalPlaceholderDict,
     MultiModalUUIDDict,
     NestedTensors,
 )
+
+try:
+    from .inputs import MultiModalDataDict  # type: ignore[attr-defined]
+except ImportError:
+    from vllm.inputs.llm import MultiModalDataDict  # noqa: F401
 from .registry import MultiModalRegistry
 
 MULTIMODAL_REGISTRY = MultiModalRegistry()
@@ -25,15 +25,11 @@ Info:
 """
 
 __all__ = [
-    "BatchedTensorInputs",
-    "ModalityData",
-    "MultiModalDataBuiltins",
     "MultiModalDataDict",
-    "MultiModalHasher",
-    "MultiModalKwargs",
-    "MultiModalKwargsItems",
-    "MultiModalPlaceholderDict",
     "MultiModalUUIDDict",
+    "BatchedTensorInputs",
+    "MultiModalHasher",
+    "MultiModalKwargsItems",
     "NestedTensors",
     "MULTIMODAL_REGISTRY",
     "MultiModalRegistry",

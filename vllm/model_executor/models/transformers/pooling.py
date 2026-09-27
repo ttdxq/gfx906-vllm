@@ -19,24 +19,34 @@
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn as nn
 from transformers import AutoModelForSequenceClassification
 
 from vllm.config.utils import getattr_iter
-from vllm.model_executor.layers.pooler import (
-    ClassifierPooler,
-    CLSPool,
-    DispatchPooler,
-    Pooler,
-)
+from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.model_executor.models.interfaces import SupportsCrossEncoding
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
+
+from .base import Base
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-class EmbeddingMixin(VllmModelForPooling):
-    default_pooling_type = "CLS"
+class ClassifierWithReshape(nn.Module):
+    """Token extraction has already been applied in `pooler.pooling`.
+
+    Add dim to match expected input shape of `classifier.forward`.
+    """
+
+    def forward(self, *args, **kwargs):
+        if len(args) > 0:
+            args = (args[0].unsqueeze(1), *args[1:])
+        return super().forward(*args, **kwargs)
+
+
+class EmbeddingMixin(VllmModelForPooling, Base):
+    default_seq_pooling_type = "CLS"
 
     def __init__(self, *, vllm_config: "VllmConfig", prefix: str = ""):
         # Skip VllmModelForPooling.__init__ and call the next class in MRO
@@ -47,16 +57,11 @@ class EmbeddingMixin(VllmModelForPooling):
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
 
-        self.pooler = DispatchPooler(
-            {
-                "token_embed": Pooler.for_token_embed(pooler_config),
-                "embed": Pooler.for_embed(pooler_config),
-            }
-        )
+        self.pooler = DispatchPooler.for_embedding(pooler_config)
 
 
-class SequenceClassificationMixin(SupportsCrossEncoding, VllmModelForPooling):
-    default_pooling_type = "CLS"
+class SequenceClassificationMixin(SupportsCrossEncoding, VllmModelForPooling, Base):
+    default_seq_pooling_type = "CLS"
 
     def __init__(self, *, vllm_config: "VllmConfig", prefix: str = ""):
         # Skip VllmModelForPooling.__init__ and call the next class in MRO
@@ -67,7 +72,7 @@ class SequenceClassificationMixin(SupportsCrossEncoding, VllmModelForPooling):
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
 
-        # Certain information about the the model and classifier can only be
+        # Certain information about the model and classifier can only be
         # inferred from the `ForSequenceClassification` class. Therefore, we
         # instantiate it on the "meta" device to avoid allocating GPU memory.
         with torch.device("meta"):
@@ -93,27 +98,15 @@ class SequenceClassificationMixin(SupportsCrossEncoding, VllmModelForPooling):
             )
         self.init_parameters(self.classifier, dtype=self.model_config.head_dtype)
 
-        class ClassifierWithReshape(self.classifier.__class__):
-            """CLSPool has already been applied in `pooling`.
-            Add dim to match expected input shape of `classifier.forward`."""
+        # Order `ClassifierWithReshape` ahead of the classifier's own class so that
+        # its `super().forward(...)` reaches the original implementation.
+        self.classifier.__class__ = type(
+            "ClassifierWithReshape",
+            (ClassifierWithReshape, type(self.classifier)),
+            {},
+        )
 
-            def forward(self, *args, **kwargs):
-                if len(args) > 0:
-                    args = (args[0].unsqueeze(1), *args[1:])
-                return super().forward(*args, **kwargs)
-
-        self.classifier.__class__ = ClassifierWithReshape
-
-        self.pooler = DispatchPooler(
-            {
-                "token_classify": Pooler.for_token_classify(
-                    pooler_config, classifier=self.classifier
-                ),
-                "classify": ClassifierPooler(
-                    pooling=CLSPool(), classifier=self.classifier, act_fn="classify"
-                ),
-                "score": ClassifierPooler(
-                    pooling=CLSPool(), classifier=self.classifier, act_fn="score"
-                ),
-            }
+        self.pooler = DispatchPooler.for_seq_cls(
+            pooler_config,
+            classifier=self.classifier,
         )

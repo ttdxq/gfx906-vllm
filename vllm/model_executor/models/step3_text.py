@@ -9,17 +9,19 @@ from typing import Any
 import torch
 from torch import nn
 
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEFactory,
+    GateLinear,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -40,6 +42,7 @@ from vllm.transformers_utils.configs.step3_vl import Step3TextConfig
 
 from .interfaces import SupportsPP
 from .utils import (
+    AutoWeightsLoader,
     PPMissingLayer,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
@@ -53,7 +56,7 @@ logger = init_logger(__name__)
 class FusedMoEBlock(nn.Module):
     def __init__(
         self,
-        config: ModelConfig,
+        config: Step3TextConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
@@ -66,21 +69,18 @@ class FusedMoEBlock(nn.Module):
                 f"the number of experts {config.moe_num_experts}."
             )
 
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=config.norm_expert_weight,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
-        self.gate = ReplicatedLinear(
+        self.gate = GateLinear(
             config.hidden_size,
             config.moe_num_experts,
-            bias=False,
-            quant_config=None,
             prefix=f"{prefix}.gate",
         )
 
@@ -94,8 +94,6 @@ class FusedMoEBlock(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -196,7 +194,6 @@ class Step3TextAttention(nn.Module):
         )
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position_embedding,
             rope_parameters=rope_parameters,
         )
@@ -347,7 +344,7 @@ class Step3TextModel(nn.Module):
             self.norm = PPMissingLayer()
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], config.hidden_size
+            ["hidden_states", "residual"], config.hidden_size
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -355,7 +352,7 @@ class Step3TextModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -385,57 +382,8 @@ class Step3TextModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-
-class Step3TextForCausalLM(nn.Module, SupportsPP):
-    def __init__(
-        self,
-        *,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-    ):
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-
-        self.config = config
-        self.vllm_config = vllm_config
-
-        self.model = Step3TextModel(vllm_config=vllm_config, prefix=prefix)
-
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-            self.logits_processor = LogitsProcessor(config.vocab_size)
-        else:
-            self.lm_head = PPMissingLayer()
-
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ):
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
-        return hidden_states
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        qkv_params_mapping = [
+        qkv_params_mapping: list[tuple[str, str, float, float]] = [
             # (param_name, shard_name, relative_start_idx, relative_end_idx)
             (
                 ".qkv_proj",
@@ -461,18 +409,33 @@ class Step3TextForCausalLM(nn.Module, SupportsPP):
                 / (self.config.share_q_dim + self.config.head_dim * 2),
             ),
         ]
-        stacked_params_mapping = [
+        stacked_params_mapping: list[tuple[str, str, int]] = [
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        base_layer = (
+            "base_layer." if any(".base_layer." in name for name in params_dict) else ""
+        )
 
-        expert_params_mapping = [
-            (".moe.experts.w13_weight", ".moe.gate_proj.weight", "w1"),
-            (".moe.experts.w13_weight", ".moe.up_proj.weight", "w3"),
-            (".moe.experts.w2_weight", ".moe.down_proj.weight", "w2"),
+        expert_params_mapping: list[tuple[str, str, str]] = [
+            (
+                f".moe.experts.routed_experts.{base_layer}w13_weight",
+                ".moe.gate_proj.weight",
+                "w1",
+            ),
+            (
+                f".moe.experts.routed_experts.{base_layer}w13_weight",
+                ".moe.up_proj.weight",
+                "w3",
+            ),
+            (
+                f".moe.experts.routed_experts.{base_layer}w2_weight",
+                ".moe.down_proj.weight",
+                "w2",
+            ),
         ]
 
         disable_moe_stacked_params = [data[1] for data in expert_params_mapping]
@@ -496,7 +459,7 @@ class Step3TextForCausalLM(nn.Module, SupportsPP):
                 break
             else:
                 for mapping in expert_params_mapping:
-                    param_name, weight_name, shard_id = mapping
+                    param_name, weight_name, expert_shard_id = mapping
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
@@ -516,7 +479,7 @@ class Step3TextForCausalLM(nn.Module, SupportsPP):
                             param,
                             loaded_weight_expert,
                             name,
-                            shard_id=shard_id,
+                            shard_id=expert_shard_id,
                             expert_id=expert_id,
                         )
                     loaded_params.add(name)
@@ -553,3 +516,56 @@ class Step3TextForCausalLM(nn.Module, SupportsPP):
                         weight_loader(param, loaded_weight)
                         loaded_params.add(name)
         return loaded_params
+
+
+class Step3TextForCausalLM(nn.Module, SupportsPP):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+
+        self.config = config
+        self.vllm_config = vllm_config
+
+        self.model = Step3TextModel(vllm_config=vllm_config, prefix=prefix)
+
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            self.logits_processor = LogitsProcessor(config.vocab_size)
+        else:
+            self.lm_head = PPMissingLayer()
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        hidden_states = self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+        return hidden_states
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)

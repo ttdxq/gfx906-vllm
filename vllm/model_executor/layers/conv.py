@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.model_executor.custom_op import CustomOp
-from vllm.utils.torch_utils import is_torch_equal
+from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 
 class ConvLayerBase(CustomOp):
@@ -105,9 +105,12 @@ class ConvLayerBase(CustomOp):
         return s
 
 
+# --8<-- [start:conv2d]
 @CustomOp.register("conv2d")
 class Conv2dLayer(ConvLayerBase):
     """Conv layer with Conv2d."""
+
+    # --8<-- [end:conv2d]
 
     num_dim = 2
 
@@ -140,7 +143,7 @@ class Conv2dLayer(ConvLayerBase):
         return x
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """Expected input shape: (batch_size, in_channels, height, width)"""
+        """Expected input shape: (batch_size, in_channels, height, width)."""
         assert x.dim() == 4
         if self.enable_linear:
             return self._forward_mulmat(x)
@@ -152,61 +155,12 @@ class Conv2dLayer(ConvLayerBase):
         return self._forward_conv(x)
 
 
-class CausalConv2dLayer(Conv2dLayer):
-    """
-    A causal version of nn.Conv2d where each location in the 2D matrix would
-    have no access to locations on its right or down
-    All arguments are the same as nn.Conv2d except padding which should be
-    set as None
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        stride: int,
-        padding: int = 0,
-        dilation: int = 1,
-        groups: int = 1,
-        bias: bool = True,
-        padding_mode: str = "zeros",
-        *,
-        params_dtype: torch.dtype | None = None,
-    ) -> None:
-        if padding is not None:
-            raise ValueError(
-                "Argument padding should be set to None for CausalConv2dLayer."
-            )
-        self._left_padding: int = kernel_size - 1
-        self._right_padding: int = stride - 1
-        padding = 0
-
-        super().__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-            groups,
-            bias,
-            padding_mode,
-            params_dtype=params_dtype,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        x = F.pad(x, pad=(self._left_padding, self._right_padding, 0, 0))
-        x = super().forward(x)
-        return x
-
-
+# --8<-- [start:conv3d]
 @CustomOp.register("conv3d")
 class Conv3dLayer(ConvLayerBase):
     """Conv layer with Conv3d."""
+
+    # --8<-- [end:conv3d]
 
     num_dim = 3
 
@@ -239,18 +193,19 @@ class Conv3dLayer(ConvLayerBase):
         return x
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """Expected input shape: (batch_size, in_channels, time, height, width)"""
+        """Expected input shape: (batch_size, in_channels, time, height, width)."""
         if self.enable_linear:
             return self._forward_mulmat(x)
         else:
             return self._forward_conv(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # PyTorch2.9.0 disabled CUDNN's Conv3D, which caused a
+        # PyTorch 2.9.0+ disabled CUDNN's Conv3D, which caused a
         # significant performance regression.
         # See: https://github.com/vllm-project/vllm/issues/27406
         # and https://github.com/pytorch/pytorch/issues/166122
+        # and https://github.com/huggingface/transformers/pull/45041
         # By default, we use CUDNN's convolution ops with optimization.
-        if self.enable_linear and is_torch_equal("2.9.0"):
+        if self.enable_linear and is_torch_equal_or_newer("2.9.0"):
             return self._forward_mulmat(x)
         return self._forward_conv(x)

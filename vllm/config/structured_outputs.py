@@ -4,7 +4,6 @@
 from typing import Any, Literal
 
 from pydantic import model_validator
-from pydantic.dataclasses import dataclass
 from typing_extensions import Self
 
 from vllm.config.utils import config
@@ -16,7 +15,6 @@ StructuredOutputsBackend = Literal[
 
 
 @config
-@dataclass
 class StructuredOutputsConfig:
     """Dataclass which contains structured outputs config for the engine."""
 
@@ -25,8 +23,6 @@ class StructuredOutputsConfig:
     regex, etc) by default. With "auto", we will make opinionated choices
     based on request contents and what the backend libraries currently support,
     so the behavior is subject to change in each release."""
-    disable_fallback: bool = False
-    """If `True`, vLLM will not fallback to a different backend on error."""
     disable_any_whitespace: bool = False
     """If `True`, json output will always be compact without any whitespace.
     If `False`, the model may generate whitespace between JSON fields,
@@ -46,8 +42,7 @@ class StructuredOutputsConfig:
     """Whether to use structured input for reasoning."""
 
     def compute_hash(self) -> str:
-        """
-        WARNING: Whenever a new field is added to this config,
+        """WARNING: Whenever a new field is added to this config,
         ensure that it is included in the factors list if
         it affects the computation graph.
 
@@ -65,22 +60,6 @@ class StructuredOutputsConfig:
 
     @model_validator(mode="after")
     def _validate_structured_output_config(self) -> Self:
-        # Import here to avoid circular import
-        from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
-
-        if self.reasoning_parser_plugin and len(self.reasoning_parser_plugin) > 3:
-            ReasoningParserManager.import_reasoning_parser(self.reasoning_parser_plugin)
-
-        valid_reasoning_parsers = ReasoningParserManager.list_registered()
-        if (
-            self.reasoning_parser != ""
-            and self.reasoning_parser not in valid_reasoning_parsers
-        ):
-            raise ValueError(
-                f"invalid reasoning parser: {self.reasoning_parser} "
-                f"(chose from {{ {','.join(valid_reasoning_parsers)} }})"
-            )
-
         if self.disable_any_whitespace and self.backend not in ("xgrammar", "guidance"):
             raise ValueError(
                 "disable_any_whitespace is only supported for "

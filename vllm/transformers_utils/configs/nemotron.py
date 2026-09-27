@@ -15,7 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Nemotron model configuration"""
+"""Nemotron model configuration."""
 
 from transformers import PretrainedConfig
 from transformers.utils import logging
@@ -24,8 +24,7 @@ logger = logging.get_logger(__name__)
 
 
 class NemotronConfig(PretrainedConfig):
-    r"""
-    This is the configuration class to store the configuration of a
+    r"""This is the configuration class to store the configuration of a
     [`NemotronModel`]. It is used to instantiate a Nemotron model
     according to the specified arguments, defining the model architecture.
     Instantiating a configuration with the defaults will yield a similar
@@ -89,9 +88,14 @@ class NemotronConfig(PretrainedConfig):
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether to tie weight embeddings
         rope_parameters (`dict`, *optional*):
-            The parameters of the RoPE embeddings.
-        partial_rotary_factor (`float`, *optional*, defaults to 0.5):
-            Percentage of the query and keys which will have rotary embedding.
+            The parameters of the RoPE embeddings. Expected contents:
+                `rope_theta` (`float`): The base period of the RoPE embeddings.
+                `rope_type` (`str`):
+                    The sub-variant of RoPE to use. Can be one of ['default', 'linear',
+                    'dynamic', 'yarn', 'longrope', 'llama3'], with 'default' being the
+                    original RoPE implementation.
+                `partial_rotary_factor` (`float`, *optional*, defaults to 0.5):
+                    Percentage of the query and keys which will have rotary embedding.
         attention_bias (`bool`, *optional*, defaults to `False`):
             Whether to use a bias in the query, key, value and output
             projection layers during self-attention.
@@ -109,7 +113,9 @@ class NemotronConfig(PretrainedConfig):
     >>> model = NemotronModel(configuration)
     >>> # Accessing the model configuration
     >>> configuration = model.config
-    ```"""
+    ```
+
+    """
 
     model_type = "nemotron"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -133,7 +139,6 @@ class NemotronConfig(PretrainedConfig):
         eos_token_id=3,
         tie_word_embeddings=False,
         rope_parameters=None,
-        partial_rotary_factor=0.5,
         attention_bias=False,
         attention_dropout=0.0,
         mlp_bias=False,
@@ -165,14 +170,16 @@ class NemotronConfig(PretrainedConfig):
         rope_theta = kwargs.pop("rope_theta", 10000.0)
         if "rope_theta" not in rope_parameters:
             rope_parameters["rope_theta"] = rope_theta
-        self.rope_parameters = rope_parameters
         # for backward compatibility
         partial_rotary_factor = (
             kwargs.get("rope_percent")
             or kwargs.get("rope_percentage")
-            or partial_rotary_factor
+            or kwargs.get("partial_rotary_factor")
+            or 0.5
         )
-        self.partial_rotary_factor = partial_rotary_factor
+        if "partial_rotary_factor" not in rope_parameters:
+            rope_parameters["partial_rotary_factor"] = partial_rotary_factor
+        self.rope_parameters = rope_parameters
         self._rope_parameters_validation()
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
@@ -187,9 +194,7 @@ class NemotronConfig(PretrainedConfig):
         )
 
     def _rope_parameters_validation(self):
-        """
-        Validate the `rope_parameters` configuration.
-        """
+        """Validate the `rope_parameters` configuration."""
         if self.rope_parameters is None:
             return
 
