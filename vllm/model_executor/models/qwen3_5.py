@@ -72,6 +72,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    maybe_remap_moe_expert_param_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
@@ -1427,6 +1428,11 @@ class Qwen3_5Model(Qwen3NextModel):
                         continue
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    # Post-#41184 the expert params live under
+                    # ``experts.routed_experts.*``; remap old-style names.
+                    name_mapped = maybe_remap_moe_expert_param_name(
+                        name_mapped, params_dict
+                    )
                     # Skip layers on other devices.
                     if is_pp_missing_parameter(name_mapped, self):
                         continue
