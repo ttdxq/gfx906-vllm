@@ -74,6 +74,16 @@ def _decode_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
     return None
 
 
+def _prefill_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
+    # GQA6 with 256-dim heads: a 32-row block spans 5 query tokens (30 of 32
+    # rows carry work) and reuses each K/V tile across them, versus only 2
+    # tokens per 16-row block. Sweeps over BLOCK_M/TILE/num_warps/num_stages
+    # at 4k-16k prefill shapes favor 32/32/4/1 uniformly on gfx906.
+    if head_size == 256 and num_queries_per_kv == 6:
+        return 32
+    return None
+
+
 def _num_query_blocks(num_query_tokens: int, num_seqs: int, block_q: int) -> int:
     # Exact block count for single-sequence batches. For multiple sequences,
     # retain the mapping gaps expected by find_seq_idx and use the safe
@@ -1069,7 +1079,12 @@ def unified_attention(
         if gfx906_sched and max_seqlen_q == 1
         else None
     )
-    BLOCK_M = decode_block_m or (
+    prefill_block_m = (
+        _prefill_block_m(head_size, num_queries_per_kv)
+        if gfx906_sched and max_seqlen_q > 1
+        else None
+    )
+    BLOCK_M = decode_block_m or prefill_block_m or (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
@@ -1173,7 +1188,13 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
-            **({"num_warps": 2, "num_stages": 1} if gfx906_sched else {}),
+            **(
+                # tuned prefill shapes run 4 warps; everything else (incl. the
+                # decode fallback through the 2D kernel) keeps 2 warps
+                {"num_warps": 4 if prefill_block_m else 2, "num_stages": 1}
+                if gfx906_sched
+                else {}
+            ),
         )
     else:
         # gfx906: scale split-KV parallelism with the decode batch shape and
