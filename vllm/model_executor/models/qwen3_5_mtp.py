@@ -19,11 +19,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_moe_expert_param_name,
+)
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5RMSNorm,
     _make_qwen35_fused_expert_params_mapping,
+    _maybe_unsqueeze_shared_expert_gate,
 )
 from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
 from vllm.sequence import IntermediateTensors
@@ -280,6 +284,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                         continue
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    # Post-#41184 the expert params live under
+                    # ``experts.routed_experts.*``; remap old-style names.
+                    name_mapped = maybe_remap_moe_expert_param_name(
+                        name_mapped, params_dict
+                    )
                     # Skip layers on other devices.
                     if is_pp_missing_parameter(name_mapped, self):
                         continue
@@ -355,6 +364,9 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    loaded_weight = _maybe_unsqueeze_shared_expert_gate(
+                        name, param, loaded_weight
+                    )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
@@ -419,13 +431,11 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         inputs_embeds = self._embed_text_input_ids(
             input_ids,
             self.model.embed_input_ids,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:

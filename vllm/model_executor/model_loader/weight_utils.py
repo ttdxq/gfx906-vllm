@@ -1889,6 +1889,11 @@ def gguf_quant_weights_iterator(
             if weight_type.name not in ("F32", "BF16", "F16"):
                 name = name.replace("weight", "qweight")
             param = torch.tensor(weight)
+            if weight_type.name == "BF16" and param.dtype == torch.uint8:
+                # numpy has no bfloat16, so the gguf reader exposes BF16
+                # tensors as raw uint8 bytes (last dim doubled); reinterpret
+                # them back to the logical bfloat16 shape.
+                param = param.view(torch.uint16).view(torch.bfloat16)
             yield name, param
 
 def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:

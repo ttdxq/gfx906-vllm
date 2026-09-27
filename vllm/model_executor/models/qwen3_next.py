@@ -1196,6 +1196,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 and capability.major == 9
                 and capability.minor == 0
             ):
+                # Match query_non_spec/key_non_spec/value_non_spec, which are
+                # already sliced to the non-spec tokens: slice the gating
+                # inputs the same way (same pattern as the spec and prefill
+                # branches above) so token counts line up under spec decoding.
+                if spec_sequence_masks is not None:
+                    a = a.index_select(0, non_spec_token_indx)
+                    b = b.index_select(0, non_spec_token_indx)
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
