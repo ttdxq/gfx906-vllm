@@ -20,6 +20,12 @@ from vllm.triton_utils import tl, triton
 
 _GFX906_MTP_CONV_DEBUG_REPORTED = False
 
+# gfx906 escape hatch: set VLLM_GFX906_TRITON_CAUSAL_CONV1D=0 to keep
+# routing prefill causal-conv1d through the per-sequence PyTorch fallback.
+ENABLE_GFX906_TRITON_CAUSAL_CONV1D = os.getenv(
+    "VLLM_GFX906_TRITON_CAUSAL_CONV1D", "1"
+).lower() in {"1", "true", "yes", "on"}
+
 
 def _causal_conv1d_gfx906_fallback(
     x: torch.Tensor,
@@ -759,7 +765,16 @@ def causal_conv1d_fn(
         and capability.major == 9
         and capability.minor == 0
     ):
-        return _causal_conv1d_gfx906_fallback(
+        # The attention-metadata builder precomputes the launch schedule
+        # (nums_dict/batch_ptr/token_chunk_offset_ptr) on the CPU copy of
+        # query_start_loc, so the Triton kernel below can run without any
+        # DtoH sync. Without that metadata, keep the per-sequence fallback.
+        metadata_ready = (
+            metadata is not None
+            and getattr(metadata, "nums_dict", None) is not None
+        )
+        if not ENABLE_GFX906_TRITON_CAUSAL_CONV1D or not metadata_ready:
+            return _causal_conv1d_gfx906_fallback(
             x=x,
             weight=weight,
             bias=bias,
