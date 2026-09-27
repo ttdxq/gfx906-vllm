@@ -7,81 +7,63 @@ from vllm.model_executor.kernels.linear.mixed_precision.conch import (
 from vllm.model_executor.kernels.linear.mixed_precision.cpu import (
     CPUWNA16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.cutlass import (
+    CutlassW4A8LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.gfx906_gptq_wna16 import (
+    Gfx906GPTQWNA16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.dynamic_4bit import (
     Dynamic4bitLinearKernel,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
     ExllamaLinearKernel,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.gfx906_gptq_wna16 import (
-    Gfx906GPTQWNA16LinearKernel,
+from vllm.model_executor.kernels.linear.mixed_precision.humming import (
+    HummingLinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.machete import (
+    MacheteLinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
+    MarlinLinearKernel,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
     MPLinearKernel,
     MPLinearLayerConfig,
 )
-
-try:
-    from vllm.model_executor.kernels.linear.mixed_precision.allspark import (
-        AllSparkLinearKernel,
-    )
-except ImportError:
-    AllSparkLinearKernel = None
-
-try:
-    from vllm.model_executor.kernels.linear.mixed_precision.cutlass import (
-        CutlassW4A8LinearKernel,
-    )
-except ImportError:
-    CutlassW4A8LinearKernel = None
-
-try:
-    from vllm.model_executor.kernels.linear.mixed_precision.machete import (
-        MacheteLinearKernel,
-    )
-except ImportError:
-    MacheteLinearKernel = None
-
-try:
-    from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
-        MarlinLinearKernel,
-    )
-except ImportError:
-    MarlinLinearKernel = None
-
-try:
-    from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
-        TritonW4A16LinearKernel,
-    )
-except ImportError:
-    TritonW4A16LinearKernel = None
-
-try:
-    from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
-        XPUwNa16LinearKernel,
-    )
-except ImportError:
-    XPUwNa16LinearKernel = None
+from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
+    RDNA3W4A16LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
+    RDNAHybridW4A16LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
+    TritonW4A16LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
+    XPUW4A8IntLinearKernel,
+    XPUwNa16LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.zentorch import (
+    ZentorchWNA16LinearKernel,
+)
 
 __all__ = [
     "MPLinearKernel",
     "MPLinearLayerConfig",
     "ConchLinearKernel",
     "CPUWNA16LinearKernel",
+    "CutlassW4A8LinearKernel",
     "Dynamic4bitLinearKernel",
     "ExllamaLinearKernel",
-    "Gfx906GPTQWNA16LinearKernel",
+    "HummingLinearKernel",
+    "MacheteLinearKernel",
+    "MarlinLinearKernel",
+    "RDNA3W4A16LinearKernel",
+    "RDNAHybridW4A16LinearKernel",
+    "TritonW4A16LinearKernel",
+    "XPUW4A8IntLinearKernel",
+    "XPUwNa16LinearKernel",
+    "ZentorchWNA16LinearKernel",
 ]
-
-if AllSparkLinearKernel is not None:
-    __all__.append("AllSparkLinearKernel")
-if CutlassW4A8LinearKernel is not None:
-    __all__.append("CutlassW4A8LinearKernel")
-if MacheteLinearKernel is not None:
-    __all__.append("MacheteLinearKernel")
-if MarlinLinearKernel is not None:
-    __all__.append("MarlinLinearKernel")
-if TritonW4A16LinearKernel is not None:
-    __all__.append("TritonW4A16LinearKernel")
-if XPUwNa16LinearKernel is not None:
-    __all__.append("XPUwNa16LinearKernel")

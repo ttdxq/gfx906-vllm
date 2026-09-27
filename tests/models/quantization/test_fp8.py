@@ -9,7 +9,7 @@ Note: these tests will only pass on L4 GPU.
 import pytest
 
 from tests.quantization.utils import is_quant_method_supported
-from vllm.attention.utils.fa_utils import flash_attn_supports_fp8
+from vllm.v1.attention.backends.fa_utils import flash_attn_supports_kv_cache_dtype
 from vllm.platforms import current_platform
 from ..utils import check_logprobs_close
 
@@ -67,15 +67,16 @@ def test_models(
 
     if kv_cache_dtype == "fp8_e5m2" and current_platform.is_rocm():
         pytest.skip(f"{kv_cache_dtype} is currently not supported on ROCm/HIP.")
+    if kv_cache_dtype == "fp8_e5m2" and current_platform.is_cuda():
+        pytest.skip(f"{kv_cache_dtype} is not supported by FLASH_ATTN on CUDA.")
 
-    if not flash_attn_supports_fp8():
+    if not flash_attn_supports_kv_cache_dtype(kv_cache_dtype):
         pytest.skip(
             f"{kv_cache_dtype} is not supported on this GPU type with {backend} attention."
         )
 
     with monkeypatch.context() as m:
         m.setenv("TOKENIZERS_PARALLELISM", "true")
-        m.setenv("VLLM_ATTENTION_BACKEND", backend)
 
         MAX_MODEL_LEN = 1024
         NUM_LOG_PROBS = 8
@@ -86,6 +87,7 @@ def test_models(
             tensor_parallel_size=tensor_parallel_size,
             enforce_eager=enforce_eager,
             kv_cache_dtype="auto",
+            attention_config={"backend": backend},
         ) as vllm_model:
             baseline_outputs = vllm_model.generate_greedy_logprobs(
                 example_prompts, max_tokens, NUM_LOG_PROBS
@@ -97,6 +99,7 @@ def test_models(
             tensor_parallel_size=tensor_parallel_size,
             enforce_eager=enforce_eager,
             kv_cache_dtype=kv_cache_dtype,
+            attention_config={"backend": backend},
         ) as vllm_model:
             test_outputs = vllm_model.generate_greedy_logprobs(
                 example_prompts, max_tokens, NUM_LOG_PROBS

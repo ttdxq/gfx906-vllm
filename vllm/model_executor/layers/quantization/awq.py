@@ -9,7 +9,7 @@ from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from vllm import envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -139,7 +139,7 @@ class AWQConfig(QuantizationConfig):
                 "this is differ from the offical vLLM."
             )
             return AWQLinearMethod(self)
-        elif isinstance(layer, FusedMoE):
+        elif isinstance(layer, RoutedExperts):
             # Lazy import to avoid circular import.
             if _use_gfx906_mobydick_awq():
                 from .awq_marlin import AWQMarlinConfig

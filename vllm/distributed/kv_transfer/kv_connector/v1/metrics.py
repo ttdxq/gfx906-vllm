@@ -7,7 +7,6 @@ from prometheus_client import Counter, Gauge, Histogram
 
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-from vllm.distributed.kv_transfer.kv_transfer_state import has_kv_transfer_group
 from vllm.logger import init_logger
 
 PromMetric: TypeAlias = Gauge | Counter | Histogram
@@ -18,8 +17,7 @@ logger = init_logger(__name__)
 
 @dataclass
 class KVConnectorStats:
-    """
-    Base class for KV Connector Stats, a container for transfer performance
+    """Base class for KV Connector Stats, a container for transfer performance
     metrics or otherwise important telemetry from the connector.
     All sub-classes need to be serializable as stats are sent from worker to
     logger process.
@@ -27,19 +25,20 @@ class KVConnectorStats:
 
     data: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return the serializable connector stats payload."""
+        return self.data
+
     def reset(self):
         """Reset the stats, clear the state."""
         raise NotImplementedError
 
     def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
-        """
-        Aggregate stats with another `KVConnectorStats` object.
-        """
+        """Aggregate stats with another `KVConnectorStats` object."""
         raise NotImplementedError
 
     def reduce(self) -> dict[str, int | float]:
-        """
-        Reduce the observations collected during a time interval to one or
+        """Reduce the observations collected during a time interval to one or
         more representative values (eg avg/median/sum of the series).
         This is meant to be called by the logger to produce a summary of the
         stats for the last time interval.
@@ -53,8 +52,6 @@ class KVConnectorStats:
 
 class KVConnectorLogging:
     def __init__(self, kv_transfer_config: KVTransferConfig | None):
-        # This should be called on frontend process.
-        assert not has_kv_transfer_group()
         # Instantiate the connector's stats class.
         if kv_transfer_config and kv_transfer_config.kv_connector:
             self.connector_cls = KVConnectorFactory.get_connector_class(
@@ -94,7 +91,7 @@ class KVConnectorLogging:
             )
 
     def log(self, log_fn=logger.info):
-        """Log transfer metrics periodically, similar to throughput logging"""
+        """Log transfer metrics periodically, similar to throughput logging."""
         if (
             self.transfer_stats_accumulator
             and not self.transfer_stats_accumulator.is_empty()
@@ -110,8 +107,7 @@ class KVConnectorLogging:
 
 
 class KVConnectorPromMetrics:
-    """
-    A base class for per-connector Prometheus metric registration
+    """A base class for per-connector Prometheus metric registration
     and recording.
     """
 
@@ -127,32 +123,19 @@ class KVConnectorPromMetrics:
         self._counter_cls = metric_types[Counter]
         self._histogram_cls = metric_types[Histogram]
         self._labelnames = labelnames
-        self._per_engine_labelvalues = per_engine_labelvalues
-
-    def make_per_engine(self, metric: PromMetric) -> dict[int, PromMetric]:
-        """
-        Create a per-engine child of a prometheus_client.Metric with
-        the appropriate labels set. The parent metric must be created
-        using the labelnames list.
-        """
-        return {
-            idx: metric.labels(*labelvalues)
-            for idx, labelvalues in self._per_engine_labelvalues.items()
-        }
+        self.per_engine_labelvalues = per_engine_labelvalues
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
-        """
-        Record the supplied transfer statistics to Prometheus metrics. These
+        """Record the supplied transfer statistics to Prometheus metrics. These
         statistics are engine-specific, and should be recorded to a metric
         with the appropriate 'engine' label. These metric instances can be
-        created using the make_per_engine() helper method.
+        created using the create_metric_per_engine() helper method.
         """
         raise NotImplementedError
 
 
-class KVConnectorPrometheus:
-    """
-    Support for registering per-connector Prometheus metrics, and
+class KVConnectorProm:
+    """Support for registering per-connector Prometheus metrics, and
     recording transfer statistics to those metrics. Uses
     KVConnectorBase.build_prom_metrics().
     """

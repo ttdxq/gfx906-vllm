@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from itertools import chain
 from typing import TYPE_CHECKING
 
@@ -81,6 +81,7 @@ class BatchUpdateBuilder:
 
         Args:
           index: request index
+
         """
         if self._is_removed_sorted:
             raise RuntimeError(
@@ -93,14 +94,14 @@ class BatchUpdateBuilder:
         return bool(self._removed)
 
     def peek_removed(self) -> int | None:
-        """Return lowest removed request index"""
+        """Return lowest removed request index."""
         if self.has_removed():
             self._ensure_removed_sorted()
             return self._removed[-1]
         return None
 
     def pop_removed(self) -> int | None:
-        """Pop lowest removed request index"""
+        """Pop lowest removed request index."""
         if self.has_removed():
             self._ensure_removed_sorted()
             return self._removed.pop()
@@ -125,6 +126,7 @@ class BatchUpdateBuilder:
 
         Returns:
           Frozen logitsprocs batch update instance; `None` if no updates
+
         """
         # Reset removal-sorting logic
         self._is_removed_sorted = False
@@ -148,7 +150,7 @@ class BatchUpdateBuilder:
 class LogitsProcessors:
     """Encapsulates initialized logitsproc objects."""
 
-    def __init__(self, logitsprocs: Iterator["LogitsProcessor"] | None = None) -> None:
+    def __init__(self, logitsprocs: Iterable["LogitsProcessor"] | None = None) -> None:
         self.argmax_invariant: list[LogitsProcessor] = []
         self.non_argmax_invariant: list[LogitsProcessor] = []
         if logitsprocs:

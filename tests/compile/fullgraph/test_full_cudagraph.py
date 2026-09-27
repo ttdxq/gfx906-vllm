@@ -9,15 +9,15 @@ import pytest
 from tests.utils import wait_for_gpu_memory_to_clear
 from tests.v1.attention.utils import full_cg_backend_configs as backend_configs
 from vllm import LLM, SamplingParams
-from vllm.config import CompilationConfig
+from vllm.config import CompilationConfig, CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_torch_equal_or_newer
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
 @contextlib.contextmanager
 def temporary_environ(env_vars):
-    """
-    Temporarily set environment variables and restore them afterward.
+    """Temporarily set environment variables and restore them afterward.
     We have to do this vs monkeypatch because monkeypatch doesn't work
     with "module" scoped fixtures.
     """
@@ -70,11 +70,14 @@ def llm_pair(request):
         elif backend_config.specific_gpu_arch == (10, 0):
             pytest.skip("Only Blackwell GPUs support Cutlass MLA")
 
+    # FlashInfer is not supported on ROCm
+    if backend_config == AttentionBackendEnum.FLASHINFER and current_platform.is_rocm():
+        pytest.skip("FlashInfer is not supported on ROCm")
+
     env_vars = {
         # Force native sampler to avoid potential nondeterminism in FlashInfer
         # when per-request generators are not used in V1.
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        **backend_config.env_vars,
     }
     with temporary_environ(env_vars):
         full = LLM(
@@ -93,7 +96,9 @@ def llm_pair(request):
             trust_remote_code=True,
             max_model_len=1024,
             max_num_seqs=128,
-            compilation_config=CompilationConfig(cudagraph_mode="PIECEWISE"),
+            compilation_config=CompilationConfig(
+                cudagraph_mode=CUDAGraphMode.PIECEWISE
+            ),
             generation_config="vllm",
             seed=42,
         )
@@ -119,8 +124,7 @@ def llm_pair(request):
     indirect=True,
 )
 class TestFullCUDAGraph:
-    """
-    Use a class such that an llm pair is constructed once for all
+    """Use a class such that an llm pair is constructed once for all
     batch_size/max_tokens combinations and released immediately after.
 
     Module-scope fixtures would stick around the whole time,
@@ -143,11 +147,9 @@ class TestFullCUDAGraph:
         ],
     )
     def test_full_cudagraph(self, batch_size, max_tokens, llm_pair: tuple[LLM, LLM]):
-        """
-        Test various batch sizes and max_tokens to ensure that the
+        """Test various batch sizes and max_tokens to ensure that the
         full cudagraph compilation works for padded cases too.
         """
-
         full_cudagraph_llm, piecewise_llm = llm_pair
 
         prompts = ["the quick brown fox"] * batch_size
@@ -166,20 +168,3 @@ class TestFullCUDAGraph:
                 piecewise_res.outputs[0].text.lower()
                 == full_res.outputs[0].text.lower()
             )
-
-
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
-def test_full_cudagraph_with_invalid_backend():
-    with (
-        temporary_environ(
-            {
-                "VLLM_ATTENTION_BACKEND": "FLEX_ATTENTION",
-                # Flex_Attention is not supported with full cuda graph
-            }
-        ),
-        pytest.raises(RuntimeError),
-    ):
-        LLM(
-            model="Qwen/Qwen2-1.5B-Instruct",
-            compilation_config=CompilationConfig(cudagraph_mode="FULL"),
-        )

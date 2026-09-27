@@ -1,26 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from http import HTTPStatus
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from typing_extensions import assert_never
+from fastapi import APIRouter, Depends, Request
 
-from vllm.entrypoints.openai.protocol import ErrorResponse
-from vllm.entrypoints.openai.utils import validate_json_request
-from vllm.entrypoints.pooling.embed.protocol import (
-    EmbeddingBytesResponse,
-    EmbeddingRequest,
-    EmbeddingResponse,
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.utils.api_utils import (
+    load_aware_call,
+    validate_json_request,
+    with_cancellation,
 )
-from vllm.entrypoints.pooling.embed.serving import OpenAIServingEmbedding
-from vllm.entrypoints.utils import load_aware_call, with_cancellation
+
+from .protocol import CohereEmbedRequest, EmbeddingRequest
+from .serving import ServingEmbedding
 
 router = APIRouter()
 
 
-def embedding(request: Request) -> OpenAIServingEmbedding | None:
-    return request.app.state.openai_serving_embedding
+def embedding(request: Request) -> ServingEmbedding:
+    handler = getattr(request.app.state, "serving_embedding", None)
+    if handler is None:
+        raise NotImplementedError("The model does not support Embeddings API")
+    return handler
 
 
 @router.post(
@@ -38,30 +40,22 @@ async def create_embedding(
     raw_request: Request,
 ):
     handler = embedding(raw_request)
-    if handler is None:
-        base_server = raw_request.app.state.openai_serving_tokenization
-        return base_server.create_error_response(
-            message="The model does not support Embeddings API"
-        )
+    return await handler(request, raw_request)
 
-    try:
-        generator = await handler.create_embedding(request, raw_request)
-    except Exception as e:
-        raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)
-        ) from e
 
-    if isinstance(generator, ErrorResponse):
-        return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
-        )
-    elif isinstance(generator, EmbeddingResponse):
-        return JSONResponse(content=generator.model_dump())
-    elif isinstance(generator, EmbeddingBytesResponse):
-        return StreamingResponse(
-            content=generator.body,
-            headers={"metadata": generator.metadata},
-            media_type=generator.media_type,
-        )
-
-    assert_never(generator)
+@router.post(
+    "/v2/embed",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_cohere_embedding(
+    request: CohereEmbedRequest,
+    raw_request: Request,
+):
+    handler = embedding(raw_request)
+    return await handler(request, raw_request)

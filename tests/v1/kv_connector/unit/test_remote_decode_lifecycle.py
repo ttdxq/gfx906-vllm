@@ -20,7 +20,6 @@ pytestmark = pytest.mark.cpu_test
 
 def test_basic_lifecycle():
     """Test lifecycle of a Remote Decode request."""
-
     vllm_config = create_vllm_config()
     scheduler = create_scheduler(vllm_config)
 
@@ -117,7 +116,6 @@ def test_basic_lifecycle():
 
 def test_short_prompt_lifecycle():
     """Test lifecycle of a Remote Decode request with short prompt."""
-
     vllm_config = create_vllm_config()
     scheduler = create_scheduler(vllm_config)
 
@@ -164,7 +162,6 @@ def test_short_prompt_lifecycle():
 
 def test_prefix_cache_lifecycle():
     """Test that remote decode params still work with a prefix cache hit."""
-
     vllm_config = create_vllm_config()
     scheduler = create_scheduler(vllm_config)
 
@@ -208,7 +205,9 @@ def test_prefix_cache_lifecycle():
 
     # Ensure we send all block ids, including the partial blocks,
     # even if there is a cache hit.
-    assert len(kv_transfer_params["remote_block_ids"]) == (NUM_EXTERNAL_FULL_BLOCKS + 1)
+    # remote_block_ids is BlockIds (tuple of lists); sum block counts across groups.
+    num_remote_blocks = sum(len(g) for g in kv_transfer_params["remote_block_ids"])
+    assert num_remote_blocks == (NUM_EXTERNAL_FULL_BLOCKS + 1)
 
     # STEP (2): Ensure it is freed.
     scheduler_output = scheduler.schedule()
@@ -222,7 +221,6 @@ def test_prefix_cache_lifecycle():
 
 def test_abort_during_kv_transfer():
     """Test aborting request does not release blocks for remote decode."""
-
     vllm_config = create_vllm_config()
     scheduler = create_scheduler(vllm_config)
 

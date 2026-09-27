@@ -55,11 +55,19 @@ def test_processor_override(
     dummy_image = image_assets[0].pil_image.resize(dummy_image_size)
     mm_data = {"image": [dummy_image] * num_imgs}
 
-    processed_inputs = processor.apply(prompt, mm_data, hf_processor_mm_kwargs)
+    processed_inputs = processor(
+        prompt,
+        mm_items=processor.info.parse_mm_data(mm_data),
+        hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+    )
 
     # Ensure the placeholders format are correct
     hf_processor = processor.info.get_hf_processor(**hf_processor_mm_kwargs)
-    hf_processed_inputs = hf_processor(text=prompt, images=mm_data["image"])
+    hf_processed_inputs = hf_processor(
+        text=prompt,
+        images=mm_data["image"],
+        **processor.info.ctx.get_merged_mm_kwargs(hf_processor_mm_kwargs),
+    )
     assert processed_inputs["prompt_token_ids"] == hf_processed_inputs["input_ids"][0]
 
     # Ensure we have the right number of placeholders per num_crops size

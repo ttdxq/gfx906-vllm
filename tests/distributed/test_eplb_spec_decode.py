@@ -6,6 +6,7 @@ import lm_eval
 import pytest
 
 from tests.utils import large_gpu_mark
+from vllm.platforms import current_platform
 
 
 def get_model_args(
@@ -14,7 +15,7 @@ def get_model_args(
     spec_method: str,
     tp_size: int,
     model_max_len: int,
-    use_async: bool = False,
+    use_async: bool = True,
 ) -> dict:
     speculative_config = {
         "method": spec_method,
@@ -22,7 +23,13 @@ def get_model_args(
         "num_speculative_tokens": 1,
         "max_model_len": model_max_len,
     }
-
+    eplb_config = {
+        "num_redundant_experts": tp_size,
+        "window_size": 128,
+        "step_interval": 1024,
+        "log_balancedness": False,
+        "use_async": use_async,
+    }
     model_args = {
         "pretrained": model_name,
         "dtype": "auto",
@@ -31,16 +38,17 @@ def get_model_args(
         "gpu_memory_utilization": 0.7,
         "speculative_config": speculative_config,
         "enable_expert_parallel": True,
-        "num_redundant_experts": tp_size,
-        "eplb_window_size": 128,
-        "eplb_step_interval": 1024,
-        "eplb_log_balancedness": False,
+        "eplb_config": eplb_config,
         "enable_eplb": True,
         "max_model_len": model_max_len,
     }
-    if use_async:
-        model_args["eplb_config"] = {"use_async": True}
     return model_args
+
+
+pytestmark = pytest.mark.skipif(
+    current_platform.is_rocm(),
+    reason="EPLB with Spec Decode is a work in progress on ROCm.",
+)
 
 
 @pytest.mark.parametrize(
@@ -67,8 +75,7 @@ def test_eplb_spec_decode(
     monkeypatch: pytest.MonkeyPatch,
     model_setup: tuple[str, str, str, int, float],
 ):
-    """
-    Test the correctness of EPLB speculative decoding with GSM8K dataset.
+    """Test the correctness of EPLB speculative decoding with GSM8K dataset.
     Applicable to MoE models with mtp or eagle spec decode.
     """
     method, model_name, spec_model_name, tp_size, expected_gsm8k_value = model_setup
@@ -101,10 +108,7 @@ def test_eplb_spec_decode(
 
 @large_gpu_mark(min_gb=80)
 def test_eplb_spec_decode_qwen3_next_mtp_async() -> None:
-    """
-    Ensure async EPLB works with MTP speculative decoding for Qwen3-Next.
-    """
-
+    """Ensure async EPLB works with MTP speculative decoding for Qwen3-Next."""
     TASK = "gsm8k"
     FILTER = "exact_match,strict-match"
     RTOL = 0.03

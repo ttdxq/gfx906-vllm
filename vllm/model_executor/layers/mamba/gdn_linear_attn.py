@@ -63,6 +63,7 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 logger = init_logger(__name__)
 ENABLE_QWEN35_FORCE_Z_ONES = os.getenv("VLLM_QWEN35_FORCE_Z_ONES", "0") == "1"
@@ -239,8 +240,8 @@ class ChunkGatedDeltaRule(CustomOp):
 
 class GatedDeltaNetAttention(nn.Module, MambaBase):
     @property
-    def mamba_type(self) -> str:
-        return "gdn_attention"
+    def mamba_type(self) -> "MambaAttentionBackendEnum":
+        return MambaAttentionBackendEnum.GDN_ATTN
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
@@ -782,7 +783,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
         self_kv_cache = self.kv_cache
         if isinstance(self_kv_cache, list):
-            self_kv_cache = self_kv_cache[forward_context.virtual_engine]
+            self_kv_cache = self_kv_cache[0]
         conv_state = (
             self_kv_cache[0]
             if is_conv_state_dim_first()
@@ -1121,7 +1122,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         forward_context = get_forward_context()
         self_kv_cache = self.kv_cache
         if isinstance(self_kv_cache, list):
-            self_kv_cache = self_kv_cache[forward_context.virtual_engine]
+            self_kv_cache = self_kv_cache[0]
         conv_state = (
             self_kv_cache[0]
             if is_conv_state_dim_first()

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
+from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 if TYPE_CHECKING:
@@ -32,9 +34,10 @@ class BaseCacheStats:
 
 class CachingMetrics:
     """Metrics for caching with a hit rate of the most recent N requests.
+
     Args:
-        interval: The number of the most recent requests to aggregate.
-            Defaults to 1000.
+        max_recent_requests: The number of the most recent requests to aggregate.
+
     """
 
     def __init__(self, max_recent_requests: int = 1000) -> None:
@@ -60,6 +63,7 @@ class CachingMetrics:
 
         Args:
             stats: The prefix cache stats.
+
         """
         # reset_prefix_cache was invoked before the current update.
         # Reset the metrics before aggregating the current stats.
@@ -111,8 +115,7 @@ class CachingMetrics:
 
 @dataclass
 class PrefixCacheStats(BaseCacheStats):
-    """
-    Stores prefix cache hit statistics.
+    """Stores prefix cache hit statistics.
     - `reset`: Whether `reset_prefix_cache` was invoked.
     - `queries`: Refers to the number of tokens that were queried.
     """
@@ -142,12 +145,17 @@ class PrefixCacheStats(BaseCacheStats):
 
 @dataclass
 class MultiModalCacheStats(BaseCacheStats):
-    """
-    Stores multi-modal cache hit statistics.
+    """Stores multi-modal cache hit statistics.
     - `reset`: Whether `reset_mm_cache` was invoked.
     - `queries`: Refers to the number of multi-modal data items
       that were queried.
     """
+
+    def record(self, num_queries: int, num_hits: int) -> None:
+        """Aggregate request information into the stats."""
+        self.requests += 1
+        self.queries += num_queries
+        self.hits += num_hits
 
 
 @dataclass
@@ -160,17 +168,35 @@ class KVCacheEvictionEvent:
 
 
 @dataclass
+class SchedulerIterationDetails:
+    """Scheduler-side details for one engine iteration."""
+
+    iteration_index: int
+    num_ctx_requests: int
+    num_ctx_tokens: int
+    num_generation_requests: int
+    num_generation_tokens: int
+    elapsed_ms: float
+    num_encoder_inputs: int = 0
+    num_encoder_output_tokens: int = 0
+    is_dummy: bool = False
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
     num_running_reqs: int = 0
-    num_waiting_reqs: int = 0
+
+    num_waiting_reqs: int = 0  # length of the "waiting" request queue
+    num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
     current_wave: int = 0
 
     kv_cache_usage: float = 0.0
+    iteration_details: SchedulerIterationDetails | None = None
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None
@@ -179,9 +205,14 @@ class SchedulerStats:
 
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
+    ec_connector_stats: dict[str, Any] | None = None
 
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)
     running_lora_adapters: dict[str, int] = field(default_factory=dict)
+
+    cudagraph_stats: CUDAGraphStat | None = None
+
+    perf_stats: PerfStats | None = None
 
 
 @dataclass
@@ -189,6 +220,7 @@ class RequestStateStats:
     """Stats that need to be tracked across delta updates."""
 
     num_generation_tokens: int = 0
+    num_preemptions: int = 0
 
     # This is an engine frontend timestamp (wall-clock)
     arrival_time: float = 0.0
@@ -211,8 +243,10 @@ class FinishedRequestStats:
     """Stats associated with a finished request."""
 
     finish_reason: "FinishReason"
+    request_id: str | None = None
     e2e_latency: float = 0.0
     num_prompt_tokens: int = 0
+    num_preemptions: int = 0
     num_generation_tokens: int = 0
     max_tokens_param: int | None = None
     queued_time: float = 0.0
@@ -221,6 +255,174 @@ class FinishedRequestStats:
     decode_time: float = 0.0
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
+    num_cached_tokens: int = 0
+
+
+@dataclass
+class PrefillStats:
+    """Breakdown of a scheduled prefill computation.
+
+    Fields:
+        num_prompt_tokens: Total number of tokens to be prefilled.
+        num_computed_tokens: Tokens to be prefilled locally (actual compute work).
+        num_cached_tokens: Tokens to be prefilled without actual compute work.
+        num_local_cached_tokens: Tokens to be prefilled from local prefix cache.
+        num_external_cached_tokens: Tokens to be prefilled from external KV transfer.
+        num_cache_creation_tokens: Tokens computed and written to the prefix cache.
+    """
+
+    num_prompt_tokens: int = 0
+    num_computed_tokens: int = 0
+    num_cached_tokens: int = 0
+    num_local_cached_tokens: int = 0
+    num_external_cached_tokens: int = 0
+    num_cache_creation_tokens: int = 0
+
+    def set(
+        self,
+        num_prompt_tokens: int,
+        num_local_cached_tokens: int,
+        num_external_cached_tokens: int,
+    ):
+        num_cached_tokens = num_local_cached_tokens + num_external_cached_tokens
+        assert num_cached_tokens <= num_prompt_tokens
+
+        self.num_prompt_tokens = num_prompt_tokens
+        self.num_computed_tokens = num_prompt_tokens - num_cached_tokens
+        self.num_cached_tokens = num_cached_tokens
+        self.num_local_cached_tokens = num_local_cached_tokens
+        self.num_external_cached_tokens = num_external_cached_tokens
+
+    def finalize(self, num_cached_tokens: int) -> None:
+        assert num_cached_tokens >= 0
+        self.num_cache_creation_tokens = max(
+            0, min(num_cached_tokens, self.num_prompt_tokens) - self.num_cached_tokens
+        )
+
+
+@dataclass
+class RequestSpecDecodeMetrics:
+    """Per-output-sequence speculative-decoding statistics accumulator.
+
+    Accumulates, over one sequence's verify steps, a histogram of accepted
+    draft-token counts (``j``, draft-only) and the total number of proposed
+    draft tokens. When ``detailed`` is requested it also records the ordered
+    per-step accepted/proposed sequences (``summary`` omits them). Tracked per
+    engine ``Request`` (one per sampled sequence, so ``n > 1`` yields one per
+    child), surfaced via ``EngineCoreOutput`` and the response
+    ``metrics.speculative_decoding`` for single-sequence requests (see
+    ``to_dict``).
+
+    Fields:
+        num_spec_tokens: Configured ``num_speculative_tokens`` (the max ``k``);
+            also the histogram's upper bound.
+        histogram: Dense counts indexed by accepted draft tokens ``j``
+            (length ``num_spec_tokens + 1``).
+        num_draft_tokens: Total proposed draft tokens, after the
+            grammar-invalidated (``num_invalid_spec_tokens``) adjustment.
+        per_step_accepted: Ordered accepted-draft count per verify step
+            (``detailed`` only; empty otherwise).
+        per_step_drafted: Ordered proposed-draft count per verify step
+            (``detailed`` only; empty otherwise).
+    """
+
+    num_spec_tokens: int
+    histogram: list[int] = field(default_factory=list)
+    num_draft_tokens: int = 0
+    per_step_accepted: list[int] = field(default_factory=list)
+    per_step_drafted: list[int] = field(default_factory=list)
+
+    @classmethod
+    def new(cls, num_spec_tokens: int) -> "RequestSpecDecodeMetrics":
+        return cls(
+            num_spec_tokens=num_spec_tokens,
+            histogram=[0] * (num_spec_tokens + 1),
+        )
+
+    def observe(
+        self, num_draft_tokens: int, num_accepted: int, detailed: bool = False
+    ) -> None:
+        self.histogram[num_accepted] += 1
+        self.num_draft_tokens += num_draft_tokens
+        if detailed:
+            self.per_step_accepted.append(num_accepted)
+            self.per_step_drafted.append(num_draft_tokens)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Payload matching ``SpeculativeDecodingMetrics`` for the response.
+
+        ``acceptance_histogram`` is a dense list indexed by accepted draft count
+        ``j`` (length ``num_spec_tokens + 1``). ``mean_acceptance_length``
+        includes the bonus token (``j + 1``); ``draft_acceptance_rate`` is
+        draft-only, full precision. Per-step arrays are included only when
+        populated (``detailed`` level).
+        """
+        num_spec_steps = sum(self.histogram)
+        num_accepted = sum(j * count for j, count in enumerate(self.histogram))
+        mean_al = 1.0 + num_accepted / num_spec_steps if num_spec_steps else 1.0
+        rate = num_accepted / self.num_draft_tokens if self.num_draft_tokens else 0.0
+        result: dict[str, Any] = {
+            "mean_acceptance_length": mean_al,
+            "draft_acceptance_rate": rate,
+            "acceptance_histogram": list(self.histogram),
+            "num_spec_steps": num_spec_steps,
+            "num_accepted_draft_tokens": num_accepted,
+            "num_draft_tokens": self.num_draft_tokens,
+            "num_spec_tokens": self.num_spec_tokens,
+        }
+        if self.per_step_accepted:
+            result["per_step_accepted"] = self.per_step_accepted
+            result["per_step_drafted"] = self.per_step_drafted
+        return result
+
+
+@dataclass
+class PromptTokenStats:
+    """Breakdown of prompt tokens by source.
+
+    Fields:
+        computed: Tokens prefilled locally (actual compute work).
+        local_cache_hit: Tokens from local prefix cache.
+        external_kv_transfer: Tokens from external KV transfer.
+        cached_tokens: Tokens skipped during prefill (from scheduler).
+        total: Total prompt tokens.
+
+    Invariants:
+        computed + local_cache_hit + external_kv_transfer = total
+        local_cache_hit + external_kv_transfer = cached_tokens
+    """
+
+    ALL_SOURCES: tuple[str, ...] = (
+        "local_compute",
+        "local_cache_hit",
+        "external_kv_transfer",
+    )
+
+    computed: int = 0
+    local_cache_hit: int = 0
+    external_kv_transfer: int = 0
+    cached_tokens: int = 0
+    total: int = 0
+
+    def update_from_output(self, prefill_stats: PrefillStats) -> None:
+        """Update stats from a prefill output."""
+        self.computed += prefill_stats.num_computed_tokens
+        self.cached_tokens += prefill_stats.num_cached_tokens
+        self.total += prefill_stats.num_prompt_tokens
+
+        self.local_cache_hit += prefill_stats.num_local_cached_tokens
+        self.external_kv_transfer += prefill_stats.num_external_cached_tokens
+
+    def get_by_source(self, source: str) -> int:
+        """Get token count by source label."""
+        source_map = {
+            "local_compute": self.computed,
+            "local_cache_hit": self.local_cache_hit,
+            "external_kv_transfer": self.external_kv_transfer,
+        }
+        if source not in source_map:
+            raise ValueError(f"Unknown source: {source}")
+        return source_map[source]
 
 
 class IterationStats:
@@ -229,7 +431,7 @@ class IterationStats:
     def __init__(self):
         self.iteration_timestamp = time.time()
         self.num_generation_tokens = 0
-        self.num_prompt_tokens = 0
+        self.prompt_token_stats = PromptTokenStats()
         self.num_preempted_reqs = 0
         self.finished_requests: list[FinishedRequestStats] = []
         self.max_num_generation_tokens_iter: list[int] = []
@@ -242,6 +444,11 @@ class IterationStats:
         field_to_value_str = ", ".join(f"{k}={v}" for k, v in vars(self).items())
         return f"{self.__class__.__name__}({field_to_value_str})"
 
+    @property
+    def num_prompt_tokens(self) -> int:
+        """Total prompt tokens (for backward compatibility)."""
+        return self.prompt_token_stats.total
+
     def _time_since(self, start: float) -> float:
         """Calculate an interval relative to this iteration's timestamp."""
         return self.iteration_timestamp - start
@@ -251,7 +458,6 @@ class IterationStats:
         output: "EngineCoreOutput",
         engine_core_timestamp: float,
         is_prefilling: bool,
-        prompt_len: int,
         req_stats: RequestStateStats,
         lora_states: "LoRARequestStates",
         lora_name: str | None,
@@ -260,7 +466,8 @@ class IterationStats:
 
         self.num_generation_tokens += num_new_generation_tokens
         if is_prefilling:
-            self.num_prompt_tokens += prompt_len
+            if output.prefill_stats is not None:
+                self.prompt_token_stats.update_from_output(output.prefill_stats)
 
             first_token_latency = self._time_since(req_stats.arrival_time)
             self.time_to_first_tokens_iter.append(first_token_latency)
@@ -319,14 +526,17 @@ class IterationStats:
                 lora_states.request_running(req_id, lora_name)
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
+                req_stats.num_preemptions += 1
                 lora_states.request_waiting(req_id, lora_name)
 
     def update_from_finished_request(
         self,
         finish_reason: "FinishReason",
+        request_id: str,
         num_prompt_tokens: int,
         max_tokens_param: int | None,
         req_stats: RequestStateStats,
+        num_cached_tokens: int = 0,
     ):
         e2e_latency = self._time_since(req_stats.arrival_time)
 
@@ -354,8 +564,10 @@ class IterationStats:
 
         finished_req = FinishedRequestStats(
             finish_reason=finish_reason,
+            request_id=request_id,
             e2e_latency=e2e_latency,
             num_prompt_tokens=num_prompt_tokens,
+            num_preemptions=req_stats.num_preemptions,
             num_generation_tokens=req_stats.num_generation_tokens,
             max_tokens_param=max_tokens_param,
             queued_time=queued_time,
@@ -364,6 +576,7 @@ class IterationStats:
             decode_time=decode_time,
             mean_time_per_output_token=mean_time_per_output_token,
             is_corrupted=req_stats.is_corrupted,
+            num_cached_tokens=num_cached_tokens,
         )
         self.finished_requests.append(finished_req)
 

@@ -13,28 +13,26 @@ from vllm.utils.import_utils import PlaceholderModule
 
 logger = init_logger(__name__)
 
-SUPPORTED_SCHEMES = ["s3://", "gs://"]
+SUPPORTED_SCHEMES = ["s3://", "gs://", "az://"]
 
 try:
     from runai_model_streamer import list_safetensors as runai_list_safetensors
     from runai_model_streamer import pull_files as runai_pull_files
-except (ImportError, OSError):
-    # see https://github.com/run-ai/runai-model-streamer/issues/26
-    # OSError will be raised on arm64 platform
+except ImportError:
     runai_model_streamer = PlaceholderModule("runai_model_streamer")  # type: ignore[assignment]
     runai_pull_files = runai_model_streamer.placeholder_attr("pull_files")
     runai_list_safetensors = runai_model_streamer.placeholder_attr("list_safetensors")
 
 
 def list_safetensors(path: str = "") -> list[str]:
-    """
-    List full file names from object path and filter by allow pattern.
+    """List full file names from object path and filter by allow pattern.
 
     Args:
         path: The object storage path to list from.
 
     Returns:
         list[str]: List of full object storage paths allowed by the pattern
+
     """
     return runai_list_safetensors(path)
 
@@ -44,8 +42,7 @@ def is_runai_obj_uri(model_or_path: str) -> bool:
 
 
 class ObjectStorageModel:
-    """
-    A class representing an ObjectStorage model mirrored into a
+    """A class representing an ObjectStorage model mirrored into a
     temporary directory.
 
     Attributes:
@@ -53,6 +50,7 @@ class ObjectStorageModel:
 
     Methods:
         pull_files(): Pull model from object storage to the temporary directory.
+
     """
 
     def __init__(self, url: str) -> None:
@@ -66,9 +64,7 @@ class ObjectStorageModel:
             "model_streamer",
             hashlib.sha256(str(url).encode()).hexdigest()[:8],
         )
-        if os.path.exists(dir_name):
-            shutil.rmtree(dir_name)
-        os.makedirs(dir_name)
+        os.makedirs(dir_name, exist_ok=True)
         self.dir = dir_name
         logger.debug("Init object storage, model cache path is: %s", dir_name)
 
@@ -90,8 +86,7 @@ class ObjectStorageModel:
         allow_pattern: list[str] | None = None,
         ignore_pattern: list[str] | None = None,
     ) -> None:
-        """
-        Pull files from object storage into the temporary directory.
+        """Pull files from object storage into the temporary directory.
 
         Args:
             model_path: The object storage path of the model.

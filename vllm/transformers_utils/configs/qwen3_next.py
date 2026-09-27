@@ -14,17 +14,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3-Next model configuration"""
+"""Qwen3-Next model configuration."""
 
-from transformers.configuration_utils import PretrainedConfig, layer_type_validation
+from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
 
 class Qwen3NextConfig(PretrainedConfig):
-    r"""
-    This is the configuration class to store the configuration of a [`Qwen3NextModel`]. It is used to instantiate a
+    r"""This is the configuration class to store the configuration of a [`Qwen3NextModel`]. It is used to instantiate a
     Qwen3-Next model according to the specified arguments, defining the model architecture.
     Instantiating a configuration with the defaults will yield a similar configuration to that of
     Qwen3-Next-80B-A3B-Instruct [Qwen/Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct).
@@ -103,8 +102,8 @@ class Qwen3NextConfig(PretrainedConfig):
                     Only used with 'llama3'. Scaling factor applied to low frequency components of the RoPE
                 `high_freq_factor` (`float`, *optional*):
                     Only used with 'llama3'. Scaling factor applied to high frequency components of the RoPE
-        partial_rotary_factor (`float`, *optional*, defaults to 0.25):
-            Percentage of the query and keys which will have rotary embedding.
+                `partial_rotary_factor` (`float`, *optional*, defaults to 0.25):
+                    Percentage of the query and keys which will have rotary embedding.
         attention_bias (`bool`, *optional*, defaults to `False`):
             Whether to use a bias in the query, key, value and output projection layers during self-attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
@@ -157,6 +156,7 @@ class Qwen3NextConfig(PretrainedConfig):
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```
+
     """  # noqa: E501
 
     model_type = "qwen3_next"
@@ -198,7 +198,6 @@ class Qwen3NextConfig(PretrainedConfig):
         use_cache=True,
         tie_word_embeddings=False,
         rope_parameters=None,
-        partial_rotary_factor=0.25,
         attention_bias=False,
         attention_dropout=0.0,
         head_dim=256,
@@ -221,7 +220,6 @@ class Qwen3NextConfig(PretrainedConfig):
     ):
         if mlp_only_layers is None:
             mlp_only_layers = []
-        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -239,6 +237,9 @@ class Qwen3NextConfig(PretrainedConfig):
         rope_theta = kwargs.pop("rope_theta", 10000.0)
         if "rope_theta" not in rope_parameters:
             rope_parameters["rope_theta"] = rope_theta
+        partial_rotary_factor = kwargs.pop("partial_rotary_factor", 0.25)
+        if "partial_rotary_factor" not in rope_parameters:
+            rope_parameters["partial_rotary_factor"] = partial_rotary_factor
         self.rope_parameters = rope_parameters
         self.partial_rotary_factor = partial_rotary_factor
         self.attention_bias = attention_bias
@@ -251,7 +252,7 @@ class Qwen3NextConfig(PretrainedConfig):
                 "linear_attention" if bool((i + 1) % 4) else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types)
+        self.validate_layer_type()
 
         # linear attention part
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
@@ -270,6 +271,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
 __all__ = ["Qwen3NextConfig"]

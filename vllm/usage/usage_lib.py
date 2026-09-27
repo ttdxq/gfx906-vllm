@@ -19,10 +19,8 @@ import requests
 import torch
 
 import vllm.envs as envs
-from vllm.connections import global_http_connection
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import cuda_get_device_properties
-from vllm.utils.torch_utils import cuda_device_count_stateless
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -37,7 +35,6 @@ _GLOBAL_RUNTIME_DATA = dict[str, str | int | bool]()
 
 _USAGE_ENV_VARS_TO_COLLECT = [
     "VLLM_USE_MODELSCOPE",
-    "VLLM_ATTENTION_BACKEND",
     "VLLM_USE_FLASHINFER_SAMPLER",
     "VLLM_PP_LAYER_PARTITION",
     "VLLM_USE_TRITON_AWQ",
@@ -137,6 +134,7 @@ class UsageMessage:
         self.total_memory: int | None = None
         self.architecture: str | None = None
         self.platform: str | None = None
+        self.xpu_runtime: str | None = None
         self.cuda_runtime: str | None = None
         self.gpu_count: int | None = None
         self.gpu_type: str | None = None
@@ -186,20 +184,6 @@ class UsageMessage:
         except Exception:
             return False
 
-    def _report_torch_xla_usage(self) -> bool:
-        try:
-            import torch_xla
-
-            self.gpu_count = torch_xla.runtime.world_size()
-            self.gpu_type = torch_xla.tpu.get_tpu_type()
-            self.gpu_memory_per_device = torch_xla.core.xla_model.get_memory_info()[
-                "bytes_limit"
-            ]
-            self.cuda_runtime = "torch_xla"
-            return True
-        except Exception:
-            return False
-
     def _report_usage_once(
         self,
         model_architecture: str,
@@ -210,16 +194,19 @@ class UsageMessage:
         from vllm.platforms import current_platform
 
         if current_platform.is_cuda_alike():
-            self.gpu_count = cuda_device_count_stateless()
+            self.gpu_count = current_platform.device_count()
             self.gpu_type, self.gpu_memory_per_device = cuda_get_device_properties(
                 0, ("name", "total_memory")
             )
         if current_platform.is_cuda():
             self.cuda_runtime = torch.version.cuda
+        if current_platform.is_xpu():
+            self.xpu_runtime = torch.version.xpu
+            self.gpu_count = torch.xpu.device_count()
+            self.gpu_type = torch.xpu.get_device_name(0)
+            self.gpu_memory_per_device = torch.xpu.get_device_properties(0).total_memory
         if current_platform.is_tpu():  # noqa: SIM102
-            if (not self._report_tpu_inference_usage()) and (
-                not self._report_torch_xla_usage()
-            ):
+            if not self._report_tpu_inference_usage():
                 logger.exception("Failed to collect TPU information")
         self.provider = _detect_cloud_provider()
         self.architecture = platform.machine()
@@ -277,8 +264,8 @@ class UsageMessage:
 
     def _send_to_server(self, data: dict[str, Any]) -> None:
         try:
-            global_http_client = global_http_connection.get_sync_client()
-            global_http_client.post(_USAGE_STATS_SERVER, json=data)
+            with requests.Session() as client:
+                client.post(_USAGE_STATS_SERVER, json=data)
         except requests.exceptions.RequestException:
             # silently ignore unless we are using debug log
             logging.debug("Failed to send usage data to server")

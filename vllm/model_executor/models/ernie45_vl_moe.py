@@ -31,13 +31,15 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention.layer import Attention
-
 # from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEFactory,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
@@ -230,6 +232,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
 
         assert text_moe_layer_start_index <= text_moe_layer_end_index
 
+        self.shared_experts: Ernie4_5_VLMoeMLP | None
         if self.has_shared_experts:
             intermediate_size = (
                 config.moe_intermediate_size[0] * config.moe_num_shared_experts
@@ -258,17 +261,17 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 prefix=f"{prefix}.text_experts_gate",
             )
 
-            self.text_experts = SharedFusedMoE(
+            self.text_experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
                 num_experts=config.moe_num_experts[0],
                 top_k=config.moe_k,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.moe_intermediate_size[0],
-                reduce_results=False,
                 renormalize=True,
                 quant_config=quant_config,
                 e_score_correction_bias=self.e_score_correction_bias[0],
                 prefix=f"{prefix}.text_experts",
+                router_logits_dtype=torch.float32,
             )
         else:
             self.text_experts = Ernie4_5_VLMoeMLP(
@@ -295,17 +298,17 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 prefix=f"{prefix}.vision_experts_gate",
             )
 
-            self.vision_experts = SharedFusedMoE(
+            self.vision_experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
                 num_experts=config.moe_num_experts[1],
                 top_k=config.moe_k,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.moe_intermediate_size[1],
-                reduce_results=False,
                 renormalize=True,
                 quant_config=quant_config,
                 e_score_correction_bias=self.e_score_correction_bias[1],
                 prefix=f"{prefix}.vision_experts",
+                router_logits_dtype=torch.float32,
             )
         else:
             self.vision_experts = Ernie4_5_VLMoeMLP(
@@ -341,9 +344,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             visual_token_mask = visual_token_mask.repeat(1, self.hidden_size).bool()
             text_token_mask = ~visual_token_mask
             final_experts_hidden_states = torch.zeros_like(hidden_states)
-            final_shared_ouput = (
-                torch.zeros_like(hidden_states) if self.has_shared_experts else None
-            )
 
             text_hidden_states = hidden_states[text_token_mask].reshape(
                 -1, self.hidden_size
@@ -355,26 +355,20 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             text_router_logits, _ = self.text_experts_gate(
                 text_hidden_states.to(dtype=torch.float32)
             )
-            text_shared_ouput, text_experts_output = self.text_experts(
+            text_output = self.text_experts(
                 hidden_states=text_hidden_states, router_logits=text_router_logits
             )
-            final_experts_hidden_states[text_token_mask] = text_experts_output.flatten()
-            if self.has_shared_experts:
-                final_shared_ouput[text_token_mask] = text_shared_ouput.flatten()
+            final_experts_hidden_states[text_token_mask] = text_output.flatten()
 
             vision_router_logits, _ = self.vision_experts_gate(
                 vision_hidden_states.to(dtype=torch.float32)
             )
-            vision_shared_ouput, vision_experts_output = self.vision_experts(
+            vision_output = self.vision_experts(
                 hidden_states=vision_hidden_states, router_logits=vision_router_logits
             )
-            final_experts_hidden_states[visual_token_mask] = (
-                vision_experts_output.flatten()
-            )
-            if self.has_shared_experts:
-                final_shared_ouput[visual_token_mask] = vision_shared_ouput.flatten()
+            final_experts_hidden_states[visual_token_mask] = vision_output.flatten()
 
-            final_hidden_states = (final_shared_ouput, final_experts_hidden_states)
+            final_hidden_states = final_experts_hidden_states
         else:
             # only text modal input
             text_router_logits, _ = self.text_experts_gate(
@@ -383,20 +377,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
 
             final_hidden_states = self.text_experts(
                 hidden_states=hidden_states, router_logits=text_router_logits
-            )
-
-        if self.has_shared_experts:
-            # for shared_experts model
-            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
-        else:
-            # for not shared_experts model
-            final_hidden_states = final_hidden_states[1]
-
-        if self.tp_size > 1:
-            final_hidden_states = (
-                self.text_experts.maybe_all_reduce_tensor_model_parallel(
-                    final_hidden_states
-                )
             )
 
         return final_hidden_states.view(orig_shape)
@@ -522,7 +502,6 @@ class Ernie4_5_VLMoeModel(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.config = config
 
@@ -563,7 +542,7 @@ class Ernie4_5_VLMoeModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -633,7 +612,7 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -644,7 +623,7 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -674,7 +653,8 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module, SupportsPP):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
+        expert_params_mapping = fused_moe_make_expert_params_mapping(
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -718,12 +698,18 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module, SupportsPP):
                     moe_offset = int(name.split(".")[-3])
                     vision_expert_start_idx = self.config.moe_num_experts[0]
                     is_text_expert = moe_offset <= vision_expert_start_idx - 1
+                    routed_experts = (
+                        ".routed_experts" if ("w13_" in name or "w2_" in name) else ""
+                    )
                     if is_text_expert:
-                        name = name.replace(".experts.", ".text_experts.")
+                        name = name.replace(
+                            ".experts", f".text_experts{routed_experts}"
+                        )
                     else:
+                        delta = moe_offset - vision_expert_start_idx
                         name = name.replace(
                             f".experts.{moe_offset}",
-                            f".vision_experts.{moe_offset - vision_expert_start_idx}",
+                            f".vision_experts{routed_experts}.{delta}",
                         )
 
                 for mapping in expert_params_mapping:
@@ -786,9 +772,10 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module, SupportsPP):
                     if is_pp_missing_parameter(name, self):
                         continue
                     # Remapping the name of FP8 kv-scale.
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
+                    remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+                    if remapped_name is None:
                         continue
+                    name = remapped_name
 
                     param = params_dict[name]
 

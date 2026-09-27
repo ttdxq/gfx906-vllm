@@ -3,41 +3,49 @@
 from typing import _get_protocol_attrs  # type: ignore
 
 import pytest
-from transformers import PreTrainedTokenizerBase
+from transformers import (
+    PreTrainedTokenizerBase,
+    TokenizersBackend,
+)
 
 from vllm.tokenizers import TokenizerLike, get_tokenizer
+from vllm.tokenizers.hf import HfTokenizer
+from vllm.tokenizers.mistral import MistralTokenizer
 
 
 def _get_missing_attrs(obj: object, target: type):
     return [k for k in _get_protocol_attrs(target) if not hasattr(obj, k)]
 
 
+def _assert_tokenizer_like(tokenizer: object):
+    missing_attrs = _get_missing_attrs(tokenizer, TokenizerLike)
+    assert not missing_attrs, f"Missing attrs: {missing_attrs}"
+
+
 def test_tokenizer_like_protocol():
-    assert not (
-        missing_attrs := _get_missing_attrs(
-            get_tokenizer("gpt2", use_fast=False),
-            TokenizerLike,
-        )
-    ), f"Missing attrs: {missing_attrs}"
+    tokenizer = get_tokenizer("openai-community/gpt2", use_fast=True)
+    assert isinstance(tokenizer, TokenizersBackend)
+    _assert_tokenizer_like(tokenizer)
 
-    assert not (
-        missing_attrs := _get_missing_attrs(
-            get_tokenizer("gpt2", use_fast=True),
-            TokenizerLike,
-        )
-    ), f"Missing attrs: {missing_attrs}"
+    tokenizer = get_tokenizer(
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        tokenizer_mode="mistral",
+    )
+    assert isinstance(tokenizer, MistralTokenizer)
+    _assert_tokenizer_like(tokenizer)
 
-    assert not (
-        missing_attrs := _get_missing_attrs(
-            get_tokenizer(
-                "mistralai/Mistral-7B-Instruct-v0.3", tokenizer_mode="mistral"
-            ),
-            TokenizerLike,
-        )
-    ), f"Missing attrs: {missing_attrs}"
+    tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3", tokenizer_mode="deepseek_v32")
+    assert isinstance(tokenizer, HfTokenizer)
+
+    # Verify it's a fast tokenizer (required for FastIncrementalDetokenizer)
+    assert isinstance(tokenizer, TokenizersBackend)
+    assert "DSV32" in tokenizer.__class__.__name__
+    _assert_tokenizer_like(tokenizer)
 
 
-@pytest.mark.parametrize("tokenizer_name", ["facebook/opt-125m", "gpt2"])
+@pytest.mark.parametrize(
+    "tokenizer_name", ["facebook/opt-125m", "openai-community/gpt2"]
+)
 def test_tokenizer_revision(tokenizer_name: str):
     # Assume that "main" branch always exists
     tokenizer = get_tokenizer(tokenizer_name, revision="main")

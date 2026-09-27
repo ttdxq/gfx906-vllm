@@ -3,6 +3,12 @@
  * __device__ datatypes vectorized by 4
  */
 
+// The legacy csrc/ and the libtorch_stable/ copies of this header define the
+// same types. #pragma once cannot dedupe two distinct paths, so both copies
+// share this guard to prevent redefinitions when one TU pulls in both.
+#ifndef VLLM_QUANTIZATION_VECTORIZATION_CUH_
+#define VLLM_QUANTIZATION_VECTORIZATION_CUH_
+
 // Include both AMD and NVIDIA fp8 types to avoid circular import
 #include <c10/util/Float8_e4m3fnuz.h>
 #include <c10/util/Float8_e4m3fn.h>
@@ -29,3 +35,5 @@ template <typename quant_type_t>
 using q8x4_t = q8_n_t<quant_type_t, 4>;
 
 }  // namespace vllm
+
+#endif  // VLLM_QUANTIZATION_VECTORIZATION_CUH_

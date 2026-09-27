@@ -18,7 +18,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
 )
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE, FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -78,6 +81,9 @@ ENABLE_GGUF_FUSED_MMVQ_OUTPUT_CACHE = _env_flag(
 ENABLE_GGUF_COALESCE_SAME_TYPE_SHARDS = _env_flag(
     "VLLM_GGUF_COALESCE_SAME_TYPE_SHARDS", False
 )
+# Keep the legacy zero-padded concat parameter for mixed-width merged GGUF
+# layers (set VLLM_GGUF_MERGED_PADDED=1 to restore the old memory layout).
+ENABLE_GGUF_MERGED_PADDED_COMPAT = _env_flag("VLLM_GGUF_MERGED_PADDED", False)
 ENABLE_GGUF_SHARDED_MMVQ_Q8_CACHE = _env_flag(
     "VLLM_GGUF_SHARDED_MMVQ_Q8_CACHE", True
 )
@@ -684,7 +690,7 @@ class GGUFConfig(QuantizationConfig):
             ):
                 return UnquantizedEmbeddingMethod()
             return GGUFEmbeddingMethod(self)
-        elif isinstance(layer, FusedMoE):
+        elif isinstance(layer, RoutedExperts):
             return GGUFMoEMethod(self, layer.moe_config)
         return None
 
@@ -1041,15 +1047,17 @@ def _collect_gguf_linear_shards(
         qweight_types = []
         for idx in shard_id:
             qweight_type = layer.qweight_type.shard_weight_type[idx]
-            if hasattr(layer.qweight, "shard_offset_map"):
-                start, end, offset = layer.qweight.shard_offset_map[idx]
-                shard = getattr(layer, "_gguf_shard_cache", {}).get(idx)
-                if shard is None:
+            shard = getattr(layer, "_gguf_shard_cache", {}).get(idx)
+            if shard is None:
+                if hasattr(layer.qweight, "shard_offset_map"):
+                    start, end, offset = layer.qweight.shard_offset_map[idx]
                     shard = qweight[start:end, :offset]
                     if not shard.is_contiguous():
                         shard = shard.contiguous()
-            else:
-                shard = qweight.data_container[qweight.shard_id_map[idx]].contiguous()
+                else:
+                    shard = qweight.data_container[
+                        qweight.shard_id_map[idx]
+                    ].contiguous()
             qweights.append(shard)
             qweight_types.append(qweight_type)
         return qweights, qweight_types
@@ -2200,6 +2208,11 @@ class GGUFLinearMethod(LinearMethodBase):
         qweight_type = layer.qweight_type
         if qweight is None or qweight_type is None:
             return
+        if isinstance(qweight, GGUFUninitializedParameter):
+            # Merged mixed-width layers keep standalone shard tensors in
+            # _gguf_shard_cache; there is no padded qweight to repack, and
+            # any tensor-method access on the uninitialized parameter raises.
+            return
         if not qweight.is_cuda or not qweight.is_contiguous():
             return
 
@@ -2264,6 +2277,24 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             layer.register_parameter("qweight", padded_param)
         elif len(data_container) > 1:
+            packed_widths = {data.size(1) for data in data_container}
+            if len(packed_widths) > 1 and not ENABLE_GGUF_MERGED_PADDED_COMPAT:
+                # Mixed packed widths (per-shard quant types differ, e.g. UD
+                # dynamic-quant gate/up): no runtime path reads the padded
+                # concat whole (_get_full_mmvq_shard_weight returns None for
+                # mixed types and apply consumes per-shard tensors), while
+                # _cache_gguf_shards would duplicate every narrower shard as
+                # a contiguous copy.  Promote the loader's standalone shard
+                # tensors to the shard cache as the single resident copy.
+                cache = {}
+                for idx in shard_id:
+                    shard = data_container[shard_id_map[idx]].to(
+                        device=qweight.device
+                    ).contiguous()
+                    cache[idx] = shard
+                qweight.data_container.clear()
+                layer._gguf_shard_cache = cache
+                return
             dtype = {data.dtype for data in data_container}
             assert len(dtype) == 1, ValueError(
                 f"Data container has mixed dtypes: {dtype}"
@@ -2501,7 +2532,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,

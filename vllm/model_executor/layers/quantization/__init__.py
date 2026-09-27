@@ -6,44 +6,56 @@ from typing import Any, Literal, get_args
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    resolve_quant_method,
+)
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
 QuantizationMethods = Literal[
     "awq",
-    "deepspeedfp",
-    "tpu_int8",
+    "auto_awq",
     "fp8",
-    "ptpc_fp8",
     "fbgemm_fp8",
     "fp_quant",
     "modelopt",
     "modelopt_fp4",
-    "bitblas",
-    "gguf",
-    "gptq_marlin_24",
-    "gptq_marlin",
-    "gptq_bitblas",
-    "awq_marlin",
+    "modelopt_mxfp8",
+    "modelopt_mixed",
+    "auto_gptq",
     "gptq",
+    "gptq_marlin",
+    "awq_marlin",
+    "humming",
     "compressed-tensors",
-    "bitsandbytes",
-    "hqq",
     "experts_int8",
-    "ipex",
     "quark",
+    "gguf",
     "moe_wna16",
     "torchao",
-    "auto-round",
-    "rtn",
     "inc",
     "mxfp4",
-    "petit_nvfp4",
-    "cpu_gptq",
-    "cpu_awq",
+    "gpt_oss_mxfp4",
+    "deepseek_v4_fp8",
+    "online",
+    # Below are online quant shorthand names (see vllm.config.quantization).
+    # Listed here as strings to avoid a circular import; kept in sync with
+    # _ONLINE_SHORTHANDS by the assertion in get_quantization_config().
+    "fp8_per_tensor",
+    "fp8_per_block",
+    "fp8_per_channel",
+    "int8_per_channel_weight_only",
+    "nvfp4_per_token",
+    "mxfp8",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
+
+DEPRECATED_QUANTIZATION_METHODS = [
+    "fbgemm_fp8",
+    "fp_quant",
+]
 
 # The customized quantization methods which will be added to this dict.
 _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
@@ -107,11 +119,12 @@ def register_quantization_config(quantization: str):
         >>>
         >>> get_quantization_config("my_quant")
         <class 'MyQuantConfig'>
+
     """  # noqa: E501
 
     def _wrapper(quant_config_cls):
         if quantization in QUANTIZATION_METHODS:
-            logger.warning(
+            logger.debug(
                 "The quantization method '%s' already exists and will be "
                 "overwritten by the quantization config %s.",
                 quantization,
@@ -119,6 +132,9 @@ def register_quantization_config(quantization: str):
             )
         else:
             QUANTIZATION_METHODS.append(quantization)
+            # Automatically assume the custom quantization config is supported
+            if sq := current_platform.supported_quantization:
+                sq.append(quantization)
 
         if not issubclass(quant_config_cls, QuantizationConfig):
             raise ValueError(
@@ -138,107 +154,99 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
 
     if quantization == "quark":
+        # [gfx906] defer the real Quark import so config probes do not
+        # initialize ROCm aiter for unrelated quantization formats.
         return _LazyQuarkConfig
 
-    from vllm.platforms import current_platform
+    # lazy import to avoid triggering `torch.compile` too early
+    from vllm.config.quantization import _ONLINE_SHORTHANDS
 
-    from .auto_round import AutoRoundConfig
-    from .awq import AWQConfig
-    from .bitblas import BitBLASConfig
-    from .bitsandbytes import BitsAndBytesConfig
+    if current_platform.is_cuda() or current_platform.is_rocm():
+        # The v4.1 class is the v4 one extended to accept model_type
+        # "deepseek_v41" and its 32x32 MXFP8 linear layout. V4.1 has
+        # platform-specific implementations for both CUDA and ROCm.
+        from vllm.models.deepseek_v41 import (
+            DeepseekV4FP8Config as DeepseekV41FP8Config,
+        )
+
+        deepseek_config: type[QuantizationConfig] = DeepseekV41FP8Config
+    else:
+        from vllm.models.deepseek_v4 import DeepseekV4FP8Config
+
+        deepseek_config = DeepseekV4FP8Config
+
+    from .auto_awq import AutoAWQConfig
+    from .auto_gptq import AutoGPTQConfig
     from .compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
-    from .cpu_wna16 import CPUAWQConfig, CPUGPTQConfig
-    from .deepspeedfp import DeepSpeedFPConfig
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
     from .fp_quant import FPQuantConfig
-    from .gguf import GGUFConfig
-    from .gptq import GPTQConfig
-    from .gptq_bitblas import GPTQBitBLASConfig
-    from .gptq_marlin import GPTQMarlinConfig
-    from .gptq_marlin_24 import GPTQMarlin24Config
-    from .hqq_marlin import HQQMarlinConfig
+    from .humming import HummingConfig
     from .inc import INCConfig
-    from .ipex_quant import IPEXConfig
-    from .modelopt import ModelOptFp8Config, ModelOptNvFp4Config
+    from .modelopt import (
+        ModelOptFp8Config,
+        ModelOptMixedPrecisionConfig,
+        ModelOptMxFp8Config,
+        ModelOptNvFp4Config,
+    )
     from .moe_wna16 import MoeWNA16Config
-    from .mxfp4 import Mxfp4Config
-    from .petit import PetitNvFp4Config
-    from .ptpc_fp8 import PTPCFp8Config
-    from .rtn import RTNConfig
+    from .gguf import GGUFConfig
+    from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
+    from .online.base import OnlineQuantizationConfig
     from .torchao import TorchAOConfig
-    from .tpu_int8 import Int8TpuConfig
-
-    if current_platform.is_cuda():
-        from .awq_marlin import AWQMarlinConfig
-    else:
-
-        class AWQMarlinConfig(QuantizationConfig):
-            @classmethod
-            def get_name(cls) -> QuantizationMethods:
-                return "awq_marlin"
-
-            @classmethod
-            def get_supported_act_dtypes(cls):
-                return []
-
-            @classmethod
-            def get_min_capability(cls) -> int:
-                return 0
-
-            @staticmethod
-            def get_config_filenames() -> list[str]:
-                return []
-
-            @classmethod
-            def from_config(cls, config: dict):
-                raise RuntimeError("awq_marlin is unavailable on non-CUDA platforms")
-
-            def get_quant_method(self, layer, prefix):
-                return None
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
-        "awq": AWQConfig,
-        "deepspeedfp": DeepSpeedFPConfig,
-        "tpu_int8": Int8TpuConfig,
+        "awq": AutoAWQConfig,
+        "awq_marlin": AutoAWQConfig,
+        "auto_awq": AutoAWQConfig,
         "fp8": Fp8Config,
         "fbgemm_fp8": FBGEMMFp8Config,
         "fp_quant": FPQuantConfig,
         "modelopt": ModelOptFp8Config,
         "modelopt_fp4": ModelOptNvFp4Config,
-        "bitblas": BitBLASConfig,
-        "gguf": GGUFConfig,
-        "gptq_marlin_24": GPTQMarlin24Config,
-        "gptq_marlin": GPTQMarlinConfig,
-        "gptq_bitblas": GPTQBitBLASConfig,
-        "awq_marlin": AWQMarlinConfig,
-        "gptq": GPTQConfig,
+        "modelopt_mxfp8": ModelOptMxFp8Config,
+        "modelopt_mixed": ModelOptMixedPrecisionConfig,
+        "auto_gptq": AutoGPTQConfig,
+        "gptq": AutoGPTQConfig,
+        "gptq_marlin": AutoGPTQConfig,
         "compressed-tensors": CompressedTensorsConfig,
-        "bitsandbytes": BitsAndBytesConfig,
-        "ptpc_fp8": PTPCFp8Config,
-        "hqq": HQQMarlinConfig,
         "experts_int8": ExpertsInt8Config,
-        "ipex": IPEXConfig,
+        "gguf": GGUFConfig,
         "moe_wna16": MoeWNA16Config,
         "torchao": TorchAOConfig,
-        "auto-round": AutoRoundConfig,
-        "rtn": RTNConfig,
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
-        "petit_nvfp4": PetitNvFp4Config,
-        "cpu_gptq": CPUGPTQConfig,
-        "cpu_awq": CPUAWQConfig,
+        "gpt_oss_mxfp4": GptOssMxfp4Config,
+        "deepseek_v4_fp8": deepseek_config,
+        "humming": HummingConfig,
+        "online": OnlineQuantizationConfig,
+        # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the
+        # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand
+        # below only applies to the `--quantization` CLI path.
+        "mxfp8": ModelOptMxFp8Config,
     }
+
+    # Register online shorthands (e.g. "fp8_per_tensor") as quant methods.
+    # setdefault so a shorthand that is also a checkpoint method (e.g. "mxfp8")
+    # keeps its checkpoint config; the shorthand still works via the
+    # `--quantization` CLI path in `resolve_quantization_config`.
+    for shorthand in _ONLINE_SHORTHANDS:
+        method_to_config.setdefault(shorthand, OnlineQuantizationConfig)
+
+    # Update the `method_to_config` with customized quantization methods.
+    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
 
     return method_to_config[quantization]
 
 
 __all__ = [
     "QuantizationConfig",
+    "resolve_quant_method",
     "QuantizationMethods",
     "get_quantization_config",
+    "register_quantization_config",
     "QUANTIZATION_METHODS",
 ]

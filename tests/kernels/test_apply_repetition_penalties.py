@@ -9,6 +9,7 @@ from vllm._custom_ops import (
     apply_repetition_penalties_torch,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_random_seed
 
 NUM_SEQS = [1, 2, 3, 4, 8, 13, 17, 32, 37, 256, 1023, 1024, 1025]
 # [stress, stress, stress, Qwen, llama 4]
@@ -34,11 +35,10 @@ def test_apply_repetition_penalties(
     dtype: torch.dtype,
     seed: int,
 ) -> None:
-    """
-    Test the apply_repetition_penalties custom op
+    """Test the apply_repetition_penalties custom op
     against a reference implementation.
     """
-    current_platform.seed_everything(seed)
+    set_random_seed(seed)
     torch.set_default_device("cuda:0")
 
     # Create test data
@@ -85,8 +85,7 @@ def test_apply_repetition_penalties(
 )
 @torch.inference_mode()
 def test_apply_repetition_penalties_zero_seqs() -> None:
-    """
-    Test the apply_repetition_penalties custom op with num_seqs=0
+    """Test the apply_repetition_penalties custom op with num_seqs=0
     against a reference implementation.
     """
     num_seqs = 0
@@ -95,7 +94,7 @@ def test_apply_repetition_penalties_zero_seqs() -> None:
     dtype = torch.float32
     seed = 0
 
-    current_platform.seed_everything(seed)
+    set_random_seed(seed)
     torch.set_default_device("cuda:0")
 
     # Create test data

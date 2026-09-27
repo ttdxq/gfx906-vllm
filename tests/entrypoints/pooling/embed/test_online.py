@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import base64
 import json
 
 import numpy as np
 import openai
+import pybase64 as base64
 import pytest
 import pytest_asyncio
 import requests
@@ -17,24 +17,45 @@ from tests.models.utils import check_embeddings_close
 from tests.utils import RemoteOpenAIServer
 from vllm.entrypoints.pooling.embed.protocol import EmbeddingResponse
 from vllm.entrypoints.pooling.pooling.protocol import PoolingResponse
-from vllm.platforms import current_platform
-from vllm.tokenizers import get_tokenizer
-from vllm.utils.serial_utils import (
-    EMBED_DTYPE_TO_TORCH_DTYPE,
-    ENDIANNESS,
+from vllm.entrypoints.pooling.utils import (
     MetadataItem,
-    binary2tensor,
+    build_metadata_items,
     decode_pooling_output,
 )
-
-if current_platform.is_rocm():
-    pytest.skip(
-        "Encoder self-attention is not implemented on ROCm.", allow_module_level=True
-    )
+from vllm.platforms import current_platform
+from vllm.tokenizers import get_tokenizer
+from vllm.utils.serial_utils import EMBED_DTYPES, ENDIANNESS, binary2tensor
 
 MODEL_NAME = "intfloat/multilingual-e5-small"
 DUMMY_CHAT_TEMPLATE = """{% for message in messages %}{{message['role'] + ': ' + message['content'] + '\\n'}}{% endfor %}"""  # noqa: E501
 DTYPE = "bfloat16"
+input_text = "The best thing about vLLM is that it supports many different models"
+input_tokens = [
+    0,
+    581,
+    2965,
+    13580,
+    1672,
+    81,
+    23708,
+    594,
+    83,
+    450,
+    442,
+    8060,
+    7,
+    5941,
+    12921,
+    115774,
+    2,
+]
+
+# On ROCm, floating-point reductions in attention and GEMM kernels are
+# non-associative and sensitive to batch geometry. Force LLM instances
+# into an identical, deterministic execution mode:
+ROCM_DETERMINISM_ARGS: list[str] = (
+    ["--max-num-seqs", "1"] if current_platform.is_rocm() else []
+)
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +63,6 @@ def server():
     args = [
         "--runner",
         "pooling",
-        # use half precision for speed and memory savings in CI environment
         "--dtype",
         DTYPE,
         "--enforce-eager",
@@ -50,6 +70,7 @@ def server():
         "512",
         "--chat-template",
         DUMMY_CHAT_TEMPLATE,
+        *ROCM_DETERMINISM_ARGS,
     ]
 
     with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
@@ -70,15 +91,47 @@ def hf_model(hf_runner):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_single_embedding(hf_model, client: openai.AsyncOpenAI, model_name: str):
-    input_texts = [
-        "The chef prepared a delicious meal.",
-    ]
+async def test_negative_token_ids(client: openai.AsyncOpenAI, model_name: str):
+    # A negative token id is out of vocabulary just like an over-large one, but
+    # is not caught by the upper-bound check. Unlike the OpenAI completion
+    # schema, the pooling schema does not constrain token ids to be
+    # non-negative, so the request reaches the shared engine-level validation.
+    with pytest.raises(openai.BadRequestError, match=".*out of vocabulary.*"):
+        await client.embeddings.create(model=model_name, input=[-1])
 
-    # test single embedding
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_basic(
+    server: RemoteOpenAIServer, client: openai.AsyncOpenAI, model_name: str
+):
+    # test /v1/models
+    response = requests.get(server.url_for("/v1/models"))
+    model = response.json()["data"][0]["id"]
+    assert model == MODEL_NAME
+
+    models = await client.models.list()
+    models = models.data
+    served_model = models[0]
+    assert served_model.id == MODEL_NAME
+
+    # test /tokenize
+    response = requests.post(
+        server.url_for("/tokenize"),
+        json={"model": model_name, "prompt": input_text},
+    )
+    assert response.json()["tokens"] == input_tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_completion_request(
+    client: openai.AsyncOpenAI, model_name: str, hf_model
+):
+    # test input: str
     embedding_response = await client.embeddings.create(
         model=model_name,
-        input=input_texts,
+        input=input_text,
         encoding_format="float",
     )
     embeddings = EmbeddingResponse.model_validate(
@@ -89,14 +142,13 @@ async def test_single_embedding(hf_model, client: openai.AsyncOpenAI, model_name
     assert len(embeddings.data) == 1
     assert len(embeddings.data[0].embedding) == 384
     assert embeddings.usage.completion_tokens == 0
-    assert embeddings.usage.prompt_tokens == 11
-    assert embeddings.usage.total_tokens == 11
+    assert embeddings.usage.prompt_tokens == len(input_tokens)
+    assert embeddings.usage.total_tokens == len(input_tokens)
 
     vllm_outputs = [d.embedding for d in embeddings.data]
-    run_embedding_correctness_test(hf_model, input_texts, vllm_outputs)
+    run_embedding_correctness_test(hf_model, [input_text], vllm_outputs)
 
-    # test using token IDs
-    input_tokens = [1, 1, 1, 1, 1]
+    # test input: list[int]
     embedding_response = await client.embeddings.create(
         model=model_name,
         input=input_tokens,
@@ -110,19 +162,22 @@ async def test_single_embedding(hf_model, client: openai.AsyncOpenAI, model_name
     assert len(embeddings.data) == 1
     assert len(embeddings.data[0].embedding) == 384
     assert embeddings.usage.completion_tokens == 0
-    assert embeddings.usage.prompt_tokens == 5
-    assert embeddings.usage.total_tokens == 5
+    assert embeddings.usage.prompt_tokens == len(input_tokens)
+    assert embeddings.usage.total_tokens == len(input_tokens)
+
+    vllm_outputs = [d.embedding for d in embeddings.data]
+    run_embedding_correctness_test(hf_model, [input_text], vllm_outputs)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_batch_embedding(hf_model, client: openai.AsyncOpenAI, model_name: str):
-    # test list[str]
-    input_texts = [
-        "The cat sat on the mat.",
-        "A feline was resting on a rug.",
-        "Stars twinkle brightly in the night sky.",
-    ]
+async def test_completion_request_batched(
+    client: openai.AsyncOpenAI, model_name: str, hf_model
+):
+    N = 10
+    input_texts = [input_text] * N
+
+    # test input: list[str]
     embedding_response = await client.embeddings.create(
         model=model_name,
         input=input_texts,
@@ -133,25 +188,19 @@ async def test_batch_embedding(hf_model, client: openai.AsyncOpenAI, model_name:
     )
 
     assert embeddings.id is not None
-    assert len(embeddings.data) == 3
+    assert len(embeddings.data) == N
     assert len(embeddings.data[0].embedding) == 384
     assert embeddings.usage.completion_tokens == 0
-    assert embeddings.usage.prompt_tokens == 33
-    assert embeddings.usage.total_tokens == 33
+    assert embeddings.usage.prompt_tokens == len(input_tokens) * N
+    assert embeddings.usage.total_tokens == len(input_tokens) * N
 
     vllm_outputs = [d.embedding for d in embeddings.data]
     run_embedding_correctness_test(hf_model, input_texts, vllm_outputs)
 
     # test list[list[int]]
-    input_tokens = [
-        [4, 5, 7, 9, 20],
-        [15, 29, 499],
-        [24, 24, 24, 24, 24],
-        [25, 32, 64, 77],
-    ]
     embedding_response = await client.embeddings.create(
         model=model_name,
-        input=input_tokens,
+        input=[input_tokens] * N,
         encoding_format="float",
     )
     embeddings = EmbeddingResponse.model_validate(
@@ -159,219 +208,19 @@ async def test_batch_embedding(hf_model, client: openai.AsyncOpenAI, model_name:
     )
 
     assert embeddings.id is not None
-    assert len(embeddings.data) == 4
+    assert len(embeddings.data) == N
     assert len(embeddings.data[0].embedding) == 384
     assert embeddings.usage.completion_tokens == 0
-    assert embeddings.usage.prompt_tokens == 17
-    assert embeddings.usage.total_tokens == 17
+    assert embeddings.usage.prompt_tokens == len(input_tokens) * N
+    assert embeddings.usage.total_tokens == len(input_tokens) * N
+
+    vllm_outputs = [d.embedding for d in embeddings.data]
+    run_embedding_correctness_test(hf_model, input_texts, vllm_outputs)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_conversation_embedding(
-    server: RemoteOpenAIServer, client: openai.AsyncOpenAI, model_name: str
-):
-    messages = [
-        {
-            "role": "user",
-            "content": "The cat sat on the mat.",
-        },
-        {
-            "role": "assistant",
-            "content": "A feline was resting on a rug.",
-        },
-        {
-            "role": "user",
-            "content": "Stars twinkle brightly in the night sky.",
-        },
-    ]
-
-    chat_response = requests.post(
-        server.url_for("v1/embeddings"),
-        json={
-            "model": model_name,
-            "messages": messages,
-            "encoding_format": "float",
-        },
-    )
-    chat_response.raise_for_status()
-    chat_embeddings = EmbeddingResponse.model_validate(chat_response.json())
-
-    tokenizer = get_tokenizer(tokenizer_name=model_name)
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        chat_template=DUMMY_CHAT_TEMPLATE,
-        add_generation_prompt=True,
-        continue_final_message=False,
-        tokenize=False,
-    )
-    completion_response = await client.embeddings.create(
-        model=model_name,
-        input=prompt,
-        encoding_format="float",
-        # To be consistent with chat
-        extra_body={"add_special_tokens": False},
-    )
-    completion_embeddings = EmbeddingResponse.model_validate(
-        completion_response.model_dump(mode="json")
-    )
-
-    assert chat_embeddings.id is not None
-    assert completion_embeddings.id is not None
-    assert chat_embeddings.created <= completion_embeddings.created
-    assert chat_embeddings.model_dump(exclude={"id", "created"}) == (
-        completion_embeddings.model_dump(exclude={"id", "created"})
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_batch_base64_embedding(
-    hf_model, client: openai.AsyncOpenAI, model_name: str
-):
-    input_texts = [
-        "Hello my name is",
-        "The best thing about vLLM is that it supports many different models",
-    ]
-
-    responses_float = await client.embeddings.create(
-        input=input_texts, model=model_name, encoding_format="float"
-    )
-    float_data = [d.embedding for d in responses_float.data]
-    run_embedding_correctness_test(hf_model, input_texts, float_data)
-
-    responses_base64 = await client.embeddings.create(
-        input=input_texts, model=model_name, encoding_format="base64"
-    )
-    base64_data = []
-    for data in responses_base64.data:
-        base64_data.append(
-            np.frombuffer(base64.b64decode(data.embedding), dtype="float32").tolist()
-        )
-
-    run_embedding_correctness_test(hf_model, input_texts, base64_data)
-
-    # Default response is float32 decoded from base64 by OpenAI Client
-    responses_default = await client.embeddings.create(
-        input=input_texts, model=model_name
-    )
-    default_data = [d.embedding for d in responses_default.data]
-    run_embedding_correctness_test(hf_model, input_texts, default_data)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_base64_embed_dtype_and_endianness(
-    server: RemoteOpenAIServer, client: openai.AsyncOpenAI, model_name: str
-):
-    input_texts = [
-        "The best thing about vLLM is that it supports many different models",
-    ]
-
-    responses_float = await client.embeddings.create(
-        input=input_texts, model=model_name, encoding_format="float"
-    )
-    float_data = [d.embedding for d in responses_float.data]
-
-    for embed_dtype in EMBED_DTYPE_TO_TORCH_DTYPE:
-        for endianness in ENDIANNESS:
-            responses_base64 = requests.post(
-                server.url_for("/v1/embeddings"),
-                json={
-                    "model": model_name,
-                    "input": input_texts,
-                    "encoding_format": "base64",
-                    "embed_dtype": embed_dtype,
-                    "endianness": endianness,
-                },
-            )
-
-            base64_data = []
-            for data in responses_base64.json()["data"]:
-                binary = base64.b64decode(data["embedding"])
-                tensor = binary2tensor(binary, (-1,), embed_dtype, endianness)
-                base64_data.append(tensor.to(torch.float32).tolist())
-
-            check_embeddings_close(
-                embeddings_0_lst=float_data,
-                embeddings_1_lst=base64_data,
-                name_0="float_data",
-                name_1="base64_data",
-                tol=1e-2,
-            )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_bytes_embed_dtype_and_endianness(
-    server: RemoteOpenAIServer, client: openai.AsyncOpenAI, model_name: str
-):
-    input_texts = [
-        "The best thing about vLLM is that it supports many different models",
-    ]
-
-    responses_float = await client.embeddings.create(
-        input=input_texts, model=model_name, encoding_format="float"
-    )
-    float_data = [d.embedding for d in responses_float.data]
-
-    for embed_dtype in list(EMBED_DTYPE_TO_TORCH_DTYPE.keys()):
-        for endianness in ENDIANNESS:
-            responses_bytes = requests.post(
-                server.url_for("/v1/embeddings"),
-                json={
-                    "model": model_name,
-                    "input": input_texts,
-                    "encoding_format": "bytes",
-                    "embed_dtype": embed_dtype,
-                    "endianness": endianness,
-                },
-            )
-
-            metadata = json.loads(responses_bytes.headers["metadata"])
-            body = responses_bytes.content
-            items = [MetadataItem(**x) for x in metadata["data"]]
-
-            bytes_data = decode_pooling_output(items=items, body=body)
-            bytes_data = [x.to(torch.float32).tolist() for x in bytes_data]
-
-            check_embeddings_close(
-                embeddings_0_lst=float_data,
-                embeddings_1_lst=bytes_data,
-                name_0="float_data",
-                name_1="bytes_data",
-                tol=1e-2,
-            )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", [MODEL_NAME])
-@pytest.mark.parametrize("param_name", ["encoding_format", "embed_dtype", "endianness"])
-async def test_params_not_supported(
-    server: RemoteOpenAIServer, model_name: str, param_name: str
-):
-    input_texts = [
-        "The best thing about vLLM is that it supports many different models",
-    ]
-
-    responses_base64 = requests.post(
-        server.url_for("/v1/embeddings"),
-        json={
-            "model": model_name,
-            "input": input_texts,
-            "encoding_format": "base64",
-            param_name: f"bad_{param_name}",
-        },
-    )
-
-    assert responses_base64.status_code == 400
-    assert "literal_error" in responses_base64.json()["error"]["message"]
-    assert f"bad_{param_name}" in responses_base64.json()["error"]["message"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_single_embedding_truncation(client: openai.AsyncOpenAI, model_name: str):
+async def test_truncate_prompt_tokens(client: openai.AsyncOpenAI, model_name: str):
     input_texts = [
         "Como o Brasil pode fomentar o desenvolvimento de modelos de IA?",
     ]
@@ -428,12 +277,7 @@ async def test_single_embedding_truncation(client: openai.AsyncOpenAI, model_nam
     assert embeddings.usage.prompt_tokens == 10
     assert embeddings.usage.total_tokens == 10
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_single_embedding_truncation_invalid(
-    client: openai.AsyncOpenAI, model_name: str
-):
+    # invalid_truncate_prompt_tokens
     input_texts = [
         "Como o Brasil pode fomentar o desenvolvimento de modelos de IA?",
     ]
@@ -447,19 +291,175 @@ async def test_single_embedding_truncation_invalid(
         assert "error" in response.object
         assert (
             "truncate_prompt_tokens value is greater than max_model_len. "
-            "Please, select a smaller truncation size." in response.message
+            "Please request a smaller truncation size." in response.message
         )
 
 
 @pytest.mark.asyncio
-async def test_invocations(server: RemoteOpenAIServer, client: openai.AsyncOpenAI):
-    input_texts = [
-        "The chef prepared a delicious meal.",
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_padding(client: openai.AsyncOpenAI, model_name: str):
+    input_texts = ["Hello"]
+
+    async def prompt_tokens(**extra_body):
+        response = await client.embeddings.create(
+            model=model_name,
+            input=input_texts,
+            extra_body=extra_body,
+        )
+        embeddings = EmbeddingResponse.model_validate(response.model_dump(mode="json"))
+        assert len(embeddings.data) == 1
+        return embeddings.usage.prompt_tokens
+
+    unpadded = await prompt_tokens()
+    padded = await prompt_tokens(padding="max_length")
+
+    # Models trained with a fixed sequence length and no attention mask need
+    # this; without it their embeddings are not comparable.
+    assert padded > unpadded
+    assert await prompt_tokens(padding="do_not_pad") == unpadded
+
+    with pytest.raises(openai.BadRequestError):
+        await client.embeddings.create(
+            model=model_name,
+            input=input_texts,
+            extra_body={"padding": "longest"},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_chat_request(
+    server: RemoteOpenAIServer, client: openai.AsyncOpenAI, model_name: str
+):
+    messages = [
+        {
+            "role": "user",
+            "content": "The cat sat on the mat.",
+        },
+        {
+            "role": "assistant",
+            "content": "A feline was resting on a rug.",
+        },
+        {
+            "role": "user",
+            "content": "Stars twinkle brightly in the night sky.",
+        },
     ]
 
+    # test chat request basic usage
+    chat_response = requests.post(
+        server.url_for("v1/embeddings"),
+        json={
+            "model": model_name,
+            "messages": messages,
+            "encoding_format": "float",
+        },
+    )
+    chat_response.raise_for_status()
+    chat_embeddings = EmbeddingResponse.model_validate(chat_response.json())
+
+    tokenizer = get_tokenizer(tokenizer_name=model_name)
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        chat_template=DUMMY_CHAT_TEMPLATE,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        tokenize=False,
+    )
+    completion_response = await client.embeddings.create(
+        model=model_name,
+        input=prompt,
+        encoding_format="float",
+        # To be consistent with chat
+        extra_body={"add_special_tokens": False},
+    )
+    completion_embeddings = EmbeddingResponse.model_validate(
+        completion_response.model_dump(mode="json")
+    )
+
+    assert chat_embeddings.id is not None
+    assert completion_embeddings.id is not None
+    assert chat_embeddings.created <= completion_embeddings.created
+    # Use tolerance-based comparison for embeddings
+    check_embeddings_close(
+        embeddings_0_lst=[d.embedding for d in chat_embeddings.data],
+        embeddings_1_lst=[d.embedding for d in completion_embeddings.data],
+        name_0="chat",
+        name_1="completion",
+    )
+    assert chat_embeddings.model_dump(exclude={"id", "created", "data"}) == (
+        completion_embeddings.model_dump(exclude={"id", "created", "data"})
+    )
+
+    # test add_generation_prompt
+    response = requests.post(
+        server.url_for("v1/embeddings"),
+        json={"model": model_name, "messages": messages, "add_generation_prompt": True},
+    )
+
+    response.raise_for_status()
+    output = EmbeddingResponse.model_validate(response.json())
+
+    assert output.object == "list"
+    assert len(output.data) == 1
+    assert output.model == MODEL_NAME
+    assert output.usage.prompt_tokens == 33
+
+    # test continue_final_message
+    response = requests.post(
+        server.url_for("v1/embeddings"),
+        json={
+            "model": model_name,
+            "messages": messages,
+            "continue_final_message": True,
+        },
+    )
+
+    response.raise_for_status()
+    output = EmbeddingResponse.model_validate(response.json())
+
+    assert output.object == "list"
+    assert len(output.data) == 1
+    assert output.model == MODEL_NAME
+    assert output.usage.prompt_tokens == 33
+
+    # test add_special_tokens
+    response = requests.post(
+        server.url_for("v1/embeddings"),
+        json={"model": model_name, "messages": messages, "add_special_tokens": True},
+    )
+
+    response.raise_for_status()
+    output = EmbeddingResponse.model_validate(response.json())
+
+    assert output.object == "list"
+    assert len(output.data) == 1
+    assert output.model == MODEL_NAME
+    assert output.usage.prompt_tokens == 35
+
+    # test continue_final_message with add_generation_prompt
+    response = requests.post(
+        server.url_for("v1/embeddings"),
+        json={
+            "model": model_name,
+            "messages": messages,
+            "continue_final_message": True,
+            "add_generation_prompt": True,
+        },
+    )
+    assert (
+        "Cannot set both `continue_final_message` and `add_generation_prompt` to True."
+        in response.json()["error"]["message"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_invocations_completion_request(
+    server: RemoteOpenAIServer, client: openai.AsyncOpenAI
+):
     request_args = {
         "model": MODEL_NAME,
-        "input": input_texts,
+        "input": input_text,
         "encoding_format": "float",
     }
 
@@ -487,7 +487,7 @@ async def test_invocations(server: RemoteOpenAIServer, client: openai.AsyncOpenA
 
 
 @pytest.mark.asyncio
-async def test_invocations_conversation(server: RemoteOpenAIServer):
+async def test_invocations_chat_request(server: RemoteOpenAIServer):
     messages = [
         {
             "role": "user",
@@ -535,15 +535,201 @@ async def test_invocations_conversation(server: RemoteOpenAIServer):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_normalize(server: RemoteOpenAIServer, model_name: str):
-    input_text = ["The chef prepared a delicious meal."]
+async def test_base64_embedding(hf_model, client: openai.AsyncOpenAI, model_name: str):
+    input_texts = [
+        "Hello my name is",
+        "The best thing about vLLM is that it supports many different models",
+    ]
 
-    async def get_outputs(normalize):
+    def check_outputs(outputs: list[list[float]]) -> None:
+        # The embeddings endpoint executes list elements as separate scheduler
+        # requests, so use the same per-request geometry for the HF reference.
+        for input_text, output in zip(input_texts, outputs, strict=True):
+            run_embedding_correctness_test(hf_model, [input_text], [output])
+
+    responses_float = await client.embeddings.create(
+        input=input_texts, model=model_name, encoding_format="float"
+    )
+    float_data = [d.embedding for d in responses_float.data]
+    check_outputs(float_data)
+
+    responses_base64 = await client.embeddings.create(
+        input=input_texts, model=model_name, encoding_format="base64"
+    )
+    base64_data = []
+    for data in responses_base64.data:
+        base64_data.append(
+            np.frombuffer(base64.b64decode(data.embedding), dtype="float32").tolist()
+        )
+
+    check_outputs(base64_data)
+
+    # Default response is float32 decoded from base64 by OpenAI Client
+    responses_default = await client.embeddings.create(
+        input=input_texts, model=model_name
+    )
+    default_data = [d.embedding for d in responses_default.data]
+    check_outputs(default_data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_base64_embed_dtype_and_endianness(
+    server: RemoteOpenAIServer, client: openai.AsyncOpenAI, model_name: str
+):
+    input_texts = [input_text] * 3
+    responses_float = await client.embeddings.create(
+        input=input_texts, model=model_name, encoding_format="float"
+    )
+    float_data = [d.embedding for d in responses_float.data]
+
+    for embed_dtype in EMBED_DTYPES:
+        for endianness in ENDIANNESS:
+            responses_base64 = requests.post(
+                server.url_for("/v1/embeddings"),
+                json={
+                    "model": model_name,
+                    "input": input_texts,
+                    "encoding_format": "base64",
+                    "embed_dtype": embed_dtype,
+                    "endianness": endianness,
+                },
+            )
+
+            base64_data = []
+            for data in responses_base64.json()["data"]:
+                binary = base64.b64decode(data["embedding"])
+                tensor = binary2tensor(binary, (-1,), embed_dtype, endianness)
+                base64_data.append(tensor.to(torch.float32).tolist())
+
+            check_embeddings_close(
+                embeddings_0_lst=float_data,
+                embeddings_1_lst=base64_data,
+                name_0="float_data",
+                name_1="base64_data",
+                tol=1e-2,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_bytes_embed_dtype_and_endianness(
+    server: RemoteOpenAIServer, client: openai.AsyncOpenAI, model_name: str
+):
+    input_texts = [input_text] * 3
+    responses_float = await client.embeddings.create(
+        input=input_texts, model=model_name, encoding_format="float"
+    )
+    float_data = [d.embedding for d in responses_float.data]
+
+    for embed_dtype in EMBED_DTYPES:
+        for endianness in ENDIANNESS:
+            responses_bytes = requests.post(
+                server.url_for("/v1/embeddings"),
+                json={
+                    "model": model_name,
+                    "input": input_texts,
+                    "encoding_format": "bytes",
+                    "embed_dtype": embed_dtype,
+                    "endianness": endianness,
+                },
+            )
+
+            metadata = json.loads(responses_bytes.headers["metadata"])
+            body = responses_bytes.content
+            items = [MetadataItem(**x) for x in metadata["data"]]
+
+            bytes_data = decode_pooling_output(items=items, body=body)
+            bytes_data = [x.to(torch.float32).tolist() for x in bytes_data]
+
+            check_embeddings_close(
+                embeddings_0_lst=float_data,
+                embeddings_1_lst=bytes_data,
+                name_0="float_data",
+                name_1="bytes_data",
+                tol=1e-2,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_bytes_only_embed_dtype_and_endianness(
+    server: RemoteOpenAIServer, client: openai.AsyncOpenAI, model_name: str
+):
+    input_texts = [
+        "The best thing about vLLM is that it supports many different models",
+    ] * 2
+
+    responses_float = await client.embeddings.create(
+        input=input_texts, model=model_name, encoding_format="float"
+    )
+    float_data = [d.embedding for d in responses_float.data]
+    embedding_size = len(float_data[0])
+
+    for embed_dtype in EMBED_DTYPES:
+        for endianness in ENDIANNESS:
+            responses_bytes = requests.post(
+                server.url_for("/v1/embeddings"),
+                json={
+                    "model": model_name,
+                    "input": input_texts,
+                    "encoding_format": "bytes_only",
+                    "embed_dtype": embed_dtype,
+                    "endianness": endianness,
+                },
+            )
+
+            assert "metadata" not in responses_bytes.headers
+            body = responses_bytes.content
+            items = build_metadata_items(
+                embed_dtype=embed_dtype,
+                endianness=endianness,
+                shape=(embedding_size,),
+                n_request=len(input_texts),
+            )
+
+            bytes_data = decode_pooling_output(items=items, body=body)
+            bytes_data = [x.to(torch.float32).tolist() for x in bytes_data]
+
+            check_embeddings_close(
+                embeddings_0_lst=float_data,
+                embeddings_1_lst=bytes_data,
+                name_0="float_data",
+                name_1="bytes_data",
+                tol=1e-2,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+@pytest.mark.parametrize("param_name", ["encoding_format", "embed_dtype", "endianness"])
+async def test_params_not_supported(
+    server: RemoteOpenAIServer, model_name: str, param_name: str
+):
+    responses_base64 = requests.post(
+        server.url_for("/v1/embeddings"),
+        json={
+            "model": model_name,
+            "input": input_text,
+            "encoding_format": "base64",
+            param_name: f"bad_{param_name}",
+        },
+    )
+
+    assert responses_base64.status_code == 400
+    assert "literal_error" in responses_base64.json()["error"]["message"]
+    assert f"bad_{param_name}" in responses_base64.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_use_activation(server: RemoteOpenAIServer, model_name: str):
+    async def get_outputs(use_activation):
         request_args = {
             "model": MODEL_NAME,
             "input": input_text,
             "encoding_format": "float",
-            "normalize": normalize,
+            "use_activation": use_activation,
         }
 
         response = requests.post(server.url_for("v1/embeddings"), json=request_args)
@@ -551,9 +737,9 @@ async def test_normalize(server: RemoteOpenAIServer, model_name: str):
 
         return torch.tensor([x["embedding"] for x in outputs["data"]])
 
-    default = await get_outputs(normalize=None)
-    w_normal = await get_outputs(normalize=True)
-    wo_normal = await get_outputs(normalize=False)
+    default = await get_outputs(use_activation=None)
+    w_normal = await get_outputs(use_activation=True)
+    wo_normal = await get_outputs(use_activation=False)
 
     assert torch.allclose(default, w_normal, atol=1e-2), "Default should use normal."
     assert not torch.allclose(w_normal, wo_normal, atol=1e-2), (
@@ -568,8 +754,6 @@ async def test_normalize(server: RemoteOpenAIServer, model_name: str):
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
 async def test_pooling_embed(server: RemoteOpenAIServer, model_name: str):
     task = "embed"
-    input_text = ["The chef prepared a delicious meal."]
-
     response = requests.post(
         server.url_for("pooling"),
         json={
@@ -588,30 +772,9 @@ async def test_pooling_embed(server: RemoteOpenAIServer, model_name: str):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_pooling_token_embed(server: RemoteOpenAIServer, model_name: str):
-    task = "token_embed"
-    input_text = ["The chef prepared a delicious meal."]
-
-    response = requests.post(
-        server.url_for("pooling"),
-        json={
-            "model": model_name,
-            "input": input_text,
-            "encoding_format": "float",
-            "task": task,
-        },
-    )
-
-    poolings = PoolingResponse.model_validate(response.json())
-
-    assert len(poolings.data) == 1
-    assert len(poolings.data[0].data) == 11
-    assert len(poolings.data[0].data[0]) == 384
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", [MODEL_NAME])
-@pytest.mark.parametrize("task", ["classify", "token_classify", "plugin"])
+@pytest.mark.parametrize(
+    "task", ["classify", "token_classify", "token_embed", "plugin"]
+)
 async def test_pooling_not_supported(
     server: RemoteOpenAIServer, model_name: str, task: str
 ):
@@ -625,6 +788,10 @@ async def test_pooling_not_supported(
         },
     )
     assert response.json()["error"]["type"] == "BadRequestError"
-    assert response.json()["error"]["message"].startswith(
-        f"Task {task} is not supported"
-    )
+    if task == "plugin":
+        err_msg = "No IOProcessor plugin installed."
+    elif task == "token_embed":
+        err_msg = "Try switching the model's pooling_task via"
+    else:
+        err_msg = f"Unsupported task: {task!r}"
+    assert response.json()["error"]["message"].startswith(err_msg)

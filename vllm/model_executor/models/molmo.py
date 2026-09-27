@@ -4,7 +4,7 @@
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import cached_property, partial
+from functools import partial
 from itertools import islice
 from typing import Annotated
 
@@ -13,14 +13,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import BatchFeature, PretrainedConfig, ProcessorMixin, TensorType
-from transformers.image_utils import ImageInput
-from transformers.tokenization_utils_base import TextInput
+from transformers import (
+    BaseImageProcessor,
+    BatchFeature,
+    PretrainedConfig,
+)
 
-from vllm.attention.layer import Attention, MultiHeadAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.config.multimodal import BaseDummyOptions
+from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -28,7 +29,9 @@ from vllm.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.activation import MulAndSilu, QuickGELU, SiluAndMul
+from vllm.model_executor.layers.attention import Attention, MMEncoderAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -43,24 +46,23 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import ImageProcessorItems, ImageSize, MultiModalDataItems
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptIndexTargets,
     PromptInsertion,
     PromptUpdate,
     PromptUpdateDetails,
+    cached_encode,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
@@ -74,7 +76,6 @@ from .interfaces import (
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -92,13 +93,12 @@ POOLING_SIZE = 2
 
 
 class MolmoImageInputs(TensorSchema):
-    """
-    Dimensions:
-        - bn: Batch size * number of images
-        - bnc: Batch size * number of images * number of crops (dynamic)
-        - np: Number of patches
-        - tp: Token sequence positions
-        - pd: Patch dimension
+    """Dimensions:
+    - bn: Batch size * number of images
+    - bnc: Batch size * number of images * number of crops (dynamic)
+    - np: Number of patches
+    - tp: Token sequence positions
+    - pd: Patch dimension
     """
 
     images: Annotated[torch.Tensor, TensorShape("bnc", "np", "pd")]
@@ -141,6 +141,7 @@ class ViTMLP(nn.Module):
         self,
         config: VisionBackboneConfig,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.w1 = ColumnParallelLinear(
@@ -148,6 +149,7 @@ class ViTMLP(nn.Module):
             config.image_mlp_dim,
             bias=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.w1",
         )
         # Activation function.
         assert config.image_mlp_activations == "quick_gelu"
@@ -157,6 +159,7 @@ class ViTMLP(nn.Module):
             config.image_emb_dim,
             bias=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.w2",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -175,6 +178,7 @@ class MultiHeadDotProductAttention(nn.Module):
         use_bias: bool = True,
         nlayers: int = 1,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -201,29 +205,37 @@ class MultiHeadDotProductAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             bias=use_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.wq",
         )
         self.wk = ColumnParallelLinear(
             nlayers * self.hidden_size,
             self.total_num_kv_heads * self.head_dim,
             bias=use_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.wk",
         )
         self.wv = ColumnParallelLinear(
             nlayers * self.hidden_size,
             self.total_num_kv_heads * self.head_dim,
             bias=use_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.wv",
         )
         self.wo = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=use_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.wo",
         )
 
         self.scale = self.head_dim**-0.5
-        self.attn = MultiHeadAttention(
-            self.num_heads, self.head_dim, self.scale, num_kv_heads=self.num_kv_heads
+        self.attn = MMEncoderAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scale,
+            num_kv_heads=self.num_kv_heads,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -253,10 +265,15 @@ class ResidualAttentionBlock(nn.Module):
         self,
         config: VisionBackboneConfig,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
-        self.attention = MultiHeadDotProductAttention(config, quant_config=quant_config)
-        self.feed_forward = ViTMLP(config, quant_config)
+        self.attention = MultiHeadDotProductAttention(
+            config, quant_config=quant_config, prefix=f"{prefix}.attention"
+        )
+        self.feed_forward = ViTMLP(
+            config, quant_config, prefix=f"{prefix}.feed_forward"
+        )
         self.attention_norm = nn.LayerNorm(
             config.image_emb_dim,
             eps=config.image_norm_eps,
@@ -279,12 +296,15 @@ class BlockCollection(nn.Module):
         self,
         config: VisionBackboneConfig,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.resblocks = nn.ModuleList(
             [
-                ResidualAttentionBlock(config, quant_config)
-                for _ in range(config.image_num_layers)
+                ResidualAttentionBlock(
+                    config, quant_config, prefix=f"{prefix}.resblocks.{i}"
+                )
+                for i in range(config.image_num_layers)
             ]
         )
 
@@ -307,10 +327,11 @@ class VisionTransformer(nn.Module):
         self,
         config: VisionBackboneConfig,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         scale = config.image_emb_dim**-0.5
-        self.patch_num = config.image_num_patch
+        self.patch_num: tuple[int, int] = config.image_num_patch
         self.class_embedding = nn.Parameter(torch.randn(config.image_emb_dim) * scale)
         self.num_prefix_tokens: int = NUM_PREFIX_TOKENS
         self.positional_embedding = nn.Parameter(
@@ -323,9 +344,11 @@ class VisionTransformer(nn.Module):
             bias=False,
         )
         self.pre_ln = nn.LayerNorm(config.image_emb_dim, eps=config.image_norm_eps)
-        self.transformer = BlockCollection(config, quant_config)
+        self.transformer = BlockCollection(
+            config, quant_config, prefix=f"{prefix}.transformer"
+        )
 
-    def add_pos_emb(self, x: torch.Tensor, patch_num: int) -> torch.Tensor:
+    def add_pos_emb(self, x: torch.Tensor, patch_num: tuple[int, int]) -> torch.Tensor:
         cls_emb = self.positional_embedding[0:1]
         pos_emb = self.positional_embedding[1:]
 
@@ -356,11 +379,9 @@ class VisionTransformer(nn.Module):
         return x
 
     def forward(
-        self, x: torch.Tensor, patch_num: int | None = None
+        self, x: torch.Tensor, patch_num: tuple[int, int] | None = None
     ) -> list[torch.Tensor]:
-        """
-        : param x: (batch_size, num_patch, n_pixels)
-        """
+        """: param x: (batch_size, num_patch, n_pixels)."""
         if patch_num is None:
             patch_num = self.patch_num
         B, N, D = x.shape
@@ -418,6 +439,7 @@ class MolmoAttention(nn.Module):
             self.total_num_kv_heads,
             bias=config.qkv_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
 
         self.tp_rank: int | None = None
@@ -433,7 +455,6 @@ class MolmoAttention(nn.Module):
         # Rotary embeddings.
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
             rope_parameters=config.rope_parameters,
         )
@@ -454,17 +475,21 @@ class MolmoAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
         )
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.q_norm is not None
+        assert self.k_norm is not None
         if self.tp_size > 1:
             q = tensor_model_parallel_all_gather(q.contiguous())
             k = tensor_model_parallel_all_gather(k.contiguous())
         q = self.q_norm(q)
         k = self.k_norm(k)
         if self.tp_size > 1:
+            assert self.tp_rank is not None
             splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
             q = splitter(q)[self.tp_rank]
             k = splitter(k)[self.tp_rank]
@@ -493,6 +518,7 @@ class LanguageModelMLP(nn.Module):
         config: PretrainedConfig,
         input_dim: int | None = None,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -503,6 +529,7 @@ class LanguageModelMLP(nn.Module):
             [self.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
         # Activation function.
         self.act_fn = MulAndSilu()
@@ -512,6 +539,7 @@ class LanguageModelMLP(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
 
     def forward(
@@ -532,6 +560,7 @@ class ImageProjectorMLP(nn.Module):
         config: PretrainedConfig,
         input_dim: int | None = None,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -542,6 +571,7 @@ class ImageProjectorMLP(nn.Module):
             [self.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.merged_linear",
         )
         # Activation function.
         self.act_fn = SiluAndMul()
@@ -552,6 +582,7 @@ class ImageProjectorMLP(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
 
     def forward(
@@ -579,7 +610,9 @@ class MolmoDecoderLayer(nn.Module):
         )
 
         # MLP block.
-        self.mlp = LanguageModelMLP(config, quant_config=quant_config)
+        self.mlp = LanguageModelMLP(
+            config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+        )
 
         # LayerNorm
         assert config.layer_norm_type == "rms"
@@ -638,11 +671,20 @@ class MolmoDecoderNormAfterLayer(MolmoDecoderLayer):
 class MolmoVisionBackbone(nn.Module, SupportsQuant):
     packed_modules_mapping = {"merged_linear": ["gate_proj", "up_proj"]}
 
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            # image_projector gate_up merge
+            "gate_proj": ("merged_linear", 0),
+            "up_proj": ("merged_linear", 1),
+        }
+    )
+
     def __init__(
         self,
         config: PretrainedConfig,
         vision_config: VisionBackboneConfig,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.vit_layers = VIT_LAYERS
@@ -651,18 +693,24 @@ class MolmoVisionBackbone(nn.Module, SupportsQuant):
             (self.image_num_patch[0] + 1) // POOLING_SIZE,
             (self.image_num_patch[1] + 1) // POOLING_SIZE,
         )
-        self.image_vit = VisionTransformer(vision_config, quant_config=quant_config)
+        self.image_vit = VisionTransformer(
+            vision_config, quant_config=quant_config, prefix=f"{prefix}.image_vit"
+        )
         self.num_prefix_tokens = self.image_vit.num_prefix_tokens
         assert self.num_prefix_tokens in {0, 1}, (
             "Only 0 or 1 prefix tokens are supported"
         )
         self.image_pooling_2d = MultiHeadDotProductAttention(
-            vision_config, nlayers=len(self.vit_layers), quant_config=quant_config
+            vision_config,
+            nlayers=len(self.vit_layers),
+            quant_config=quant_config,
+            prefix=f"{prefix}.image_pooling_2d",
         )
         self.image_projector = ImageProjectorMLP(
             config,
             input_dim=vision_config.image_emb_dim,
             quant_config=quant_config,
+            prefix=f"{prefix}.image_projector",
         )
 
         image_dim = vision_config.image_emb_dim * len(self.vit_layers)
@@ -677,9 +725,7 @@ class MolmoVisionBackbone(nn.Module, SupportsQuant):
         return self.image_vit.patch_embedding.weight.device
 
     def encode_image(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        : param images: (batch_size, num_crops, num_patch, n_pixels)
-        """
+        """: param images: (batch_size, num_crops, num_patch, n_pixels)."""
         B, T, N, D = images.shape
 
         mask = ~torch.all(images.view(B * T, N, D) == -1, dim=(1, 2), keepdim=True)
@@ -759,38 +805,8 @@ class MolmoVisionBackbone(nn.Module, SupportsQuant):
         return image_features
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("merged_linear", "gate_proj", 0),
-            ("merged_linear", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @support_torch_compile
@@ -835,7 +851,7 @@ class MolmoModel(nn.Module, SupportsQuant):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -869,20 +885,7 @@ class MolmoModel(nn.Module, SupportsQuant):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            if is_pp_missing_parameter(name, self):
-                continue
-
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        return AutoWeightsLoader(self).load_weights(weights)
 
 
 def _lowest_multiple(x: int, k: int) -> int:
@@ -978,117 +981,28 @@ def select_tiling(
     return candidate_tilings[ix]
 
 
-class MolmoProcessorWrapper:
-    """
-    Wraps `MolmoProcessor` so that it can be called directly.
+def _as_2tuple(x: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(x, int):
+        return x, x
 
-    The original definition can be found here:
-    https://huggingface.co/allenai/Molmo-7B-D-0924/blob/main/preprocessing_molmo.py
-    """
+    return x
 
-    def __init__(self, processor: ProcessorMixin):
-        super().__init__()
 
-        self.processor = processor
-
-    @cached_property
-    def vocab(self) -> dict[str, int]:
-        return self.processor.tokenizer.vocab  # type: ignore
-
-    @cached_property
-    def max_crops(self) -> int:
-        image_processor = self.processor.image_processor  # type: ignore
-
-        max_crops = image_processor.max_crops
-        assert isinstance(max_crops, int)
-
-        return max_crops
-
-    @cached_property
-    def base_image_input_size(self) -> tuple[int, int]:
-        image_processor = self.processor.image_processor  # type: ignore
-
-        base_image_input_size = image_processor.base_image_input_size
-        if isinstance(base_image_input_size, int):
-            return base_image_input_size, base_image_input_size
-
-        return tuple(base_image_input_size)
-
-    @cached_property
-    def image_patch_size(self) -> int:
-        image_processor = self.processor.image_processor  # type: ignore
-
-        image_patch_size = image_processor.image_patch_size
-        assert isinstance(image_patch_size, int)
-
-        return image_patch_size
-
-    @cached_property
-    def overlap_margins(self) -> tuple[int, int]:
-        image_processor = self.processor.image_processor  # type: ignore
-
-        left_margin, right_margin = image_processor.overlap_margins
-        assert isinstance(left_margin, int)
-        assert isinstance(right_margin, int)
-
-        return left_margin, right_margin
-
-    @cached_property
-    def image_token_length_w(self) -> int:
-        image_processor = self.processor.image_processor  # type: ignore
-
-        image_token_length_w = image_processor.image_token_length_w
-        assert isinstance(image_token_length_w, int)
-
-        return image_token_length_w
-
-    @cached_property
-    def image_token_length_h(self) -> int:
-        image_processor = self.processor.image_processor  # type: ignore
-
-        image_token_length_h = image_processor.image_token_length_h
-        assert isinstance(image_token_length_h, int)
-
-        return image_token_length_h
-
-    @property
-    def message_format(self) -> str | None:
-        return "role"
-
-    @property
-    def always_start_with_space(self) -> bool:
-        return True
-
-    @cached_property
-    def image_patch_id(self) -> int:
-        return self.vocab[IMAGE_PATCH_TOKEN]
-
-    @cached_property
-    def im_col_id(self) -> int:
-        return self.vocab[IM_COL_TOKEN]
-
-    @cached_property
-    def im_start_id(self) -> int:
-        return self.vocab[IM_START_TOKEN]
-
-    @cached_property
-    def im_end_id(self) -> int:
-        return self.vocab[IM_END_TOKEN]
-
-    @property
-    def pooling_size(self) -> int:
-        return POOLING_SIZE
+class MolmoProcessingInfo(BaseProcessingInfo):
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"image": None}
 
     def select_tiling(
         self,
         *,
         image_width: int,
         image_height: int,
+        image_processor: BaseImageProcessor,
     ) -> tuple[int, int]:
-        max_crops = self.max_crops
-        left_margin, right_margin = self.overlap_margins
-        base_image_input_size = self.base_image_input_size
-        base_image_input_d = self.image_patch_size
+        max_crops = image_processor.max_crops
+        left_margin, right_margin = image_processor.overlap_margins
+        base_image_input_size = _as_2tuple(image_processor.base_image_input_size)
+        base_image_input_d = image_processor.image_patch_size
 
         total_margin_pixels = base_image_input_d * (right_margin + left_margin)
         crop_patches = base_image_input_size[0] // base_image_input_d
@@ -1108,16 +1022,18 @@ class MolmoProcessorWrapper:
         *,
         image_width: int,
         image_height: int,
+        image_processor: BaseImageProcessor,
     ) -> tuple[int, int]:
-        left_margin, right_margin = self.overlap_margins
-        base_image_input_size = self.base_image_input_size
-        base_image_input_d = self.image_patch_size
-        pooling_size = self.pooling_size
+        left_margin, right_margin = image_processor.overlap_margins
+        base_image_input_size = _as_2tuple(image_processor.base_image_input_size)
+        base_image_input_d = image_processor.image_patch_size
+        pooling_size = POOLING_SIZE
 
         crop_patches = base_image_input_size[0] // base_image_input_d
         tiling_w, tiling_h = self.select_tiling(
             image_height=image_height,
             image_width=image_width,
+            image_processor=image_processor,
         )
 
         nrows, ncols = get_patches_grid_size(
@@ -1131,73 +1047,22 @@ class MolmoProcessorWrapper:
 
         return ncols, nrows
 
-    def __call__(
-        self,
-        text: TextInput | list[TextInput] | None = None,
-        images: ImageInput | list[ImageInput] | None = None,
-        return_tensors: str | TensorType | None = None,
-        **kwargs,
-    ) -> BatchFeature:
-        outputs = self.processor.process(  # type: ignore
-            text, images, **kwargs
-        )
-
-        if images is None:
-            images = []
-        if not isinstance(images, list):
-            images = [images]
-
-        input_ids: torch.Tensor = outputs.pop("input_ids")
-        outputs["input_ids"] = input_ids.unsqueeze(0)
-
-        image_input_idx = outputs.pop("image_input_idx", None)
-        if image_input_idx is not None:
-            feat_is_patch = image_input_idx >= 0
-
-            tilings = [
-                self.select_tiling(
-                    image_width=image.size[0],
-                    image_height=image.size[1],
-                )
-                for image in images
-            ]
-            # For each image: tiling_h * tiling_w + extra
-            num_crops = torch.tensor(tilings).prod(-1) + 1
-            assert num_crops.sum() == len(feat_is_patch)
-
-            outputs["image_input_idx"] = image_input_idx
-            outputs["num_crops"] = num_crops
-            outputs["img_patch_id"] = self.image_patch_id
-
-        return BatchFeature(outputs)
-
-
-class MolmoProcessingInfo(BaseProcessingInfo):
-    def get_hf_processor(self, **kwargs: object) -> MolmoProcessorWrapper:
-        processor = self.ctx.get_hf_processor(**kwargs)
-        return MolmoProcessorWrapper(processor)
-
-    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None}
-
     def get_num_image_tokens(
         self,
         *,
         image_width: int,
         image_height: int,
-        processor: MolmoProcessorWrapper | None,
+        image_processor: BaseImageProcessor,
     ) -> int:
-        if processor is None:
-            processor = self.get_hf_processor()
-
-        ncols, nrows = processor.get_patches_grid_size(
+        ncols, nrows = self.get_patches_grid_size(
             image_width=image_width,
             image_height=image_height,
+            image_processor=image_processor,
         )
-        pooling_size = processor.pooling_size
+        pooling_size = POOLING_SIZE
 
-        image_token_length_w = processor.image_token_length_w
-        image_token_length_h = processor.image_token_length_h
+        image_token_length_w = image_processor.image_token_length_w
+        image_token_length_h = image_processor.image_token_length_h
 
         # Calculate total tokens: 2 for start/end + (w+1)*h for column separators
         extra = 2 + (image_token_length_w + 1) * image_token_length_h
@@ -1207,9 +1072,10 @@ class MolmoProcessingInfo(BaseProcessingInfo):
 
     def get_image_size_with_most_features(self) -> ImageSize:
         processor = self.get_hf_processor()
+        image_processor = processor.image_processor
 
-        tilings = get_candidate_tilings(processor.max_crops)
-        base_h, base_w = processor.base_image_input_size
+        tilings = get_candidate_tilings(image_processor.max_crops)
+        base_h, base_w = _as_2tuple(image_processor.base_image_input_size)
 
         largest_feature_size, largest_feature_pinpoint = 0, None
         for wr, hr in tilings:
@@ -1218,7 +1084,7 @@ class MolmoProcessingInfo(BaseProcessingInfo):
             feat_size = self.get_num_image_tokens(
                 image_width=width,
                 image_height=height,
-                processor=processor,
+                image_processor=image_processor,
             )
             if feat_size > largest_feature_size:
                 largest_feature_size = feat_size
@@ -1238,47 +1104,96 @@ class MolmoDummyInputsBuilder(BaseDummyInputsBuilder[MolmoProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
         target_width, target_height = self.info.get_image_size_with_most_features()
-        num_images = mm_counts.get("image", 0)
-
-        image_overrides = mm_options.get("image") if mm_options else None
 
         return {
             "image": self._get_dummy_images(
                 width=target_width,
                 height=target_height,
-                num_images=num_images,
-                overrides=image_overrides,
+                num_images=mm_counts.get("image", 0),
+                overrides=mm_options.get("image"),
             )
         }
 
 
 class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
-    def _apply_hf_processor_tokens_only(
-        self,
-        prompt_tokens: list[int],
-    ) -> list[int]:
+    def _get_hf_mm_text(self, mm_counts: Mapping[str, int]) -> str:
+        return self.dummy_inputs.get_dummy_text(mm_counts)
+
+    def _postprocess_prompt(self, prompt: list[int]) -> list[int]:
         processor = self.info.get_hf_processor()
 
         # The chat template is already applied to the prompt tokens
         # Use message_format="none" to avoid applying it again
         # Prepend an empty space if `always_start_with_space` is True
-        tokens = processor.processor.get_tokens_input(  # type: ignore
-            self.info.get_tokenizer().decode(prompt_tokens),
+        tokens = processor.get_tokens_input(
+            self.info.get_tokenizer().decode(prompt),
             message_format="none",
-            always_start_with_space=processor.always_start_with_space,
+            always_start_with_space=True,
         )
 
         # Prepend a BOS token id to the tokens
-        processed_data = self.info.ctx.call_hf_processor(
-            processor,  # type: ignore
+        return self.info.ctx.call_hf_processor(
+            processor.process,
             dict(tokens=tokens),
-        )
-        (prompt_ids,) = processed_data.pop("input_ids").tolist()
+        )["input_ids"].tolist()
 
-        return prompt_ids
+    def _call_hf_processor(
+        self,
+        hf_data: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        hf_processor = self.info.get_hf_processor(**hf_kwargs)
+        return self.info.ctx.call_hf_processor(
+            hf_processor.process,
+            hf_data,
+            hf_kwargs,
+        )
+
+    def _postprocess_hf_mm_data(
+        self,
+        hf_data: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
+        processed_data: BatchFeature,
+    ) -> BatchFeature:
+        if not hf_data:
+            return processed_data
+
+        hf_processor = self.info.get_hf_processor(**hf_kwargs)
+        tokenizer = hf_processor.tokenizer
+        image_patch_id = tokenizer.vocab[IMAGE_PATCH_TOKEN]
+
+        image_processor = hf_processor.image_processor
+
+        processed_data.pop("input_ids")
+
+        if (images := hf_data.get("images")) is not None:
+            mm_items = self.info.parse_mm_data({"image": images}, validate=False)
+            parsed_images = mm_items.get_items("image", ImageProcessorItems)
+            image_sizes = [
+                parsed_images.get_image_size(i) for i in range(len(parsed_images))
+            ]
+
+            feat_is_patch = processed_data["image_input_idx"] >= 0
+
+            tilings = [
+                self.info.select_tiling(
+                    image_width=image_size.width,
+                    image_height=image_size.height,
+                    image_processor=image_processor,
+                )
+                for image_size in image_sizes
+            ]
+            # For each image: tiling_h * tiling_w + extra
+            num_crops = torch.tensor(tilings).prod(-1) + 1
+            assert num_crops.sum() == len(feat_is_patch)
+
+            processed_data["num_crops"] = num_crops
+            processed_data["img_patch_id"] = image_patch_id
+
+        return processed_data
 
     def _get_mm_fields_config(
         self,
@@ -1292,8 +1207,10 @@ class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
             images=MultiModalFieldConfig.flat_from_sizes("image", num_crops),
             image_masks=MultiModalFieldConfig.flat_from_sizes("image", num_crops),
             image_input_idx=MultiModalFieldConfig.flat_from_sizes("image", num_crops),
-            num_crops=MultiModalFieldConfig.batched("image"),
-            img_patch_id=MultiModalFieldConfig.shared("image", num_images),
+            num_crops=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
+            img_patch_id=MultiModalFieldConfig.shared(
+                "image", num_images, keep_on_cpu=True
+            ),
         )
 
     def _get_prompt_updates(
@@ -1302,16 +1219,18 @@ class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
+        tokenizer = self.info.get_tokenizer()
+        vocab = tokenizer.get_vocab()
+        img_patch_id = vocab[IMAGE_PATCH_TOKEN]
+        img_col_id = vocab[IM_COL_TOKEN]
+        img_start_id = vocab[IM_START_TOKEN]
+        img_end_id = vocab[IM_END_TOKEN]
+
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
-
-        image_token_length_w = processor.image_token_length_w
-        image_token_length_h = processor.image_token_length_h
-        pooling_size = processor.pooling_size
-
-        img_patch_id = processor.image_patch_id
-        img_col_id = processor.im_col_id
-        img_start_id = processor.im_start_id
-        img_end_id = processor.im_end_id
+        image_processor = processor.image_processor
+        image_token_length_w = image_processor.image_token_length_w
+        image_token_length_h = image_processor.image_token_length_h
+        pooling_size = POOLING_SIZE
 
         extra_row = [img_patch_id] * image_token_length_w + [img_col_id]
         extra_joint = [img_start_id] + extra_row * image_token_length_h + [img_end_id]
@@ -1320,9 +1239,10 @@ class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
             images = mm_items.get_items("image", ImageProcessorItems)
             image_size = images.get_image_size(item_idx)
 
-            ncols, nrows = processor.get_patches_grid_size(
+            ncols, nrows = self.info.get_patches_grid_size(
                 image_width=image_size.width,
                 image_height=image_size.height,
+                image_processor=image_processor,
             )
 
             joint_row = [img_patch_id] * ((ncols + 1) // pooling_size) + [img_col_id]
@@ -1340,7 +1260,9 @@ class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
         return [
             PromptInsertion(
                 modality="image",
-                target=PromptIndexTargets.prefix("<|endoftext|>"),
+                target=PromptIndexTargets.prefix(
+                    cached_encode(tokenizer, "<|endoftext|>", add_special_tokens=False),
+                ),
                 insertion=get_insertion_molmo,
             )
         ]
@@ -1354,8 +1276,6 @@ class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
 class MolmoForCausalLM(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA, SupportsQuant
 ):
-    merge_by_field_config = True
-
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={
             # vision backbone mapping
@@ -1407,21 +1327,30 @@ class MolmoForCausalLM(
         self.multimodal_config = multimodal_config
 
         vision_config = VisionBackboneConfig()
-        self.vision_backbone = MolmoVisionBackbone(config, vision_config, quant_config)
-        self.model = MolmoModel(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
-        self.img_patch_id = None
 
-        if self.config.weight_tying:
-            self.lm_head = self.model.transformer.wte
-        else:
-            self.lm_head = ParallelLMHead(
-                config.embedding_size or config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
+        with self._mark_tower_model(vllm_config, "image"):
+            self.vision_backbone = MolmoVisionBackbone(
+                config,
+                vision_config,
+                quant_config,
+                prefix=maybe_prefix(prefix, "vision_backbone"),
             )
+
+        with self._mark_language_model(vllm_config):
+            self.model = MolmoModel(
+                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            )
+
+        self.img_patch_id: int | None = None
+
+        self.lm_head = ParallelLMHead(
+            config.embedding_size or config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        if self.config.weight_tying:
+            self.lm_head = self.lm_head.tie_weights(self.model.transformer.wte)
 
         self.logits_processor = LogitsProcessor(
             config.embedding_size or config.vocab_size
@@ -1486,9 +1415,6 @@ class MolmoForCausalLM(
             results.append(feats[is_valid][order])
         return results
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.model
-
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
@@ -1523,9 +1449,7 @@ class MolmoForCausalLM(
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
-        """
-        Get the module prefix in multimodal models
-        """
+        """Get the module prefix in multimodal models."""
         return MultiModelKeys.from_string_field(
             language_model="model",
             connector="vision_backbone.image_projector",

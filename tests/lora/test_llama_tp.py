@@ -10,6 +10,7 @@ import vllm.config
 from vllm import LLM
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+from vllm.platforms import current_platform
 
 from ..utils import VLLM_PATH, create_new_process_for_each_test, multi_gpu_test
 
@@ -76,11 +77,18 @@ def do_sample(
             if lora_id
             else None,
         )
-    # Print the outputs.
+    lora_request = LoRARequest(str(lora_id), lora_id, lora_path) if lora_id else None
     generated_texts: list[str] = []
     for output in outputs:
         prompt = output.prompt
         generated_text = output.outputs[0].text
+        # The output should include  correct lora_request info
+        if lora_request is not None:
+            assert output.lora_request.lora_name == lora_request.lora_name
+            assert output.lora_request.lora_int_id == lora_request.lora_int_id
+            assert output.lora_request.lora_path == lora_request.lora_path
+        else:
+            assert output.lora_request is None
         generated_texts.append(generated_text)
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
     return generated_texts
@@ -132,6 +140,9 @@ def test_llama_lora(llama32_lora_files, cudagraph_specialize_lora: bool):
     generate_and_test(llm, llama32_lora_files)
 
 
+@pytest.mark.skipif(
+    current_platform.is_cuda_alike(), reason="Skipping to avoid redundant model tests"
+)
 @multi_gpu_test(num_gpus=4)
 def test_llama_lora_tp4(llama32_lora_files):
     llm = vllm.LLM(
@@ -177,7 +188,7 @@ def test_tp2_serialize_and_deserialize_lora(
         result = subprocess.run(
             [
                 sys.executable,
-                f"{VLLM_PATH}/examples/others/tensorize_vllm_model.py",
+                f"{VLLM_PATH}/examples/features/tensorize_vllm_model.py",
                 "--model",
                 MODEL_PATH,
                 "--lora-path",
@@ -217,6 +228,10 @@ def test_tp2_serialize_and_deserialize_lora(
         max_model_len=1024,
         tensor_parallel_size=2,
         max_loras=2,
+        # Leave headroom for LoRA adapter loading and Triton JIT
+        # compilation, which can allocate GPU memory concurrently
+        # during the first inference step.
+        gpu_memory_utilization=0.85,
     )
 
     tc_as_dict = tensorizer_config.to_serializable()

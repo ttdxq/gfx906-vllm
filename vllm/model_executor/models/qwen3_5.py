@@ -44,7 +44,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
@@ -206,12 +206,18 @@ def _make_qwen35_fused_expert_params_mapping(
         else ""
     )
     mapping: list[tuple[str, str, int, str]] = []
-    for param_name, ckpt_name, _, shard_id in FusedMoE.make_expert_params_mapping(
+    # Upstream renamed FusedMoE.make_expert_params_mapping into
+    # RoutedExperts.build_expert_params_mapping; an empty routed_experts_prefix
+    # and no LoRA prefix keep the returned tuples identical to the old format
+    # ("experts.w13_", "experts.<id>.<proj>.").
+    expert_mapping = RoutedExperts.build_expert_params_mapping(
         ckpt_gate_proj_name="gate_up_proj",
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="gate_up_proj",
         num_experts=1,
-    ):
+        routed_experts_prefix="",
+    )
+    for param_name, ckpt_name, _, shard_id in expert_mapping:
         if shard_id == "w3":
             continue
         target = "w13_weight" if param_name.startswith("experts.w13_") else "w2_weight"
@@ -1620,6 +1626,11 @@ class Qwen3_5ForCausalLMBase(
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
+    # Maps PEFT embed/lm_head LoRA targets onto vLLM embedding wrappers.
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
@@ -1759,7 +1770,7 @@ class Qwen3_5ForCausalLMBase(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["mtp."],
+            ignore_unexpected_prefixes=["mtp."],
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
@@ -1942,7 +1953,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["mtp."],
+            ignore_unexpected_prefixes=["mtp."],
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 

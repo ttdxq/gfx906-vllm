@@ -12,10 +12,12 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
-from vllm.utils.import_utils import has_deep_ep, has_deep_gemm, has_pplx
-from vllm.utils.torch_utils import cuda_device_count_stateless
+from vllm.utils.import_utils import has_deep_ep, has_deep_gemm
+from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.worker.workspace import init_workspace_manager
 
 from .modular_kernel_tools.common import (
     Config,
@@ -36,21 +38,16 @@ from .modular_kernel_tools.parallel_utils import (
     ProcessGroupInfo,
     parallel_launch_with_config,
 )
+from .utils import check_accuracy
 
 has_any_multi_gpu_package = (
-    has_deep_ep() or has_deep_gemm() or has_pplx() or has_flashinfer_cutlass_fused_moe()
+    has_deep_ep() or has_deep_gemm() or has_flashinfer_cutlass_fused_moe()
 )
 
 meets_multi_gpu_requirements = pytest.mark.skipif(
     not has_any_multi_gpu_package,
-    reason="Requires deep_ep or deep_gemm or pplx or flashinfer packages",
+    reason="Requires deep_ep or deep_gemm or flashinfer packages",
 )
-
-if current_platform.is_fp8_fnuz():
-    pytest.skip(
-        "Tests in this file require float8_e4m3fn and platform does not support",
-        allow_module_level=True,
-    )
 
 
 def format_result(verbose, msg, ex=None):
@@ -69,6 +66,44 @@ def format_result(verbose, msg, ex=None):
         print(".", end="")
 
 
+def assert_aiter_quant_scheme_case(config: Config) -> None:
+    """Make the AITER (weight_quant_key, activation_quant_key) pair this
+    config exercises explicit, instead of AiterExperts being reached only
+    indirectly through the general quant-config sweep.
+    See https://github.com/vllm-project/vllm/issues/54966."""
+    fe_cls = config.fused_experts_type
+    if getattr(fe_cls, "__name__", "") != "AiterExperts":
+        return
+
+    if config.quant_config is None:
+        w_key, a_key = None, None
+    else:
+        w_key, a_key = config.fp8_quant_key_pair()
+
+    assert fe_cls._supports_quant_scheme(w_key, a_key), (
+        f"AITER case (weight_key={w_key}, activation_key={a_key}) reached "
+        "the modular-kernel harness, but AiterExperts._supports_quant_scheme "
+        "does not declare it supported."
+    )
+    print(f"[AITER case] weight_key={w_key}, activation_key={a_key}")
+
+
+def assert_aiter_activation_case(config: Config) -> None:
+    """Make the AITER activation this config exercises explicit, instead of
+    AiterExperts being reached only indirectly through the general
+    activation sweep. See https://github.com/vllm-project/vllm/issues/54966."""
+    fe_cls = config.fused_experts_type
+    if getattr(fe_cls, "__name__", "") != "AiterExperts":
+        return
+
+    assert fe_cls._supports_activation(config.activation), (
+        f"AITER case activation={config.activation} reached the "
+        "modular-kernel harness, but AiterExperts._supports_activation "
+        "does not declare it supported."
+    )
+    print(f"[AITER case] activation={config.activation}")
+
+
 def rank_worker(
     pgi: ProcessGroupInfo,
     vllm_config: VllmConfig,
@@ -77,13 +112,11 @@ def rank_worker(
     weights: WeightTensors,
     verbose: bool,
 ):
-    current_platform.seed_everything(pgi.rank)
+    # Initialize workspace manager in child process
+    device = torch.device(f"cuda:{pgi.local_rank}")
+    init_workspace_manager(device)
 
-    # sanity check
-    from vllm import envs
-
-    if base_config.fused_moe_chunk_size is not None:
-        assert base_config.fused_moe_chunk_size == envs.VLLM_FUSED_MOE_CHUNK_SIZE
+    set_random_seed(pgi.rank)
 
     # get weights to this device
     weights.to_current_device()
@@ -109,6 +142,43 @@ def rank_worker(
             # inputs for rank
             rank_tensors = RankTensors.make(config, pgi)
 
+            # Skip unsupported: AITER block-scaled MoE does not
+            # support apply_router_weight_on_input (topk=1 path).
+            # https://github.com/ROCm/aiter/issues/2418
+            if (
+                topk == 1
+                and config.supports_apply_weight_on_input()
+                and getattr(config.fused_experts_type, "__name__", "") == "AiterExperts"
+                and config.quant_block_shape is not None
+            ):
+                print(
+                    f"Skipping[{pgi.rank}]: m={m}, topk={topk}"
+                    " (AITER block-scaled + weight-on-input,"
+                    " https://github.com/ROCm/aiter/issues/2418)"
+                )
+                count -= 1
+                continue
+
+            # Skip unsupported: AITER x DeepEP-HT/Mori dispatch crashes
+            # with an illegal memory access at world_size>1 on gfx942.
+            # https://github.com/vllm-project/vllm/issues/57029
+            if (
+                config.world_size > 1
+                and getattr(config.fused_experts_type, "__name__", "") == "AiterExperts"
+                and getattr(config.prepare_finalize_type, "__name__", "")
+                in ("DeepEPHTPrepareAndFinalize", "MoriPrepareAndFinalize")
+            ):
+                print(
+                    f"Skipping[{pgi.rank}]: m={m}, topk={topk}"
+                    " (AITER x DeepEP-HT/Mori illegal memory access,"
+                    " https://github.com/vllm-project/vllm/issues/57029)"
+                )
+                count -= 1
+                continue
+
+            assert_aiter_quant_scheme_case(config)
+            assert_aiter_activation_case(config)
+
             # modular kernel out
             mk_out = run_modular_kernel(pgi, vllm_config, config, weights, rank_tensors)
 
@@ -122,7 +192,23 @@ def rank_worker(
                 atol = 3e-2
                 rtol = 3e-2
 
-            torch.testing.assert_close(ref_out, mk_out, atol=atol, rtol=rtol)
+            # On ROCm, AITER FP8 fused MoE uses hardware FP8
+            # dot-product which can produce slightly larger error
+            # than dequant+f32 matmul at FP8 representable-value
+            # boundaries. Allow a small percentage of elements to
+            # exceed the base tolerance by a bounded margin.
+            # https://github.com/ROCm/aiter/issues/2421
+            from vllm.platforms import current_platform as _cp
+
+            is_aiter_fp8 = (
+                _cp.is_rocm()
+                and getattr(config.fused_experts_type, "__name__", "") == "AiterExperts"
+                and config.quant_config is not None
+            )
+            if is_aiter_fp8:
+                check_accuracy(ref_out, mk_out, atol=atol, rtol=rtol, percent=0.9)
+            else:
+                torch.testing.assert_close(ref_out, mk_out, atol=atol, rtol=rtol)
             format_result(verbose, config.describe())
         except Exception as ex:
             format_result(verbose, config.describe(), ex)
@@ -157,22 +243,31 @@ Ns = [1024]
 TOPKs = [4, 1]
 Es = [32]
 DTYPEs = [torch.bfloat16]
-FUSED_MOE_CHUNK_SIZEs = [None, 16]
+MK_ACTIVATIONS = [
+    MoEActivation.SILU,
+    MoEActivation.GELU,
+]
 
 
 def is_nyi_config(config: Config) -> bool:
     # We know these configs to be legitimate. but still fail.
     info = expert_info(config.fused_experts_type)
-
     if info.needs_matching_quant:
         # The triton kernels expect both per-act-token-quant and
         # per-out-ch-quant or neither.
         unsupported_quant_config = (
             config.is_per_act_token_quant + config.is_per_out_ch_quant
         ) == 1
-        return unsupported_quant_config
+        if unsupported_quant_config:
+            return True
 
-    return not info.supports_expert_map
+    if config.activation != MoEActivation.SILU:
+        if getattr(config.fused_experts_type, "__name__", "") != "AiterExperts":
+            return True  # AITER-only for this axis, for now
+        if config.quant_dtype is not None:
+            return True  # unquantized-only for this axis, for now
+
+    return False
 
 
 def generate_valid_test_cases(
@@ -181,14 +276,14 @@ def generate_valid_test_cases(
     cases = []
     total = 0
 
-    for k, n, e, dtype, quant_config, combination, chunk_size in product(
+    for k, n, e, dtype, quant_config, activation, combination in product(
         Ks,
         Ns,
         Es,
         DTYPEs,
         MK_QUANT_CONFIGS,
+        MK_ACTIVATIONS,
         product(prepare_finalize_types, MK_FUSED_EXPERT_TYPES),
-        FUSED_MOE_CHUNK_SIZEs,
     ):
         total = total + 1
 
@@ -200,9 +295,9 @@ def generate_valid_test_cases(
             topks=TOPKs,
             dtype=dtype,
             quant_config=quant_config,
+            activation=activation,
             prepare_finalize_type=combination[0],
             fused_experts_type=combination[1],
-            fused_moe_chunk_size=chunk_size,
             world_size=world_size,
         )
 
@@ -228,9 +323,9 @@ def generate_valid_test_cases(
                 e,
                 dtype,
                 quant_config,
+                activation,
                 combination[0],
                 combination[1],
-                chunk_size,
                 world_size,
             )
         )
@@ -241,7 +336,8 @@ def generate_valid_test_cases(
 
 
 @pytest.mark.parametrize(
-    "k,n,e,dtype,quant_config,prepare_finalize_type,fused_experts_type,chunk_size,world_size",
+    "k,n,e,dtype,quant_config,activation,"
+    "prepare_finalize_type,fused_experts_type,world_size",
     generate_valid_test_cases(
         world_size=2, prepare_finalize_types=MK_MULTI_GPU_PREPARE_FINALIZE_TYPES
     ),
@@ -253,16 +349,16 @@ def test_modular_kernel_combinations_multigpu(
     e: int,
     dtype: torch.dtype,
     quant_config: TestMoEQuantConfig | None,
+    activation: MoEActivation,
     prepare_finalize_type: mk.FusedMoEPrepareAndFinalize,
-    fused_experts_type: mk.FusedMoEPermuteExpertsUnpermute,
-    chunk_size: int | None,
+    fused_experts_type: mk.FusedMoEExperts,
     world_size: int,
     pytestconfig,
 ):
-    if cuda_device_count_stateless() < world_size:
+    if current_platform.device_count() < world_size:
         pytest.skip(
             f"Not enough GPUs available to run, got "
-            f"{cuda_device_count_stateless()} exepected "
+            f"{current_platform.device_count()} expected "
             f"{world_size}."
         )
 
@@ -274,9 +370,9 @@ def test_modular_kernel_combinations_multigpu(
         topks=TOPKs,
         dtype=dtype,
         quant_config=quant_config,
+        activation=activation,
         prepare_finalize_type=prepare_finalize_type,
         fused_experts_type=fused_experts_type,
-        fused_moe_chunk_size=chunk_size,
         world_size=world_size,
     )
     verbosity = pytestconfig.getoption("verbose")
@@ -284,7 +380,8 @@ def test_modular_kernel_combinations_multigpu(
 
 
 @pytest.mark.parametrize(
-    "k,n,e,dtype,quant_config,prepare_finalize_type,fused_experts_type,chunk_size,world_size",
+    "k,n,e,dtype,quant_config,activation,"
+    "prepare_finalize_type,fused_experts_type,world_size",
     generate_valid_test_cases(
         world_size=1, prepare_finalize_types=MK_SINGLE_GPU_PREPARE_FINALIZE_TYPES
     ),
@@ -295,11 +392,12 @@ def test_modular_kernel_combinations_singlegpu(
     e: int,
     dtype: torch.dtype,
     quant_config: TestMoEQuantConfig | None,
+    activation: MoEActivation,
     prepare_finalize_type: mk.FusedMoEPrepareAndFinalize,
-    fused_experts_type: mk.FusedMoEPermuteExpertsUnpermute,
-    chunk_size: int | None,
+    fused_experts_type: mk.FusedMoEExperts,
     world_size: int,
     pytestconfig,
+    workspace_init,
 ):
     """Note: float8_e4m3fn is not supported on CUDA architecture < 89,
     and those tests will be skipped on unsupported hardware."""
@@ -311,9 +409,9 @@ def test_modular_kernel_combinations_singlegpu(
         topks=TOPKs,
         dtype=dtype,
         quant_config=quant_config,
+        activation=activation,
         prepare_finalize_type=prepare_finalize_type,
         fused_experts_type=fused_experts_type,
-        fused_moe_chunk_size=chunk_size,
         world_size=world_size,
     )
 
@@ -335,7 +433,7 @@ if __name__ == "__main__":
         description=(
             "Run single prepare-finalize & fused-experts combination test"
             "Example : python3 -m tests.kernels.moe.test_modular_kernel_combinations "
-            "--pf-type PplxPrepareAndFinalize --experts-type BatchedTritonExperts"
+            "--pf-type DeepEPLLPrepareAndFinalize --experts-type BatchedTritonExperts"
         )
     )
     args = parser.parse_args()

@@ -32,12 +32,6 @@ from .llm import (
     TextPrompt,
     TokensPrompt,
 )
-# Legacy schema kept alongside .engine types until all consumers migrate.
-from .data import (
-    ProcessorInputs,
-    SingletonInputs,
-    zip_enc_dec_prompts,
-)
 
 __all__ = [
     "ModalityData",
@@ -67,7 +61,4 @@ __all__ = [
     "EncoderDecoderInput",
     "SingletonInput",
     "EngineInput",
-    "ProcessorInputs",
-    "SingletonInputs",
-    "zip_enc_dec_prompts",
 ]

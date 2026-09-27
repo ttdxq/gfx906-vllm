@@ -15,7 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""NemotronH model configuration"""
+"""NemotronH model configuration."""
 
 import regex as re
 from transformers.configuration_utils import PretrainedConfig
@@ -25,12 +25,12 @@ logger = logging.get_logger(__name__)
 
 
 class NemotronHConfig(PretrainedConfig):
-    r"""
-    This is the configuration class to store the configuration of a
+    r"""This is the configuration class to store the configuration of a
     [`NemotronHModel`]. It is used to instantiate a NemotronH model according
     to the specified arguments, defining the model architecture. Instantiating
     a configuration with the defaults will yield a similar configuration to
     that of the NemotronH-v0.1 model.
+
     Args:
         vocab_size (`int`, *optional*, defaults to 131072):
             Vocabulary size of the NemotronH model. Defines the number of
@@ -51,6 +51,8 @@ class NemotronHConfig(PretrainedConfig):
             The pattern of the hybrid model. The pattern is a string of
             characters where each character represents
             M: Mamba2, *: Attention, -: MLP
+        mtp_hybrid_override_pattern (`str`, *optional*, defaults to `"*E"`):
+            The pattern of the MTP layers.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the
             Transformer encoder.
@@ -137,6 +139,7 @@ class NemotronHConfig(PretrainedConfig):
             Size of chunks for Mamba processing.
         rescale_prenorm_residual (`bool`, *optional*, defaults to `True`):
             Whether to rescale the pre-normalization residual connections.
+
     """
 
     model_type = "nemotron_h"
@@ -150,6 +153,7 @@ class NemotronHConfig(PretrainedConfig):
         intermediate_size=21504,
         num_hidden_layers=52,
         hybrid_override_pattern="M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-",
+        mtp_hybrid_override_pattern="*E",
         num_attention_heads=32,
         head_dim=128,
         num_key_value_heads=8,  # nemo: num_query_groups
@@ -189,6 +193,7 @@ class NemotronHConfig(PretrainedConfig):
         n_shared_experts=1,
         moe_intermediate_size=7688,
         moe_shared_expert_intermediate_size=7688,
+        moe_latent_size=None,
         num_experts_per_tok=2,
         routed_scaling_factor=1.0,
         n_group=1,
@@ -202,6 +207,7 @@ class NemotronHConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.hybrid_override_pattern = hybrid_override_pattern
+        self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         self.sliding_window = sliding_window
@@ -214,10 +220,9 @@ class NemotronHConfig(PretrainedConfig):
         assert len(self.hybrid_override_pattern) == self.num_hidden_layers, (
             "hybrid_override_pattern must have same length as num_hidden_layers"
         )
-        assert re.match(r"^[*-M]+$", self.hybrid_override_pattern), (
-            "hybrid_override_pattern must only contain characters 'M', '*', or '-'"
+        assert re.match(r"^[*-ME]+$", self.hybrid_override_pattern), (
+            "hybrid_override_pattern must only contain characters 'M', '*', '-', or 'E'"
         )
-
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
@@ -254,6 +259,7 @@ class NemotronHConfig(PretrainedConfig):
         self.n_shared_experts = n_shared_experts
         self.moe_intermediate_size = moe_intermediate_size
         self.moe_shared_expert_intermediate_size = moe_shared_expert_intermediate_size  # noqa: E501
+        self.moe_latent_size = moe_latent_size
         self.num_experts_per_tok = num_experts_per_tok
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group

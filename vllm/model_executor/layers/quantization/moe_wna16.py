@@ -14,11 +14,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     int4_w4a16_moe_quant_config,
     int8_w8a16_moe_quant_config,
 )
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE,
+from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
+    RoutedExperts,
 )
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -60,11 +60,25 @@ class MoeWNA16Config(QuantizationConfig):
         self.use_marlin = False
         # Avoid circular import
         from vllm.model_executor.layers.quantization.awq import AWQConfig
-        from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
-        from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
+
+        # The awq_marlin/gptq_marlin configs are optional: keep moe_wna16
+        # usable when those modules are not available on this build.
+        try:
+            from vllm.model_executor.layers.quantization.awq_marlin import (
+                AWQMarlinConfig,
+            )
+            from vllm.model_executor.layers.quantization.gptq_marlin import (
+                GPTQMarlinConfig,
+            )
+        except ImportError:
+            AWQMarlinConfig = None
+            GPTQMarlinConfig = None
 
         if self.linear_quant_method == "gptq":
-            self.use_marlin = GPTQMarlinConfig.is_gptq_marlin_compatible(full_config)
+            if GPTQMarlinConfig is not None:
+                self.use_marlin = GPTQMarlinConfig.is_gptq_marlin_compatible(
+                    full_config
+                )
         elif self.linear_quant_method == "awq":
             capability_tuple = current_platform.get_device_capability()
             device_capability = (
@@ -78,7 +92,8 @@ class MoeWNA16Config(QuantizationConfig):
                     f"Minimum capability: {awq_min_capability}. "
                     f"Current capability: {device_capability}."
                 )
-            self.use_marlin = AWQMarlinConfig.is_awq_marlin_compatible(full_config)
+            if AWQMarlinConfig is not None:
+                self.use_marlin = AWQMarlinConfig.is_awq_marlin_compatible(full_config)
         else:
             raise ValueError("moe_wna16 only support gptq and awq.")
 
@@ -202,7 +217,7 @@ class MoeWNA16Config(QuantizationConfig):
                     )
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
-        elif isinstance(layer, FusedMoE):
+        elif isinstance(layer, RoutedExperts):
             return MoeWNA16Method(self, layer.moe_config)
         return None
 
@@ -399,7 +414,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
     def _apply_gfx906_torch_fallback(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -459,7 +474,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,

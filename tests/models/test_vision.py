@@ -6,13 +6,14 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from tests.utils import multi_gpu_test
+from tests.utils import ensure_current_vllm_config, multi_gpu_test
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
 from vllm.model_executor.models.vision import (
+    FusedInputNorm,
     get_load_balance_assignment,
     resolve_visual_encoder_outputs,
     run_dp_sharded_mrope_vision_model,
@@ -21,6 +22,7 @@ from vllm.model_executor.models.vision import (
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.system_utils import update_environment_variables
+from vllm.utils.torch_utils import set_random_seed
 
 pytestmark = pytest.mark.cpu_test
 
@@ -39,9 +41,7 @@ pytestmark = pytest.mark.cpu_test
 def test_resolve_visual_encoder_outputs(
     select_layers, num_layers_loaded, max_possible_layers, expected_features
 ):
-    """
-    Test that offsets are correctly handled for vision feature layers.
-    """
+    """Test that offsets are correctly handled for vision feature layers."""
     encoder_outputs = [torch.tensor([idx]) for idx in range(num_layers_loaded + 1)]
     output_tensor = resolve_visual_encoder_outputs(
         encoder_outputs=encoder_outputs,
@@ -92,16 +92,14 @@ def test_run_dp_sharded_vision_model(batch_size: int):
 def run_dp_sharded_vision_model_vs_direct(
     local_rank: int, world_size: int, batch_size: int, master_port: int
 ):
-    """
-    Test that run_dp_sharded_vision_model produces the same results as
+    """Test that run_dp_sharded_vision_model produces the same results as
     calling the model directly.
     """
-
     # Set random seed for reproducibility
-    current_platform.seed_everything(0)
+    set_random_seed(0)
 
-    device = f"{current_platform.device_name}:{local_rank}"
-    current_platform.set_device(device)
+    device = f"{current_platform.device_type}:{local_rank}"
+    torch.accelerator.set_device_index(device)
     torch.set_default_device(device)
 
     update_environment_variables(
@@ -116,7 +114,8 @@ def run_dp_sharded_vision_model_vs_direct(
 
     # initialize distributed
     init_distributed_environment()
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    with ensure_current_vllm_config():
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     # Create a test input tensor
     image_input = torch.randn(batch_size, 3, 224, 224)
@@ -279,14 +278,13 @@ def test_run_dp_sharded_mrope_vision_model(batch_size: int):
 def run_dp_sharded_mrope_vision_model_vs_direct(
     local_rank: int, world_size: int, batch_size: int, master_port: int
 ):
-    """
-    Test that run_dp_sharded_mrope_vision_model produces the same results as
+    """Test that run_dp_sharded_mrope_vision_model produces the same results as
     calling the model directly.
     """
     # Set random seed for reproducibility
-    current_platform.seed_everything(0)
-    device = f"{current_platform.device_name}:{local_rank}"
-    current_platform.set_device(device)
+    set_random_seed(0)
+    device = f"{current_platform.device_type}:{local_rank}"
+    torch.accelerator.set_device_index(device)
     torch.set_default_device(device)
 
     update_environment_variables(
@@ -301,7 +299,8 @@ def run_dp_sharded_mrope_vision_model_vs_direct(
 
     # initialize distributed
     init_distributed_environment()
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    with ensure_current_vllm_config():
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     # Create test data
     grid_thw_list = []
@@ -361,8 +360,8 @@ def run_dp_sharded_mrope_vision_model_empty_input_worker(
 ):
     """Test run_dp_sharded_mrope_vision_model with empty input."""
     # Set up distributed environment
-    device = f"{current_platform.device_name}:{local_rank}"
-    current_platform.set_device(device)
+    device = f"{current_platform.device_type}:{local_rank}"
+    torch.accelerator.set_device_index(device)
     torch.set_default_device(device)
 
     update_environment_variables(
@@ -376,7 +375,8 @@ def run_dp_sharded_mrope_vision_model_empty_input_worker(
     )
 
     init_distributed_environment()
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    with ensure_current_vllm_config():
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     # Create empty inputs
     pixel_values = torch.empty((0, 768))
@@ -408,9 +408,9 @@ def run_dp_sharded_mrope_vision_model_uneven_load_worker(
 ):
     """Test run_dp_sharded_mrope_vision_model with uneven load distribution."""
     # Set up distributed environment
-    current_platform.seed_everything(123)
-    device = f"{current_platform.device_name}:{local_rank}"
-    current_platform.set_device(device)
+    set_random_seed(123)
+    device = f"{current_platform.device_type}:{local_rank}"
+    torch.accelerator.set_device_index(device)
     torch.set_default_device(device)
 
     update_environment_variables(
@@ -424,7 +424,8 @@ def run_dp_sharded_mrope_vision_model_uneven_load_worker(
     )
 
     init_distributed_environment()
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    with ensure_current_vllm_config():
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     # Create images with very different sizes
     grid_thw_list = [
@@ -487,3 +488,62 @@ def test_simple_mrope_vision_model_spatial_merge(spatial_merge_size: int):
 
     assert output.shape[0] == expected_output_patches
     assert output.shape[1] == vision_model.out_hidden_size
+
+
+def _reference_input_norm(
+    pixel_values: torch.Tensor,
+    image_mean: list[float],
+    image_std: list[float],
+    rescale_factor: float,
+    channel: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Straightforward per-channel affine: (x * rescale - mean) / std."""
+    patches, size = pixel_values.shape
+    patch_size = size // channel
+    mean = torch.tensor(image_mean, dtype=torch.float32).view(1, channel, 1)
+    std = torch.tensor(image_std, dtype=torch.float32).view(1, channel, 1)
+    x = pixel_values.to(torch.float32).view(patches, channel, patch_size)
+    x = (x * rescale_factor - mean) / std
+    return x.view(patches, size).to(out_dtype)
+
+
+@pytest.mark.parametrize("num_patches", [1, 37, 70000])
+def test_fused_input_norm_matches_reference(num_patches: int):
+    """FusedInputNorm must equal the plain affine, including for num_patches
+    above the cuDNN batch-norm grid limit (~65535) that previously raised
+    CUDNN_STATUS_INTERNAL_ERROR (issue #51717)."""
+    channel = 3
+    patch_size = 14 * 14
+    image_mean = [0.48145466, 0.4578275, 0.40821073]
+    image_std = [0.26862954, 0.26130258, 0.27577711]
+    rescale_factor = 1.0 / 255.0
+
+    set_random_seed(0)
+    pixel_values = torch.randint(
+        0, 256, (num_patches, channel * patch_size), dtype=torch.float32
+    )
+
+    norm = FusedInputNorm(
+        image_mean=image_mean,
+        image_std=image_std,
+        rescale_factor=rescale_factor,
+        channel=channel,
+    )
+    assert not norm.is_identity
+
+    out = norm(pixel_values, visual_dtype=torch.float32)
+    expected = _reference_input_norm(
+        pixel_values, image_mean, image_std, rescale_factor, channel, torch.float32
+    )
+    torch.testing.assert_close(out, expected)
+
+
+def test_fused_input_norm_identity_passthrough():
+    """The identity configuration returns the input unchanged (cast only)."""
+    norm = FusedInputNorm.identity()
+    assert norm.is_identity
+
+    pixel_values = torch.randn(8, 3 * 196, dtype=torch.float32)
+    out = norm(pixel_values, visual_dtype=torch.bfloat16)
+    torch.testing.assert_close(out, pixel_values.to(torch.bfloat16))

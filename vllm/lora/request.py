@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import warnings
 
 import msgspec
 
@@ -11,39 +10,34 @@ class LoRARequest(
     omit_defaults=True,  # type: ignore[call-arg]
     array_like=True,
 ):  # type: ignore[call-arg]
-    """
-    Request for a LoRA adapter.
-
-    Note that this class should be used internally. For online
-    serving, it is recommended to not allow users to use this class but
-    instead provide another layer of abstraction to prevent users from
-    accessing unauthorized LoRA adapters.
+    """Request for a LoRA adapter.
 
     lora_int_id must be globally unique for a given adapter.
     This is currently not enforced in vLLM.
+
+    load_inplace: If True, forces reloading the adapter even if one
+        with the same lora_int_id already exists in the cache. This replaces
+        the existing adapter in-place. If False (default), only loads if the
+        adapter is not already loaded.
     """
 
     lora_name: str
     lora_int_id: int
     lora_path: str = ""
-    lora_local_path: str | None = msgspec.field(default=None)
-    long_lora_max_len: int | None = None
     base_model_name: str | None = msgspec.field(default=None)
     tensorizer_config_dict: dict | None = None
+    load_inplace: bool = False
+    is_3d_lora_weight: bool = False
+    """Whether this adapter's MoE weights are stored in the 3D fused
+    `gate_up_proj` / `down_proj` layout (one fused tensor per layer) or the
+    2D per-expert split layout (separate `gate_proj` / `up_proj` / `down_proj`
+    tensors per expert). Only consulted when the engine is started with
+    `enable_mixed_moe_lora_format=True`; otherwise it is ignored and the
+    on-disk format is inferred from the base model."""
 
     def __post_init__(self):
         if self.lora_int_id < 1:
             raise ValueError(f"id must be > 0, got {self.lora_int_id}")
-        if self.lora_local_path:
-            warnings.warn(
-                "The 'lora_local_path' attribute is deprecated "
-                "and will be removed in a future version. "
-                "Please use 'lora_path' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if not self.lora_path:
-                self.lora_path = self.lora_local_path or ""
 
         # Ensure lora_path is not empty
         assert self.lora_path, "lora_path cannot be empty"
@@ -60,39 +54,15 @@ class LoRARequest(
     def path(self):
         return self.lora_path
 
-    @property
-    def local_path(self):
-        warnings.warn(
-            "The 'local_path' attribute is deprecated "
-            "and will be removed in a future version. "
-            "Please use 'path' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.lora_path
-
-    @local_path.setter
-    def local_path(self, value):
-        warnings.warn(
-            "The 'local_path' attribute is deprecated "
-            "and will be removed in a future version. "
-            "Please use 'path' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.lora_path = value
-
     def __eq__(self, value: object) -> bool:
-        """
-        Overrides the equality method to compare LoRARequest
+        """Overrides the equality method to compare LoRARequest
         instances based on lora_name. This allows for identification
         and comparison lora adapter across engines.
         """
         return isinstance(value, self.__class__) and self.lora_name == value.lora_name
 
     def __hash__(self) -> int:
-        """
-        Overrides the hash method to hash LoRARequest instances
+        """Overrides the hash method to hash LoRARequest instances
         based on lora_name. This ensures that LoRARequest instances
         can be used in hash-based collections such as sets and dictionaries,
         identified by their names across engines.

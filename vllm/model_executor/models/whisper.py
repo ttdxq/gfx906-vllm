@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import enum
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
-from typing import Annotated, Literal, cast
+from typing import Annotated
 
 import numpy as np
 import torch
@@ -16,44 +17,66 @@ from transformers import (
 )
 from transformers.models.whisper.modeling_whisper import sinusoids
 
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.layer import Attention, MultiHeadAttention
-from vllm.attention.layers.cross_attention import CrossAttention
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, SpeechToTextConfig, VllmConfig
-from vllm.config.multimodal import BaseDummyOptions
+from vllm.config.multimodal import MultiModalDummyOptions
+from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.inputs.data import PromptType
+from vllm.inputs import (
+    ExplicitEncoderDecoderPrompt,
+    MultiModalDataDict,
+    PromptType,
+    TextPrompt,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention import (
+    Attention,
+    CrossAttention,
+    MMEncoderAttention,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.whisper_utils import (
+    ISO639_1_SUPPORTED_LANGS,
+)
+from vllm.model_executor.offloader import get_offloader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseProcessingInfo,
     EncDecMultiModalProcessor,
     PromptReplacement,
     PromptUpdate,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.multimodal.processing.processor import HFMultiModalInputs
+from vllm.renderers import TokenizeParams
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.jsontree import json_map_leaves
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.attention.backend import (
+    AttentionType,
+)
 
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsTranscription
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsTranscription,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -64,75 +87,18 @@ from .utils import (
 
 logger = init_logger(__name__)
 
-# From https://platform.openai.com/docs/guides/speech-to-text/supported-languages
 
-ISO639_1_SUPPORTED_LANGS = {
-    "af": "Afrikaans",
-    "ar": "Arabic",
-    "hy": "Armenian",
-    "az": "Azerbaijani",
-    "be": "Belarusian",
-    "bs": "Bosnian",
-    "bg": "Bulgarian",
-    "ca": "Catalan",
-    "zh": "Chinese",
-    "hr": "Croatian",
-    "cs": "Czech",
-    "da": "Danish",
-    "nl": "Dutch",
-    "en": "English",
-    "et": "Estonian",
-    "fi": "Finnish",
-    "fr": "French",
-    "gl": "Galician",
-    "de": "German",
-    "el": "Greek",
-    "he": "Hebrew",
-    "hi": "Hindi",
-    "hu": "Hungarian",
-    "is": "Icelandic",
-    "id": "Indonesian",
-    "it": "Italian",
-    "ja": "Japanese",
-    "kn": "Kannada",
-    "kk": "Kazakh",
-    "ko": "Korean",
-    "lv": "Latvian",
-    "lt": "Lithuanian",
-    "mk": "Macedonian",
-    "ms": "Malay",
-    "mr": "Marathi",
-    "mi": "Maori",
-    "ne": "Nepali",
-    "no": "Norwegian",
-    "fa": "Persian",
-    "pl": "Polish",
-    "pt": "Portuguese",
-    "ro": "Romanian",
-    "ru": "Russian",
-    "sr": "Serbian",
-    "sk": "Slovak",
-    "sl": "Slovenian",
-    "es": "Spanish",
-    "sw": "Swahili",
-    "sv": "Swedish",
-    "tl": "Tagalog",
-    "ta": "Tamil",
-    "th": "Thai",
-    "tr": "Turkish",
-    "uk": "Ukrainian",
-    "ur": "Urdu",
-    "vi": "Vietnamese",
-    "cy": "Welsh",
-}
+class WhisperPosEmbedType(enum.Enum):
+    SINUSOIDAL = "sinusoidal"
+    ROPE = "rope"
+    LEARNED = "learned"
 
 
 class WhisperAudioInputs(TensorSchema):
-    """
-    Dimensions:
-        - b: Batch size
-        - nmb: Number of mel bins
-        - t: Time frames (M)
+    """Dimensions:
+    - b: Batch size
+    - nmb: Number of mel bins
+    - t: Time frames (M)
     """
 
     input_features: Annotated[
@@ -141,7 +107,7 @@ class WhisperAudioInputs(TensorSchema):
     ]
 
 
-class WhisperEncoderAttention(MultiHeadAttention):
+class WhisperEncoderAttention(MMEncoderAttention):
     """Multi-headed attention for Whisper encoder with 2D tensor support."""
 
     def forward(
@@ -149,10 +115,13 @@ class WhisperEncoderAttention(MultiHeadAttention):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        # Only used for FlashInfer CuDNN backend.
+        sequence_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Input shape: batch_size x seq_len x hidden_size
-                     or seq_len x hidden_size
+        """Input shape: batch_size x seq_len x hidden_size
+        or seq_len x hidden_size
         """
         is_2d = query.dim() == 2
         if is_2d:
@@ -161,7 +130,14 @@ class WhisperEncoderAttention(MultiHeadAttention):
             value = value.unsqueeze(0)
 
         # Call the parent forward method
-        out = super().forward(query, key, value)
+        out = super().forward(
+            query,
+            key,
+            value,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
+        )
 
         if is_2d:
             out = out.squeeze(0)
@@ -184,6 +160,7 @@ class WhisperAttention(nn.Module):
         num_heads: int,
         bias: bool = True,
         attn_type: AttentionType = AttentionType.DECODER,
+        per_layer_sliding_window: int | None = None,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -251,6 +228,7 @@ class WhisperAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.attn",
                 attn_type=self.attn_type,
+                per_layer_sliding_window=per_layer_sliding_window,
             )
 
     def _init_qkv(
@@ -273,11 +251,29 @@ class WhisperAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        # Only used for FlashInfer CuDNN backend.
+        sequence_lengths: torch.Tensor | None = None,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        attn_output = self.attn(q, k, v)
+        if cu_seqlens is None:
+            attn_output = self.attn(q, k, v)
+        else:
+            assert self.attn_type == AttentionType.ENCODER, (
+                "Variable-length attention metadata is only supported for "
+                "encoder self-attention."
+            )
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
+            )
 
         output, _ = self.out_proj(attn_output)
 
@@ -318,11 +314,12 @@ class WhisperCrossAttention(WhisperAttention):
             quant_config=quant_config,
             prefix=f"{prefix}.q_proj",
         )
-        self.kv_proj = QKVParallelLinear(
-            hidden_size=embed_dim,
-            head_size=self.head_dim,
-            total_num_heads=0,
-            total_num_kv_heads=self.total_num_heads,
+        # Use MergedColumnParallelLinear for K and V projections.
+        # This enables LoRA support via MergedColumnParallelLinearWithLoRA
+        # which handles 2-slice configurations.
+        self.kv_proj = MergedColumnParallelLinear(
+            input_size=embed_dim,
+            output_sizes=[embed_dim, embed_dim],
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_proj",
@@ -386,6 +383,7 @@ class WhisperEncoderLayer(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        sliding_window = getattr(config, "sliding_window", None)
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
@@ -394,6 +392,7 @@ class WhisperEncoderLayer(nn.Module):
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
             attn_type=AttentionType.ENCODER,
+            per_layer_sliding_window=sliding_window,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
@@ -411,10 +410,19 @@ class WhisperEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        # Only used for FlashInfer CuDNN backend.
+        sequence_lengths: torch.Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
+        )
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -487,25 +495,59 @@ class WhisperDecoderLayer(nn.Module):
 
 class WhisperEncoder(nn.Module):
     def __init__(
-        self, *, vllm_config: VllmConfig, prefix: str = "", init_in_fp32: bool = False
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        init_in_fp32: bool = False,
+        enable_pp: bool = True,
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
         embed_dim = config.d_model
+
+        self.pos_embed_type = WhisperPosEmbedType(
+            getattr(config, "pos_embed", "sinusoidal")
+        )
         self.num_mel_bins = config.num_mel_bins
         self.max_source_positions = config.max_source_positions
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
 
         self.conv1 = nn.Conv1d(self.num_mel_bins, embed_dim, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.encoder_layers,
-            lambda prefix: WhisperEncoderLayer(
+        self.conv2 = nn.Conv1d(embed_dim, embed_dim, stride=2, kernel_size=3, padding=1)
+
+        self.total_stride = self.conv1.stride[0] * self.conv2.stride[0]
+
+        def create_layer(prefix: str) -> nn.Module:
+            return WhisperEncoderLayer(
                 vllm_config=vllm_config, prefix=f"{prefix}.layers"
-            ),
-            prefix=f"{prefix}.layers",
-        )
+            )
+
+        if enable_pp:
+            self.start_layer, self.end_layer, self.layers = make_layers(
+                config.encoder_layers,
+                create_layer,
+                prefix=f"{prefix}.layers",
+            )
+        else:
+            self.start_layer = 0
+            self.end_layer = config.encoder_layers
+            self.layers = nn.ModuleList(
+                get_offloader().wrap_modules(
+                    create_layer(prefix=f"{prefix}.layers.{idx}")
+                    for idx in range(config.encoder_layers)
+                )
+            )
         self.layer_norm = nn.LayerNorm(config.d_model)
+
+        if self.pos_embed_type not in (
+            WhisperPosEmbedType.SINUSOIDAL,
+            WhisperPosEmbedType.LEARNED,
+        ):
+            raise ValueError(
+                "Only sinusoidal or learned position embeddings are supported "
+                f"for non-causal models, but got {self.pos_embed_type}"
+            )
 
         maybe_fp32_init_ctx = (
             set_default_torch_dtype(torch.float32) if init_in_fp32 else nullcontext()
@@ -520,17 +562,28 @@ class WhisperEncoder(nn.Module):
                 sinusoids(*self.embed_positions.weight.shape)
             )
 
-    def forward(self, input_features: torch.Tensor | list[torch.Tensor]):
+    def forward(
+        self, input_features: torch.Tensor | list[torch.Tensor]
+    ) -> torch.Tensor:
         hidden_states = []
+        input_is_batched = False
         for features in input_features:
             embeds = nn.functional.gelu(self.conv1(features))
             embeds = nn.functional.gelu(self.conv2(embeds))
+
             embeds = embeds.transpose(-1, -2)
             embeds = (embeds + self.embed_positions.weight[: embeds.size(-2), :]).to(
                 embeds.dtype
             )
+
             hidden_states.append(embeds)
-        hidden_states = torch.cat(hidden_states)
+            input_is_batched = embeds.ndim > 2
+        # Input to MHA must be B x T x D
+        if input_is_batched:
+            # Models using WhisperEncoder may handle batching internally.
+            hidden_states = torch.cat(hidden_states)
+        else:
+            hidden_states = torch.stack(hidden_states, dim=0)
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(hidden_states)
@@ -539,6 +592,7 @@ class WhisperEncoder(nn.Module):
         return hidden_states
 
 
+@support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": -1})
 class WhisperDecoder(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -603,8 +657,7 @@ class WhisperModel(nn.Module):
         positions: torch.Tensor,
         encoder_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
-        assert len(encoder_outputs) in (0, 1)
-        enc_states = encoder_outputs[0] if len(encoder_outputs) == 1 else None
+        enc_states = torch.cat(encoder_outputs, dim=0) if len(encoder_outputs) else None
         decoder_outputs = self.decoder(
             input_ids=input_ids,
             positions=positions,
@@ -620,45 +673,29 @@ class WhisperModel(nn.Module):
             return None
         return self.encoder(input_features)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-            (".encoder_attn.kv_proj", ".encoder_attn.k_proj", "k"),
-            (".encoder_attn.kv_proj", ".encoder_attn.v_proj", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
-
 
 class WhisperProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self) -> WhisperConfig:
         return self.ctx.get_hf_config(WhisperConfig)
+
+    def get_default_tok_params(self) -> TokenizeParams:
+        # Special tokens should be provided by the user based on the
+        # task and language of their request. Also needed to avoid
+        # appending an EOS token to the prompt which disrupts generation.
+        return super().get_default_tok_params().with_kwargs(add_special_tokens=False)
+
+    def get_data_parser(self):
+        feature_extractor = self.get_feature_extractor()
+
+        return MultiModalDataParser(
+            target_sr=feature_extractor.sampling_rate,
+            target_channels=self.get_target_channels(),
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
+
+    @property
+    def skip_prompt_length_check(self) -> bool:
+        return True  # Because the encoder prompt is padded
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": 1}
@@ -668,6 +705,10 @@ class WhisperProcessingInfo(BaseProcessingInfo):
         feature_extractor = hf_processor.feature_extractor  # type: ignore
         assert isinstance(feature_extractor, WhisperFeatureExtractor)
         return feature_extractor
+
+    def get_target_channels(self) -> int:
+        """Return target audio channels for Whisper models (mono)."""
+        return 1
 
     def get_num_audio_tokens(self) -> int:
         return self.get_hf_config().max_source_positions
@@ -683,66 +724,52 @@ class WhisperDummyInputsBuilder(BaseDummyInputsBuilder[WhisperProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
         feature_extractor = self.info.get_feature_extractor()
 
         sampling_rate = feature_extractor.sampling_rate
         audio_len = feature_extractor.chunk_length * sampling_rate
-        num_audios = mm_counts.get("audio", 0)
-
-        audio_overrides = mm_options.get("audio") if mm_options else None
 
         return {
             "audio": self._get_dummy_audios(
-                length=audio_len, num_audios=num_audios, overrides=audio_overrides
+                length=audio_len,
+                num_audios=mm_counts.get("audio", 0),
+                overrides=mm_options.get("audio"),
             )
         }
 
 
 class WhisperMultiModalProcessor(EncDecMultiModalProcessor[WhisperProcessingInfo]):
-    def _get_data_parser(self) -> MultiModalDataParser:
-        feature_extractor = self.info.get_feature_extractor()
-        return MultiModalDataParser(target_sr=feature_extractor.sampling_rate)
-
-    @property
-    def pad_dummy_encoder_prompt(self) -> bool:
-        return True
+    def _get_hf_mm_text(self, mm_counts: Mapping[str, int]) -> str:
+        return self.dummy_inputs.get_dummy_text(mm_counts)
 
     def create_encoder_prompt(
         self,
-        prompt: str | list[int],
-        mm_data: MultiModalDataDict,
-    ) -> str | list[int]:
+        prompt: list[int],
+        mm_items: MultiModalDataItems,
+    ) -> list[int]:
         # Strictly speaking, whisper encoder only accept audio features.
         # We create a dummy encoder prompt here which will be padded to
         # num_audio_tokens. So that we can create dummy data from this
         # for encoder profiling.
         return [0]
 
-    def _call_hf_processor(
+    def _get_hf_mm_inputs(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        if mm_data:
-            feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
-            mm_data = dict(audio=mm_data.pop("audios"))
-            mm_kwargs = dict(
-                **mm_kwargs,
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
+    ) -> HFMultiModalInputs:
+        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_kwargs)
+
+        feature_extractor = self.info.get_feature_extractor(**hf_kwargs)
+        return hf_inputs._replace(
+            hf_kwargs=dict(
+                hf_inputs.hf_kwargs,
                 sampling_rate=feature_extractor.sampling_rate,
+                truncation=True,
             )
-        processed_outputs = super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
         )
-        if "labels" in processed_outputs:
-            processed_outputs["input_ids"] = processed_outputs.pop("labels")
-        return processed_outputs
 
     def _get_mm_fields_config(
         self,
@@ -773,71 +800,130 @@ class WhisperMultiModalProcessor(EncDecMultiModalProcessor[WhisperProcessingInfo
     dummy_inputs=WhisperDummyInputsBuilder,
 )
 class WhisperForConditionalGeneration(
-    nn.Module, SupportsTranscription, SupportsMultiModal
+    nn.Module,
+    SupportsTranscription,
+    SupportsMultiModal,
+    SupportsLoRA,
 ):
-    merge_by_field_config = True
+    # LoRA-specific attributes
     packed_modules_mapping = {
-        "self_attn.qkv_proj": [
-            "self_attn.q_proj",
-            "self_attn.k_proj",
-            "self_attn.v_proj",
-        ],
-        "encoder_attn.kv_proj": ["encoder_attn.k_proj", "encoder_attn.v_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "kv_proj": ["k_proj", "v_proj"],
     }
 
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."}
+        orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."},
+        orig_to_new_stacked={
+            # weight_name: (param_name, shard_id)
+            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
+            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
+            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
+            ".encoder_attn.k_proj": (".encoder_attn.kv_proj", 0),
+            ".encoder_attn.v_proj": (".encoder_attn.kv_proj", 1),
+        },
+        orig_to_new_prefix={"proj_out.": None},
     )
 
     # Whisper only supports audio-conditioned generation.
     supports_transcription_only = True
     supports_segment_timestamp = True
+    supports_explicit_language_detection = True
     supported_languages = ISO639_1_SUPPORTED_LANGS
 
     @classmethod
     def validate_language(cls, language: str | None) -> str | None:
         if language is None:
-            # TODO language should be optional and can be guessed.
-            # For now we default to en. See
-            # https://github.com/huggingface/transformers/blob/main/src/transformers/models/whisper/generation_whisper.py#L1520
-            logger.warning(
-                "Defaulting to language='en'. If you wish to transcribe "
-                "audio in a different language, pass the `language` field "
+            logger.debug(
+                "No language specified. Language will be auto-detected "
+                "from audio. To skip detection, pass the `language` field "
                 "in the TranscriptionRequest."
             )
-            language = "en"
+            return None
         return super().validate_language(language)
 
     @classmethod
     def get_generation_prompt(
         cls,
-        audio: np.ndarray,
-        model_config: ModelConfig,  # not needed here
-        stt_config: SpeechToTextConfig,
-        language: str | None,
-        task_type: Literal["transcribe", "translate"],
-        request_prompt: str,
-        to_language: str | None,
+        stt_params: SpeechToTextParams,
     ) -> PromptType:
+        audio = stt_params.audio
+        stt_config = stt_params.stt_config
+        language = stt_params.language
+        task_type = stt_params.task_type
+        request_prompt = stt_params.request_prompt
+
         if language is None:
             raise ValueError(
                 "Language must be specified when creating the Whisper prompt"
             )
-        prompt = {
-            "encoder_prompt": {
-                # Whisper does not support encoder prompt.
-                "prompt": "",
-                "multi_modal_data": {
-                    "audio": (audio, stt_config.sample_rate),
-                },
-            },
-            "decoder_prompt": (
-                (f"<|prev|>{request_prompt}" if request_prompt else "")
-                + f"<|startoftranscript|><|{language}|>"
-                + f"<|{task_type}|><|notimestamps|>"
+
+        decoder_text = (
+            f"<|prev|>{request_prompt}" if request_prompt else ""
+        ) + f"<|startoftranscript|><|{language}|><|{task_type}|><|notimestamps|>"
+
+        return ExplicitEncoderDecoderPrompt(
+            encoder_prompt=TextPrompt(
+                prompt="",  # Whisper does not support encoder prompt.
+                multi_modal_data={"audio": (audio, stt_config.sample_rate)},
             ),
-        }
-        return cast(PromptType, prompt)
+            decoder_prompt=TextPrompt(prompt=decoder_text),
+        )
+
+    @classmethod
+    def get_language_token_ids(
+        cls,
+        tokenizer: object,
+    ) -> list[int]:
+        """Return token IDs for all supported language tokens.
+
+        Used with ``SamplingParams.allowed_token_ids`` to constrain
+        language detection to only produce valid language tokens.
+        """
+        token_ids = [
+            tokenizer.convert_tokens_to_ids(f"<|{lang_code}|>")
+            for lang_code in cls.supported_languages
+        ]
+        return token_ids
+
+    @classmethod
+    def get_language_detection_prompt(
+        cls,
+        audio: np.ndarray,
+        stt_config: SpeechToTextConfig,
+    ) -> PromptType:
+        """Return a prompt that elicits a single language token from Whisper.
+
+        Feed only ``<|startoftranscript|>`` as the decoder input so the model
+        predicts the most likely language token (e.g. ``<|de|>``).
+        """
+        return ExplicitEncoderDecoderPrompt(
+            encoder_prompt=TextPrompt(
+                prompt="",
+                multi_modal_data={"audio": (audio, stt_config.sample_rate)},
+            ),
+            decoder_prompt=TextPrompt(prompt="<|startoftranscript|>"),
+        )
+
+    @classmethod
+    def parse_language_detection_output(
+        cls,
+        token_ids: list[int],
+        tokenizer: object,
+    ) -> str | None:
+        """Parse the language token predicted by Whisper.
+
+        Decodes the first token ID and extracts the language code from the
+        ``<|xx|>`` format. Expects a valid language token from constrained generation.
+        """
+        decoded = tokenizer.decode(
+            [token_ids[0]],
+            skip_special_tokens=False,
+        )
+        # Whisper language tokens have the form <|xx|>
+        assert decoded.startswith("<|") and decoded.endswith("|>")
+        lang_code = decoded[2:-2]
+        assert lang_code in cls.supported_languages
+        return lang_code
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -880,7 +966,12 @@ class WhisperForConditionalGeneration(
         self.config = config
         self.dtype = vllm_config.model_config.dtype
 
-        self.model = WhisperModel(vllm_config=vllm_config, prefix=prefix)
+        with self._mark_composite_model(
+            vllm_config,
+            language_targets=WhisperDecoder,
+            tower_targets={"audio": WhisperEncoder},
+        ):
+            self.model = WhisperModel(vllm_config=vllm_config, prefix=prefix)
 
         self.proj_out = ParallelLMHead(
             config.vocab_size,
@@ -908,13 +999,13 @@ class WhisperForConditionalGeneration(
         )
         return decoder_outputs
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.model.decoder
-
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         # Required as part of SupportsMultiModal interface.
         audio_input = self._parse_and_validate_audio_input(**kwargs)
-        return [self.model.get_encoder_outputs(audio_input["input_features"])]
+        # Split concatenated encoder outputs into one tensor per audio input
+        enc_output = self.model.get_encoder_outputs(audio_input["input_features"])
+        # The assumption is we can only process whole mm items (audios)
+        return enc_output.unbind(dim=0)
 
     def embed_input_ids(
         self,
@@ -922,7 +1013,6 @@ class WhisperForConditionalGeneration(
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         # This method just returns the decoder sequence embeddings since
         # Whisper does not have encoder text tokens.
@@ -941,23 +1031,22 @@ class WhisperForConditionalGeneration(
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["proj_out."])
+        loader = AutoWeightsLoader(self)
 
         # add fake zeros bias for k_proj to state_dict
-        weights = _create_fake_bias_for_k_proj(weights)
+        weights = _create_fake_bias_for_k_proj(weights, ".k_proj.weight")
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 def _create_fake_bias_for_k_proj(
-    weights: Iterable[tuple[str, torch.Tensor]],
+    weights: Iterable[tuple[str, torch.Tensor]], fake_bias_key_name: str
 ) -> Iterable[tuple[str, torch.Tensor]]:
-    """
-    Create full zeros bias for k_proj weight in self-attn and x-attn layers.
+    """Create full zeros bias for k_proj weight in self-attn and x-attn layers.
     So that the bias for k_proj in qkv_proj can be initialized with zeros.
     """
     for name, weight in weights:
-        if name.endswith(".k_proj.weight"):
+        yield name, weight
+        if name.endswith(fake_bias_key_name):
             bias = torch.zeros(weight.size(0))
             bias_name = name.replace("weight", "bias")
-            yield from [(name, weight), (bias_name, bias)]
-        yield name, weight
+            yield bias_name, bias

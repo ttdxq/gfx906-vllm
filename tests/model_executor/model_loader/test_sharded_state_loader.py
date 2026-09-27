@@ -9,10 +9,10 @@ from tempfile import TemporaryDirectory
 
 import pytest
 import torch
-from huggingface_hub import snapshot_download
 
 from vllm import LLM, SamplingParams
 from vllm.model_executor.model_loader import ShardedStateLoader
+from vllm.transformers_utils.repo_utils import hf_api
 
 prompts = [
     "Hello, my name is",
@@ -51,7 +51,7 @@ def test_filter_subtensors():
 
 @pytest.fixture(scope="module")
 def llama_3p2_1b_files():
-    input_dir = snapshot_download(
+    input_dir = hf_api().snapshot_download(
         "meta-llama/Llama-3.2-1B-Instruct", ignore_patterns=["*.bin*", "original/*"]
     )
 
@@ -95,6 +95,11 @@ def test_sharded_state_loader(
     input_dir = llama_3p2_1b_files
     ctx = mp.get_context("spawn")
 
+    # Keep batching deterministic: this test compares exact greedy outputs
+    # across separate engine processes, whose schedulers may otherwise form
+    # different batches depending on prompt-processing timing.
+    platform_args = {"max_num_seqs": 1}
+
     # Run in separate processes for memory & CUDA isolation
     with TemporaryDirectory() as output_dir:
         p = ctx.Process(
@@ -104,6 +109,7 @@ def test_sharded_state_loader(
                 tensor_parallel_size=tp_size,
                 gpu_memory_utilization=gpu_memory_utilization,
                 enforce_eager=True,
+                **platform_args,
             ),
         )
         p.start()
@@ -118,6 +124,7 @@ def test_sharded_state_loader(
                 enable_lora=enable_lora,
                 gpu_memory_utilization=gpu_memory_utilization,
                 tensor_parallel_size=tp_size,
+                **platform_args,
             ),
         )
         p.start()
@@ -141,6 +148,7 @@ def test_sharded_state_loader(
                 gpu_memory_utilization=gpu_memory_utilization,
                 tensor_parallel_size=tp_size,
                 load_format="sharded_state",
+                **platform_args,
             ),
         )
         p.start()

@@ -1,362 +1,180 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-This test file includes some cases where it is inappropriate to
+"""This test file includes some cases where it is inappropriate to
 only get the `eos_token_id` from the tokenizer as defined by
-`vllm.LLMEngine._get_eos_token_id`.
+`BaseRenderer.get_eos_token_id`.
 """
+
+import math
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import MagicMock, patch
 
 import pytest
-from transformers import SiglipVisionConfig
+from transformers import PretrainedConfig
 
+from vllm.config.model import ModelConfig
 from vllm.tokenizers import get_tokenizer
-from vllm.transformers_utils import config as config_utils
-from vllm.transformers_utils import gguf_utils
-from vllm.transformers_utils.config import try_get_generation_config
-from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
-
-
-@pytest.mark.parametrize(
-    ("model_type", "expected_class_name"),
-    [
-        ("qwen3_5_text", "Qwen3_5TextConfig"),
-        ("qwen3_5_moe_text", "Qwen3_5MoeTextConfig"),
-    ],
+from vllm.transformers_utils import config as config_module
+from vllm.transformers_utils.config import (
+    get_safetensors_params_metadata,
+    mrope_num_dims,
+    patch_legacy_rope_type,
+    try_get_generation_config,
+    uses_mrope,
 )
-def test_qwen35_text_only_config_registry(model_type, expected_class_name):
-    assert config_utils._CONFIG_REGISTRY[model_type].__name__ == expected_class_name
+from vllm.transformers_utils.configs.glm5_next import (
+    Glm5NextConfig,
+    Glm5NextTextConfig,
+    Glm5NextVisionConfig,
+)
+from vllm.transformers_utils.configs.mistral import adapt_config_dict
 
 
-def test_detect_gguf_multimodal_ignores_unrelated_shared_projector(tmp_path):
-    model = tmp_path / "Qwen3.6-27B-UD-Q4_K_XL.gguf"
-    model.touch()
-    (tmp_path / "Qwen3.8-27B-UD-Q4_K_XL.gguf").touch()
-    (tmp_path / "Qwen3.8-27B-mmproj-F16.gguf").touch()
-
-    assert gguf_utils.detect_gguf_multimodal(str(model)) is None
-
-
-def test_detect_gguf_multimodal_matches_model_family(tmp_path):
-    model = tmp_path / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
-    model.touch()
-    mmproj = tmp_path / "Qwen3.8-27B-mmproj-F16.gguf"
-    mmproj.touch()
-    (tmp_path / "Qwen3.6-27B-UD-Q4_K_XL.gguf").touch()
-
-    assert gguf_utils.detect_gguf_multimodal(str(model)) == mmproj
-
-
-def test_detect_gguf_multimodal_accepts_single_family_directory(tmp_path):
-    model = tmp_path / "gemma-3-4b-it-Q4_K_M.gguf"
-    model.touch()
-    (tmp_path / "gemma-3-4b-it-Q6_K.gguf").touch()
-    mmproj = tmp_path / "mmproj-model-f16-4B.gguf"
-    mmproj.touch()
-
-    assert gguf_utils.detect_gguf_multimodal(str(model)) == mmproj
-
-
-def test_patch_qwen35_multimodal_gguf_config(monkeypatch, tmp_path):
-    model = tmp_path / "qwen35.gguf"
-    mmproj = tmp_path / "mmproj.gguf"
-    model.write_bytes(b"GGUF")
-    mmproj.write_bytes(b"GGUF")
-    vision_config = SiglipVisionConfig(
-        hidden_size=1152,
-        intermediate_size=4304,
-        num_hidden_layers=27,
-        num_attention_heads=16,
-        image_size=768,
-        patch_size=16,
-    )
-    vision_config.projection_dim = 5120
-    vision_config.spatial_merge_size = 2
-
-    monkeypatch.setattr(gguf_utils, "detect_gguf_multimodal", lambda _: mmproj)
-    monkeypatch.setattr(
-        gguf_utils,
-        "extract_vision_config_from_gguf",
-        lambda _: vision_config,
-    )
-
-    config = Qwen3_5Config(architectures=["Qwen3_5ForCausalLM"])
-    patched = gguf_utils.maybe_patch_hf_config_from_gguf(str(model), config)
-
-    assert patched.architectures == ["Qwen3_5ForConditionalGeneration"]
-    assert patched.vision_config.depth == 27
-    assert patched.vision_config.num_heads == 16
-    assert patched.vision_config.out_hidden_size == 5120
-    assert patched.vision_config.num_position_embeddings == 2304
-    assert patched.vision_config.deepstack_visual_indexes == []
-
-
-def test_multimodal_gguf_uses_original_processor_repo(monkeypatch, tmp_path):
-    model = tmp_path / "qwen35.gguf"
-    mmproj = tmp_path / "mmproj.gguf"
-    model.write_bytes(b"GGUF")
-    mmproj.write_bytes(b"GGUF")
-
-    monkeypatch.setattr(gguf_utils, "detect_gguf_multimodal", lambda _: mmproj)
-    monkeypatch.setattr(gguf_utils.gguf, "GGUFReader", lambda _: object())
-    monkeypatch.setattr(
-        gguf_utils,
-        "_read_gguf_scalar",
-        lambda _reader, key, default=None: (
-            "https://huggingface.co/Qwen/Qwen3.8-27B"
-            if key == "general.base_model.0.repo_url"
-            else default
-        ),
-    )
-
-    assert gguf_utils.gguf_multimodal_processor_repo(str(model)) == "Qwen/Qwen3.8-27B"
-
-
-def test_maybe_override_with_speculators_skips_unsupported_local_gguf_arch(
-    monkeypatch,
-    tmp_path,
-):
-    model = tmp_path / "qwen35.gguf"
-    model.write_bytes(b"GGUF")
-
-    def fail_get_config_dict(*args, **kwargs):
-        raise ValueError("GGUF model with architecture qwen35 is not supported yet.")
-
-    monkeypatch.setattr(
-        config_utils.PretrainedConfig,
-        "get_config_dict",
-        fail_get_config_dict,
-    )
-
-    assert config_utils.maybe_override_with_speculators(
-        model=str(model),
-        tokenizer="/tmp/tokenizer",
-        trust_remote_code=False,
-    ) == (str(model), "/tmp/tokenizer", None)
-
-
-def test_maybe_override_with_speculators_reraises_hf_config_path_gguf_errors(
-    monkeypatch,
-    tmp_path,
-):
-    model = tmp_path / "qwen35.gguf"
-    model.write_bytes(b"GGUF")
-
-    def fail_get_config_dict(*args, **kwargs):
-        raise ValueError("GGUF model with architecture qwen35 is not supported yet.")
-
-    monkeypatch.setattr(
-        config_utils.PretrainedConfig,
-        "get_config_dict",
-        fail_get_config_dict,
-    )
-
-    with pytest.raises(ValueError, match="architecture qwen35"):
-        config_utils.maybe_override_with_speculators(
-            model=str(model),
-            tokenizer="/tmp/tokenizer",
-            trust_remote_code=False,
-            hf_config_path="/tmp/hf-config",
-        )
-
-
-def test_get_config_builds_qwen35_config_from_local_gguf_metadata(
-    monkeypatch,
-    tmp_path,
-):
-    model = tmp_path / "qwen35.gguf"
-    model.write_bytes(b"GGUF")
-
-    def fail_get_config_dict(*args, **kwargs):
-        raise ValueError("GGUF model with architecture qwen35 is not supported yet.")
-
-    config_dict = {
-        "architectures": ["Qwen3_5ForCausalLM"],
-        "model_type": "qwen3_5",
-        "text_config": {
-            "model_type": "qwen3_5_text",
-            "vocab_size": 248320,
-            "hidden_size": 5120,
-            "intermediate_size": 17408,
-            "num_hidden_layers": 65,
-            "num_attention_heads": 24,
-            "num_key_value_heads": 4,
-            "max_position_embeddings": 262144,
-            "rms_norm_eps": 1e-6,
-            "head_dim": 256,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "linear_num_key_heads": 16,
-            "linear_num_value_heads": 24,
-            "full_attention_interval": 4,
-            "rope_parameters": {
-                "rope_type": "default",
-                "rope_theta": 10000000.0,
-                "mrope_section": [11, 11, 10, 0],
-                "mrope_interleaved": True,
-            },
-            "bos_token_id": 248044,
-            "eos_token_id": 248046,
-            "pad_token_id": 248055,
-            "tie_word_embeddings": False,
+def test_patch_legacy_rope_type_preserves_nope_layers():
+    """NoPE layers stay disabled while later RoPE layers are normalized."""
+    rope_parameters = {
+        "full_attention": None,
+        "sliding_attention": {
+            "type": "mrope",
+            "mrope_section": [24, 20, 20],
         },
     }
 
-    monkeypatch.setattr(
-        config_utils.PretrainedConfig,
-        "get_config_dict",
-        fail_get_config_dict,
+    patch_legacy_rope_type(rope_parameters)
+
+    assert rope_parameters == {
+        "full_attention": None,
+        "sliding_attention": {
+            "type": "mrope",
+            "rope_type": "default",
+            "mrope_section": [24, 20, 20],
+        },
+    }
+
+
+def test_patch_legacy_rope_type_normalizes_telechat3_yarn():
+    """TeleChat3's RoPE is YaRN with 0.07 in place of the usual 0.1.
+
+    Encoding that as a precomputed attention_factor keeps the config
+    plain YaRN, which Transformers and every "yarn" guard understand.
+    `mscale` cannot express it: Transformers only applies mscale when
+    mscale_all_dim is also truthy.
+    """
+    rope_parameters = {
+        "type": "telechat3-yarn",
+        "rope_type": "telechat3-yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 8192,
+    }
+
+    patch_legacy_rope_type(rope_parameters)
+
+    assert rope_parameters == {
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 8192,
+        "attention_factor": pytest.approx(0.07 * math.log(4.0) + 1.0),
+    }
+
+
+def test_mistral_yarn_apply_scale_false_disables_yarn_magnitude_scaling():
+    """`yarn.apply_scale: false` must reach the DeepSeek-style attentions.
+
+    Transformers spells it `attention_factor = 1.0`, which DeepseekV2Attention
+    and its siblings read to select `deepseek_llama_scaling` over
+    `deepseek_yarn`; without it Mistral-Large-3 runs with a spurious
+    yarn_get_mscale(factor)^2 attention scaling.
+    """
+    params = {
+        "dim": 7168,
+        "n_layers": 61,
+        "head_dim": 192,
+        "hidden_dim": 16384,
+        "n_heads": 128,
+        "n_kv_heads": 128,
+        "norm_eps": 1e-5,
+        "vocab_size": 131072,
+        "rope_theta": 10000.0,
+        "max_position_embeddings": 294912,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "moe": {
+            "num_experts": 128,
+            "num_experts_per_tok": 4,
+            "num_shared_experts": 1,
+            "expert_hidden_dim": 4096,
+            "first_k_dense_replace": 3,
+            "route_every_n": 1,
+            "routed_scale": 1.0,
+            "num_expert_groups": 1,
+            "num_expert_groups_per_tok": 1,
+        },
+        "llama_4_scaling": {"beta": 0.1, "original_max_position_embeddings": 8192},
+        "yarn": {
+            "alpha": 1,
+            "apply_scale": False,
+            "beta": 32,
+            "factor": 36,
+            "original_max_position_embeddings": 8192,
+        },
+    }
+
+    config = adapt_config_dict(params, defaults={})
+
+    assert config.architectures == ["MistralLarge3ForCausalLM"]
+    assert config.rope_parameters["attention_factor"] == 1.0
+
+
+def test_glm5_next_accepts_deepseek_sparse_attention_layers():
+    layer_types = ["linear_attention", "deepseek_sparse_attention"]
+
+    config = Glm5NextTextConfig(
+        num_hidden_layers=len(layer_types), layer_types=layer_types
     )
-    monkeypatch.setattr(
-        config_utils,
-        "qwen35_gguf_config_dict",
-        lambda model: config_dict,
+
+    assert config.layer_types == layer_types
+    assert config.layers_block_type == ["linear_attention", "attention"]
+
+
+def test_glm5_next_accepts_prebuilt_subconfigs():
+    text_config = Glm5NextTextConfig(hidden_size=1024)
+    vision_config = Glm5NextVisionConfig(hidden_size=768)
+
+    config = Glm5NextConfig(
+        text_config=text_config,
+        vision_config=vision_config,
     )
 
-    config = config_utils.get_config(str(model), trust_remote_code=False)
-
-    assert config.model_type == "qwen3_5"
-    assert config.architectures == ["Qwen3_5ForCausalLM"]
-    assert config.text_config.linear_num_value_heads == 24
+    assert config.text_config is text_config
+    assert config.vision_config is vision_config
 
 
-def test_try_get_safetensors_metadata_skips_local_files(monkeypatch, tmp_path):
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"GGUF")
-
-    def fail_get_safetensors_metadata(*args, **kwargs):
-        raise AssertionError("local model files should not query HF metadata")
-
-    monkeypatch.setattr(
-        config_utils,
-        "get_safetensors_metadata",
-        fail_get_safetensors_metadata,
-    )
-
-    assert config_utils.try_get_safetensors_metadata(str(model)) is None
-
-
-def test_qwen35_gguf_config_derives_value_heads_from_attn_qkv(
-    monkeypatch,
-    tmp_path,
-):
-    model = tmp_path / "qwen35-4b.gguf"
-    model.write_bytes(b"GGUF")
-
-    class FakeField:
-        def __init__(self, value):
-            self.value = value
-
-        def contents(self):
-            return self.value
-
-    class FakeTensor:
-        def __init__(self, name, shape):
-            self.name = name
-            self.shape = shape
-
-    class FakeReader:
-        tensors = [
-            FakeTensor("blk.0.attn_qkv.weight", (2560, 8192)),
-            FakeTensor("output.weight", (151936, 2560)),
-        ]
-
-        def get_field(self, key):
-            fields = {
-                "general.architecture": "qwen35",
-                "tokenizer.ggml.tokens": ["<pad>", "x"],
-                "qwen35.ssm.state_size": 128,
-                "qwen35.ssm.group_count": 16,
-                "qwen35.block_count": 1,
-                "qwen35.embedding_length": 2560,
-                "qwen35.feed_forward_length": 9728,
-                "qwen35.attention.head_count": 16,
-                "qwen35.attention.head_count_kv": 8,
-                "qwen35.context_length": 32768,
-                "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
-                "qwen35.attention.key_length": 256,
-                "qwen35.ssm.conv_kernel": 4,
-                "qwen35.full_attention_interval": 4,
-                "qwen35.rope.freq_base": 1000000.0,
-                "qwen35.rope.dimension_sections": [8, 8, 8, 0],
-                "tokenizer.ggml.bos_token_id": 0,
-                "tokenizer.ggml.eos_token_id": 1,
-                "tokenizer.ggml.padding_token_id": 0,
-            }
-            if key not in fields:
-                return None
-            return FakeField(fields[key])
-
-    monkeypatch.setattr(gguf_utils.gguf, "GGUFReader", lambda _: FakeReader())
-
-    config_dict = gguf_utils.qwen35_gguf_config_dict(str(model))
-
-    assert config_dict is not None
-    assert config_dict["text_config"]["linear_num_value_heads"] == 32
-
-
-def test_qwen35_gguf_config_excludes_dense_mtp_layer(
-    monkeypatch,
-    tmp_path,
-):
-    model = tmp_path / "qwen35-mtp.gguf"
-    model.write_bytes(b"GGUF")
-
-    class FakeField:
-        def __init__(self, value):
-            self.value = value
-
-        def contents(self):
-            return self.value
-
-    class FakeTensor:
-        def __init__(self, name, shape):
-            self.name = name
-            self.shape = shape
-
-    class FakeReader:
-        tensors = [
-            FakeTensor("blk.0.attn_qkv.weight", (2560, 8192)),
-            FakeTensor("blk.1.attn_k.weight", (2560, 1024)),
-            FakeTensor("blk.1.nextn.eh_proj.weight", (2560, 5120)),
-            FakeTensor("output.weight", (248320, 2560)),
-        ]
-
-        def get_field(self, key):
-            fields = {
-                "general.architecture": "qwen35",
-                "tokenizer.ggml.tokens": ["<pad>", "x"],
-                "qwen35.ssm.state_size": 128,
-                "qwen35.ssm.group_count": 16,
-                "qwen35.block_count": 2,
-                "qwen35.nextn_predict_layers": 1,
-                "qwen35.embedding_length": 2560,
-                "qwen35.feed_forward_length": 9728,
-                "qwen35.attention.head_count": 16,
-                "qwen35.attention.head_count_kv": 8,
-                "qwen35.context_length": 32768,
-                "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
-                "qwen35.attention.key_length": 256,
-                "qwen35.ssm.conv_kernel": 4,
-                "qwen35.full_attention_interval": 4,
-                "qwen35.rope.freq_base": 1000000.0,
-                "qwen35.rope.dimension_sections": [8, 8, 8, 0],
-                "tokenizer.ggml.bos_token_id": 0,
-                "tokenizer.ggml.eos_token_id": 1,
-                "tokenizer.ggml.padding_token_id": 0,
-            }
-            value = fields.get(key)
-            return None if value is None else FakeField(value)
-
-    monkeypatch.setattr(gguf_utils.gguf, "GGUFReader", lambda _: FakeReader())
-
-    config_dict = gguf_utils.qwen35_gguf_config_dict(str(model))
-
-    assert config_dict is not None
-    text_config = config_dict["text_config"]
-    assert text_config["num_hidden_layers"] == 1
-    assert len(text_config["layer_types"]) == 1
-    assert text_config["num_nextn_predict_layers"] == 1
+@pytest.mark.parametrize(
+    ("kwargs", "option"),
+    [
+        (
+            {"index_topk": 2048, "index_dsa_use_layernorm": False},
+            "index_dsa_use_layernorm",
+        ),
+        (
+            {"index_topk": 2048, "index_kpool_compress": False},
+            "index_kpool_compress",
+        ),
+        (
+            {"index_topk": 2048, "index_kpool_always_select_tail": False},
+            "index_kpool_always_select_tail",
+        ),
+        ({"hres_vwnstyle": False}, "hres_vwnstyle"),
+        ({"mhc_no_norm_weight": True}, "mhc_no_norm_weight"),
+    ],
+)
+def test_glm5_next_rejects_unimplemented_config_options(kwargs, option):
+    with pytest.raises(NotImplementedError, match=option):
+        Glm5NextTextConfig(**kwargs)
 
 
 def test_get_llama3_eos_token():
@@ -379,3 +197,107 @@ def test_get_blip2_eos_token():
     generation_config = try_get_generation_config(model_name, trust_remote_code=False)
     assert generation_config is not None
     assert generation_config.eos_token_id == 50118
+
+
+def test_model_config_generation_fallback_forwards_code_revision():
+    model_config = cast(
+        ModelConfig,
+        SimpleNamespace(
+            generation_config="auto",
+            hf_config_path=None,
+            model="org/model",
+            trust_remote_code=True,
+            revision="model-pin",
+            code_revision="code-pin",
+            config_format="auto",
+            hf_token=None,
+        ),
+    )
+
+    with (
+        patch.object(
+            config_module.GenerationConfig,
+            "from_pretrained",
+            side_effect=OSError,
+        ),
+        patch.object(
+            config_module,
+            "get_config",
+            return_value=PretrainedConfig(),
+        ) as get_config,
+    ):
+        ModelConfig.try_get_generation_config(model_config)
+
+    get_config.assert_called_once_with(
+        "org/model",
+        trust_remote_code=True,
+        revision="model-pin",
+        code_revision="code-pin",
+        config_format="auto",
+        token=None,
+    )
+
+
+def test_safetensors_metadata_of_repo_without_safetensors():
+    """A repo storing its weights in another format is an answer, not a failure,
+    so it must not be retried."""
+    from huggingface_hub.errors import LocalEntryNotFoundError, NotASafetensorsRepoError
+
+    get_safetensors_metadata = MagicMock(
+        side_effect=NotASafetensorsRepoError("not a safetensors repo")
+    )
+    api = SimpleNamespace(
+        get_safetensors_metadata=get_safetensors_metadata,
+        snapshot_download=MagicMock(side_effect=LocalEntryNotFoundError("no cache")),
+    )
+
+    with patch.object(config_module, "hf_api", lambda: api):
+        assert get_safetensors_params_metadata("some/pytorch-only-model") == {}
+
+    get_safetensors_metadata.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("section_key", "mrope_section", "expected_num_dims"),
+    [
+        ("mrope_section", [16, 24, 24], 3),
+        ("mrope_section", [16, 16, 16, 16], 4),
+        # Interleaved M-RoPE takes 2 sections but still consumes 3D positions
+        ("mrope_section", [32, 32], 3),
+        # HunYuan-VL checkpoints ship the section under its legacy name
+        ("xdrope_section", [16, 16, 16, 16], 4),
+    ],
+)
+def test_mrope_num_dims(section_key, mrope_section, expected_num_dims):
+    config = PretrainedConfig()
+    config.rope_parameters = {"rope_type": "default", section_key: mrope_section}
+
+    assert uses_mrope(config)
+    assert mrope_num_dims(config) == expected_num_dims
+
+
+@pytest.mark.parametrize("section_name", ["mrope_section", "xdrope_section"])
+def test_mrope_num_dims_from_config_attribute(section_name):
+    """Some configs expose the section as an attribute rather than under
+    `rope_parameters`."""
+    config = PretrainedConfig()
+    setattr(config, section_name, [16, 16, 16, 16])
+
+    assert uses_mrope(config)
+    assert mrope_num_dims(config) == 4
+
+
+def test_mrope_num_dims_from_nested_rope_parameters():
+    """Sections nested by layer type must be found, not silently defaulted."""
+    config = PretrainedConfig()
+    config.rope_parameters = {
+        "full_attention": {"mrope_section": [16, 16, 16, 16]},
+        "linear_attention": {"rope_type": "default"},
+    }
+
+    assert uses_mrope(config)
+    assert mrope_num_dims(config) == 4
+
+
+def test_mrope_num_dims_without_mrope():
+    assert mrope_num_dims(PretrainedConfig()) == 0

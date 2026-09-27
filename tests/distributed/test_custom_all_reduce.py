@@ -9,7 +9,9 @@ import torch
 import torch.distributed as dist
 
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  # noqa
+from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
+from vllm.platforms import current_platform
 
 from ..utils import (
     ensure_model_parallel_initialized,
@@ -24,6 +26,200 @@ for i, v in enumerate(test_sizes):
 
 
 @ray.remote(num_gpus=1, max_calls=1)
+def _all_reduce_mhc(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    from vllm.model_executor.kernels.mhc.tilelang import (
+        mhc_post_tilelang,
+        mhc_pre_delayed_tilelang,
+    )
+
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        comm = get_tp_group().device_communicator.ca_comm
+        assert comm is not None and comm.mnnvl_lamport_ag_multicast_ptr
+        fn = torch.zeros(24, 20480, device=device)
+        scale = torch.ones(3, device=device)
+        base = torch.zeros(24, device=device)
+
+        # Changing shapes and interleaving all-gather exercise the shared
+        # Lamport stages, including cleanup of a larger previous payload.
+        def run(n):
+            torch.manual_seed(42 + rank)
+            x = torch.randn(n, 5120, device=device, dtype=torch.bfloat16)
+            # Packed +0/-0 pairs collide with the Lamport sentinel.
+            x[:, :16] = 0
+            x[:, 9:16:2] = -0.0
+            torch.manual_seed(123)
+            residual = torch.randn(n, 4, 5120, device=device, dtype=torch.bfloat16)
+            post = torch.rand(n, 4, device=device)
+            comb = torch.randn(n, 4, 4, device=device) * 0.1
+            pre = torch.rand(n, 4, device=device)
+            weight = torch.randn(5120, device=device, dtype=torch.bfloat16)
+            output = torch.empty_like(residual)
+            normalized = torch.empty_like(x)
+
+            def fused():
+                torch.ops._C_custom_ar.all_reduce_mhc(
+                    x,
+                    residual,
+                    post,
+                    comb,
+                    pre,
+                    weight,
+                    output,
+                    normalized,
+                    comm.mnnvl_lamport_ag_local_ptr,
+                    comm.mnnvl_lamport_ag_multicast_ptr,
+                    comm.mnnvl_lamport_epochs[0],
+                    rank,
+                    comm.mnnvl_buffer_size,
+                    1e-6,
+                )
+
+            def check():
+                gathered = comm.custom_all_gather(x)
+                assert gathered is not None
+                peers = gathered.view(tp_size, n, 5120).float()
+                reduced = peers[0].clone()
+                for peer in peers[1:]:
+                    reduced.add_(peer)
+                expected = mhc_post_tilelang(
+                    reduced.bfloat16(), residual, post.unsqueeze(-1), comb
+                )
+                expected_norm = mhc_pre_delayed_tilelang(
+                    expected,
+                    fn,
+                    scale,
+                    base,
+                    1e-6,
+                    1e-6,
+                    1e-6,
+                    2.0,
+                    20,
+                    pre_mix=pre,
+                    norm_weight=weight,
+                )[2]
+                torch.testing.assert_close(output, expected, rtol=0.008, atol=1e-6)
+                torch.testing.assert_close(
+                    normalized, expected_norm, rtol=0.008, atol=0.008
+                )
+
+            fused()
+            check()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for _ in range(6):
+                    fused()
+            for _ in range(20):
+                graph.replay()
+            check()
+            x.mul_(0.5)
+            residual.mul_(2)
+            graph.replay()
+            check()
+
+        # Cover fixed Q6 and shrinking/growing adaptive verification batches.
+        for n in (1, 6, 12, 8, 16, 3, 5, 2, 4, 1):
+            run(n)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100), reason="Requires SM100"
+)
+def test_all_reduce_mhc_preserves_bf16_boundaries_and_graph_replay(monkeypatch):
+    if torch.accelerator.device_count() < 4:
+        pytest.skip("Requires four GPUs with NVLink multicast")
+    multi_process_parallel(monkeypatch, 4, 1, _all_reduce_mhc)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        (torch.float32, True),
+        (torch.float16, True),
+        (torch.bfloat16, True),
+        (torch.int8, False),
+        (torch.float8_e4m3fn, False),
+    ],
+)
+def test_custom_allreduce_filters_dtype(
+    dtype: torch.dtype,
+    expected: bool,
+) -> None:
+    communicator = car.CustomAllreduce.__new__(car.CustomAllreduce)
+    communicator.disabled = False
+    communicator.world_size = 2
+    communicator.max_size = 1024
+    communicator._ptr = 0
+
+    assert communicator.should_custom_ar(torch.empty(16, dtype=dtype)) is expected
+
+
+@pytest.mark.parametrize(
+    ("major", "local_multicast", "expected"),
+    [
+        (8, True, False),
+        (9, True, False),
+        (10, False, False),
+        (10, True, True),
+    ],
+)
+def test_cross_node_mnnvl_gate_checks_generation_and_multicast(
+    monkeypatch,
+    major,
+    local_multicast,
+    expected,
+):
+    def has_device_capability(capability, device_id):
+        assert capability == 100
+        assert device_id == 3
+        return major >= 10
+
+    monkeypatch.setattr(
+        car.current_platform,
+        "has_device_capability",
+        has_device_capability,
+    )
+    monkeypatch.setattr(
+        car,
+        "_has_local_multicast_support",
+        lambda _device: local_multicast,
+    )
+    monkeypatch.setattr(car.dist, "all_reduce", lambda *_args, **_kwargs: None)
+
+    assert car._group_can_attempt_mnnvl(object(), torch.device("cuda:3")) is expected
+
+
+def test_cross_node_mnnvl_gate_requires_support_on_every_rank(monkeypatch):
+    monkeypatch.setattr(
+        car.current_platform,
+        "has_device_capability",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        car,
+        "_has_local_multicast_support",
+        lambda _device: True,
+    )
+
+    def report_unsupported_peer(support, **_kwargs):
+        support.zero_()
+
+    monkeypatch.setattr(car.dist, "all_reduce", report_unsupported_peer)
+
+    assert not car._group_can_attempt_mnnvl(object(), torch.device("cuda:0"))
+
+
+def test_local_multicast_support_rejects_non_cuda(monkeypatch):
+    monkeypatch.setattr(car.current_platform, "is_cuda", lambda: False)
+
+    assert not car._has_local_multicast_support(torch.device("cuda:0"))
+
+
+@ray.remote(num_gpus=1, max_calls=1)
 def graph_allreduce(
     monkeypatch: pytest.MonkeyPatch,
     tp_size,
@@ -33,8 +229,9 @@ def graph_allreduce(
 ):
     with monkeypatch.context() as m:
         m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        m.delenv("HIP_VISIBLE_DEVICES", raising=False)
         device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
+        torch.accelerator.set_device_index(device)
         init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
         ensure_model_parallel_initialized(tp_size, pp_size)
         group = get_tp_group().device_group
@@ -47,7 +244,7 @@ def graph_allreduce(
         data = torch.zeros(1)
         data = data.to(device=device)
         torch.distributed.all_reduce(data, group=group)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         del data
 
         # we use the first group to communicate once
@@ -61,13 +258,11 @@ def graph_allreduce(
             for dtype in [torch.float32, torch.float16, torch.bfloat16]:
                 with graph_capture(device=device) as graph_capture_context:
                     # use integers so result matches NCCL exactly
-                    inp1 = torch.randint(
-                        1, 16, (sz,), dtype=dtype, device=torch.cuda.current_device()
-                    )
-                    inp2 = torch.randint(
-                        1, 16, (sz,), dtype=dtype, device=torch.cuda.current_device()
-                    )
-                    torch.cuda.synchronize()
+                    device_idx = torch.accelerator.current_device_index()
+                    inp1 = torch.randint(1, 16, (sz,), dtype=dtype, device=device_idx)
+                    inp2 = torch.randint(1, 16, (sz,), dtype=dtype, device=device_idx)
+
+                    torch.accelerator.synchronize()
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, stream=graph_capture_context.stream):
                         for i in range(num_communication):
@@ -92,8 +287,9 @@ def eager_allreduce(
 ):
     with monkeypatch.context() as m:
         m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        m.delenv("HIP_VISIBLE_DEVICES", raising=False)
         device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
+        torch.accelerator.set_device_index(device)
         init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
 
         # we use the first group to communicate once
@@ -127,6 +323,6 @@ def test_custom_allreduce(
     test_target,
 ):
     world_size = tp_size * pipeline_parallel_size
-    if world_size > torch.cuda.device_count():
+    if world_size > torch.accelerator.device_count():
         pytest.skip("Not enough GPUs to run the test.")
     multi_process_parallel(monkeypatch, tp_size, pipeline_parallel_size, test_target)

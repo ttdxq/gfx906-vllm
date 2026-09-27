@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
+
+from vllm import envs
 from collections.abc import Mapping
 from typing import Any, Literal, cast
 
 from vllm.config import VllmConfig
+from vllm.exceptions import VLLMValidationError
 from vllm.inputs import (
     EngineInput,
     PromptType,
@@ -21,12 +24,14 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
 from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.multimodal.utils import argsort_mm_positions
-from vllm.renderers import renderer_from_config
+from vllm.renderers import BaseRenderer, renderer_from_config
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import MistralTokenizer, TokenizerLike
-from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
+from vllm.utils.async_utils import make_async
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.metrics.stats import MultiModalCacheStats
 from vllm.v1.structured_output.backend_guidance import validate_guidance_grammar
 from vllm.v1.structured_output.backend_lm_format_enforcer import (
@@ -44,7 +49,8 @@ class InputProcessor:
     def __init__(
         self,
         vllm_config: VllmConfig,
-        tokenizer: TokenizerLike | None,
+        renderer: BaseRenderer | None = None,
+        *,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ) -> None:
         self.vllm_config = vllm_config
@@ -56,20 +62,29 @@ class InputProcessor:
         self.generation_config_fields = self.model_config.try_get_generation_config()
 
         self.mm_registry = mm_registry
-        self.mm_processor_cache = processor_cache_from_config(vllm_config, mm_registry)
+        self.mm_processor_cache = processor_cache_from_config(vllm_config)
 
-        renderer = renderer_from_config(vllm_config, tokenizer=tokenizer)
+        # Callers (e.g. AsyncLLM) pass an already-built renderer; only build
+        # one (and its tokenizer) when not provided.
+        self.renderer = renderer = renderer or renderer_from_config(vllm_config)
+        tokenizer = self.renderer.tokenizer
         if self.model_config.is_multimodal_model:
             renderer.mm_processor = mm_registry.create_processor(
                 self.model_config,
                 tokenizer=tokenizer,
-                cache=self.mm_processor_cache,
             )
 
         self.input_preprocessor = InputPreprocessor(
             vllm_config,
             renderer=renderer,
             mm_registry=mm_registry,
+        )
+
+        # Raw-prompt preprocessing (tokenization and multimodal processing)
+        # is blocking, so async callers run it on the renderer's thread pool
+        # to keep their event loop responsive.
+        self.process_inputs_async = make_async(
+            self.process_inputs, executor=self.renderer._executor
         )
 
     @property
@@ -154,11 +169,8 @@ class InputProcessor:
         self,
         params: SamplingParams,
     ) -> None:
-        # Logits processors not supported.
-        if params.logits_processors:
-            raise ValueError(
-                "vLLM V1 does not support per request user provided logits processors."
-            )
+        # NOTE: per-request user logits processors were removed from
+        # SamplingParams upstream; there is no field left to reject here.
         # Penalties/bad words under async scheduling + spec decode are synced
         # from upstream #30495 (multi-placeholder folding plus spec_token_ids
         # backfill) and verified: greedy MTP + penalties is coherent over
@@ -406,6 +418,26 @@ class InputProcessor:
             mm_uuids[modality] = [f"{request_id}-{modality}-{i}" for i in range(n)]
         return mm_uuids
 
+    @staticmethod
+    def assign_request_id(request: EngineCoreRequest):
+        """Replace the externally supplied request ID with an internal request ID
+        that adds 8 random characters in order to ensure uniqueness.
+        """
+        if request.external_req_id is not None:
+            raise ValueError(
+                "The external_req_id field should not be set on EngineCoreRequests"
+                " passed to vLLM; use the request_id field."
+            )
+        request.external_req_id = request.request_id
+        if envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION:
+            logger.warning_once(
+                "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION is set and will be "
+                "removed in a future release. Duplicate externally-provided "
+                "request IDs may cause failures and/or subtle correctness errors."
+            )
+        else:
+            request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
+
     def process_inputs(
         self,
         request_id: str,
@@ -417,6 +449,10 @@ class InputProcessor:
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        supported_tasks: tuple[Any, ...] | None = None,
+        resumable: bool = False,
+        session_id: str | None = None,
+        kv_hints: KvHintsEnvelope | None = None,
     ) -> EngineCoreRequest:
         self._validate_lora(lora_request)
         self._validate_params(params)
@@ -470,9 +506,8 @@ class InputProcessor:
         from vllm.platforms import current_platform
 
         current_platform.validate_request(
-            prompt=prompt,
-            params=params,
             processed_inputs=processed_inputs,
+            params=params,
         )
 
         eos_token_id = self.input_preprocessor.renderer.get_eos_token_id()
@@ -499,6 +534,13 @@ class InputProcessor:
                     prompt_token_ids, prompt_embeds
                 )
                 sampling_params.max_tokens = self.model_config.max_model_len - seq_len
+                # min_tokens is not checked while max_tokens is unset.
+                if sampling_params.min_tokens > sampling_params.max_tokens:
+                    raise VLLMValidationError(
+                        f"min_tokens must be less than or equal to "
+                        f"max_tokens={sampling_params.max_tokens}, got "
+                        f"{sampling_params.min_tokens}."
+                    )
             sampling_params.update_from_generation_config(
                 self.generation_config_fields, eos_token_id
             )
@@ -538,13 +580,15 @@ class InputProcessor:
             mm_features=mm_features,
             sampling_params=sampling_params,
             pooling_params=pooling_params,
-            eos_token_id=eos_token_id,
             arrival_time=arrival_time,
             lora_request=lora_request,
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            resumable=resumable,
+            session_id=session_id,
+            kv_hints=kv_hints,
         )
 
     def _validate_model_inputs(
@@ -574,6 +618,14 @@ class InputProcessor:
             else None
         )
         prompt_len = length_from_prompt_token_ids_or_embeds(prompt_ids, prompt_embeds)
+        if prompt_inputs["type"] == "embeds":
+            is_token_ids = prompt_inputs.get("is_token_ids")
+            if is_token_ids is not None and len(is_token_ids) != prompt_len:
+                raise VLLMValidationError(
+                    "prompt_is_token_ids must have the same length as prompt_embeds "
+                    f"(expected {prompt_len}, got {len(is_token_ids)}).",
+                    parameter="prompt_is_token_ids",
+                )
         if not prompt_ids:
             if prompt_type == "encoder" and model_config.is_multimodal_model:
                 pass  # Mllama may have empty encoder inputs for text-only data

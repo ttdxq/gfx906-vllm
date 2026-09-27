@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -35,7 +35,7 @@ MovedRequest = tuple[int, int, MoveDirectionality]
 
 @dataclass(frozen=True)
 class BatchUpdate:
-    """Persistent batch state change info for logitsprocs"""
+    """Persistent batch state change info for logitsprocs."""
 
     batch_size: int  # Current num reqs in batch
 
@@ -62,7 +62,9 @@ class LogitsProcessor(ABC):
     def validate_params(cls, sampling_params: SamplingParams):
         """Validate sampling params for this logits processor.
 
-        Raise ValueError for invalid ones.
+        Raise ``VLLMValidationError`` (preferred) / ``ValueError`` (backward compatible)
+        for invalid params. Bare ``ValueError`` is converted to ``VLLMValidationError``
+        at the engine boundary so online serving returns HTTP 400.
         """
         return None
 
@@ -94,7 +96,7 @@ class LogitsProcessor(ABC):
     @abstractmethod
     def update_state(
         self,
-        batch_update: Optional["BatchUpdate"],
+        batch_update: "BatchUpdate | None",
     ) -> None:
         """Called when there are new output tokens, prior
         to each forward pass.
@@ -102,5 +104,6 @@ class LogitsProcessor(ABC):
         Args:
             batch_update: Non-None iff there have been changes
                 to the batch makeup.
+
         """
         raise NotImplementedError

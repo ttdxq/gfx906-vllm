@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Sequence
-from typing import Any, Generic, TypeVar
+from typing import Generic, TypeVar
 
 from vllm.config import VllmConfig
-from vllm.entrypoints.pooling.pooling.protocol import IOProcessorResponse
-from vllm.inputs.data import PromptType
+from vllm.inputs import PromptType
 from vllm.outputs import PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
+from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 
 IOProcessorInput = TypeVar("IOProcessorInput")
@@ -17,8 +16,27 @@ IOProcessorOutput = TypeVar("IOProcessorOutput")
 
 
 class IOProcessor(ABC, Generic[IOProcessorInput, IOProcessorOutput]):
-    def __init__(self, vllm_config: VllmConfig):
+    """Abstract interface for pre/post-processing of engine I/O."""
+
+    def __init__(self, vllm_config: VllmConfig, renderer: BaseRenderer):
+        super().__init__()
+
         self.vllm_config = vllm_config
+
+    def parse_data(self, data: object) -> IOProcessorInput:
+        raise NotImplementedError
+
+    def merge_sampling_params(
+        self,
+        params: SamplingParams | None = None,
+    ) -> SamplingParams:
+        return params or SamplingParams()
+
+    def merge_pooling_params(
+        self,
+        params: PoolingParams | None = None,
+    ) -> PoolingParams:
+        return params or PoolingParams(task="plugin")
 
     @abstractmethod
     def pre_process(
@@ -59,19 +77,4 @@ class IOProcessor(ABC, Generic[IOProcessorInput, IOProcessorOutput]):
             [(i, item) async for i, item in model_output], key=lambda output: output[0]
         )
         collected_output = [output[1] for output in sorted_output]
-        return self.post_process(collected_output, request_id, **kwargs)
-
-    @abstractmethod
-    def parse_request(self, request: Any) -> IOProcessorInput:
-        raise NotImplementedError
-
-    def validate_or_generate_params(
-        self, params: SamplingParams | PoolingParams | None = None
-    ) -> SamplingParams | PoolingParams:
-        return params or PoolingParams()
-
-    @abstractmethod
-    def output_to_response(
-        self, plugin_output: IOProcessorOutput
-    ) -> IOProcessorResponse:
-        raise NotImplementedError
+        return self.post_process(collected_output, request_id=request_id, **kwargs)

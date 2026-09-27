@@ -1,29 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pydantic models for Anthropic API protocol"""
+"""Pydantic models for Anthropic API protocol."""
 
 import time
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+import vllm.envs as envs
 
 
 class AnthropicError(BaseModel):
-    """Error structure for Anthropic API"""
+    """Error structure for Anthropic API."""
 
     type: str
     message: str
 
 
 class AnthropicErrorResponse(BaseModel):
-    """Error response structure for Anthropic API"""
+    """Error response structure for Anthropic API."""
 
     type: Literal["error"] = "error"
     error: AnthropicError
 
 
 class AnthropicUsage(BaseModel):
-    """Token usage information"""
+    """Token usage information."""
 
     input_tokens: int
     output_tokens: int
@@ -32,33 +34,51 @@ class AnthropicUsage(BaseModel):
 
 
 class AnthropicContentBlock(BaseModel):
-    """Content block in message"""
+    """Content block in message."""
 
-    type: Literal["text", "image", "tool_use", "tool_result"]
+    type: Literal[
+        "text",
+        "image",
+        "tool_use",
+        "tool_result",
+        "tool_reference",
+        "thinking",
+        "redacted_thinking",
+    ]
     text: str | None = None
     # For image content
     source: dict[str, Any] | None = None
     # For tool use/result
     id: str | None = None
+    tool_use_id: str | None = None
     name: str | None = None
     input: dict[str, Any] | None = None
     content: str | list[dict[str, Any]] | None = None
     is_error: bool | None = None
+    # For tool_reference content
+    tool_name: str | None = None
+    # For thinking content
+    thinking: str | None = None
+    signature: str | None = None
+    # For redacted thinking content (safety-filtered by the API)
+    data: str | None = None
 
 
 class AnthropicMessage(BaseModel):
-    """Message structure"""
+    """Message structure."""
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: str | list[AnthropicContentBlock]
 
 
 class AnthropicTool(BaseModel):
-    """Tool definition"""
+    """Tool definition."""
 
     name: str
     description: str | None = None
     input_schema: dict[str, Any]
+    strict: bool | None = None
+    defer_loading: bool | None = None
 
     @field_validator("input_schema")
     @classmethod
@@ -71,20 +91,44 @@ class AnthropicTool(BaseModel):
 
 
 class AnthropicToolChoice(BaseModel):
-    """Tool Choice definition"""
+    """Tool Choice definition."""
 
-    type: Literal["auto", "any", "tool"]
+    type: Literal["auto", "any", "tool", "none"]
     name: str | None = None
+    disable_parallel_tool_use: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_name_required_for_tool(self) -> "AnthropicToolChoice":
+        if self.type == "tool" and not self.name:
+            raise ValueError("tool_choice.name is required when type is 'tool'")
+        return self
+
+
+class AnthropicJsonOutputFormat(BaseModel):
+    """JSON output format configuration."""
+
+    json_schema: dict[str, Any] | None = Field(default=None, alias="schema")
+    type: Literal["json_schema"] = "json_schema"
+
+
+class AnthropicOutputConfig(BaseModel):
+    """Configuration options for the model's output, such as the output format."""
+
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    format: AnthropicJsonOutputFormat | None = None
 
 
 class AnthropicMessagesRequest(BaseModel):
-    """Anthropic Messages API request"""
+    """Anthropic Messages API request."""
 
     model: str
     messages: list[AnthropicMessage]
     max_tokens: int
     metadata: dict[str, Any] | None = None
-    stop_sequences: list[str] | None = None
+    output_config: AnthropicOutputConfig | None = None
+    stop_sequences: (
+        Annotated[list[str], Field(max_length=envs.VLLM_MAX_STOP_STRINGS)] | None
+    ) = None
     stream: bool | None = False
     system: str | list[AnthropicContentBlock] | None = None
     temperature: float | None = None
@@ -92,6 +136,45 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
     top_p: float | None = None
+
+    # vLLM-specific fields that are not in Anthropic spec
+    cache_salt: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1024,
+        description=(
+            "If specified, the prefix cache will be salted with the provided "
+            "string to prevent an attacker to guess prompts in multi-user "
+            "environments. The salt should be random, protected from "
+            "access by 3rd parties, and long enough to be "
+            "unpredictable (e.g., 43 characters base64-encoded, corresponding "
+            "to 256 bit)."
+        ),
+    )
+    kv_transfer_params: dict[str, Any] | None = Field(
+        default=None,
+        description="KVTransfer parameters used for disaggregated serving.",
+    )
+    ec_transfer_params: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "ECTransfer parameters used for encoder-cache disaggregated serving."
+        ),
+    )
+    vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
+        default=None,
+        description=(
+            "Additional request parameters with (list of) string or "
+            "numeric values, used by custom extensions."
+        ),
+    )
+    chat_template_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Additional keyword args to pass to the chat template renderer. "
+            "Will be accessible by the template."
+        ),
+    )
 
     @field_validator("model")
     @classmethod
@@ -109,11 +192,16 @@ class AnthropicMessagesRequest(BaseModel):
 
 
 class AnthropicDelta(BaseModel):
-    """Delta for streaming responses"""
+    """Delta for streaming responses."""
 
-    type: Literal["text_delta", "input_json_delta"] | None = None
+    type: (
+        Literal["text_delta", "input_json_delta", "thinking_delta", "signature_delta"]
+        | None
+    ) = None
     text: str | None = None
+    thinking: str | None = None
     partial_json: str | None = None
+    signature: str | None = None
 
     # Message delta
     stop_reason: (
@@ -123,7 +211,7 @@ class AnthropicDelta(BaseModel):
 
 
 class AnthropicStreamEvent(BaseModel):
-    """Streaming event"""
+    """Streaming event."""
 
     type: Literal[
         "message_start",
@@ -135,7 +223,7 @@ class AnthropicStreamEvent(BaseModel):
         "ping",
         "error",
     ]
-    message: Optional["AnthropicMessagesResponse"] = None
+    message: "AnthropicMessagesResponse | None" = None
     delta: AnthropicDelta | None = None
     content_block: AnthropicContentBlock | None = None
     index: int | None = None
@@ -144,7 +232,7 @@ class AnthropicStreamEvent(BaseModel):
 
 
 class AnthropicMessagesResponse(BaseModel):
-    """Anthropic Messages API response"""
+    """Anthropic Messages API response."""
 
     id: str
     type: Literal["message"] = "message"
@@ -157,6 +245,53 @@ class AnthropicMessagesResponse(BaseModel):
     stop_sequence: str | None = None
     usage: AnthropicUsage | None = None
 
+    # vLLM-specific fields that are not in Anthropic spec
+    kv_transfer_params: dict[str, Any] | None = Field(
+        default=None, description="KVTransfer parameters."
+    )
+    ec_transfer_params: dict[str, Any] | None = Field(
+        default=None, description="ECTransfer parameters."
+    )
+
     def model_post_init(self, __context):
         if not self.id:
             self.id = f"msg_{int(time.time() * 1000)}"
+
+
+class AnthropicContextManagement(BaseModel):
+    """Context management information for token counting."""
+
+    original_input_tokens: int
+
+
+class AnthropicCountTokensRequest(BaseModel):
+    """Anthropic messages.count_tokens request."""
+
+    model: str
+    messages: list[AnthropicMessage]
+    system: str | list[AnthropicContentBlock] | None = None
+    tool_choice: AnthropicToolChoice | None = None
+    tools: list[AnthropicTool] | None = None
+
+    # vLLM-specific fields that are not in Anthropic spec
+    chat_template_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Additional keyword args to pass to the chat template renderer. "
+            "Will be accessible by the template."
+        ),
+    )
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, v):
+        if not v:
+            raise ValueError("Model is required")
+        return v
+
+
+class AnthropicCountTokensResponse(BaseModel):
+    """Anthropic messages.count_tokens response."""
+
+    input_tokens: int
+    context_management: AnthropicContextManagement | None = None

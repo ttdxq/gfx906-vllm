@@ -12,7 +12,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -223,13 +223,18 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        # Upstream renamed FusedMoE.make_expert_params_mapping into
+        # RoutedExperts.build_expert_params_mapping; an empty
+        # routed_experts_prefix and no LoRA prefix keep the returned tuples
+        # identical to the old format.
+        expert_params_mapping = RoutedExperts.build_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts
             if hasattr(self.config, "num_experts")
             else 0,
+            routed_experts_prefix="",
         )
 
         params_dict = dict(self.named_parameters())

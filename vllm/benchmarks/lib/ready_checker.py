@@ -8,7 +8,11 @@ import time
 import aiohttp
 from tqdm.asyncio import tqdm
 
+from vllm.logger import init_logger
+
 from .endpoint_request_func import RequestFunc, RequestFuncInput, RequestFuncOutput
+
+logger = init_logger(__name__)
 
 
 async def wait_for_endpoint(
@@ -18,12 +22,12 @@ async def wait_for_endpoint(
     timeout_seconds: int = 600,
     retry_interval: int = 5,
 ) -> RequestFuncOutput:
-    """
-    Wait for an endpoint to become available before starting benchmarks.
+    """Wait for an endpoint to become available before starting benchmarks.
 
     Args:
         request_func: The async request function to call
         test_input: The RequestFuncInput to test with
+        session: The aiohttp session used to issue the probe requests
         timeout_seconds: Maximum time to wait in seconds (default: 10 minutes)
         retry_interval: Time between retries in seconds (default: 5 seconds)
 
@@ -32,6 +36,7 @@ async def wait_for_endpoint(
 
     Raises:
         ValueError: If the endpoint doesn't become available within the timeout
+
     """
     deadline = time.perf_counter() + timeout_seconds
     output = RequestFuncOutput(success=False)
@@ -61,6 +66,9 @@ async def wait_for_endpoint(
                 if output.success:
                     pbar.close()
                     return output
+                else:
+                    err_last_line = str(output.error).rstrip().rsplit("\n", 1)[-1]
+                    logger.warning("Endpoint is not ready. Error='%s'", err_last_line)
             except aiohttp.ClientConnectorError:
                 pass
 

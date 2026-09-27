@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import os
-from typing import Any
 
 import torch
-import torch.distributed
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_world_group
 from vllm.logger import init_logger
-from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
+from vllm.utils.mem_utils import MemorySnapshot, format_gib
+from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
-from vllm.v1.worker.xpu_model_runner import XPUModelRunner
+from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.xpu_model_runner import XPUModelRunner, XPUModelRunnerV2
+
+from .utils import request_memory
 
 logger = init_logger(__name__)
 
@@ -36,137 +38,134 @@ class XPUWorker(Worker):
         assert device_config.device_type == "xpu"
         assert current_platform.is_xpu()
 
-        # Torch profiler. Enabled and configured through env vars:
-        # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
-        self.profiler: Any | None = None
-        if envs.VLLM_TORCH_PROFILER_DIR:
-            torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
-            worker_name = f"{vllm_config.instance_id}-rank-{self.rank}"
-            logger.info(
-                "Profiling enabled. Traces will be saved to: %s",
-                torch_profiler_trace_dir,
-            )
-            logger.debug(
-                "Profiler config: record_shapes=%s,"
-                "profile_memory=%s,with_stack=%s,with_flops=%s",
-                envs.VLLM_TORCH_PROFILER_RECORD_SHAPES,
-                envs.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY,
-                envs.VLLM_TORCH_PROFILER_WITH_STACK,
-                envs.VLLM_TORCH_PROFILER_WITH_FLOPS,
-            )
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.XPU,
-                ],
-                record_shapes=envs.VLLM_TORCH_PROFILER_RECORD_SHAPES,
-                profile_memory=envs.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY,
-                with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
-                with_flops=envs.VLLM_TORCH_PROFILER_WITH_FLOPS,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir,
-                    worker_name=worker_name,
-                    use_gzip=envs.VLLM_TORCH_PROFILER_USE_GZIP,
-                ),
-            )
-        else:
-            self.profiler = None
-
-    # we provide this function due to `torch.xpu.mem_get_info()` doesn't
-    # return correct free_gpu_memory on intel client GPU. We need to
-    # calculate/estiamte it.
-    def xpu_get_mem_info(self):
-        if current_platform.is_data_center_gpu():
-            return torch.xpu.mem_get_info()
-        else:
-            _, total_gpu_memory = torch.xpu.mem_get_info()
-            # FIXME: memory_allocated() doesn't count non-torch allocations,
-            # and we don't have any API to get it. so we mark it as 128MB.
-            used_memory = torch.xpu.memory_allocated()
-            non_torch_allocations = 128 * 1024 * 1024
-            free_gpu_memory = total_gpu_memory - (used_memory + non_torch_allocations)
-            return free_gpu_memory, total_gpu_memory
-
-    @torch.inference_mode()
-    def determine_available_memory(self) -> int:
-        """Profiles the peak memory usage of the model to determine how many
-        KV blocks may be allocated without OOMs.
-        The engine will first conduct a profiling of the existing memory usage.
-        Then, it calculates the maximum possible number of GPU and CPU blocks
-        that can be allocated with the remaining free memory.
-        .. tip::
-            You may limit the usage of GPU memory
-            by adjusting the `gpu_memory_utilization` parameter.
-        """
-        # Profile the memory usage of the model and get the maximum number of
-        # cache blocks that can be allocated with the remaining free memory.
-        torch.xpu.empty_cache()
-        torch.xpu.reset_peak_memory_stats()
-
-        free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info()
-        current_allocated_bytes = torch.xpu.memory_allocated()
-        msg = (
-            "Before memory profiling run, "
-            f"total GPU memory: {total_gpu_memory / 1024**2:.2f} MB, "
-            f"model load takes {current_allocated_bytes / 1024**2:.2f} MB, "
-            f"free gpu memory is {free_gpu_memory / 1024**2:.2f} MB."
-        )
-        logger.info(msg)
-        # Execute a forward pass with dummy inputs to profile the memory usage
-        # of the model.
-        self.model_runner.profile_run()
-
-        free_gpu_memory, _ = self.xpu_get_mem_info()
-        # NOTE(woosuk): Here we assume that the other processes using the same
-        # GPU did not change their memory usage during the profiling.
-        assert self.init_gpu_memory > free_gpu_memory, (
-            "Error in memory profiling. "
-            f"Initial free memory {self.init_gpu_memory}, current free memory"
-            f" {free_gpu_memory}. This happens when the GPU memory was "
-            "not properly cleaned up before initializing the vLLM instance."
-        )
-
-        # Get the peak memory allocation recorded by torch
-        peak_memory = torch.xpu.memory_stats()["allocated_bytes.all.peak"]
-
-        torch.xpu.empty_cache()
-        torch_allocated_bytes = torch.xpu.memory_stats()["allocated_bytes.all.current"]
-        total_allocated_bytes = self.xpu_get_mem_info()[1] - self.xpu_get_mem_info()[0]
-
-        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
-        if non_torch_allocations > 0:
-            peak_memory += non_torch_allocations
-        available_kv_cache_memory = (
-            total_gpu_memory * self.cache_config.gpu_memory_utilization - peak_memory
-        )
-
-        msg = (
-            "After memory profiling run, "
-            f"peak memory usage is {peak_memory / 1024**2:.2f} MB,"
-            f"torch mem is {torch_allocated_bytes / 1024**2:.2f} MB, "
-            f"non-torch mem is {non_torch_allocations / 1024**2:.2f} MB, "
-            f"free gpu memory is {free_gpu_memory / 1024**2:.2f} MB."
-        )
-        logger.info(msg)
-
-        return int(available_kv_cache_memory)
-
     def init_device(self):
+        # In DP mode, XPU workers see all visible devices.
+        # Offset local_rank by the local DP shard.
+        parallel_config = self.parallel_config
+        if (
+            parallel_config.distributed_executor_backend
+            not in ("ray", "external_launcher")
+            and parallel_config.data_parallel_backend != "ray"
+            and (
+                parallel_config.data_parallel_external_lb
+                or parallel_config.nnodes_within_dp == 1
+            )
+        ):
+            dp_local_rank = parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel_config.data_parallel_index
+            replica_world_size = parallel_config.world_size
+            visible_device_count = torch.accelerator.device_count()
+
+            if parallel_config.data_parallel_external_lb:
+                if parallel_config.nnodes_within_dp > 1:
+                    # The replica spans nodes, so use its node-local shard.
+                    replica_world_size = parallel_config.local_world_size
+                    if replica_world_size > visible_device_count:
+                        raise ValueError(
+                            f"Local TP/PP/PCP replica size ({replica_world_size}) "
+                            "exceeds the number of visible XPU devices "
+                            f"({visible_device_count})."
+                        )
+                    local_dp_capacity = visible_device_count // replica_world_size
+                elif replica_world_size < visible_device_count:
+                    # A node can host multiple complete TP/PP/PCP replicas.
+                    local_dp_capacity = visible_device_count // replica_world_size
+                    if visible_device_count % replica_world_size != 0:
+                        logger.warning_once(
+                            "XPU external LB cannot evenly divide "
+                            "%d visible devices into TP/PP/PCP replicas of "
+                            "size %d. This node can host %d complete DP "
+                            "replicas, leaving %d visible devices unused.",
+                            visible_device_count,
+                            replica_world_size,
+                            local_dp_capacity,
+                            visible_device_count % replica_world_size,
+                        )
+                elif replica_world_size == visible_device_count:
+                    # A node hosts exactly one complete TP/PP/PCP replica.
+                    local_dp_capacity = 1
+                    logger.warning_once(
+                        "XPU external LB sees exactly enough devices for one "
+                        "TP/PP/PCP replica. This may be the intended "
+                        "configuration, but it may also indicate that device "
+                        "visibility is misconfigured. Every DP rank must see "
+                        "all XPU devices on its node; consider removing "
+                        "ZE_AFFINITY_MASK or setting it to expose the complete "
+                        "device set."
+                    )
+                else:
+                    # The topology says single-node, but the replica does not fit.
+                    raise ValueError(
+                        f"TP/PP/PCP replica size ({replica_world_size}) exceeds "
+                        f"the number of visible XPU devices ({visible_device_count}), "
+                        "but nnodes_within_dp is 1. Configure the multi-node "
+                        "topology, or ensure every DP rank can see all devices "
+                        "on its node."
+                    )
+                # Strip the node component off the global DP index to get this
+                # engine's slot on its own node. Assumes the launcher assigns
+                # DP ranks to nodes in contiguous blocks (node 0 gets ranks
+                # 0..capacity-1, and so on), which is what the usual sequential
+                # and one-pod-per-rank deployments do. A round-robin or
+                # unbalanced assignment would silently map two engines onto the
+                # same device.
+                dp_local_rank = parallel_config.data_parallel_index % local_dp_capacity
+
+            self.local_rank += dp_local_rank * replica_world_size
+
         device = self.device_config.device
         if (
             isinstance(device, torch.device)
             and device.type == "xpu"
             and current_platform.is_xpu()
         ):
-            self.device = torch.device(f"xpu:{self.local_rank}")
-            current_platform.set_device(self.device)
+            assigned_physical_gpu_ids = self.parallel_config.assigned_physical_gpu_ids
+            if assigned_physical_gpu_ids is not None:
+                from vllm.platforms.interface import set_assigned_physical_gpu_ids
+
+                set_assigned_physical_gpu_ids(assigned_physical_gpu_ids)
+                assert self.local_rank < len(assigned_physical_gpu_ids), (
+                    f"local_rank {self.local_rank} is out of bounds for "
+                    f"assigned_physical_gpu_ids {assigned_physical_gpu_ids}"
+                )
+                # NOTE: local_world_size is derived from parallel_config.nnodes,
+                # which is only set for the "mp" multi-node backend. With the
+                # "ray"/"external_launcher" backends nnodes stays 1, so
+                # local_world_size collapses to the full world_size and this
+                # check wrongly fires on cross-node deployments.
+                # assigned_physical_gpu_ids is already per-node and the
+                # local_rank bound above fully validates the mapping for
+                # these backends, so skip the check for them.
+                if parallel_config.distributed_executor_backend not in (
+                    "ray",
+                    "external_launcher",
+                ):
+                    assert parallel_config.local_world_size <= len(
+                        assigned_physical_gpu_ids
+                    ), (
+                        f"local_world_size ({parallel_config.local_world_size})"
+                        " exceeds assigned_physical_gpu_ids count "
+                        f"({len(assigned_physical_gpu_ids)})"
+                    )
+            else:
+                assert self.local_rank < torch.accelerator.device_count(), (
+                    f"DP adjusted local rank {self.local_rank} is out of "
+                    f"bounds for {torch.accelerator.device_count()} devices."
+                )
+
+            visible_device_index = (
+                current_platform.logical_device_id_to_visible_device_id(self.local_rank)
+            )
+            self.device = torch.device(f"xpu:{visible_device_index}")
+            torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
-            torch.xpu.empty_cache()
+            torch.accelerator.empty_cache()
             self.init_gpu_memory = torch.xpu.get_device_properties(
-                self.local_rank
+                visible_device_index
             ).total_memory
         else:
-            raise RuntimeError(f"Not support device type: {self.device_config.device}")
+            raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
         ENV_LOCAL_WORLD_SIZE = os.getenv(
@@ -184,15 +183,60 @@ class XPUWorker(Worker):
             current_platform.dist_backend,
         )
 
-        # global all_reduce needed for overall oneccl warm up
-        torch.distributed.all_reduce(
-            torch.zeros(1).xpu(), group=get_world_group().device_group
-        )
+        # oneCCL warm-up; only meaningful for multi-device runs. Requiring it
+        # with a single worker breaks platforms where oneCCL cannot enumerate
+        # device topology (e.g. paravirtualized GPUs).
+        if (
+            self.parallel_config.world_size > 1
+            and torch.distributed.is_xccl_available()
+        ):
+            torch.distributed.all_reduce(torch.zeros(1).xpu())
+
+        if self.use_v2_model_runner:
+            logger.info_once("Using V2 Model Runner")
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
+        # Now take memory snapshot after NCCL is initialized
+        gc.collect()
+        torch.accelerator.empty_cache()
+
+        # take current memory snapshot
+        self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+        self.requested_memory = request_memory(init_snapshot, self.cache_config)
+        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+        logger.debug(
+            "worker requested memory: %sGiB", format_gib(self.requested_memory)
+        )
+
+        # Initialize workspace manager
+        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        init_workspace_manager(self.device, num_ubatches)
+
         # Construct the model runner
-        self.model_runner = XPUModelRunner(  # type: ignore
+        model_runner = XPUModelRunnerV2 if self.use_v2_model_runner else XPUModelRunner
+        self.model_runner = model_runner(  # type: ignore
             self.vllm_config, self.device
+        )
+
+        if self.rank == 0:
+            # If usage stat is enabled, collect relevant info.
+            report_usage_stats(self.vllm_config)
+
+    def shutdown(self) -> None:
+        logger.info(
+            "XPUWorker shutdown: cleaning up (rank=%d, local_rank=%d)",
+            self.rank,
+            self.local_rank,
+        )
+        super().shutdown()
+        from vllm.device_allocator.xpumem import XpuMemAllocator
+
+        if XpuMemAllocator.instance is not None:
+            XpuMemAllocator.instance.release_pools()
+        logger.info(
+            "XPUWorker shutdown: done (rank=%d, local_rank=%d)",
+            self.rank,
+            self.local_rank,
         )

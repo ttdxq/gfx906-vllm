@@ -5,8 +5,6 @@ import uuid
 from dataclasses import field
 from typing import Any, Literal, get_args
 
-from pydantic.dataclasses import dataclass
-
 from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 
@@ -15,8 +13,47 @@ KVConsumer = Literal["kv_consumer", "kv_both"]
 KVRole = Literal[KVProducer, KVConsumer]
 
 
+def hisparse_host_pool_gib(
+    kv_transfer_config: "KVTransferConfig | None",
+) -> float | None:
+    if kv_transfer_config is None:
+        return None
+    if kv_transfer_config.kv_connector == "MultiConnector":
+        connectors = kv_transfer_config.kv_connector_extra_config.get("connectors", [])
+    else:
+        connectors = [
+            {
+                "kv_connector": kv_transfer_config.kv_connector,
+                "kv_connector_extra_config": (
+                    kv_transfer_config.kv_connector_extra_config
+                ),
+            }
+        ]
+    entries = [
+        connector.get("kv_connector_extra_config", {})
+        for connector in connectors
+        if connector.get("kv_connector") == "HiSparseConnector"
+    ]
+    if len(entries) > 1:
+        raise ValueError("Only one HiSparseConnector may be configured")
+    if not entries:
+        return None
+    host_pool_gib = entries[0].get("host_pool_gib")
+    if host_pool_gib is None:
+        raise ValueError("HiSparseConnector requires host_pool_gib")
+    host_pool_gib = float(host_pool_gib)
+    if host_pool_gib <= 0:
+        raise ValueError("HiSparseConnector host_pool_gib must be positive")
+    return host_pool_gib
+
+
+def kv_buffer_device_default_factory() -> str:
+    from vllm.platforms import current_platform
+
+    return current_platform.device_type
+
+
 @config
-@dataclass
 class KVTransferConfig:
     """Configuration for distributed KV cache transfer."""
 
@@ -27,9 +64,9 @@ class KVTransferConfig:
     engine_id: str | None = None
     """The engine id for KV transfers."""
 
-    kv_buffer_device: str = "cuda"
-    """The device used by kv connector to buffer the KV cache. Choices are 
-    'cuda' and 'cpu'."""
+    kv_buffer_device: str = field(default_factory=kv_buffer_device_default_factory)
+    """The device used by kv connector to buffer the KV cache. Choices are
+    'cuda', 'cpu' and 'xpu'."""
 
     kv_buffer_size: float = 1e9
     """The buffer size for TorchDistributedConnector. Measured in number of
@@ -45,8 +82,7 @@ class KVTransferConfig:
     Currently only 1P1D is supported."""
 
     kv_parallel_size: int = 1
-    """The number of parallel instances for KV cache transfer. For
-    P2pNcclConnector, this should be 2."""
+    """The number of parallel instances for KV cache transfer."""
 
     kv_ip: str = "127.0.0.1"
     """The KV connector ip, used to build distributed connection."""
@@ -64,9 +100,13 @@ class KVTransferConfig:
     enable_permute_local_kv: bool = False
     """Experiment feature flag to enable HND to NHD KV Transfer"""
 
+    kv_load_failure_policy: Literal["recompute", "fail"] = "fail"
+    """Policy for handling KV cache load failures.
+    'recompute': reschedule the request to recompute failed blocks
+    'fail': immediately fail the request with an error finish reason (default)"""
+
     def compute_hash(self) -> str:
-        """
-        WARNING: Whenever a new field is added to this config,
+        """WARNING: Whenever a new field is added to this config,
         ensure that it is included in the factors list if
         it affects the computation graph.
 
@@ -112,3 +152,12 @@ class KVTransferConfig:
 
     def get_from_extra_config(self, key, default) -> Any:
         return self.kv_connector_extra_config.get(key, default)
+
+    def has_connector(self, connector_name: str) -> bool:
+        """Whether ``connector_name`` is configured, directly or in MultiConnector."""
+        if self.kv_connector == connector_name:
+            return True
+        return self.kv_connector == "MultiConnector" and any(
+            child.get("kv_connector") == connector_name
+            for child in self.kv_connector_extra_config.get("connectors", [])
+        )

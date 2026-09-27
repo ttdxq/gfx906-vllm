@@ -7,32 +7,29 @@
 # Copyright (c) 2023 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
-import os
-from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping, Sequence
-from typing import Annotated, Any, Literal, TypeAlias, TypeVar
+from abc import abstractmethod
+from collections.abc import Hashable, Iterable, Mapping, Sequence
+from functools import cached_property
+from typing import Annotated, Any, Literal, TypeAlias, TypedDict, TypeVar
 
-import numpy.typing as npt
 import torch
 import torch.nn as nn
-import torchvision.transforms as T
-from PIL import Image
-from transformers import BatchFeature, PretrainedConfig, TensorType
+from transformers import BatchFeature, PretrainedConfig
 
 from vllm.config import VllmConfig
-from vllm.config.multimodal import BaseDummyOptions
+from vllm.config.multimodal import MultiModalDummyOptions
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.awq import AWQConfig
+from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.models.intern_vit import (
     InternVisionModel,
-    InternVisionPatchModel,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
+    BatchedTensorInputs,
     MultiModalFieldConfig,
+    MultiModalKwargsItem,
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import (
@@ -42,42 +39,43 @@ from vllm.multimodal.parse import (
     MultiModalDataItems,
 )
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
-    PromptUpdateDetails,
+    cached_encode,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
-from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.processors.internvl import (
+    InternVLImageProcessor,
+    InternVLProcessor,
+    InternVLVideoProcessor,
+)
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
-from vllm.utils.torch_utils import set_default_torch_num_threads
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
 )
-from .utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
-
-IMG_START = "<img>"
-IMG_END = "</img>"
-IMG_CONTEXT = "<IMG_CONTEXT>"
-
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+from .utils import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    init_vllm_registered_model,
+    maybe_prefix,
+)
 
 
 class InternVLImagePixelInputs(TensorSchema):
-    """
-    Dimensions:
-        - bn: Batch size * number of images
-        - bnp: Batch size * number of images * (1 + num_patches)
-        - c: Number of channels (3)
-        - h: Height of each image patch
-        - w: Width of each image patch
+    """Dimensions:
+    - bn: Batch size * number of images
+    - bnp: Batch size * number of images * (1 + num_patches)
+    - c: Number of channels (3)
+    - h: Height of each image patch
+    - w: Width of each image patch
     """
 
     type: Literal["pixel_values"]
@@ -86,11 +84,10 @@ class InternVLImagePixelInputs(TensorSchema):
 
 
 class InternVLImageEmbeddingInputs(TensorSchema):
-    """
-    Dimensions:
-        - n: Number of images
-        - f: Total image feature size
-        - h: Hidden size (must match the hidden size of language model backbone)
+    """Dimensions:
+    - n: Number of images
+    - f: Total image feature size
+    - h: Hidden size (must match the hidden size of language model backbone)
     """
 
     type: Literal["image_embeds"]
@@ -101,13 +98,12 @@ InternVLImageInputs: TypeAlias = InternVLImagePixelInputs | InternVLImageEmbeddi
 
 
 class InternVLVideoPixelInputs(TensorSchema):
-    """
-    Dimensions:
-        - bvf: Batch size * number of videos * num_frames
-        - bn: Batch size * number of images
-        - c: Number of channels (3)
-        - h: Height of each video frame
-        - w: Width of each video frame
+    """Dimensions:
+    - bvf: Batch size * number of videos * num_frames
+    - bn: Batch size * number of images
+    - c: Number of channels (3)
+    - h: Height of each video frame
+    - w: Width of each video frame
     """
 
     type: Literal["pixel_values_videos"]
@@ -116,11 +112,10 @@ class InternVLVideoPixelInputs(TensorSchema):
 
 
 class InternVLVideoEmbeddingInputs(TensorSchema):
-    """
-    Dimensions:
-        - n: Number of videos
-        - f: Total video feature size
-        - h: Hidden size (must match the hidden size of language model backbone)
+    """Dimensions:
+    - n: Number of videos
+    - f: Total video feature size
+    - h: Hidden size (must match the hidden size of language model backbone)
     """
 
     type: Literal["video_embeds"]
@@ -130,585 +125,16 @@ class InternVLVideoEmbeddingInputs(TensorSchema):
 InternVLVideoInputs: TypeAlias = InternVLVideoPixelInputs | InternVLVideoEmbeddingInputs
 
 
-# adapted from https://huggingface.co/OpenGVLab/InternVL2-1B
-def build_transform(input_size: int):
-    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
-    transform = T.Compose(
-        [
-            T.Lambda(lambda img: convert_image_mode(img, "RGB")),
-            T.Resize(
-                (input_size, input_size), interpolation=T.InterpolationMode.BICUBIC
-            ),
-            T.ToTensor(),
-            T.Normalize(mean=MEAN, std=STD),
-        ]
-    )
-    # Image transformation operations (which include tensor computations
-    # on the CPU) can occupy a substantial number of CPU cores, introducing
-    # overhead due to CPU contention. This issue becomes particularly
-    # noticeable when deploying multiple vLLM instances on a single machine.
-    # Therefore, it is necessary to limit the number of threads allocated to
-    # image transformation tasks.
-    num_threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
-
-    def apply(img):
-        with set_default_torch_num_threads(num_threads):
-            return transform(img)
-
-    return apply
-
-
-# adapted from https://huggingface.co/OpenGVLab/InternVL2-1B
-def find_closest_aspect_ratio(
-    aspect_ratio: float,
-    target_ratios: list[tuple[int, int]],
-    *,
-    width: int,
-    height: int,
-    image_size: int,
-) -> tuple[int, int]:
-    best_ratio_diff = float("inf")
-    best_ratio = (1, 1)
-    area = width * height
-    for ratio in target_ratios:
-        target_aspect_ratio = ratio[0] / ratio[1]
-        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
-        if ratio_diff < best_ratio_diff:
-            best_ratio_diff = ratio_diff
-            best_ratio = ratio
-        elif ratio_diff == best_ratio_diff:
-            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
-                best_ratio = ratio
-    return best_ratio
-
-
-def resolve_internvl_min_max_num(
-    *,
-    min_dynamic_patch: int,
-    max_dynamic_patch: int,
-    dynamic_image_size: bool,
-    use_thumbnail: bool,
-) -> tuple[int, int]:
-    min_dynamic_patch = min_dynamic_patch if dynamic_image_size else 1
-    max_dynamic_patch = max_dynamic_patch if dynamic_image_size else 1
-
-    if use_thumbnail and max_dynamic_patch != 1:
-        max_dynamic_patch += 1
-
-    return min_dynamic_patch, max_dynamic_patch
-
-
-def get_internvl_target_ratios(
-    min_num: int,
-    max_num: int,
-) -> list[tuple[int, int]]:
-    target_ratios = {
-        (i, j)
-        for n in range(min_num, max_num + 1)
-        for i in range(1, n + 1)
-        for j in range(1, n + 1)
-        if min_num <= i * j <= max_num
-    }
-    return sorted(target_ratios, key=lambda x: x[0] * x[1])
-
-
-def calculate_internvl_targets(
-    *,
-    orig_width: int,
-    orig_height: int,
-    target_ratios: list[tuple[int, int]],
-    image_size: int,
-    use_thumbnail: bool,
-) -> tuple[int, int, int]:
-    aspect_ratio = orig_width / orig_height
-
-    # find the closest aspect ratio to the target
-    target_aspect_ratio = find_closest_aspect_ratio(
-        aspect_ratio,
-        target_ratios,
-        width=orig_width,
-        height=orig_height,
-        image_size=image_size,
-    )
-
-    # calculate the target width and height
-    target_width = image_size * target_aspect_ratio[0]
-    target_height = image_size * target_aspect_ratio[1]
-    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
-
-    # add thumbnail image if num_blocks != 1
-    if use_thumbnail and blocks != 1:
-        blocks += 1
-
-    return blocks, target_width, target_height
-
-
-# adapted from https://huggingface.co/OpenGVLab/InternVL2-1B
-def dynamic_preprocess_internvl(
-    image: Image.Image,
-    *,
-    target_ratios: list[tuple[int, int]],
-    image_size: int,
-    use_thumbnail: bool,
-) -> list[Image.Image]:
-    orig_width, orig_height = image.size
-
-    # calculate the number of blocks without thumbnail
-    blocks, target_width, target_height = calculate_internvl_targets(
-        orig_width=orig_width,
-        orig_height=orig_height,
-        target_ratios=target_ratios,
-        image_size=image_size,
-        use_thumbnail=False,
-    )
-
-    # resize the image
-    resized_img = image.resize((target_width, target_height))
-    processed_images = []
-    for i in range(blocks):
-        box = (
-            (i % (target_width // image_size)) * image_size,
-            (i // (target_width // image_size)) * image_size,
-            ((i % (target_width // image_size)) + 1) * image_size,
-            ((i // (target_width // image_size)) + 1) * image_size,
-        )
-        # split the image
-        split_img = resized_img.crop(box)
-        processed_images.append(split_img)
-
-    assert len(processed_images) == blocks
-
-    if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
-        processed_images.append(thumbnail_img)
-
-    return processed_images
-
-
-# adapted from https://huggingface.co/OpenGVLab/InternVL2-1B
-def image_to_pixel_values_internvl(
-    image: Image.Image,
-    *,
-    input_size: int,
-    min_num: int,
-    max_num: int,
-    use_thumbnail: bool,
-) -> torch.Tensor:
-    target_ratios = get_internvl_target_ratios(min_num, max_num)
-
-    transform = build_transform(input_size=input_size)
-    images = dynamic_preprocess_internvl(
-        image,
-        target_ratios=target_ratios,
-        image_size=input_size,
-        use_thumbnail=use_thumbnail,
-    )
-
-    pixel_values = torch.stack([transform(image) for image in images])
-    return pixel_values
-
-
-# adapted from https://huggingface.co/OpenGVLab/InternVL2-1B
-def video_to_pixel_values_internvl(
-    video: npt.NDArray,
-    *,
-    input_size: int,
-    min_num: int,
-    max_num: int,
-    use_thumbnail: bool,
-) -> torch.Tensor:
-    target_ratios = get_internvl_target_ratios(min_num, max_num)
-
-    transform = build_transform(input_size=input_size)
-    frames_list = list[Image.Image]()
-    for frame in video:
-        pil_frame = dynamic_preprocess_internvl(
-            Image.fromarray(frame, mode="RGB"),
-            target_ratios=target_ratios,
-            image_size=input_size,
-            use_thumbnail=use_thumbnail,
-        )
-        assert len(pil_frame) == 1
-        frames_list.extend(pil_frame)
-
-    pixel_values = torch.stack([transform(image) for image in frames_list])
-    return pixel_values
-
-
-class BaseInternVLProcessor(ABC):
-    """
-    This model doesn't define its own HF processor,
-    so we implement our own one here.
-
-    The code to insert image tokens is based on:
-    https://huggingface.co/OpenGVLab/InternVL2-1B/blob/main/modeling_internvl_chat.py#L252
-    """
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        tokenizer: TokenizerLike,
-        *,
-        min_dynamic_patch: int | None = None,
-        max_dynamic_patch: int | None = None,
-        dynamic_image_size: bool | None = None,
-    ) -> None:
-        super().__init__()
-
-        self.config = config
-        self.tokenizer = tokenizer
-
-        image_size: int = config.vision_config.image_size
-        patch_size: int = config.vision_config.patch_size
-
-        if min_dynamic_patch is None:
-            min_dynamic_patch = config.min_dynamic_patch
-        assert isinstance(min_dynamic_patch, int)
-
-        if max_dynamic_patch is None:
-            max_dynamic_patch = config.max_dynamic_patch
-        assert isinstance(max_dynamic_patch, int)
-
-        if dynamic_image_size is None:
-            dynamic_image_size = config.dynamic_image_size
-        assert isinstance(dynamic_image_size, bool)
-
-        self.num_image_token = int(
-            (image_size // patch_size) ** 2 * (config.downsample_ratio**2)
-        )
-        self.image_size = image_size
-        self.min_dynamic_patch = min_dynamic_patch
-        self.max_dynamic_patch = max_dynamic_patch
-        self.dynamic_image_size = dynamic_image_size
-        self.use_thumbnail: bool = config.use_thumbnail
-
-    @property
-    @abstractmethod
-    def image_token_id(self) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_image_repl(
-        self,
-        feature_size: int,
-        num_patches: int | None,
-    ) -> PromptUpdateDetails[str]:
-        raise NotImplementedError
-
-    def resolve_min_max_num(
-        self,
-        *,
-        min_dynamic_patch: int | None = None,
-        max_dynamic_patch: int | None = None,
-        dynamic_image_size: bool | None = None,
-        use_thumbnail: bool | None = None,
-    ) -> tuple[int, int]:
-        min_dynamic_patch = (
-            self.min_dynamic_patch if min_dynamic_patch is None else min_dynamic_patch
-        )
-        max_dynamic_patch = (
-            self.max_dynamic_patch if max_dynamic_patch is None else max_dynamic_patch
-        )
-        dynamic_image_size = (
-            self.dynamic_image_size
-            if dynamic_image_size is None
-            else dynamic_image_size
-        )
-        use_thumbnail = self.use_thumbnail if use_thumbnail is None else use_thumbnail
-
-        return resolve_internvl_min_max_num(
-            min_dynamic_patch=min_dynamic_patch,
-            max_dynamic_patch=max_dynamic_patch,
-            dynamic_image_size=dynamic_image_size,
-            use_thumbnail=use_thumbnail,
-        )
-
-    def resolve_target_ratios(
-        self,
-        *,
-        min_dynamic_patch: int | None = None,
-        max_dynamic_patch: int | None = None,
-        dynamic_image_size: bool | None = None,
-        use_thumbnail: bool | None = None,
-    ) -> list[tuple[int, int]]:
-        min_num, max_num = self.resolve_min_max_num(
-            min_dynamic_patch=min_dynamic_patch,
-            max_dynamic_patch=max_dynamic_patch,
-            dynamic_image_size=dynamic_image_size,
-            use_thumbnail=use_thumbnail,
-        )
-
-        return get_internvl_target_ratios(min_num, max_num)
-
-    def get_num_image_tokens(
-        self,
-        *,
-        image_width: int,
-        image_height: int,
-    ) -> int:
-        target_ratios = self.resolve_target_ratios(
-            use_thumbnail=False,  # Applied in calculate_targets
-        )
-
-        num_patches, _, _ = calculate_internvl_targets(
-            orig_width=image_width,
-            orig_height=image_height,
-            image_size=self.image_size,
-            target_ratios=target_ratios,
-            use_thumbnail=self.use_thumbnail,
-        )
-
-        return num_patches * self.num_image_token
-
-    def _images_to_pixel_values_lst(
-        self,
-        images: list[Image.Image],
-        min_dynamic_patch: int | None = None,
-        max_dynamic_patch: int | None = None,
-        dynamic_image_size: bool | None = None,
-    ) -> list[torch.Tensor]:
-        min_num, max_num = self.resolve_min_max_num(
-            min_dynamic_patch=min_dynamic_patch,
-            max_dynamic_patch=max_dynamic_patch,
-            dynamic_image_size=dynamic_image_size,
-            use_thumbnail=False,  # Applied in image_to_pixel_values
-        )
-
-        return [
-            image_to_pixel_values_internvl(
-                image,
-                input_size=self.image_size,
-                min_num=min_num,
-                max_num=max_num,
-                use_thumbnail=self.use_thumbnail,
-            )
-            for image in images
-        ]
-
-    def _preprocess_image(
-        self,
-        text: list[str],
-        images: list[Image.Image],
-        min_dynamic_patch: int | None = None,
-        max_dynamic_patch: int | None = None,
-        dynamic_image_size: bool | None = None,
-    ) -> tuple[list[str], dict[str, torch.Tensor]]:
-        if len(images) == 0:
-            image_inputs = {}
-        else:
-            pixel_values_lst = self._images_to_pixel_values_lst(
-                images,
-                min_dynamic_patch=min_dynamic_patch,
-                max_dynamic_patch=max_dynamic_patch,
-                dynamic_image_size=dynamic_image_size,
-            )
-            image_inputs = {
-                "pixel_values_flat": torch.cat(pixel_values_lst),
-                "image_num_patches": torch.tensor(
-                    [len(item) for item in pixel_values_lst]
-                ),
-            }
-
-            for pixel_values in pixel_values_lst:
-                num_patches = pixel_values.shape[0]
-                feature_size = num_patches * self.num_image_token
-
-                image_repl = self.get_image_repl(feature_size, num_patches)
-                text = [t.replace("<image>", image_repl.full, 1) for t in text]
-        return text, image_inputs
-
-    def _make_batch_input(self, input_item: Any | list[Any] | None = None):
-        if input_item is None:
-            input_item = []
-        if not isinstance(input_item, list):
-            input_item = [input_item]
-        return input_item
-
-    def __call__(
-        self,
-        text: str | list[str] | None = None,
-        images: Image.Image | list[Image.Image] | None = None,
-        min_dynamic_patch: int | None = None,
-        max_dynamic_patch: int | None = None,
-        dynamic_image_size: bool | None = None,
-        return_tensors: str | TensorType | None = None,
-    ) -> BatchFeature:
-        text, images = [self._make_batch_input(x) for x in (text, images)]
-
-        text, image_inputs = self._preprocess_image(
-            text=text,
-            images=images,
-            min_dynamic_patch=min_dynamic_patch,
-            max_dynamic_patch=max_dynamic_patch,
-            dynamic_image_size=dynamic_image_size,
-        )
-
-        text_inputs = self.tokenizer(text)
-
-        combined_outputs = {**text_inputs, **image_inputs}
-
-        return BatchFeature(combined_outputs, tensor_type=return_tensors)
-
-
-class InternVLProcessor(BaseInternVLProcessor):
-    """
-    HF Processor for InternVLChatModel with extended video processing logic.
-
-    Code for video processing is adapted from video example:
-    https://huggingface.co/OpenGVLab/InternVL3-1B#inference-with-transformers
-    """
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        tokenizer: TokenizerLike,
-        *,
-        min_dynamic_patch: int | None = None,
-        max_dynamic_patch: int | None = None,
-        dynamic_image_size: bool | None = None,
-        video_token: str | None = None,
-    ) -> None:
-        super().__init__(
-            config=config,
-            tokenizer=tokenizer,
-            min_dynamic_patch=min_dynamic_patch,
-            max_dynamic_patch=max_dynamic_patch,
-            dynamic_image_size=dynamic_image_size,
-        )
-        # add extra video token for video processing
-        self.video_token = video_token
-
-    @property
-    def image_token_id(self) -> int:
-        return self.tokenizer.get_vocab()[IMG_CONTEXT]
-
-    @property
-    def video_token_id(self) -> int | None:
-        if self.video_token is None:
-            return None
-        return self.tokenizer.get_vocab().get(self.video_token, None)
-
-    @property
-    def supports_video(self) -> bool:
-        return self.video_token_id is not None
-
-    def _videos_to_pixel_values_lst(
-        self,
-        videos: list[npt.NDArray],
-        dynamic_image_size: bool | None = None,
-    ) -> list[torch.Tensor]:
-        min_num, max_num = self.resolve_min_max_num(
-            min_dynamic_patch=1,
-            max_dynamic_patch=1,
-            dynamic_image_size=dynamic_image_size,
-            use_thumbnail=False,  # Applied in image_to_pixel_values
-        )
-
-        return [
-            video_to_pixel_values_internvl(
-                video,
-                input_size=self.image_size,
-                min_num=min_num,
-                max_num=max_num,
-                use_thumbnail=False,
-            )
-            for video in videos
-        ]
-
-    def _preprocess_video(
-        self,
-        text: list[str],
-        videos: list[npt.NDArray],
-        dynamic_image_size: bool | None = None,
-    ):
-        if len(videos) == 0 or not self.supports_video:
-            video_inputs = {}
-        else:
-            pixel_values_lst_video = self._videos_to_pixel_values_lst(
-                videos,
-                dynamic_image_size=dynamic_image_size,
-            )
-            video_inputs = {
-                "pixel_values_flat_video": torch.cat(pixel_values_lst_video),
-                "video_num_patches": torch.tensor(
-                    [len(item) for item in pixel_values_lst_video]
-                ),
-            }
-
-            for pixel_values in pixel_values_lst_video:
-                num_patches = pixel_values.shape[0]
-
-                video_repl = self.get_video_repl(
-                    self.num_image_token, num_patches, self.video_token
-                )
-                text = [t.replace("<video>", video_repl.full, 1) for t in text]
-        return text, video_inputs
-
-    def __call__(
-        self,
-        text: str | list[str] | None = None,
-        images: Image.Image | list[Image.Image] | None = None,
-        videos: npt.NDArray | list[npt.NDArray] | None = None,
-        min_dynamic_patch: int | None = None,
-        max_dynamic_patch: int | None = None,
-        dynamic_image_size: bool | None = None,
-        return_tensors: str | TensorType | None = None,
-    ) -> BatchFeature:
-        text, images, videos = [
-            self._make_batch_input(x) for x in (text, images, videos)
-        ]
-
-        text, image_inputs = self._preprocess_image(
-            text=text,
-            images=images,
-            min_dynamic_patch=min_dynamic_patch,
-            max_dynamic_patch=max_dynamic_patch,
-            dynamic_image_size=dynamic_image_size,
-        )
-
-        text, video_inputs = self._preprocess_video(
-            text=text,
-            videos=videos,
-            dynamic_image_size=dynamic_image_size,
-        )
-
-        text_inputs = self.tokenizer(text)
-
-        combined_outputs = {**text_inputs, **image_inputs, **video_inputs}
-
-        return BatchFeature(combined_outputs, tensor_type=return_tensors)
-
-    def get_image_repl(
-        self,
-        feature_size: int,
-        num_patches: int | None,
-    ) -> PromptUpdateDetails[str]:
-        repl_features = IMG_CONTEXT * feature_size
-        repl_full = IMG_START + repl_features + IMG_END
-
-        return PromptUpdateDetails.select_text(repl_full, IMG_CONTEXT)
-
-    def get_video_repl(
-        self,
-        feature_size: int,
-        num_patches: int | None = None,
-        video_context_token: str = IMG_CONTEXT,
-    ) -> PromptUpdateDetails[str]:
-        repl_features = video_context_token * self.num_image_token
-        repl_features_with_sep = IMG_START + repl_features + IMG_END
-        # num_patches is equal to num_frames
-        repl_full = "".join(
-            [f"Frame{i + 1}: {repl_features_with_sep}" for i in range(num_patches)]
-        )
-
-        return PromptUpdateDetails.select_text(repl_full, video_context_token)
+class InternVLMultiModalInputs(TypedDict, total=False):
+    images: InternVLImageInputs | None
+    videos: InternVLVideoInputs | None
 
 
 class BaseInternVLProcessingInfo(BaseProcessingInfo):
     """Basic image-only ProcessingInfo for InternVL-style models."""
 
     @abstractmethod
-    def get_hf_processor(self, **kwargs: object) -> BaseInternVLProcessor:
+    def get_hf_processor(self, **kwargs: object) -> InternVLProcessor:
         raise NotImplementedError
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
@@ -719,11 +145,8 @@ class BaseInternVLProcessingInfo(BaseProcessingInfo):
         *,
         image_width: int,
         image_height: int,
-        processor: BaseInternVLProcessor | None,
+        processor: InternVLProcessor,
     ) -> int:
-        if processor is None:
-            processor = self.get_hf_processor()
-
         return processor.get_num_image_tokens(
             image_width=image_width,
             image_height=image_height,
@@ -731,8 +154,9 @@ class BaseInternVLProcessingInfo(BaseProcessingInfo):
 
     def get_image_size_with_most_features(self) -> ImageSize:
         processor = self.get_hf_processor()
+        image_processor = processor.image_processor
 
-        base_size = processor.image_size
+        base_size = image_processor.image_size
         target_ratios = processor.resolve_target_ratios()
 
         largest_feature_size, largest_feature_pinpoint = 0, None
@@ -779,19 +203,16 @@ class BaseInternVLDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
         target_width, target_height = self.info.get_image_size_with_most_features()
-        num_images = mm_counts.get("image", 0)
-
-        image_overrides = mm_options.get("image") if mm_options else None
 
         return {
             "image": self._get_dummy_images(
                 width=target_width,
                 height=target_height,
-                num_images=num_images,
-                overrides=image_overrides,
+                num_images=mm_counts.get("image", 0),
+                overrides=mm_options.get("image"),
             )
         }
 
@@ -799,35 +220,23 @@ class BaseInternVLDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
 class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
     """Basic image-only MultiModalProcessor for InternVL-style models."""
 
-    def _call_hf_processor(
+    def _postprocess_hf_mm_data(
         self,
-        prompt: str,
         mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+        processed_data: BatchFeature,
     ) -> BatchFeature:
-        processed_outputs = super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
-        )
-
-        hf_processor = self.info.get_hf_processor(**mm_kwargs)
-        image_token_id = hf_processor.image_token_id
+        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        image_token_id = hf_processor.ctx_image_token_id
 
         # Since there may be extra tokens in the feature placeholders,
         # we need to pass the image token ID to the model to select the
         # tokens to merge from the vision encoder outputs
-        processed_outputs["image_token_id"] = torch.tensor(image_token_id)
+        processed_data["image_token_id"] = torch.tensor(image_token_id)
 
-        return processed_outputs
+        return processed_data
 
-    def _get_mm_fields_config(
-        self,
-        hf_inputs: BatchFeature,
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> Mapping[str, MultiModalFieldConfig]:
+    def _get_image_fields_config(self, hf_inputs: BatchFeature):
         image_num_patches = hf_inputs.get("image_num_patches", torch.empty(0))
         num_images = len(image_num_patches)
 
@@ -835,20 +244,28 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
             pixel_values_flat=MultiModalFieldConfig.flat_from_sizes(
                 "image", image_num_patches
             ),
-            image_num_patches=MultiModalFieldConfig.batched("image"),
+            image_num_patches=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
             image_embeds=MultiModalFieldConfig.batched("image"),
-            image_token_id=MultiModalFieldConfig.shared("image", num_images),
+            image_token_id=MultiModalFieldConfig.shared(
+                "image", num_images, keep_on_cpu=True
+            ),
         )
 
-    def _get_prompt_updates(
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        return self._get_image_fields_config(hf_inputs)
+
+    def _get_prompt_repl_image(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        out_mm_kwargs: MultiModalKwargsItems,
-    ) -> Sequence[PromptUpdate]:
-        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        hf_processor: InternVLProcessor,
+        out_mm_data: BatchedTensorInputs,
+    ):
+        tokenizer = self.info.get_tokenizer()
 
-        out_mm_data = out_mm_kwargs.get_data()
         if "image_num_patches" in out_mm_data:
             image_num_patches = out_mm_data["image_num_patches"]
             assert isinstance(image_num_patches, torch.Tensor)
@@ -868,6 +285,7 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
             if isinstance(images, ImageEmbeddingItems):
                 feature_size = images.get_feature_size(item_idx)
             else:
+                assert isinstance(images, ImageProcessorItems)
                 image_size = images.get_image_size(item_idx)
                 feature_size = self.info.get_num_image_tokens(
                     image_width=image_size.width,
@@ -879,37 +297,98 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
             if num_patches is not None:
                 assert isinstance(num_patches, int)
 
-            return hf_processor.get_image_repl(feature_size, num_patches)
+            return hf_processor.get_image_repl(num_patches, num_features=feature_size)
+
+        return PromptReplacement(
+            modality="image",
+            target=cached_encode(tokenizer, "<image>", add_special_tokens=False),
+            replacement=get_replacement_internvl,
+        )
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        out_mm_data = out_mm_kwargs.get_data()
 
         return [
-            PromptReplacement(
-                modality="image",
-                target="<image>",
-                replacement=get_replacement_internvl,
-            )
+            self._get_prompt_repl_image(mm_items, hf_processor, out_mm_data),
         ]
 
 
 class InternVLProcessingInfo(BaseInternVLProcessingInfo):
-    """InternVL ProcessingInfo extended for video processing"""
+    """InternVL ProcessingInfo extended for video processing."""
 
-    @property
-    def supports_video(self):
-        return self.get_hf_processor().supports_video
+    def get_image_processor(self, **kwargs):
+        config = self.get_hf_config()
+        vision_config = config.vision_config
 
-    def get_supported_mm_limits(self):
-        video_limit = {"video": None} if self.supports_video else {}
-        return {**super().get_supported_mm_limits(), **video_limit}
+        kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
+        kwargs.setdefault("image_size", vision_config.image_size)
+        kwargs.setdefault("min_dynamic_patch", config.min_dynamic_patch)
+        kwargs.setdefault("max_dynamic_patch", config.max_dynamic_patch)
+        kwargs.setdefault("dynamic_image_size", config.dynamic_image_size)
+        kwargs.setdefault("use_thumbnail", config.use_thumbnail)
 
-    def get_video_token(self) -> str | None:
+        return InternVLImageProcessor(**kwargs)
+
+    def get_video_processor(self, **kwargs):
+        config = self.get_hf_config()
+        vision_config = config.vision_config
+
+        kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
+        kwargs.setdefault("image_size", vision_config.image_size)
+
+        return InternVLVideoProcessor(**kwargs)
+
+    @cached_property
+    def ctx_video_token(self):
         text_model_type = self.get_hf_config().get_text_config().model_type
-        video_token_map = {
+        ctx_video_token_map = {
             "qwen2": "<|video_pad|>",
             "qwen3": "<|video_pad|>",
             "qwen3_moe": "<|video_pad|>",
             "gpt_oss": "<|reserved_200000|>",
         }
-        return video_token_map.get(text_model_type)
+
+        if text_model_type not in ctx_video_token_map:
+            return None
+
+        ctx_video_token = ctx_video_token_map[text_model_type]
+        if ctx_video_token not in self.get_tokenizer().get_vocab():
+            return None
+
+        return ctx_video_token
+
+    def get_hf_processor(self, **kwargs: object) -> InternVLProcessor:
+        config = self.get_hf_config()
+        vision_config = config.vision_config
+
+        image_processor = self.get_image_processor(**kwargs)
+        image_size = image_processor.image_size
+        patch_size = vision_config.patch_size
+        downsample_ratio = config.downsample_ratio
+        image_seq_length = int((image_size // patch_size) ** 2 * (downsample_ratio**2))
+
+        ctx_video_token = self.ctx_video_token
+        video_processor = (
+            self.get_video_processor(**kwargs) if ctx_video_token else None
+        )
+
+        return InternVLProcessor(
+            tokenizer=self.get_tokenizer(),
+            image_processor=image_processor,
+            video_processor=video_processor,
+            image_seq_length=image_seq_length,
+            ctx_video_token=ctx_video_token,
+        )
+
+    def get_supported_mm_limits(self):
+        video_limit = {"video": None} if self.ctx_video_token else {}
+        return {**super().get_supported_mm_limits(), **video_limit}
 
     def get_num_frames_with_most_features(
         self,
@@ -920,27 +399,19 @@ class InternVLProcessingInfo(BaseInternVLProcessingInfo):
         max_videos = mm_counts.get("video", 0)
 
         processor = self.get_hf_processor()
+        num_image_token = processor.image_seq_length
 
         max_image_tokens = self.get_max_image_tokens() * max_images
-        max_total_frames = (seq_len - max_image_tokens) // processor.num_image_token
+        max_total_frames = (seq_len - max_image_tokens) // num_image_token
         max_frames_per_video = max_total_frames // max(max_videos, 1)
 
         return max(max_frames_per_video, 1)
-
-    def get_hf_processor(self, **kwargs: object) -> InternVLProcessor:
-        return self.ctx.init_processor(
-            InternVLProcessor,
-            config=self.get_hf_config(),
-            tokenizer=self.get_tokenizer(),
-            video_token=self.get_video_token(),
-            **kwargs,
-        )
 
 
 class InternVLDummyInputsBuilder(
     BaseInternVLDummyInputsBuilder[InternVLProcessingInfo]
 ):
-    """InternVL DummyInputsBuilder extended for video support"""
+    """InternVL DummyInputsBuilder extended for video support."""
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_videos = mm_counts.get("video", 0)
@@ -951,19 +422,17 @@ class InternVLDummyInputsBuilder(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
-        dummy_image = super().get_dummy_mm_data(
-            seq_len=seq_len, mm_counts=mm_counts, mm_options=mm_options
-        )
-        if self.info.supports_video:
+        dummy_image = super().get_dummy_mm_data(seq_len, mm_counts, mm_options)
+        if self.info.ctx_video_token:
             config = self.info.get_hf_config()
             image_size: int = config.vision_config.image_size
             target_num_frames = self.info.get_num_frames_with_most_features(
                 seq_len, mm_counts
             )
             num_videos = mm_counts.get("video", 0)
-            video_overrides = mm_options.get("video") if mm_options else None
+            video_overrides = mm_options.get("video")
             dummy_video = {
                 "video": self._get_dummy_videos(
                     width=image_size,
@@ -981,47 +450,78 @@ class InternVLDummyInputsBuilder(
 class InternVLMultiModalProcessor(
     BaseInternVLMultiModalProcessor[InternVLProcessingInfo]
 ):
-    """InternVL MultiModalProcessor extended for video support"""
+    """InternVL MultiModalProcessor extended for video support."""
 
-    def _call_hf_processor(
+    def _postprocess_hf_mm_data(
         self,
-        prompt: str,
         mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+        processed_data: BatchFeature,
     ) -> BatchFeature:
-        processed_outputs = super()._call_hf_processor(
-            prompt, mm_data, mm_kwargs, tok_kwargs
+        processed_data = super()._postprocess_hf_mm_data(
+            mm_data,
+            hf_processor_mm_kwargs,
+            processed_data,
         )
 
-        hf_processor = self.info.get_hf_processor(**mm_kwargs)
-        if (
-            self.info.supports_video
-            and (video_token_id := hf_processor.video_token_id) is not None
-        ):
-            processed_outputs["video_token_id"] = torch.tensor(video_token_id)
-        return processed_outputs
+        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        if (video_token_id := hf_processor.ctx_video_token_id) is not None:
+            processed_data["video_token_id"] = torch.tensor(video_token_id)
+
+        return processed_data
+
+    def _get_video_fields_config(self, hf_inputs: BatchFeature):
+        video_num_patches = hf_inputs.get("video_num_patches", torch.empty(0))
+        num_videos = len(video_num_patches)
+
+        return dict(
+            pixel_values_flat_video=MultiModalFieldConfig.flat_from_sizes(
+                "video", video_num_patches
+            ),
+            video_num_patches=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
+            video_token_id=MultiModalFieldConfig.shared(
+                "video", num_videos, keep_on_cpu=True
+            ),
+        )
 
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        image_fields = super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs)
-        if self.info.supports_video:
-            video_num_patches = hf_inputs.get("video_num_patches", torch.empty(0))
-            num_videos = len(video_num_patches)
-            video_fields = dict(
-                pixel_values_flat_video=MultiModalFieldConfig.flat_from_sizes(
-                    "video", video_num_patches
-                ),
-                video_num_patches=MultiModalFieldConfig.batched("video"),
-                video_token_id=MultiModalFieldConfig.shared("video", num_videos),
-            )
-        else:
-            video_fields = {}
+        fields = self._get_image_fields_config(hf_inputs)
+        if self.info.ctx_video_token:
+            fields |= self._get_video_fields_config(hf_inputs)
 
-        return image_fields | video_fields
+        return fields
+
+    def _get_prompt_repl_video(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor: InternVLProcessor,
+        out_mm_data: BatchedTensorInputs,
+    ):
+        tokenizer = self.info.get_tokenizer()
+
+        if "video_num_patches" in out_mm_data:
+            video_num_patches_tensor = out_mm_data["video_num_patches"]
+            assert isinstance(video_num_patches_tensor, torch.Tensor)
+            video_num_patches: list[int] = video_num_patches_tensor.tolist()
+        else:
+            video_num_patches = []
+
+        def get_video_replacement_internvl(item_idx: int):
+            num_patches = video_num_patches[item_idx]
+            if num_patches is not None:
+                assert isinstance(num_patches, int)
+
+            return hf_processor.get_video_repl(num_patches)
+
+        return PromptReplacement(
+            modality="video",
+            target=cached_encode(tokenizer, "<video>", add_special_tokens=False),
+            replacement=get_video_replacement_internvl,
+        )
 
     def _get_prompt_updates(
         self,
@@ -1029,43 +529,18 @@ class InternVLMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
-        prompt_repl = super()._get_prompt_updates(
-            mm_items=mm_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-            out_mm_kwargs=out_mm_kwargs,
-        )
-
         hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
-
         out_mm_data = out_mm_kwargs.get_data()
-        if "video_num_patches" in out_mm_data:
-            video_num_patches = out_mm_data["video_num_patches"]
-            assert isinstance(video_num_patches, torch.Tensor)
-            video_num_patches = video_num_patches.tolist()
-        else:
-            video_num_patches = []
 
-        def get_video_replacement_internvl(item_idx: int):
-            feature_size = hf_processor.num_image_token
-            num_patches = video_num_patches[item_idx]
-            if num_patches is not None:
-                assert isinstance(num_patches, int)
-
-            return hf_processor.get_video_repl(
-                feature_size, num_patches, video_context_token=hf_processor.video_token
+        prompt_repls = [
+            self._get_prompt_repl_image(mm_items, hf_processor, out_mm_data),
+        ]
+        if self.info.ctx_video_token is not None:
+            prompt_repls.append(
+                self._get_prompt_repl_video(mm_items, hf_processor, out_mm_data)
             )
 
-        if self.info.supports_video:
-            prompt_repl = [
-                *prompt_repl,
-                PromptReplacement(
-                    modality="video",
-                    target="<video>",
-                    replacement=get_video_replacement_internvl,
-                ),
-            ]
-
-        return prompt_repl
+        return prompt_repls
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1073,10 +548,34 @@ class InternVLMultiModalProcessor(
     info=InternVLProcessingInfo,
     dummy_inputs=InternVLDummyInputsBuilder,
 )
-class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
-    merge_by_field_config = True
-
+class InternVLChatModel(
+    nn.Module,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsLoRA,
+    SupportsEncoderCudaGraph,
+):
     supports_encoder_tp_data = True
+    supports_tower_connector_lora = True
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix=dict.fromkeys(
+            [
+                "action_embed",
+                "temporal_embed",
+                "track_embed",
+                "track_embed_decoder",
+                "box_token",
+                "cg_criterion",
+                "cg_model",
+                "loc_encoder",
+                "loc_decoder",
+                "sam",
+                "temporal_token",
+                "track_token",
+            ]
+        )
+    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1092,7 +591,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        multimodal_config = vllm_config.model_config.multimodal_config
+        multimodal_config = vllm_config.model_config.get_multimodal_config()
 
         self.config = config
         self.multimodal_config = multimodal_config
@@ -1102,43 +601,39 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         image_size = config.force_image_size or config.vision_config.image_size
         patch_size = config.vision_config.patch_size
         self.patch_size = patch_size
-        self.num_image_token = int(
-            (image_size // patch_size) ** 2 * (config.downsample_ratio**2)
-        )
+        self.patch_tokens = (image_size // patch_size) ** 2
+        self.num_image_token = int(self.patch_tokens * (config.downsample_ratio**2))
         self.downsample_ratio = config.downsample_ratio
         self.ps_version = config.ps_version
 
-        self.llm_arch_name = config.text_config.architectures[0]
-        self.is_mono = self.llm_arch_name == "InternLM2VEForCausalLM"
-        self.vision_model = self._init_vision_model(
-            config,
-            quant_config=quant_config,
-            is_mono=self.is_mono,
-            prefix=maybe_prefix(prefix, "vision_model"),
-        )
+        with self._mark_tower_model(vllm_config, {"image", "video"}):
+            self.vision_model = self._init_vision_model(
+                config,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "vision_model"),
+            )
+            self.mlp1 = self._init_mlp1(config)
 
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=config.text_config,
-            prefix=maybe_prefix(prefix, "language_model"),
-        )
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
 
-        self.mlp1 = self._init_mlp1(config)
+        self.img_context_token_id: int | None = None
+        self.video_context_token_id: int | None = None
 
-        self.img_context_token_id = None
-        self.video_context_token_id = None
-
-        self.visual_token_mask = None
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
 
     def _patch_quant_config(
-        self, config: PretrainedConfig, quant_config: QuantizationConfig
+        self, config: PretrainedConfig, quant_config: QuantizationConfig | None
     ):
         # the awq models from OpenGVLab missing `modules_to_not_convert`
         # patch the quant_config to add `modules_to_not_convert` back
-        if isinstance(quant_config, AWQConfig):
+        if isinstance(quant_config, AutoAWQConfig):
             text_config = config.text_config
             llm_quant_config = getattr(text_config, "quantization_config", None)
             if (not quant_config.modules_to_not_convert) and (
@@ -1151,27 +646,22 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         config: PretrainedConfig,
         quant_config: QuantizationConfig | None,
         *,
-        is_mono: bool,
         prefix: str,
     ):
-        if not is_mono:
-            vision_feature_layer = config.select_layer
-            if vision_feature_layer < 0:
-                num_hidden_layers = (
-                    config.vision_config.num_hidden_layers + vision_feature_layer + 1
-                )
-            else:
-                num_hidden_layers = vision_feature_layer + 1
-
-            return InternVisionModel(
-                config.vision_config,
-                quant_config=quant_config,
-                num_hidden_layers_override=num_hidden_layers,
-                prefix=prefix,
-                use_data_parallel=self.use_data_parallel,
+        vision_feature_layer = config.select_layer
+        if vision_feature_layer < 0:
+            num_hidden_layers = (
+                config.vision_config.num_hidden_layers + vision_feature_layer + 1
             )
         else:
-            return InternVisionPatchModel(config.vision_config)
+            num_hidden_layers = vision_feature_layer + 1
+
+        return InternVisionModel(
+            config.vision_config,
+            quant_config=quant_config,
+            num_hidden_layers_override=num_hidden_layers,
+            prefix=prefix,
+        )
 
     def _init_mlp1(self, config: PretrainedConfig) -> nn.Module:
         vit_hidden_size = config.vision_config.hidden_size
@@ -1253,10 +743,10 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
 
     def _parse_and_validate_video_input(
         self, **kwargs: object
-    ) -> InternVLVideoPixelInputs | None:
+    ) -> InternVLVideoInputs | None:
         pixel_values_flat_video = kwargs.pop("pixel_values_flat_video", None)
         video_num_patches = kwargs.pop("video_num_patches", None)
-        video_embeds = kwargs.pop("image_embeds", None)
+        video_embeds = kwargs.pop("video_embeds", None)
 
         if pixel_values_flat_video is None and video_embeds is None:
             return None
@@ -1297,8 +787,6 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         ):
             return image_input["data"]
 
-        assert self.vision_model is not None
-
         image_embeds = self.extract_feature(image_input["pixel_values_flat"])
 
         num_patches = image_input["num_patches"]
@@ -1316,8 +804,10 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         ]
         return image_embeds.split(image_feature_sizes)
 
-    def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
-        modalities = {}
+    def _parse_and_validate_multimodal_inputs(
+        self, **kwargs: object
+    ) -> InternVLMultiModalInputs:
+        modalities: InternVLMultiModalInputs = {}
 
         # Preserve the order of modalities if there are multiple of them
         # from the order of kwargs.
@@ -1331,18 +821,6 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
                 modalities["videos"] = self._parse_and_validate_video_input(**kwargs)
 
         return modalities
-
-    def _set_visual_token_mask(self, input_ids: torch.Tensor) -> None:
-        if self.is_mono:
-            assert self.img_context_token_id is not None
-            self.visual_token_mask = (input_ids == self.img_context_token_id).reshape(
-                -1, 1
-            )
-        else:
-            self.visual_token_mask = None
-
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         modalities = self._parse_and_validate_multimodal_inputs(**kwargs)
@@ -1358,12 +836,14 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         for modality in modalities:
             if modality == "images":
                 image_input = modalities["images"]
-                image_embeddings = self._process_vision_input(image_input)
-                multimodal_embeddings += tuple(image_embeddings)
+                if image_input is not None:
+                    image_embeddings = self._process_vision_input(image_input)
+                    multimodal_embeddings += tuple(image_embeddings)
             if modality == "videos":
                 video_input = modalities["videos"]
-                video_embeddings = self._process_vision_input(video_input)
-                multimodal_embeddings += tuple(video_embeddings)
+                if video_input is not None:
+                    video_embeddings = self._process_vision_input(video_input)
+                    multimodal_embeddings += tuple(video_embeddings)
 
         return multimodal_embeddings
 
@@ -1373,11 +853,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
-        if multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
-            self._set_visual_token_mask(input_ids)
-
         # This is to satisfy the type checker for each overload
         if multimodal_embeddings is None or is_multimodal is None:
             return super().embed_input_ids(input_ids)
@@ -1386,19 +862,17 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
             input_ids,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> IntermediateTensors:
         if intermediate_tensors is not None:
-            input_ids = None
             inputs_embeds = None
 
         forward_kwargs = {
@@ -1407,11 +881,6 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
             "intermediate_tensors": intermediate_tensors,
             "inputs_embeds": inputs_embeds,
         }
-
-        # Only required if the model is mono-architecture
-        if self.visual_token_mask is not None:
-            forward_kwargs.update({"visual_token_mask": self.visual_token_mask})
-            self.visual_token_mask = None
 
         hidden_states = self.language_model.model(**forward_kwargs)
         return hidden_states
@@ -1423,30 +892,190 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # unused modules appear in OpenGVLab/InternVideo2_5_Chat_8B
-        skip_prefixes = [
-            "action_embed",
-            "temporal_embed",
-            "track_embed",
-            "track_embed_decoder",
-            "box_token",
-            "cg_criterion",
-            "cg_model",
-            "loc_encoder",
-            "loc_decoder",
-            "sam",
-            "temporal_token",
-            "track_token",
-        ]
-        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        return loader.load_weights(weights)
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
-        """
-        Get the module prefix in multimodal models
-        """
+        """Get the module prefix in multimodal models."""
         return MultiModelKeys.from_string_field(
             language_model="language_model",
             connector="mlp1",
             tower_model="vision_model",
         )
+
+    def get_mm_lora_token_counts(
+        self,
+        *,
+        modality: str,
+        mm_kwargs: MultiModalKwargsItem | None,
+        num_mm_embeds: int,
+    ) -> tuple[int, int | None]:
+        del modality, mm_kwargs
+        if num_mm_embeds <= 0 or self.num_image_token <= 0:
+            return 0, 0
+
+        num_patches = num_mm_embeds // self.num_image_token
+        tower_tokens = num_patches * (self.patch_tokens + 1)
+        return tower_tokens, num_patches * self.num_image_token
+
+    # -- SupportsEncoderCudaGraph protocol methods --
+
+    def get_encoder_cudagraph_config(self):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
+
+        return EncoderCudaGraphConfig(
+            modalities=["image", "video"],
+            # InternVision uses standard ViT attention (no rotary embeddings,
+            # no variable-length sequence metadata), so the only graph-recorded
+            # buffer is pixel_values_flat itself.
+            buffer_keys=["pixel_values_flat"],
+            out_hidden_size=self.config.text_config.hidden_size,
+        )
+
+    def get_input_modality(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> str:
+        if "pixel_values_flat" in mm_kwargs:
+            return "image"
+        return "video"
+
+    def get_encoder_cudagraph_budget_range(
+        self,
+        vllm_config: "VllmConfig",
+    ) -> tuple[int, int]:
+        # Min: 1 tile → num_image_token output tokens.
+        min_budget = self.num_image_token
+        max_budget = min(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.model_config.max_model_len,
+        )
+        return (min_budget, max_budget)
+
+    def _get_internvl_patches_list(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[int]:
+        """Return per-item tile counts as a plain list of ints."""
+        if self.get_input_modality(mm_kwargs) == "image":
+            patches = mm_kwargs.get("image_num_patches", [])
+        else:
+            patches = mm_kwargs.get("video_num_patches", [])
+        if isinstance(patches, torch.Tensor):
+            return patches.tolist()
+        return [int(n) for n in patches]
+
+    def get_encoder_cudagraph_item_specs(
+        self,
+        mm_kwargs: dict[str, Any],
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
+
+        return [
+            EncoderItemSpec(
+                input_size=n,
+                output_tokens=n * self.num_image_token,
+            )
+            for n in self._get_internvl_patches_list(mm_kwargs)
+        ]
+
+    def select_encoder_cudagraph_items(
+        self,
+        mm_kwargs: dict[str, Any],
+        indices: list[int],
+    ) -> dict[str, Any]:
+        modality = self.get_input_modality(mm_kwargs)
+        pv_key = (
+            "pixel_values_flat" if modality == "image" else "pixel_values_flat_video"
+        )
+        patches_key = (
+            "image_num_patches" if modality == "image" else "video_num_patches"
+        )
+
+        pixel_values = mm_kwargs[pv_key]
+        patches_list = self._get_internvl_patches_list(mm_kwargs)
+
+        if len(indices) == 0:
+            return {pv_key: pixel_values[:0], patches_key: []}
+
+        # Compute cumulative tile offsets for slicing pixel_values.
+        cum_patches = [0]
+        for n in patches_list:
+            cum_patches.append(cum_patches[-1] + n)
+
+        selected_pv = torch.cat(
+            [pixel_values[cum_patches[i] : cum_patches[i + 1]] for i in indices]
+        )
+        selected_patches = [patches_list[i] for i in indices]
+
+        return {pv_key: selected_pv, patches_key: selected_patches}
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphCaptureInputs,
+        )
+
+        # Size the buffer to hold the maximum possible tiles for this budget.
+        total_tiles = max(token_budget // self.num_image_token, 1)
+        image_size = self.config.vision_config.image_size
+
+        dummy_pixel_values = torch.randn(
+            total_tiles, 3, image_size, image_size, device=device, dtype=dtype
+        )
+
+        return EncoderCudaGraphCaptureInputs(
+            values={"pixel_values_flat": dummy_pixel_values},
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphReplayBuffers,
+        )
+
+        modality = self.get_input_modality(mm_kwargs)
+        pv_key = (
+            "pixel_values_flat" if modality == "image" else "pixel_values_flat_video"
+        )
+        return EncoderCudaGraphReplayBuffers(
+            values={"pixel_values_flat": mm_kwargs[pv_key]},
+        )
+
+    def encoder_cudagraph_forward(
+        self,
+        values: dict[str, torch.Tensor],
+        path: str = "default",
+    ) -> torch.Tensor:
+        # The graph is always captured with pixel_values_flat as the input
+        # buffer. During video replay the manager copies video tiles into
+        # this same buffer before calling graph.replay(), so we always read
+        # from pixel_values_flat here.
+        pixel_values = values["pixel_values_flat"]
+        out = self.extract_feature(pixel_values)  # [N, num_image_token, H]
+        return out.view(-1, self.config.text_config.hidden_size)
+
+    def encoder_eager_forward(
+        self,
+        mm_kwargs: dict[str, Any],
+        path: str = "default",
+    ) -> torch.Tensor:
+        if self.get_input_modality(mm_kwargs) == "image":
+            pixel_values = mm_kwargs["pixel_values_flat"]
+        else:
+            pixel_values = mm_kwargs["pixel_values_flat_video"]
+        out = self.extract_feature(pixel_values)  # [N, num_image_token, H]
+        return out.view(-1, self.config.text_config.hidden_size)

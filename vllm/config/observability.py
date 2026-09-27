@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from functools import cached_property
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from packaging.version import parse
 from pydantic import Field, field_validator, model_validator
-from pydantic.dataclasses import dataclass
 
 from vllm import version
 from vllm.config.utils import config
@@ -16,7 +15,6 @@ DetailedTraceModules = Literal["model", "worker", "all"]
 
 
 @config
-@dataclass
 class ObservabilityConfig:
     """Configuration for observability - metrics and tracing."""
 
@@ -47,6 +45,18 @@ class ObservabilityConfig:
     Note that collecting detailed timing information for each request can be
     expensive."""
 
+    per_request_spec_decode_metrics: Literal["none", "summary", "detailed"] = "none"
+    """Include per-request speculative-decoding acceptance metrics in the
+    response under `metrics.speculative_decoding`. `none` disables; `summary` adds mean
+    acceptance length, draft acceptance rate, and the step-by-draft-length
+    histogram; `detailed` additionally records the ordered per-step
+    accepted/proposed arrays (one entry per verify step). Only reported for
+    single-sequence requests (`n == 1`), mirroring the timing metrics. No effect
+    unless speculative decoding is enabled. Independent of `--disable-log-stats`.
+    This is the per-request response-body counterpart of the aggregate
+    `vllm:spec_decode_*` Prometheus metrics. The response field is experimental
+    and its shape may change in a future release."""
+
     kv_cache_metrics: bool = False
     """Enable KV cache residency metrics (lifetime, idle time, reuse gaps).
     Uses sampling to minimize overhead.
@@ -54,6 +64,36 @@ class ObservabilityConfig:
 
     kv_cache_metrics_sample: float = Field(default=0.01, gt=0, le=1)
     """Sampling rate for KV cache metrics (0.0, 1.0]. Default 0.01 = 1% of blocks."""
+
+    cudagraph_metrics: bool = False
+    """Enable CUDA graph metrics (number of padded/unpadded tokens, runtime cudagraph
+    dispatch modes, and their observed frequencies at every logging interval)."""
+
+    enable_layerwise_nvtx_tracing: bool = False
+    """Enable layerwise NVTX tracing. This traces the execution of each layer or
+    module in the model and attach information such as input/output shapes to
+    nvtx range markers. Noted that this doesn't work with CUDA graphs enabled."""
+
+    enable_mfu_metrics: bool = False
+    """Enable Model FLOPs Utilization (MFU) metrics."""
+
+    enable_mm_processor_stats: bool = False
+    """Enable collection of timing statistics for multimodal processor operations.
+    This is for internal use only (e.g., benchmarks) and is not exposed as a CLI
+    argument."""
+
+    enable_logging_iteration_details: bool = False
+    """Enable detailed logging of iteration details.
+    If set, vllm EngineCore will log iteration details
+    This includes number of context/generation requests and tokens
+    and the elapsed cpu time for the iteration."""
+
+    jit_monitor_mode: Literal["warn", "error"] = "warn"
+    """How to handle post-warmup JIT compilation events."""
+
+    jit_monitor_verbose: bool = False
+    """Log every monitored JIT compile with runtime details. This can emit many
+    logs and add overhead, so it is intended for debugging."""
 
     @cached_property
     def collect_model_forward_time(self) -> bool:
@@ -72,8 +112,7 @@ class ObservabilityConfig:
         )
 
     def compute_hash(self) -> str:
-        """
-        WARNING: Whenever a new field is added to this config,
+        """WARNING: Whenever a new field is added to this config,
         ensure that it is included in the factors list if
         it affects the computation graph.
 
@@ -101,25 +140,14 @@ class ObservabilityConfig:
     @classmethod
     def _validate_otlp_traces_endpoint(cls, value: str | None) -> str | None:
         if value is not None:
-            from vllm.tracing import is_otel_available, otel_import_error_traceback
+            from vllm.tracing import is_tracing_available, otel_import_error_traceback
 
-            if not is_otel_available():
+            if not is_tracing_available():
                 raise ValueError(
                     "OpenTelemetry is not available. Unable to configure "
                     "'otlp_traces_endpoint'. Ensure OpenTelemetry packages are "
                     f"installed. Original error:\n{otel_import_error_traceback}"
                 )
-        return value
-
-    @field_validator("collect_detailed_traces")
-    @classmethod
-    def _validate_collect_detailed_traces(
-        cls, value: list[DetailedTraceModules] | None
-    ) -> list[DetailedTraceModules] | None:
-        """Handle the legacy case where users might provide a comma-separated
-        string instead of a list of strings."""
-        if value is not None and len(value) == 1 and "," in value[0]:
-            value = cast(list[DetailedTraceModules], value[0].split(","))
         return value
 
     @model_validator(mode="after")

@@ -6,9 +6,11 @@ import hashlib
 import importlib.metadata
 import os
 import sqlite3
-from typing import TYPE_CHECKING
+import tempfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from typing import TYPE_CHECKING, TypeVar
 
-import numpy as np
 import regex as re
 import torch
 from cachetools import LRUCache
@@ -16,12 +18,13 @@ from cachetools import LRUCache
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import LazyLoader
+from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 if TYPE_CHECKING:
     import outlines_core as oc
+    import transformers.convert_slow_tokenizer as convert_slow_tokenizer
     import transformers.file_utils as file_utils
-    import transformers.models.gpt2.tokenization_gpt2 as tokenization_gpt2
     import xgrammar as xgr
 
     from vllm.tokenizers import TokenizerLike
@@ -30,19 +33,69 @@ else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     oc = LazyLoader("oc", globals(), "outlines_core")
     file_utils = LazyLoader("file_utils", globals(), "transformers.file_utils")
-    tokenization_gpt2 = LazyLoader(
-        "tokenization_gpt2",
-        globals(),
-        "transformers.models.gpt2.tokenization_gpt2",
+    convert_slow_tokenizer = LazyLoader(
+        "convert_slow_tokenizer", globals(), "transformers.convert_slow_tokenizer"
     )
 
-    TokenizerLike = object
-    SchedulerOutput = object
-    InputBatch = object
 
 logger = init_logger(__name__)
 
+_T = TypeVar("_T")
+
 CACHE = None
+
+
+def strip_speculative_padding(token_ids: list[int]) -> list[int]:
+    """Drop speculative-decoding padding from a token block.
+
+    ngram and other speculative backends pad rejected draft positions with a
+    -1 sentinel. Structured-output grammars treat every entry as a real token
+    id, so the sentinels (and everything after the first one) are removed here,
+    before tokens reach any backend, rather than inside a single backend.
+    """
+    for i, token_id in enumerate(token_ids):
+        if token_id < 0:
+            return token_ids[:i]
+    return token_ids
+
+
+def compile_regex_with_timeout(fn: Callable[[str], _T], pattern: str) -> _T:
+    """Run a regex compilation callable with a timeout.
+
+    Prevents ReDoS attacks where adversarial regex patterns (e.g. nested
+    quantifiers like ``(a+)+b``) cause exponential DFA state-space explosion,
+    hanging the inference worker indefinitely.
+
+    Args:
+        fn: Single-argument callable that takes the pattern and performs
+            the regex compilation.
+        pattern: The regex pattern string, passed to *fn* and included in
+            timeout error messages.
+
+    Raises:
+        ValueError: If compilation exceeds the configured timeout.
+
+    """
+    timeout = envs.VLLM_REGEX_COMPILATION_TIMEOUT_S
+    if timeout <= 0:
+        return fn(pattern)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn, pattern)
+    try:
+        result = future.result(timeout=timeout)
+    except TimeoutError:
+        future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise ValueError(
+            f"Regex compilation timed out after {timeout}s. "
+            "The pattern may be too complex or contain constructs that "
+            "cause exponential state-space explosion (e.g. nested "
+            f"quantifiers). Pattern: {pattern[:200]}"
+        ) from None
+    else:
+        executor.shutdown(wait=False)
+        return result
 
 
 def apply_grammar_bitmask(
@@ -51,13 +104,14 @@ def apply_grammar_bitmask(
     input_batch: InputBatch,
     logits: torch.Tensor,
 ) -> None:
-    """
-    Apply grammar bitmask to output logits of the model with xgrammar function.
+    """Apply grammar bitmask to output logits of the model with xgrammar function.
 
     Args:
         scheduler_output (SchedulerOutput): The result of engine scheduling.
+        grammar_output (GrammarOutput): The grammar bitmask to apply.
         input_batch (InputBatch): The input of model runner.
         logits (torch.Tensor): The output logits of model forward.
+
     """
     # Serialization of np.ndarray is much more efficient than a tensor,
     # so we receive it in that format.
@@ -74,61 +128,71 @@ def apply_grammar_bitmask(
     # request in the batch, as the logit indices are offset by this amount.
     struct_out_req_batch_indices: dict[str, int] = {}
     cumulative_offset = 0
-    seq = sorted(input_batch.req_id_to_index.items(), key=lambda x: x[1])
-    for req_id, batch_index in seq:
+    spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+    struct_out_req_ids = set(grammar_output.structured_output_request_ids)
+    for batch_index, req_id in enumerate(input_batch.req_ids):
         logit_index = batch_index + cumulative_offset
-        cumulative_offset += len(
-            scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-        )
-        if req_id in grammar_output.structured_output_request_ids:
+        cumulative_offset += len(spec_tokens.get(req_id, ()))
+        if req_id in struct_out_req_ids:
             struct_out_req_batch_indices[req_id] = logit_index
 
     out_indices = []
 
     # Reorder the bitmask to match the order of the requests in the batch.
-    sorted_bitmask = np.full(
-        shape=(logits.shape[0], grammar_bitmask.shape[1]),
-        fill_value=-1,
-        dtype=grammar_bitmask.dtype,
+    sorted_bitmask_tensor = torch.full(
+        (logits.shape[0], grammar_bitmask.shape[1]),
+        -1,
+        dtype=torch.from_numpy(grammar_bitmask[:0]).dtype,
+        pin_memory=PIN_MEMORY,
     )
+    sorted_bitmask = sorted_bitmask_tensor.numpy()
     cumulative_index = 0
     for req_id in grammar_output.structured_output_request_ids:
-        num_spec_tokens = len(
-            scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-        )
-        if req_id in struct_out_req_batch_indices:
-            logit_index = struct_out_req_batch_indices[req_id]
+        num_spec_tokens = len(spec_tokens.get(req_id, ()))
+        if (logit_idx := struct_out_req_batch_indices.get(req_id)) is not None:
             for i in range(1 + num_spec_tokens):
-                sorted_bitmask[logit_index + i] = grammar_bitmask[cumulative_index + i]
-                out_indices.append(logit_index + i)
+                bitmask_index = logit_idx + i
+                sorted_bitmask[bitmask_index] = grammar_bitmask[cumulative_index + i]
+                out_indices.append(bitmask_index)
         cumulative_index += 1 + num_spec_tokens
 
-    # Copy async to device as tensor.
-    grammar_bitmask = torch.from_numpy(sorted_bitmask).to(
-        logits.device, non_blocking=True
-    )
+    # Copy async to device.
+    grammar_bitmask = sorted_bitmask_tensor.to(logits.device, non_blocking=True)
 
     # If the length of out indices and the logits have the same shape
     # we don't need to pass indices to the kernel,
     # since the bitmask is already aligned with the logits.
     skip_out_indices = len(out_indices) == logits.shape[0]
 
-    index_tensor = None
-    if not skip_out_indices:
-        # xgrammar expects a python list of indices but it will actually work with
-        # a tensor. If we copy the tensor ourselves here we can do it in a non_blocking
-        # manner and there should be no cpu sync within xgrammar.
-        index_tensor = torch.tensor(
-            out_indices, dtype=torch.int32, device="cpu", pin_memory=True
-        )
-        index_tensor = index_tensor.to(logits.device, non_blocking=True)
+    if not logits.is_cpu:
+        index_tensor = None
+        if not skip_out_indices:
+            # xgrammar expects a python list of indices but it will actually work with
+            # a tensor. If we copy the tensor ourselves here we can do it in a
+            # non_blocking manner and there should be no cpu sync within xgrammar.
+            index_tensor = async_tensor_h2d(
+                out_indices, dtype=torch.int32, device=logits.device
+            )
 
-    xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=index_tensor)
+        xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=index_tensor)
+        return
+
+    # CPU case, use list for indices.
+    indices = None if skip_out_indices else out_indices
+    # Handle dtype conversion for CPU (older xgrammar CPU kernels require float32)
+    # See: https://github.com/vllm-project/vllm/issues/31901
+    if logits.dtype != torch.float32:
+        # Convert to float32, apply bitmask, then convert back
+        logits_fp32 = logits.to(torch.float32)
+        xgr.apply_token_bitmask_inplace(logits_fp32, grammar_bitmask, indices=indices)
+        # Copy the modified values back to the original tensor
+        logits.copy_(logits_fp32.to(logits.dtype))
+    else:
+        xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=indices)
 
 
 class OutlinesVocabulary:
-    """
-    Wrapper class for `outlines_core.Vocabulary`,
+    """Wrapper class for `outlines_core.Vocabulary`,
     which allows us to store a hash with the vocabulary
     """
 
@@ -143,7 +207,7 @@ class OutlinesVocabulary:
 
 
 def get_outlines_cache_path() -> str:
-    """Get the context object that contains previously-computed return values"""
+    """Get the context object that contains previously-computed return values."""
     outlines_cache_dir = os.getenv("OUTLINES_CACHE_DIR")
     xdg_cache_home = os.getenv("XDG_CACHE_HOME")
     home_dir = os.path.expanduser("~")
@@ -151,21 +215,19 @@ def get_outlines_cache_path() -> str:
     if outlines_cache_dir:
         # OUTLINES_CACHE_DIR takes precedence
         return outlines_cache_dir
-    elif xdg_cache_home:
+    if xdg_cache_home:
         return os.path.join(xdg_cache_home, ".cache", "outlines")
     # If homedir is "/", we may be inside a container, and thus writing to
     # root would be problematic, so we fall back to using a tempfile.
     # Also validate the path exists, since os.path.expanduser does
     # not guarantee existence.
-    elif os.path.isdir(home_dir) and home_dir != "/":
+    if os.path.isdir(home_dir) and home_dir != "/":
         # Default Unix fallback: ~/.cache/outlines
         return os.path.join(home_dir, ".cache", "outlines")
-    else:
-        import tempfile
 
-        # home_dir may be / inside a docker container without existing user
-        tempdir = tempfile.gettempdir()
-        return os.path.join(tempdir, ".cache", "outlines")
+    # home_dir may be / inside a docker container without existing user
+    tempdir = tempfile.gettempdir()
+    return os.path.join(tempdir, ".cache", "outlines")
 
 
 class OutlinesDiskCache:
@@ -233,8 +295,7 @@ class OutlinesDiskCache:
 
 
 def get_outlines_cache():
-    """Get the Cache instance to be used for index caching"""
-
+    """Get the Cache instance to be used for index caching."""
     cache_dir = get_outlines_cache_path()
     if envs.VLLM_V1_USE_OUTLINES_CACHE:
         logger.warning(
@@ -250,25 +311,26 @@ def get_outlines_cache():
             cache.clear()
         cache.set("__version__", outlines_version)
         return cache
-    else:
-        return LRUCache(maxsize=128)
+
+    return LRUCache(maxsize=128)
 
 
 re_llama_byte_token = re.compile(r"^<0x[0-9A-F]{2}>$")
 re_replacement_seq = re.compile(r"^.{0,6}�+.{0,6}$")
 
 
-def _reduced_vocabulary(
-    tokenizer: TokenizerLike,
-    eos_token_id: int,
-) -> dict[bytes, list[int]]:
+def _reduced_vocabulary(tokenizer: TokenizerLike) -> dict[bytes, list[int]]:
     """Create a map from vocabulary tokens to lists of equivalent token ids.
 
     Returns:
         A Dict of token string -> equivalent token ids
-    """
 
-    unicode_to_bytes = {v: k for k, v in tokenization_gpt2.bytes_to_unicode().items()}
+    """
+    eos_token_id = tokenizer.eos_token_id
+
+    unicode_to_bytes = {
+        v: k for k, v in convert_slow_tokenizer.bytes_to_unicode().items()
+    }
 
     def convert_token_to_string(token: str) -> str:
         string = tokenizer.convert_tokens_to_string([token])
@@ -298,7 +360,9 @@ def _reduced_vocabulary(
                 # by this point.
                 token_bytes = bytes(token_str)  # type: ignore[arg-type]
 
-            elif "\ufffd" in token_str and not re_replacement_seq.match(token_str):
+            elif (token_str == "\ufffd" and token != "\ufffd") or (
+                "\ufffd" in token_str and not re_replacement_seq.match(token_str)
+            ):
                 # Handle tokens with invalid UTF-8 sequences.
                 if re_llama_byte_token.match(token):
                     # Llama-like tokenizers use <0xXX> for incomplete sequences.
@@ -330,39 +394,17 @@ def get_outlines_vocabulary(tokenizer: TokenizerLike) -> oc.Vocabulary:
     if hasattr(tokenizer, "_outlines_vocabulary"):
         return tokenizer._outlines_vocabulary  # type: ignore
 
-    try:
-        if (
-            hasattr(
-                tokenizer,
-                "eos_token_id",
-            )
-            and tokenizer.eos_token_id is not None
-        ):
-            eos_token_id = tokenizer.eos_token_id
-        else:
-            raise ValueError(
-                f"Error during structured outputs setup for outlines: Tokenizer ({type(tokenizer)}) has no `eos_token_id` property, but `eos_token_id` is required for structured outputs to work properly."  # noqa: E501
-            )
+    reduced_vocab = _reduced_vocabulary(tokenizer)
+    vocabulary = OutlinesVocabulary(
+        oc.Vocabulary(tokenizer.eos_token_id, reduced_vocab)
+    )
+    tokenizer._outlines_vocabulary = vocabulary  # type: ignore
 
-        reduced_vocab = _reduced_vocabulary(
-            tokenizer,
-            eos_token_id,  # type: ignore
-        )
-        vocabulary = OutlinesVocabulary(oc.Vocabulary(eos_token_id, reduced_vocab))
-        tokenizer._outlines_vocabulary = vocabulary  # type: ignore
-
-        return vocabulary
-    except AttributeError as e:
-        raise ValueError(
-            f"Cannot get the vocabulary of the tokenizer "
-            f"({type(tokenizer)}). The tokenizer should have a "
-            "get_vocab method."
-        ) from e
+    return vocabulary
 
 
 def grammar_is_likely_lark(grammar_str: str) -> bool:
-    """
-    Check if grammar appears to use Lark syntax.
+    """Check if grammar appears to use Lark syntax.
 
     Args:
         grammar_str: Input grammar string
@@ -375,6 +417,7 @@ def grammar_is_likely_lark(grammar_str: str) -> bool:
         True
         >>> grammar_is_likely_lark("rule ::= 'abc'")
         False
+
     """
     if not grammar_str or not isinstance(grammar_str, str):
         return False
@@ -393,8 +436,7 @@ def grammar_is_likely_lark(grammar_str: str) -> bool:
 
 
 def convert_lark_to_ebnf(grammar_str: str) -> str:
-    """
-    Convert a Lark grammar string to EBNF format.
+    """Convert a Lark grammar string to EBNF format.
 
     EBNF reference:
     https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md
@@ -411,6 +453,7 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
         >>> print(convert_lark_to_ebnf("rule: 'hello'"))
         root ::= rule
         rule ::= "hello"
+
     """
     if not isinstance(grammar_str, str):
         raise ValueError(f"Grammar must be a string, got {type(grammar_str)}")
@@ -524,9 +567,18 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
 
 def choice_as_grammar(choice: list[str]) -> str:
     def escape_ebnf_string(s: str) -> str:
-        """Escape special characters in a EBNF string."""
-        # Escape double quotes and backslashes
-        return re.sub(r'(["\\])', r"\\\1", s)
+        """Escape EBNF literals, including raw LF, CR, and NUL terminators."""
+        escapes = {"\\": r"\\", '"': r"\"", "\n": r"\n", "\r": r"\r", "\t": r"\t"}
+
+        def escape_char(ch: str) -> str:
+            if ch in escapes:
+                return escapes[ch]
+            # Escape remaining C0 controls (U+0000-U+001F) and DEL (U+007F).
+            if ord(ch) < 0x20 or ord(ch) == 0x7F:
+                return f"\\u{ord(ch):04x}"
+            return ch
+
+        return "".join(escape_char(ch) for ch in s)
 
     escaped_choices = (escape_ebnf_string(c) for c in choice)
     grammar = "root ::= " + " | ".join(f'"{c}"' for c in escaped_choices)

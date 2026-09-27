@@ -7,16 +7,105 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
+from functools import lru_cache
+
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
+import vllm.envs as envs
+from vllm.v1.kv_cache_interface import KVQuantMode
+
+
+def vllm_is_batch_invariant() -> bool:
+    return bool(envs.VLLM_BATCH_INVARIANT)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
+
+# gfx906 decode scheduling knobs, migrated from the legacy attention op path.
+# On gfx906 the tuning applies unconditionally; the env var is only an
+# emergency kill switch for debugging.
+ENABLE_GFX906_ATTN_SCHED_TUNING = os.getenv(
+    "VLLM_GFX906_TRITON_ATTN_TUNING", "1"
+).lower() in {"1", "true", "yes", "on"}
+
+# Upper bound for split-KV segments the decode policy may request. The
+# backend sizes its softmax segment buffers with this value on gfx906.
+GFX906_MAX_DECODE_SEGMENTS = 128
+
+
+@lru_cache(maxsize=1)
+def _is_gfx906_rocm() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.major == 9
+        and capability.minor == 0
+    )
+
+
+def _gfx906_sched_tuning_enabled() -> bool:
+    return ENABLE_GFX906_ATTN_SCHED_TUNING and _is_gfx906_rocm()
+
+
+def gfx906_decode_segments_capacity() -> int:
+    """Segment-buffer capacity the backend should allocate on this platform."""
+    return GFX906_MAX_DECODE_SEGMENTS if _gfx906_sched_tuning_enabled() else 0
+
+
+def _decode_num_warps(head_size: int, max_seqlen_k: int) -> int:
+    # Wide-head decodes keep 4 warps busy once the KV scan is long enough;
+    # short contexts run faster with 2 warps on gfx906.
+    if head_size > 128 and max_seqlen_k >= 1536:
+        return 4
+    return 2
+
+
+def _decode_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
+    # GQA6 with 256-dim heads: one query token spans exactly 6 rows, so an
+    # 8-row block covers a single token without padding a second one.
+    if head_size == 256 and num_queries_per_kv == 6:
+        return 8
+    return None
+
+
+def _num_query_blocks(num_query_tokens: int, num_seqs: int, block_q: int) -> int:
+    # Exact block count for single-sequence batches. For multiple sequences,
+    # retain the mapping gaps expected by find_seq_idx and use the safe
+    # upper bound without realizing query_lens on the CPU.
+    if num_seqs == 1:
+        return (num_query_tokens + block_q - 1) // block_q
+    return num_query_tokens // block_q + num_seqs
+
+
+def _decode_num_segments(
+    max_seqlen_k: int,
+    num_query_blocks: int,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+) -> int:
+    # Keep short-context decode at 16 segments, but increase split-KV
+    # parallelism on gfx906 once the KV scan is large enough to amortize
+    # the extra reduction work.
+    if max_seqlen_k < 2048:
+        return 16
+
+    base_grid_size = max(num_query_blocks * num_kv_heads, 1)
+    target_grid_size = 1024 if num_queries_per_kv <= 2 else 512
+    if max_seqlen_k >= 8192:
+        target_grid_size = max(target_grid_size, 1024)
+    if max_seqlen_k >= 16384 and num_queries_per_kv == 1:
+        target_grid_size = 2048
+    if max_seqlen_k >= 24576:
+        target_grid_size = 4096 if num_queries_per_kv == 1 else 2048
+
+    segments = (target_grid_size + base_grid_size - 1) // base_grid_size
+    return min(128, max(16, triton.next_power_of_2(segments)))
 
 
 @triton.jit
@@ -911,9 +1000,43 @@ def unified_attention(
     # Optional tensor for prefix lengths (PrefixLM support)
     mm_prefix_range=None,
     use_alibi_sqrt=False,
+    # The upstream triton_attn backend passes these newer knobs by keyword.
+    # This gfx906 fork implements none of the features behind them yet;
+    # accept them for call compatibility and fail loudly when a run
+    # actually requests one (see the guard at the top of the body).
+    rswa_prefix_lens=None,
+    rswa_window: int | None = None,
+    kv_quant_mode: KVQuantMode = KVQuantMode.NONE,
+    k_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
+    v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
+    chunk_lookback: int = -1,
+    # Tensor-descriptor loads (Intel Xe2/Xe3) are numerics-neutral; this
+    # fork never uses tensor descriptors, so the flag is accepted and
+    # ignored.
+    use_td: bool = False,
+    # Gemma4 mm_prefix + sliding-window clamping is not implemented here.
+    mm_prefix_clamp_sliding_window: bool = False,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
+
+    if (
+        rswa_prefix_lens is not None
+        or rswa_window is not None
+        or chunk_lookback != -1
+        or mm_prefix_clamp_sliding_window
+        or k_scale_cache is not None
+        or v_scale_cache is not None
+        or kv_quant_mode not in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR)
+    ):
+        # Per-tensor FP8 needs no new plumbing: its scales arrive through
+        # the k_descale / v_descale args above, as before the refactor.
+        raise NotImplementedError(
+            "The gfx906 Triton unified-attention fork does not implement "
+            "R-SWA, chunked attention, per-token-head/INT4 KV caches, or "
+            f"mm-prefix sliding-window clamping (kv_quant_mode={kv_quant_mode}, "
+            f"chunk_lookback={chunk_lookback}, rswa_window={rswa_window})."
+        )
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -939,7 +1062,14 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
-    BLOCK_M = (
+    gfx906_sched = _gfx906_sched_tuning_enabled()
+
+    decode_block_m = (
+        _decode_block_m(head_size, num_queries_per_kv)
+        if gfx906_sched and max_seqlen_q == 1
+        else None
+    )
+    BLOCK_M = decode_block_m or (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
@@ -953,7 +1083,10 @@ def unified_attention(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    if gfx906_sched:
+        total_num_q_blocks = _num_query_blocks(q.shape[0], num_seqs, BLOCK_Q)
+    else:
+        total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
     # Tile sizes for prefill and decode. Gemma3 models use optimized values.
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
@@ -1040,11 +1173,24 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            **({"num_warps": 2, "num_stages": 1} if gfx906_sched else {}),
         )
     else:
-        kernel_unified_attention_3d[
-            (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
-        ](
+        # gfx906: scale split-KV parallelism with the decode batch shape and
+        # context length instead of the fixed default, bounded by the segment
+        # buffers allocated by the backend.
+        num_segments = num_par_softmax_segments
+        if gfx906_sched and softmax_segm_output is not None:
+            num_segments = min(
+                _decode_num_segments(
+                    max_seqlen_k,
+                    total_num_q_blocks,
+                    num_kv_heads,
+                    num_queries_per_kv,
+                ),
+                softmax_segm_output.shape[2],
+            )
+        kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, num_segments)](
             segm_output_ptr=softmax_segm_output,
             segm_max_ptr=softmax_segm_max,
             segm_expsum_ptr=softmax_segm_expsum,
@@ -1091,7 +1237,15 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
-            NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            NUM_SEGMENTS_PER_SEQ=num_segments,
+            **(
+                {
+                    "num_warps": _decode_num_warps(head_size, max_seqlen_k),
+                    "num_stages": 1,
+                }
+                if gfx906_sched
+                else {}
+            ),
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
@@ -1110,6 +1264,6 @@ def unified_attention(
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
-            NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            NUM_SEGMENTS_PER_SEQ=num_segments,
             USE_FP8=output_scale is not None,
         )

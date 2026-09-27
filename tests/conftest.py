@@ -6,9 +6,6 @@ from copy import deepcopy
 
 from tblib import pickling_support
 
-# Import fixture
-from tests.v1.entrypoints.conftest import sample_json_schema  # noqa
-
 # ruff: noqa
 
 # Install support for pickling exceptions so that we can nicely propagate
@@ -27,14 +24,14 @@ import threading
 from collections.abc import Generator
 from contextlib import nullcontext
 from enum import Enum
-from typing import Any, Callable, TypedDict, TypeVar, cast
+from typing import Any, Callable, TypedDict, TypeVar, cast, TYPE_CHECKING, Optional
 
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from huggingface_hub import snapshot_download
+from vllm.transformers_utils.repo_utils import hf_api
 from PIL import Image
 from transformers import (
     AutoConfig,
@@ -45,11 +42,16 @@ from transformers import (
 )
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
-from tests.models.utils import TokensTextLogprobs, TokensTextLogprobsPromptLogprobs
+from tests.models.utils import (
+    TokensTextLogprobs,
+    TokensTextLogprobsPromptLogprobs,
+    softmax,
+)
 from vllm import LLM, SamplingParams, envs
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
+from vllm.config.cache import CacheConfig
 from vllm.config.model import ConvertOption, RunnerOption, _get_and_verify_dtype
 from vllm.connections import global_http_connection
 from vllm.distributed import (
@@ -59,14 +61,74 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
+from vllm.multimodal.media import MediaWithBytes
 from vllm.multimodal.utils import fetch_image
 from vllm.outputs import RequestOutput
+from vllm.platforms import current_platform
 from vllm.sampling_params import BeamSearchParams
+from vllm.transformers_utils.repo_utils import with_retry
 from vllm.transformers_utils.utils import maybe_model_redirect
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.torch_utils import set_default_torch_num_threads
 
+from torch._inductor.utils import fresh_cache
+
+
+if TYPE_CHECKING:
+    from transformers import PythonBackend, TokenizersBackend
+    from transformers.generation.utils import GenerateOutput
+
+
 logger = init_logger(__name__)
+
+
+@pytest.fixture
+def sample_json_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "age": {"type": "integer"},
+            "skills": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                },
+            },
+            "grade": {
+                "type": "string",
+                "pattern": "^[A-D]$",
+            },
+            "email": {
+                "type": "string",
+                "pattern": "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$",
+            },
+            "work_history": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "company": {"type": "string"},
+                        "duration": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 100.0,
+                        },
+                        "position": {"type": "string"},
+                    },
+                    "required": ["company", "duration", "position"],
+                    "additionalProperties": False,
+                },
+                "minItems": 0,
+                "maxItems": 3,
+            },
+        },
+        "required": ["name", "age", "skills", "grade", "email", "work_history"],
+        "additionalProperties": False,
+        "minProperties": 1,
+        "maxProperties": 10,
+    }
+
 
 _TEST_DIR = os.path.dirname(__file__)
 _TEST_PROMPTS = [os.path.join(_TEST_DIR, "prompts", "example.txt")]
@@ -163,17 +225,42 @@ def init_test_http_connection():
 
 @pytest.fixture
 def dist_init():
-    temp_file = tempfile.mkstemp()[1]
-    init_distributed_environment(
-        world_size=1,
-        rank=0,
-        distributed_init_method=f"file://{temp_file}",
-        local_rank=0,
-        backend="nccl",
-    )
-    initialize_model_parallel(1, 1)
-    yield
-    cleanup_dist_env_and_memory()
+    from tests.utils import ensure_current_vllm_config
+
+    # Close the fd returned by mkstemp; FileStore opens the path itself.
+    # Leaving it open leaks one FD per test and eventually exhausts the
+    # ulimit, causing FileStore's destructor to throw c10::DistStoreError
+    # ("Too many open files") during gc and abort the process.
+    fd, temp_file = tempfile.mkstemp()
+    os.close(fd)
+
+    try:
+        with ensure_current_vllm_config():
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                distributed_init_method=f"file://{temp_file}",
+                local_rank=0,
+                backend="gloo" if current_platform.is_cpu() else "nccl",
+            )
+            initialize_model_parallel(1, 1)
+            yield
+        cleanup_dist_env_and_memory()
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_file)
+
+
+@pytest.fixture
+def default_vllm_config():
+    """Set a default VllmConfig for tests that directly test CustomOps or pathways
+    that use get_current_vllm_config() outside of a full engine context.
+    """
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    config = VllmConfig()
+    with set_current_vllm_config(config):
+        yield config
 
 
 @pytest.fixture()
@@ -193,6 +280,26 @@ def cleanup_fixture(should_do_global_cleanup_after_test: bool):
         cleanup_dist_env_and_memory()
 
 
+@pytest.fixture
+def workspace_init():
+    """Initialize the workspace manager for tests that need it.
+
+    This fixture initializes the workspace manager with the current
+    platform's accelerator device if available, and resets it after the test
+    completes. Tests that create a full vLLM engine should NOT use this
+    fixture as the engine will initialize the workspace manager itself.
+    """
+    from vllm.v1.worker.workspace import (
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    if torch.accelerator.is_available():
+        init_workspace_manager(torch.device(0))
+    yield
+    reset_workspace_manager()
+
+
 @pytest.fixture(autouse=True)
 def dynamo_reset():
     yield
@@ -201,10 +308,7 @@ def dynamo_reset():
 
 @pytest.fixture
 def example_prompts() -> list[str]:
-    prompts = []
-    for filename in _TEST_PROMPTS:
-        prompts += _read_prompts(filename)
-    return prompts
+    return [prompt for filename in _TEST_PROMPTS for prompt in _read_prompts(filename)]
 
 
 @pytest.fixture
@@ -223,10 +327,7 @@ class DecoderPromptType(Enum):
 
 @pytest.fixture
 def example_long_prompts() -> list[str]:
-    prompts = []
-    for filename in _LONG_PROMPTS:
-        prompts += _read_prompts(filename)
-    return prompts
+    return [prompt for filename in _LONG_PROMPTS for prompt in _read_prompts(filename)]
 
 
 @pytest.fixture(scope="session")
@@ -246,6 +347,20 @@ def audio_assets() -> AudioTestAssets:
 
 _T = TypeVar("_T", nn.Module, torch.Tensor, BatchEncoding, BatchFeature, dict)
 _R = TypeVar("_R")
+
+
+def _fix_v4_tied_weights_keys(model_cls: type) -> None:
+    """Convert a v4 list-format _tied_weights_keys to the transformers v5 dict form."""
+    tied = getattr(model_cls, "_tied_weights_keys", None)
+    if not isinstance(tied, list) or not tied:
+        return
+    result = {
+        k: "model.embed_tokens.weight"
+        for k in tied
+        if "lm_head" in k and k.endswith(".weight")
+    }
+    if result:
+        setattr(model_cls, "_tied_weights_keys", result)
 
 
 class HfRunner:
@@ -274,12 +389,15 @@ class HfRunner:
         model_name: str,
         dtype: str = "auto",
         *,
+        revision: str | None = None,
         model_kwargs: dict[str, Any] | None = None,
         trust_remote_code: bool = True,
         is_sentence_transformer: bool = False,
         is_cross_encoder: bool = False,
         skip_tokenizer_init: bool = False,
         auto_cls: type[_BaseAutoModelClass] = AutoModelForCausalLM,
+        tokenizer_name: str | None = None,
+        processor: Any | None = None,
         # Set this to avoid hanging issue
         default_torch_num_threads: int | None = None,
     ) -> None:
@@ -293,12 +411,15 @@ class HfRunner:
             self._init(
                 model_name=model_name,
                 dtype=dtype,
+                revision=revision,
                 model_kwargs=model_kwargs,
                 trust_remote_code=trust_remote_code,
                 is_sentence_transformer=is_sentence_transformer,
                 is_cross_encoder=is_cross_encoder,
                 skip_tokenizer_init=skip_tokenizer_init,
                 auto_cls=auto_cls,
+                tokenizer_name=tokenizer_name,
+                processor=processor,
             )
 
     def _init(
@@ -306,12 +427,15 @@ class HfRunner:
         model_name: str,
         dtype: str = "auto",
         *,
+        revision: str | None = None,
         model_kwargs: dict[str, Any] | None = None,
         trust_remote_code: bool = True,
         is_sentence_transformer: bool = False,
         is_cross_encoder: bool = False,
         skip_tokenizer_init: bool = False,
         auto_cls: type[_BaseAutoModelClass] = AutoModelForCausalLM,
+        tokenizer_name: str | None = None,
+        processor: Any | None = None,
     ) -> None:
         model_name = maybe_model_redirect(model_name)
         self.model_name = model_name
@@ -320,12 +444,22 @@ class HfRunner:
             model_name,
             trust_remote_code=trust_remote_code,
         )
+        # HF runner should use the HF config so that it's consistent with the HF model
+        if self.config.__module__.startswith("vllm.transformers_utils.configs"):
+            from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+            del CONFIG_MAPPING._extra_content[self.config.model_type]
+            self.config = AutoConfig.from_pretrained(
+                model_name,
+                trust_remote_code=trust_remote_code,
+            )
         self.device = self.get_default_device()
         self.dtype = dtype = _get_and_verify_dtype(
             self.model_name,
             self.config,
             dtype=dtype,
             is_pooling_model=is_sentence_transformer or is_cross_encoder,
+            config_format="hf",
         )
 
         model_kwargs = model_kwargs if model_kwargs is not None else {}
@@ -337,6 +471,7 @@ class HfRunner:
 
             self.model = SentenceTransformer(
                 model_name,
+                revision=revision,
                 device=self.device,
                 model_kwargs=model_kwargs,
                 trust_remote_code=trust_remote_code,
@@ -347,15 +482,66 @@ class HfRunner:
 
             self.model = CrossEncoder(
                 model_name,
+                revision=revision,
                 device=self.device,
                 automodel_args=model_kwargs,
                 trust_remote_code=trust_remote_code,
             )
         else:
-            model = auto_cls.from_pretrained(
-                model_name,
-                trust_remote_code=trust_remote_code,
-                **model_kwargs,
+            if trust_remote_code and hasattr(self.config, "auto_map"):
+                cls_ref = self.config.auto_map.get(auto_cls.__name__)
+                if cls_ref is not None:
+                    from vllm.transformers_utils.dynamic_module import (
+                        try_get_class_from_dynamic_module,
+                    )
+
+                    model_cls = try_get_class_from_dynamic_module(
+                        cls_ref,
+                        model_name,
+                        trust_remote_code=trust_remote_code,
+                        warn_on_fail=False,
+                    )
+                    if model_cls is not None:
+                        _fix_v4_tied_weights_keys(model_cls)
+
+            from transformers.integrations import is_deepspeed_zero3_enabled
+
+            # On ROCm, avoid a converted CPU copy when downcasting FP32 references.
+            # Same-dtype CPU loads can stay lazily mapped and use less host RAM.
+            # Leave customized, remote, and quantized loading unchanged.
+            if (
+                current_platform.is_rocm()
+                and self.device == "cuda"
+                and auto_cls is AutoModelForCausalLM
+                and revision is None
+                and model_kwargs.keys() == {"dtype"}
+                and self.config.dtype == torch.float32
+                and model_kwargs["dtype"] in (torch.float16, torch.bfloat16)
+                and not (trust_remote_code and hasattr(self.config, "auto_map"))
+                and getattr(self.config, "quantization_config", None) is None
+                and getattr(
+                    self.config.get_text_config(decoder=True),
+                    "quantization_config",
+                    None,
+                )
+                is None
+                and not is_deepspeed_zero3_enabled()
+            ):
+                model_kwargs = {
+                    **model_kwargs,
+                    "device_map": torch.device(
+                        "cuda", torch.accelerator.current_device_index()
+                    ),
+                }
+
+            model = cast(
+                nn.Module,
+                auto_cls.from_pretrained(
+                    model_name,
+                    revision=revision,
+                    trust_remote_code=trust_remote_code,
+                    **model_kwargs,
+                ),
             )
 
             # in case some unquantized custom models are not in same dtype
@@ -364,31 +550,41 @@ class HfRunner:
             ):
                 model = model.to(dtype=self.dtype)
 
-            if (
-                getattr(model, "quantization_method", None) != "bitsandbytes"
-                and len({p.device for p in model.parameters()}) < 2
-            ):
+            if len({p.device for p in model.parameters()}) < 2:
                 model = model.to(device=self.device)
 
             self.model = model
 
         if not skip_tokenizer_init:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
+            self.tokenizer: "PythonBackend | TokenizersBackend" = (
+                AutoTokenizer.from_pretrained(
+                    tokenizer_name or model_name,
+                    trust_remote_code=trust_remote_code,
+                )
             )
 
-        # don't put this import at the top level
-        # it will call torch.cuda.device_count()
-        from transformers import AutoProcessor  # noqa: F401
+        if processor is not None:
+            self.processor = processor
+        else:
+            # don't put this import at the top level
+            # it will call torch.accelerator.device_count()
+            from transformers import AutoProcessor
 
-        self.processor = AutoProcessor.from_pretrained(
-            model_name,
-            dtype=dtype,
-            trust_remote_code=trust_remote_code,
-        )
+            # A concurrent refresh of the shared HF cache can briefly hide
+            # processor configuration files. Retry just as model config loading
+            # does in vllm.transformers_utils.config.
+            self.processor = with_retry(
+                lambda: AutoProcessor.from_pretrained(
+                    model_name,
+                    trust_remote_code=trust_remote_code,
+                ),
+                f"Error loading processor for {model_name}",
+            )
         if skip_tokenizer_init:
+            if self.processor is None:
+                raise ValueError(
+                    "skip_tokenizer_init=True requires processor initialization."
+                )
             self.tokenizer = self.processor.tokenizer
 
     def get_inputs(
@@ -397,6 +593,7 @@ class HfRunner:
         images: PromptImageInput | None = None,
         videos: PromptVideoInput | None = None,
         audios: PromptAudioInput | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
     ) -> list[BatchFeature | BatchEncoding | dict[str, torch.Tensor]]:
         if images is not None:
             assert len(prompts) == len(images)
@@ -410,10 +607,24 @@ class HfRunner:
         all_inputs: list[BatchFeature | BatchEncoding | dict[str, torch.Tensor]] = []
         for i, prompt in enumerate(prompts):
             if isinstance(prompt, str):
-                processor_kwargs: dict[str, Any] = {
-                    "text": prompt,
-                    "return_tensors": "pt",
-                }
+                if self.processor is None:
+                    raise RuntimeError(
+                        "HfRunner.processor is not initialized. "
+                        "Pass processor=... to HfRunner or set "
+                        "hf_model.processor before generation."
+                    )
+                # Create a copy to avoid modifying the original dict
+                processor_kwargs = (
+                    tokenization_kwargs.copy()
+                    if tokenization_kwargs is not None
+                    else {}
+                )
+                processor_kwargs.update(
+                    {
+                        "text": prompt,
+                        "return_tensors": "pt",
+                    }
+                )
                 if images is not None and (image := images[i]) is not None:
                     processor_kwargs["images"] = image
                 if videos is not None and (video := videos[i]) is not None:
@@ -475,7 +686,7 @@ class HfRunner:
             elif problem_type == "multi_label_classification":
                 logits = output.logits.sigmoid()[0].tolist()
             else:
-                logits = output.logits.softmax(dim=-1)[0].tolist()
+                logits = softmax(output.logits)[0].tolist()
             outputs.append(logits)
 
         return outputs
@@ -494,18 +705,23 @@ class HfRunner:
 
         outputs: list[tuple[list[list[int]], list[str]]] = []
         for inputs in all_inputs:
-            output_ids = self.model.generate(
+            generate_kwargs = dict(kwargs)
+            generate_kwargs.setdefault("tokenizer", self.tokenizer)
+            output_ids: torch.Tensor = self.model.generate(
                 **self.wrap_device(inputs),
                 use_cache=True,
-                **kwargs,
+                **generate_kwargs,
             )
+            if self.processor is None:
+                raise RuntimeError(
+                    "HfRunner.processor is not initialized; cannot decode output."
+                )
             output_str = self.processor.batch_decode(
                 output_ids,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
-            output_ids = output_ids.cpu().tolist()
-            outputs.append((output_ids, output_str))
+            outputs.append((output_ids.cpu().tolist(), output_str))
         return outputs
 
     def generate_greedy(
@@ -573,14 +789,16 @@ class HfRunner:
 
         all_logprobs: list[list[torch.Tensor]] = []
         for inputs in all_inputs:
-            output = self.model.generate(
+            generate_kwargs = dict(kwargs)
+            generate_kwargs.setdefault("tokenizer", self.tokenizer)
+            output: "GenerateOutput" = self.model.generate(
                 **self.wrap_device(inputs),
                 use_cache=True,
                 do_sample=False,
                 max_new_tokens=max_tokens,
                 output_hidden_states=True,
                 return_dict_in_generate=True,
-                **kwargs,
+                **generate_kwargs,
             )
             seq_logprobs = self._hidden_states_to_seq_logprobs(output.hidden_states)
             all_logprobs.append(seq_logprobs)
@@ -644,10 +862,16 @@ class HfRunner:
         images: PromptImageInput | None = None,
         audios: PromptAudioInput | None = None,
         videos: PromptVideoInput | None = None,
+        use_cache: bool = True,
+        tokenization_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> list[TokensTextLogprobs]:
         all_inputs = self.get_inputs(
-            prompts, images=images, videos=videos, audios=audios
+            prompts,
+            images=images,
+            videos=videos,
+            audios=audios,
+            tokenization_kwargs=tokenization_kwargs,
         )
 
         all_logprobs: list[list[dict[int, float]]] = []
@@ -655,20 +879,28 @@ class HfRunner:
         all_output_strs: list[str] = []
 
         for inputs in all_inputs:
-            output = self.model.generate(
+            generate_kwargs = dict(kwargs)
+            generate_kwargs.setdefault("tokenizer", self.tokenizer)
+            output: "GenerateOutput" = self.model.generate(
                 **self.wrap_device(inputs),
-                use_cache=True,
+                use_cache=use_cache,
                 do_sample=False,
                 max_new_tokens=max_tokens,
                 output_hidden_states=True,
                 return_dict_in_generate=True,
-                **kwargs,
+                **generate_kwargs,
+            )
+
+            # Encoder-decoder models return decoder_hidden_states instead of
+            # hidden_states
+            hidden_states = (
+                getattr(output, "hidden_states", None) or output.decoder_hidden_states
             )
 
             (
                 seq_logprobs_lst,
                 output_len,
-            ) = self._hidden_states_to_logprobs(output.hidden_states, num_logprobs)
+            ) = self._hidden_states_to_logprobs(hidden_states, num_logprobs)
 
             all_logprobs.append(seq_logprobs_lst)
             seq_ids = output.sequences[0]
@@ -690,16 +922,51 @@ class HfRunner:
         return self.model.predict(prompts, *args, convert_to_tensor=True, **kwargs)
 
     def __enter__(self):
+        if current_platform.is_rocm() or current_platform.is_xpu():
+            # Record starting memory usage stats on ROCm/XPU so that we can
+            # wait for memory to roughly settle back below these levels on
+            # shutdown. This is helpful in cases where the HfRunner is
+            # initialized after significant GPU memory is already occupied,
+            # e.g. in
+            # tests/basic_correctness/test_basic_correctness.py::test_models_distributed
+            # where vllm worker processes are still alive and holding GPU
+            # memory when hf_runner.__exit__ is called.
+            from tests.utils import record_gpu_memory_usage_stats
+
+            if (device_count := current_platform.device_count()) > 0:
+                devices = list(range(device_count))
+                mem_usage_stats = record_gpu_memory_usage_stats(devices=devices)
+                self.threshold_ratios = {
+                    device: 0.05 + mem_used / mem_tot
+                    for device, (mem_used, mem_tot) in mem_usage_stats.items()
+                }
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        from tests.utils import wait_for_memory_to_settle
+
         del self.model
         cleanup_dist_env_and_memory()
+        # ROCm/XPU free VRAM lazily; wait so a runner started right after this
+        # HF model exits does not OOM on its startup memory guard.
+        wait_for_memory_to_settle(
+            threshold_ratio=getattr(self, "threshold_ratios", None)
+        )
+        if hasattr(self, "threshold_ratios"):
+            del self.threshold_ratios
 
 
 @pytest.fixture(scope="session")
 def hf_runner():
     return HfRunner
+
+
+def _default_block_size() -> int:
+    if current_platform.is_xpu():
+        return 64
+    if current_platform.is_cpu():
+        return 128
+    return 16
 
 
 class VllmRunner:
@@ -715,6 +982,8 @@ class VllmRunner:
     - `enable_chunked_prefill`: Set to `False` instead of `None` for
       test reproducibility.
     - `enforce_eager`: Set to `False` to test CUDA graph.
+    - `kernel_config.enable_jit_warmup`: Set to `False` to reduce test startup
+      time.
     """
 
     def __init__(
@@ -725,14 +994,13 @@ class VllmRunner:
         tokenizer_name: str | None = None,
         tokenizer_mode: str = "auto",
         trust_remote_code: bool = True,
-        seed: int | None = 0,
+        seed: int = 0,
         max_model_len: int | None = 1024,
         dtype: str = "auto",
         disable_log_stats: bool = True,
         tensor_parallel_size: int = 1,
-        block_size: int = 16 if not torch.xpu.is_available() else 64,
+        block_size: int = _default_block_size(),
         enable_chunked_prefill: bool | None = False,
-        swap_space: int = 4,
         enforce_eager: bool | None = False,
         # Set this to avoid hanging issue
         default_torch_num_threads: int | None = None,
@@ -743,6 +1011,8 @@ class VllmRunner:
             if default_torch_num_threads is None
             else set_default_torch_num_threads(default_torch_num_threads)
         )
+
+        kwargs.setdefault("kernel_config", {"enable_jit_warmup": False})
 
         if not kwargs.get("compilation_config", None):
             # Note(@tdoublep): This is set to 4 because some tests (e.g., hybrid
@@ -759,6 +1029,35 @@ class VllmRunner:
                     num_speculative_tokens + 1
                 )
 
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm():
+            gpu_memory_utilization = kwargs.get(
+                "gpu_memory_utilization",
+                CacheConfig.gpu_memory_utilization,
+            )
+            # V1 startup requires free_memory >= total * gpu_memory_utilization.
+            # ROCm CI can hand a test a device that is still lazily releasing
+            # VRAM from a previous process, so wait before constructing LLM.
+            from tests.utils import wait_for_memory_to_settle
+
+            wait_for_memory_to_settle(threshold_ratio=1.0 - gpu_memory_utilization)
+        elif current_platform.is_xpu():
+            # The XPU/oneAPI runtime keeps ~1 GiB of context resident in the
+            # parent pytest process for its whole lifetime (grown by in-process
+            # HfRunner models), and distributed tests additionally allocate a
+            # CCL context in the engine subprocess. The default utilization of
+            # 0.92 leaves too little headroom for both, so lower it on XPU when
+            # the caller did not request an explicit value.
+            if "gpu_memory_utilization" not in kwargs:
+                kwargs["gpu_memory_utilization"] = 0.9
+            gpu_memory_utilization = kwargs["gpu_memory_utilization"]
+            # XPU (Level Zero) can also release device memory lazily after a
+            # previous engine shuts down, so wait before constructing LLM.
+            from tests.utils import wait_for_memory_to_settle
+
+            wait_for_memory_to_settle(threshold_ratio=1.0 - gpu_memory_utilization)
+
         with init_ctx:
             self.llm = LLM(
                 model=model_name,
@@ -769,7 +1068,6 @@ class VllmRunner:
                 trust_remote_code=trust_remote_code,
                 dtype=dtype,
                 seed=seed,
-                swap_space=swap_space,
                 enforce_eager=enforce_eager,
                 disable_log_stats=disable_log_stats,
                 tensor_parallel_size=tensor_parallel_size,
@@ -781,7 +1079,10 @@ class VllmRunner:
 
     def get_inputs(
         self,
-        prompts: list[str] | list[torch.Tensor] | list[list[int]],
+        prompts: list[str]
+        | list[torch.Tensor]
+        | list[list[int]]
+        | list[dict[str, Any]],
         images: PromptImageInput | None = None,
         videos: PromptVideoInput | None = None,
         audios: PromptAudioInput | None = None,
@@ -795,26 +1096,32 @@ class VllmRunner:
 
         inputs = list[dict[str, Any]]()
         for i, prompt in enumerate(prompts):
-            prompt_dict = dict[str, Any]()
-            if isinstance(prompt, str):
-                prompt_dict["prompt"] = prompt
-            elif isinstance(prompt, list):
-                prompt_dict["prompt_token_ids"] = prompt
+            # If we're passing an encoder/decoder prompt, we assume it
+            # already contains the multimodal data in the prompt
+            if isinstance(prompt, dict):
+                assert images is None and audios is None and videos is None
+                inputs.append(prompt.copy())
             else:
-                prompt_dict["prompt_embeds"] = prompt
+                prompt_dict = dict[str, Any]()
+                if isinstance(prompt, str):
+                    prompt_dict["prompt"] = prompt
+                elif isinstance(prompt, list):
+                    prompt_dict["prompt_token_ids"] = prompt
+                else:
+                    prompt_dict["prompt_embeds"] = prompt
 
-            multi_modal_data = dict[str, Any]()
-            if images is not None and (image := images[i]) is not None:
-                multi_modal_data["image"] = image
-            if videos is not None and (video := videos[i]) is not None:
-                multi_modal_data["video"] = video
-            if audios is not None and (audio := audios[i]) is not None:
-                multi_modal_data["audio"] = audio
+                multi_modal_data = dict[str, Any]()
+                if images is not None and (image := images[i]) is not None:
+                    multi_modal_data["image"] = image
+                if videos is not None and (video := videos[i]) is not None:
+                    multi_modal_data["video"] = video
+                if audios is not None and (audio := audios[i]) is not None:
+                    multi_modal_data["audio"] = audio
 
-            if multi_modal_data:
-                prompt_dict["multi_modal_data"] = multi_modal_data
+                if multi_modal_data:
+                    prompt_dict["multi_modal_data"] = multi_modal_data
 
-            inputs.append(prompt_dict)
+                inputs.append(prompt_dict)
 
         return inputs
 
@@ -842,6 +1149,8 @@ class VllmRunner:
             req_sample_output_ids: list[list[int]] = []
             req_sample_output_strs: list[str] = []
             req_logprobs = []
+            if req_output.prompt_logprobs:
+                req_logprobs.extend(req_output.prompt_logprobs)
             for sample in req_output.outputs:
                 output_str = sample.text
                 output_ids = list(sample.token_ids)
@@ -964,7 +1273,9 @@ class VllmRunner:
             **kwargs,
         )
 
-    def generate_prompt_perplexity(self, prompts: list[str]) -> list[float]:
+    def generate_prompt_perplexity(
+        self, prompts: list[str], mask: Optional[list[str]] = None
+    ) -> list[float]:
         """
         Return the perplexity score associated with generating the prompts
 
@@ -975,13 +1286,20 @@ class VllmRunner:
             prompts, max_tokens=1, num_logprobs=None, num_prompt_logprobs=0
         )
 
+        mask_prefix_lens = (
+            [len(self.llm.get_tokenizer()(prefix)["input_ids"]) for prefix in mask]
+            if mask is not None
+            else [0 for _ in range(len(prompts))]
+        )
+
         perplexities = []
-        for output in outputs:
+        for output, mask_prefix_len in zip(outputs, mask_prefix_lens):
             output = cast(TokensTextLogprobsPromptLogprobs, output)
             token_datas = cast(list[dict[int, Logprob] | None], output[3])
             assert token_datas[0] is None
+
             token_log_probs = []
-            for token_data in token_datas[1:]:
+            for token_data in token_datas[mask_prefix_len + 1 :]:
                 assert token_data is not None
                 assert len(token_data) == 1
                 token_log_prob = list(token_data.values())[0].logprob
@@ -1042,10 +1360,6 @@ class VllmRunner:
         req_outputs = self.llm.encode(prompts, pooling_task="token_classify")
         return [req_output.outputs.data for req_output in req_outputs]
 
-    def reward(self, prompts: list[str]) -> list[list[float]]:
-        req_outputs = self.llm.reward(prompts)
-        return [req_output.outputs.data for req_output in req_outputs]
-
     def score(
         self,
         text_1: list[str] | str,
@@ -1062,12 +1376,48 @@ class VllmRunner:
     def get_llm(self) -> LLM:
         return self.llm
 
+    def collective_rpc(self, *args, **kwargs):
+        return self.llm.collective_rpc(*args, **kwargs)
+
     def __enter__(self):
         return self
 
+    def _wait_for_memory_release(self, gpu_memory_utilization: float) -> None:
+        from tests.utils import wait_for_memory_to_settle
+
+        # V1 startup requires free_memory >= total * gpu_memory_utilization.
+        # Wait for the complementary used-memory ratio so the next runner does
+        # not fail the startup guard immediately after this runner exits. The
+        # wait is bounded so cleanup failures fail this test instead of hanging.
+        wait_for_memory_to_settle(threshold_ratio=1.0 - gpu_memory_utilization)
+
     def __exit__(self, exc_type, exc_value, traceback):
+        # Explicitly shutdown the engine core to release GPU resources
+        # This is needed because when executing consecutive tests, the GC
+        # might not be fast enough in shutting down the llm engine. This can lead to OOMs
+        # because when the next test starts some GPU memory is still in use.
+        gpu_memory_utilization = (
+            self.llm.llm_engine.vllm_config.cache_config.gpu_memory_utilization
+        )
+        from vllm.platforms import current_platform
+
+        try:
+            # Give the engine core time to run its own graceful shutdown
+            # (model_executor teardown + empty_cache + process-group destroy)
+            # before the process manager SIGKILLs it at the default 5s. On ROCm
+            # a hard kill leaves the whole allocation for the driver's slow async
+            # VRAM reclamation, which starves the next test's startup.
+            shutdown_timeout = 60.0 if current_platform.is_rocm() else None
+            self.llm.llm_engine.engine_core.shutdown(timeout=shutdown_timeout)
+        except Exception:
+            # Don't fail the test on shutdown errors since cleanup will still
+            # proceed, but don't hide them either: a failure here usually
+            # means the engine's GPU memory was never released.
+            logger.exception("Engine core shutdown raised; GPU memory may leak")
         del self.llm
+        torch._dynamo.reset()
         cleanup_dist_env_and_memory()
+        self._wait_for_memory_release(gpu_memory_utilization)
 
 
 @pytest.fixture(scope="session")
@@ -1208,7 +1558,7 @@ _dummy_gemma2_embedding_path = os.path.join(temp_dir, "dummy_gemma2_embedding")
 def dummy_opt_path():
     json_path = os.path.join(_dummy_opt_path, "config.json")
     if not os.path.exists(_dummy_opt_path):
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id="facebook/opt-125m",
             local_dir=_dummy_opt_path,
             ignore_patterns=["*.bin", "*.bin.index.json", "*.pt", "*.h5", "*.msgpack"],
@@ -1226,7 +1576,7 @@ def dummy_opt_path():
 def dummy_llava_path():
     json_path = os.path.join(_dummy_llava_path, "config.json")
     if not os.path.exists(_dummy_llava_path):
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id="llava-hf/llava-1.5-7b-hf",
             local_dir=_dummy_llava_path,
             ignore_patterns=[
@@ -1251,7 +1601,7 @@ def dummy_llava_path():
 def dummy_gemma2_embedding_path():
     json_path = os.path.join(_dummy_gemma2_embedding_path, "config.json")
     if not os.path.exists(_dummy_gemma2_embedding_path):
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id="BAAI/bge-multilingual-gemma2",
             local_dir=_dummy_gemma2_embedding_path,
             ignore_patterns=[
@@ -1335,7 +1685,13 @@ class AssetHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.debug(
+                "Client disconnected while serving test asset %s: %r", filename, e
+            )
+            self.close_connection = True
 
 
 def _find_free_port() -> int:
@@ -1389,7 +1745,11 @@ class LocalAssetServer:
         return f"{self.base_url}/{name}"
 
     def get_image_asset(self, name: str) -> Image.Image:
-        return fetch_image(self.url_for(name))
+        image = fetch_image(self.url_for(name))
+        # Unwrap MediaWithBytes if present
+        if isinstance(image, MediaWithBytes):
+            image = image.media
+        return image
 
 
 @pytest.fixture(scope="session")
@@ -1430,30 +1790,148 @@ def disable_deepgemm_ue8m0(monkeypatch):
         is_deep_gemm_e8m0_used.cache_clear()
 
 
+def _should_clean_gpu_memory_between_tests() -> bool:
+    # This must stay opt-in: a function-scoped fixture cannot distinguish
+    # stale VRAM from allocations owned by longer-lived module/session fixtures.
+    return os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") == "1"
+
+
 @pytest.fixture(autouse=True)
 def clean_gpu_memory_between_tests():
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
+    if not _should_clean_gpu_memory_between_tests():
         yield
         return
 
-    # Wait for GPU memory to be cleared before starting the test
     import gc
 
-    from tests.utils import wait_for_gpu_memory_to_clear
+    from tests.utils import wait_for_gpu_memory_to_clear, wait_for_memory_to_settle
 
-    num_gpus = torch.cuda.device_count()
-    if num_gpus > 0:
+    num_gpus = torch.accelerator.device_count()
+
+    def _wait_for_settled_gpu_memory() -> None:
+        if num_gpus <= 0:
+            return
         try:
-            wait_for_gpu_memory_to_clear(
-                devices=list(range(num_gpus)),
-                threshold_ratio=0.1,
-            )
+            if current_platform.is_rocm():
+                wait_for_memory_to_settle()
+            else:
+                wait_for_gpu_memory_to_clear(
+                    devices=list(range(num_gpus)),
+                    threshold_ratio=0.1,
+                )
         except ValueError as e:
             logger.info("Failed to clean GPU memory: %s", e)
 
+    _wait_for_settled_gpu_memory()
+
     yield
 
-    # Clean up GPU memory after the test
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         gc.collect()
+    _wait_for_settled_gpu_memory()
+
+
+@pytest.fixture
+def use_fresh_inductor_cache():
+    """
+    Use a fresh inductor cache for the test.
+    This is useful to ensure that the test is not affected by the
+    previous test calls.
+    """
+    with fresh_cache():
+        yield
+
+
+@pytest.fixture
+def disable_vllm_compile_cache(monkeypatch, use_fresh_inductor_cache):
+    """
+    Use a fresh inductor cache AND disable vLLM's on-disk torch.compile cache.
+
+    This forces compilation (and any custom compile passes) to actually run
+    instead of being served from a warm cache left behind by previous runs
+    (e.g. on persistent CI agents). Use this for tests that inspect what
+    happens during compilation; use ``use_fresh_inductor_cache`` (or
+    ``fresh_vllm_cache``) instead when the vLLM compile cache must stay
+    enabled (e.g. cache save/load tests).
+    """
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
+    yield
+
+
+@pytest.fixture
+def fresh_vllm_cache(monkeypatch, use_fresh_inductor_cache):
+    """Temporary VLLM_CACHE_ROOT combined with a fresh inductor cache."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        monkeypatch.setenv("VLLM_CACHE_ROOT", tmp_dir)
+        yield tmp_dir
+
+
+@pytest.fixture(scope="function")
+def enable_pickle(monkeypatch):
+    """`LLM.apply_model` requires pickling a function."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+
+@pytest.fixture(scope="function")
+def disable_log_dedup(monkeypatch):
+    """
+    Disable log deduplication such that warning_once and info_once always print.
+    """
+
+    # Patch logger._print_warning_once to remove the lru_cache decorator
+    from vllm import logger
+
+    original_print_warning_once = logger._print_warning_once
+    original_print_info_once = logger._print_info_once
+    original_print_debug_once = logger._print_debug_once
+
+    logger._print_warning_once = original_print_warning_once.__wrapped__
+    logger._print_info_once = original_print_info_once.__wrapped__
+    logger._print_debug_once = original_print_debug_once.__wrapped__
+
+    yield
+    logger._print_warning_once = original_print_warning_once
+    logger._print_info_once = original_print_info_once
+    logger._print_debug_once = original_print_debug_once
+
+
+@pytest.fixture(scope="function")
+def fake_vllm_ir(monkeypatch):
+    """
+    Pytest fixture to allow isolated IR op registration in tests.
+
+    Replaces IrOp.registry with an empty dict and swaps ``vllm_ir_torch_lib`` for a
+    fresh ``Library`` with a unique namespace per test (see ``Library.ns``).
+
+    Torch keeps registrations for the process lifetime; reusing the fragment
+    name ``vllm_ir`` and defining the same op string again can segfault. A
+    random library name keeps each fixture run on a disjoint namespace.
+
+    The test Library is kept alive until after monkeypatch teardown so PyTorch's
+    C++ state is not freed while references may still exist.
+
+    Usage:
+        def test_my_ir_op(fake_vllm_ir):
+            @vllm.ir.register_op
+            def my_test_op(x: torch.Tensor) -> torch.Tensor:
+                return x * 2
+
+            result = my_test_op(torch.tensor([1, 2, 3]))
+            # Registry and library cleaned up automatically after the test
+    """
+    import secrets
+
+    from torch.library import Library
+    from vllm.ir.op import IrOp
+
+    monkeypatch.setattr(IrOp, "registry", {})
+
+    # Keep a local reference so the Library is not GC'd before monkeypatch
+    # teardown restores the original reference.
+    test_lib = Library(f"vllm_ir_{secrets.token_hex(8)}", "FRAGMENT")
+    monkeypatch.setattr("vllm.ir.op.vllm_ir_torch_lib", test_lib)
+
+    yield
+
+    del test_lib

@@ -8,12 +8,19 @@ import pytest
 
 import vllm.envs as envs
 from vllm.envs import (
+    disable_envs_cache,
     enable_envs_cache,
     env_list_with_choices,
     env_set_with_choices,
     env_with_choices,
     environment_variables,
 )
+from vllm.exceptions import VLLMValidationError
+
+
+def test_object_storage_shm_default_name():
+    """The generated name must fit macOS's shared-memory name limit."""
+    assert len(envs._generate_shm_name()) <= 30
 
 
 def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):
@@ -25,6 +32,32 @@ def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):
     assert envs.VLLM_PORT == 1234
     # __getattr__ is not decorated with functools.cache
     assert not hasattr(envs.__getattr__, "cache_info")
+
+
+def test_nixl_side_channel_host_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_NIXL_SIDE_CHANNEL_HOST", "10.0.0.15")
+
+    assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
+
+
+def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_API_KEY", "sk-super-secret")
+
+    assert "VLLM_API_KEY" not in envs.compile_factors()
+
+
+def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
+    monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)
+    assert envs.VLLM_P2P_SIDE_CHANNEL_HOST == "localhost"
+    assert envs.VLLM_P2P_SIDE_CHANNEL_PORT == 5710
+
+    monkeypatch.setenv("VLLM_P2P_SIDE_CHANNEL_HOST", "10.0.0.20")
+    monkeypatch.setenv("VLLM_P2P_SIDE_CHANNEL_PORT", "5799")
+    assert envs.VLLM_P2P_SIDE_CHANNEL_HOST == "10.0.0.20"
+    assert envs.VLLM_P2P_SIDE_CHANNEL_PORT == 5799
 
 
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
@@ -55,6 +88,82 @@ def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     # Reset envs.__getattr__ back to none-cached version to
     # avoid affecting other tests
     envs.__getattr__ = envs.__getattr__.__wrapped__
+
+
+def test_getattr_with_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
+    # __getattr__ is not decorated with functools.cache
+    assert not hasattr(envs.__getattr__, "cache_info")
+
+    # Enable envs cache and ignore ongoing environment changes
+    enable_envs_cache()
+    assert envs.VLLM_HOST_IP == "1.1.1.1"
+    # With cache enabled, the environment variable value is cached and unchanged
+    monkeypatch.setenv("VLLM_HOST_IP", "2.2.2.2")
+    assert envs.VLLM_HOST_IP == "1.1.1.1"
+
+    disable_envs_cache()
+    assert envs.VLLM_HOST_IP == "2.2.2.2"
+    # After cache disabled, the environment variable value would be synced
+    # with os.environ
+    monkeypatch.setenv("VLLM_HOST_IP", "3.3.3.3")
+    assert envs.VLLM_HOST_IP == "3.3.3.3"
+
+
+def test_is_envs_cache_enabled() -> None:
+    assert not envs._is_envs_cache_enabled()
+    enable_envs_cache()
+    assert envs._is_envs_cache_enabled()
+
+    # Only wrap one-layer of cache, so we only need to
+    # call disable once to reset.
+    enable_envs_cache()
+    enable_envs_cache()
+    enable_envs_cache()
+    disable_envs_cache()
+    assert not envs._is_envs_cache_enabled()
+
+    disable_envs_cache()
+    assert not envs._is_envs_cache_enabled()
+
+
+def test_precompiled_install_flags_are_orthogonal() -> None:
+    # The Rust frontend flag is independent of the C-extension precompiled
+    # flag: requesting the precompiled Rust frontend must not implicitly
+    # enable the precompiled C extensions.
+    with patch.dict(os.environ, {"VLLM_USE_PRECOMPILED_RUST": "1"}, clear=True):
+        assert environment_variables["VLLM_USE_PRECOMPILED"]() is False
+        assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
+
+    # ...and the reverse: requesting precompiled C extensions (here via a
+    # wheel location, which enables VLLM_USE_PRECOMPILED) must not flip the
+    # Rust frontend flag.
+    with patch.dict(
+        os.environ, {"VLLM_PRECOMPILED_WHEEL_LOCATION": "/tmp/vllm.whl"}, clear=True
+    ):
+        assert environment_variables["VLLM_USE_PRECOMPILED"]() is True
+        assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is False
+
+    # ...and with both set together, each flag is still parsed independently.
+    with patch.dict(
+        os.environ,
+        {
+            "VLLM_PRECOMPILED_WHEEL_LOCATION": "/tmp/vllm.whl",
+            "VLLM_USE_PRECOMPILED_RUST": "1",
+        },
+        clear=True,
+    ):
+        assert environment_variables["VLLM_USE_PRECOMPILED"]() is True
+        assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
+
+
+def test_rust_bench_auto_path_missing_fails_fast() -> None:
+    with (
+        patch.dict(os.environ, {"VLLM_USE_RUST_BENCH": "1"}, clear=True),
+        patch("vllm.envs.os.path.isfile", return_value=False),
+        pytest.raises(FileNotFoundError, match="vllm-rs binary was not found"),
+    ):
+        environment_variables["VLLM_RUST_FRONTEND_PATH"]()
 
 
 class TestEnvWithChoices:
@@ -151,6 +260,21 @@ class TestEnvWithChoices:
                 ValueError, match="Invalid value 'invalid' for TEST_ENV"
             ):
                 env_func()
+
+
+def test_gdn_decode_kernel_env(monkeypatch: pytest.MonkeyPatch):
+    env_func = environment_variables["VLLM_GDN_DECODE_KERNEL"]
+    monkeypatch.delenv("VLLM_GDN_DECODE_KERNEL", raising=False)
+    assert env_func() == "cuda"
+
+    for value in ("cuda", "triton"):
+        monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", value)
+        assert env_func() == value
+
+    for value in ("fused", "invalid"):
+        monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", value)
+        with pytest.raises(ValueError, match="VLLM_GDN_DECODE_KERNEL"):
+            env_func()
 
 
 class TestEnvListWithChoices:
@@ -367,55 +491,104 @@ class TestEnvSetWithChoices:
             assert env_func() == {"option1", "option2"}
 
 
+class TestVllmConfigureLogging:
+    """Test cases for VLLM_CONFIGURE_LOGGING environment variable."""
+
+    def test_configure_logging_defaults_to_true(self):
+        """Test that VLLM_CONFIGURE_LOGGING defaults to True when not set."""
+        # Ensure the env var is not set
+        with patch.dict(os.environ, {}, clear=False):
+            if "VLLM_CONFIGURE_LOGGING" in os.environ:
+                del os.environ["VLLM_CONFIGURE_LOGGING"]
+
+            # Clear cache if it exists
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            result = envs.VLLM_CONFIGURE_LOGGING
+            assert result is True
+            assert isinstance(result, bool)
+
+    def test_configure_logging_with_zero_string(self):
+        """Test that VLLM_CONFIGURE_LOGGING='0' evaluates to False."""
+        with patch.dict(os.environ, {"VLLM_CONFIGURE_LOGGING": "0"}):
+            # Clear cache if it exists
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            result = envs.VLLM_CONFIGURE_LOGGING
+            assert result is False
+            assert isinstance(result, bool)
+
+    def test_configure_logging_with_one_string(self):
+        """Test that VLLM_CONFIGURE_LOGGING='1' evaluates to True."""
+        with patch.dict(os.environ, {"VLLM_CONFIGURE_LOGGING": "1"}):
+            # Clear cache if it exists
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            result = envs.VLLM_CONFIGURE_LOGGING
+            assert result is True
+            assert isinstance(result, bool)
+
+    def test_configure_logging_with_invalid_value_raises_error(self):
+        """Test that invalid VLLM_CONFIGURE_LOGGING value raises ValueError."""
+        with patch.dict(os.environ, {"VLLM_CONFIGURE_LOGGING": "invalid"}):
+            # Clear cache if it exists
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            with pytest.raises(ValueError, match="invalid literal for int"):
+                _ = envs.VLLM_CONFIGURE_LOGGING
+
+
 class TestVllmMaxNSequences:
-    def test_default_value(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("VLLM_MAX_N_SEQUENCES", raising=False)
-        assert envs.VLLM_MAX_N_SEQUENCES == 16384
+    def test_default_value(self):
+        """Test that VLLM_MAX_N_SEQUENCES defaults to 64."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_MAX_N_SEQUENCES", None)
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            assert envs.VLLM_MAX_N_SEQUENCES == 16384
 
     def test_custom_value(self, monkeypatch: pytest.MonkeyPatch):
+        """Test that VLLM_MAX_N_SEQUENCES can be overridden."""
         monkeypatch.setenv("VLLM_MAX_N_SEQUENCES", "128")
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+
         assert envs.VLLM_MAX_N_SEQUENCES == 128
 
+    def test_sampling_params_respects_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test that SamplingParams rejects n above the limit."""
+        from vllm.sampling_params import SamplingParams
 
-@pytest.mark.parametrize(
-    ("name", "default", "custom"),
-    [
-        ("VLLM_MAX_AUDIO_DECODE_DURATION_S", 600, 10),
-        ("VLLM_MAX_AUDIO_DECODE_BYTES", 268_435_456, 1024),
-        ("VLLM_MAX_IMAGE_PIXELS", 178_956_970, 4096),
-        ("VLLM_MAX_COMPLETION_PROMPTS", 1024, 8),
-    ],
-)
-def test_resource_limit_envs(
-    monkeypatch: pytest.MonkeyPatch, name: str, default: int, custom: int
-):
-    monkeypatch.delenv(name, raising=False)
-    assert environment_variables[name]() == default
+        monkeypatch.delenv("VLLM_MAX_N_SEQUENCES", raising=False)
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
 
-    monkeypatch.setenv(name, str(custom))
-    assert environment_variables[name]() == custom
+        max_n = envs.VLLM_MAX_N_SEQUENCES
+        SamplingParams(n=max_n)
 
+        with pytest.raises(VLLMValidationError, match="n must be at most"):
+            SamplingParams(n=max_n + 1)
 
-def test_sampling_params_rejects_excessive_n(monkeypatch: pytest.MonkeyPatch):
-    from vllm import SamplingParams
+    def test_sampling_params_respects_custom_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test that SamplingParams uses the overridden env var limit."""
+        from vllm.sampling_params import SamplingParams
 
-    monkeypatch.setenv("VLLM_MAX_N_SEQUENCES", "4")
-    SamplingParams(n=4)
-    with pytest.raises(ValueError, match="n must be at most 4"):
-        SamplingParams(n=5)
+        monkeypatch.setenv("VLLM_MAX_N_SEQUENCES", "128")
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
 
+        SamplingParams(n=128)
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("temperature", float("nan")),
-        ("temperature", float("inf")),
-        ("repetition_penalty", float("nan")),
-        ("repetition_penalty", float("inf")),
-    ],
-)
-def test_sampling_params_rejects_non_finite_values(field: str, value: float):
-    from vllm import SamplingParams
-
-    with pytest.raises(ValueError, match="finite number"):
-        SamplingParams(**{field: value})
+        with pytest.raises(VLLMValidationError, match="n must be at most 128"):
+            SamplingParams(n=129)

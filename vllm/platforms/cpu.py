@@ -2,20 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import glob
-import json
 import os
 import platform
 import subprocess
 import sys
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import regex as re
 import torch
 
 from vllm import envs
-from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.logger import init_logger
+from vllm.utils.cpu_resource_utils import (
+    DEVICE_CONTROL_ENV_VAR,
+    get_memory_node_info,
+    get_visible_memory_node,
+)
+from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interface import CpuArchEnum, Platform, PlatformEnum
 
@@ -23,8 +26,64 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     VllmConfig = None
+
+
+def _cpu_mamba_backend(vllm_config: VllmConfig) -> str:
+    """Return the CPU state backend selected by the model configuration."""
+    model_config = vllm_config.model_config
+    if model_config is None:
+        return "none"
+
+    hf_config = getattr(model_config, "hf_text_config", None)
+    model_type = str(getattr(hf_config, "model_type", "")).lower()
+    architecture = str(getattr(model_config, "architecture", "")).lower()
+    layer_types = getattr(hf_config, "layer_types", None)
+    has_linear_attention = isinstance(layer_types, (list, tuple)) and (
+        "linear_attention" in layer_types
+    )
+
+    try:
+        has_inner_state = bool(model_config.has_inner_state)
+    except (AttributeError, RuntimeError):
+        has_inner_state = False
+
+    if not (has_inner_state or has_linear_attention):
+        return "none"
+
+    fallback_backend = model_type or architecture or "unknown"
+    if not has_linear_attention:
+        return fallback_backend
+
+    try:
+        model_cls, _ = model_config.registry.resolve_model_cls(
+            model_config.architecture,
+            model_config=model_config,
+        )
+    except Exception:
+        return fallback_backend
+
+    try:
+        state_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+    except Exception:
+        return fallback_backend
+
+    if not isinstance(state_dtypes, tuple) or len(state_dtypes) != 2:
+        return fallback_backend
+
+    if vllm_config.cache_config.mamba_ssm_cache_dtype == "float16":
+        cache_dtype = torch.float16
+    elif vllm_config.cache_config.mamba_ssm_cache_dtype == "bfloat16":
+        cache_dtype = torch.bfloat16
+    else:
+        return fallback_backend
+
+    if state_dtypes[1] == cache_dtype:
+        return "gdn"
+
+    return fallback_backend
 
 
 def get_max_threads(pid=0):
@@ -36,86 +95,40 @@ def get_max_threads(pid=0):
         raise NotImplementedError("Unsupported OS")
 
 
-@dataclass
-class LogicalCPUInfo:
-    id: int = -1
-    physical_core: int = -1
-    numa_node: int = -1
-
-    @classmethod
-    def _int(cls, value: str) -> int:
-        try:
-            int_value = int(value)
-        except Exception:
-            int_value = -1
-        return int_value
-
-    @staticmethod
-    def json_decoder(obj_dict: dict):
-        id = obj_dict.get("cpu")
-        physical_core = obj_dict.get("core")
-        numa_node = obj_dict.get("node")
-
-        if not (id is None or physical_core is None or numa_node is None):
-            return LogicalCPUInfo(
-                id=LogicalCPUInfo._int(id),
-                physical_core=LogicalCPUInfo._int(physical_core),
-                numa_node=LogicalCPUInfo._int(numa_node),
-            )
-        else:
-            return obj_dict
-
-
 class CpuPlatform(Platform):
     _enum = PlatformEnum.CPU
     device_name: str = "cpu"
     device_type: str = "cpu"
     dispatch_key: str = "CPU"
     dist_backend: str = "gloo"
-    device_control_env_var = "CPU_VISIBLE_MEMORY_NODES"
+    device_control_env_var = DEVICE_CONTROL_ENV_VAR
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
         if self.get_cpu_architecture() == CpuArchEnum.POWERPC:
-            return [torch.bfloat16, torch.float32]
+            return [torch.bfloat16, torch.float32, torch.float16]
         elif self.get_cpu_architecture() == CpuArchEnum.ARM and sys.platform.startswith(
             "darwin"
         ):
-            if (
-                subprocess.check_output(
-                    ["sysctl -n hw.optional.arm.FEAT_BF16"], shell=True
-                ).strip()
+            # sysctl exits non-zero when the OID is absent, so check_output would
+            # raise instead of letting the fp16/fp32 fallback below run.
+            bf16 = (
+                subprocess.run(
+                    ["sysctl", "-n", "hw.optional.arm.FEAT_BF16"], capture_output=True
+                ).stdout.strip()
                 == b"1"
-            ):
+            )
+            if bf16:
                 return [torch.bfloat16, torch.float16, torch.float32]
             return [torch.float16, torch.float32]
         elif self.get_cpu_architecture() == CpuArchEnum.RISCV:
-            # Workaround for Issue #25655: RISC-V scheduler bug with float16
-            #
-            # Background:
-            # - RISC-V currently uses scalar code path
-            # - There is a latent bug in the vLLM scheduler that provides
-            # invalid
-            #   physical_block_idx values under certain conditions
-            # - This bug causes segmentation faults when using float16
-            # dtype on RISC-V
-            # - Testing shows that forcing float32 successfully bypasses
-            # this issue
-            #
-            # Technical details:
-            # - The bug manifests as out-of-bounds physical_block_idx in
-            # block_tables
-            # - Only occurs on RISC-V hardware
-            # tested on Sophgo SG2044
-            # - Does not reproduce on x86 or other architectures
-            # - Root cause is in Python-level scheduling logic,
-            # not C++ kernels
-            #
-            # This is a temporary workaround until the scheduler bug is fixed.
-            # See: https://github.com/vllm-project/vllm/issues/25655
-            return [torch.float32]
+            return [torch.bfloat16, torch.float16, torch.float32]
         # x86/aarch64 CPU has supported both bf16 and fp16 natively.
         return [torch.bfloat16, torch.float16, torch.float32]
+
+    @classmethod
+    def check_runner_kv_caches_multi_layer(cls) -> None:
+        pass
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -125,45 +138,55 @@ class CpuPlatform(Platform):
     def get_attn_backend_cls(
         cls,
         selected_backend: "AttentionBackendEnum",
-        head_size: int,
-        dtype: torch.dtype,
-        kv_cache_dtype: str | None,
-        block_size: int,
-        use_mla: bool,
-        has_sink: bool,
-        use_sparse: bool,
-        attn_type: str | None = None,
+        attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
+        if attn_selector_config.use_sparse:
+            raise NotImplementedError("Sparse Attention is not supported on CPU.")
+        if attn_selector_config.use_mla:
+            amx_available = (
+                cls.get_cpu_architecture() == CpuArchEnum.X86
+                and torch.cpu._is_amx_tile_supported()
+            )
+            if amx_available and selected_backend != AttentionBackendEnum.CPU_MLA:
+                # Prefer AMX when available, unless CPU_MLA was explicitly requested.
+                if (
+                    selected_backend
+                    and selected_backend != AttentionBackendEnum.AMX_MLA
+                ):
+                    logger.info("Cannot use %s backend on CPU.", selected_backend)
+                logger.info_once("Using %s backend.", AttentionBackendEnum.AMX_MLA.name)
+                return AttentionBackendEnum.AMX_MLA.get_path()
+            # Reference MLA implementation on CPU. Performance is not the
+            # goal here; the backend simply wires the CPU decode kernel
+            # (`mla_decode_kvcache`) and an SDPA-based prefill together with
+            # the shared MLA scaffolding so that DeepSeek-style models can
+            # execute on CPU.
+            if selected_backend and selected_backend not in (
+                AttentionBackendEnum.CPU_MLA,
+                AttentionBackendEnum.AMX_MLA,
+            ):
+                logger.info("Cannot use %s backend on CPU.", selected_backend)
+            logger.info_once("Using %s backend.", AttentionBackendEnum.CPU_MLA.name)
+            return AttentionBackendEnum.CPU_MLA.get_path()
         if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
             logger.info("Cannot use %s backend on CPU.", selected_backend)
-        if use_mla:
-            raise NotImplementedError("MLA is not supported on CPU.")
-        if use_sparse:
-            raise NotImplementedError("Sparse Attention is not supported on CPU.")
         return AttentionBackendEnum.CPU_ATTN.get_path()
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        from vllm.utils.mem_constants import GiB_bytes
+        meminfo = get_memory_node_info(device_id)
 
-        kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
-        if kv_cache_space is None:
-            kv_cache_space = 4 * GiB_bytes  # type: ignore
-            logger.warning_once(
-                "Environment variable VLLM_CPU_KVCACHE_SPACE (GiB) "
-                "for CPU backend is not set, using 4 by default."
-            )
-        else:
-            kv_cache_space *= GiB_bytes
-
-        return kv_cache_space
+        return meminfo.total_memory
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
-        """
-        Set the device for the current platform.
-        """
+        """Set the device for the current platform."""
         torch.cpu.set_device(device)
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        pass
 
     @classmethod
     def inference_mode(cls):
@@ -176,54 +199,135 @@ class CpuPlatform(Platform):
         if model_config is not None:
             model_config.disable_cascade_attn = True
 
+        # Import lazily: vllm.triton_utils imports vllm.platforms.current_platform,
+        # which is still being resolved while this platform class is loading.
+        from vllm.triton_utils import HAS_TRITON
+
+        if cls.get_cpu_architecture() == CpuArchEnum.X86 and not HAS_TRITON:
+            logger.warning_once(
+                "Triton is not installed. triton-cpu is expected on x86 CPUs."
+            )
+
         cache_config = vllm_config.cache_config
 
-        if cache_config.block_size is None:
+        is_deepseek_v4 = (
+            model_config is not None
+            and getattr(model_config.hf_config, "model_type", None) == "deepseek_v4"
+        )
+
+        # The CPU MLA decode kernel only compiles with block_size=16 today
+        # (see csrc/cpu/mla_decode.cpp). If the model uses MLA we override
+        # the default block size regardless of user preference to avoid a
+        # runtime kernel dispatch failure. AMX MLA has no such constraint
+        # (same AMX-available condition as get_attn_backend_cls), so it's
+        # excluded from this override. DeepSeek-V4 is also excluded here and
+        # handled in its own branch below: its sparse-MLA and indexer
+        # backends declare block_size=256 as their only supported kernel
+        # block size (DeepseekV4SparseMLABackend/DeepseekV4IndexerBackend),
+        # so it needs the same override-regardless-of-preference treatment
+        # as CPU MLA, just with a different value.
+        cpu_mla_enabled = (
+            not is_deepseek_v4
+            and model_config is not None
+            and getattr(model_config, "use_mla", False)
+        )
+        amx_mla_enabled = (
+            cpu_mla_enabled
+            and cls.get_cpu_architecture() == CpuArchEnum.X86
+            and torch.cpu._is_amx_tile_supported()
+            and vllm_config.attention_config.backend != AttentionBackendEnum.CPU_MLA
+        )
+        reference_cpu_mla_enabled = cpu_mla_enabled and not amx_mla_enabled
+        # DeepSeek-V4's CPU attention/indexer kernels
+        # (csrc/cpu/sgl-kernels/{flash_mla,store_cache,compressor,
+        # paged_mqa_logits,topk}.cpp) are AMX-kernel-backed and built on the
+        # same paged/position-indexed conventions as the GPU/XPU backends
+        # (block_table/slot_mapping addressing throughout, chunk metadata
+        # that already carries per-token causal offsets for partial/extend
+        # continuation) -- so they support chunked prefill and prefix
+        # caching the same way. `amx_mla_enabled` above deliberately
+        # excludes DeepSeek-V4 (it has its own block-size requirements,
+        # unrelated to chunked-prefill support), so it can't be reused here.
+        amx_mla_or_dsv4_enabled = amx_mla_enabled or (
+            is_deepseek_v4
+            and cls.get_cpu_architecture() == CpuArchEnum.X86
+            and torch.cpu._is_amx_tile_supported()
+        )
+        if reference_cpu_mla_enabled:
+            if cache_config.user_specified_block_size and cache_config.block_size != 16:
+                logger.warning(
+                    "CPU MLA backend requires block_size=16, overriding "
+                    "user-specified block_size=%s.",
+                    cache_config.block_size,
+                )
+            cache_config.block_size = 16
+        elif is_deepseek_v4:
+            if (
+                cache_config.user_specified_block_size
+                and cache_config.block_size != 256
+            ):
+                logger.warning(
+                    "DeepSeek-V4 CPU backend requires block_size=256, "
+                    "overriding user-specified block_size=%s.",
+                    cache_config.block_size,
+                )
+            cache_config.block_size = 256
+        elif not cache_config.user_specified_block_size:
             cache_config.block_size = 128
 
-        if cache_config.block_size % 32 != 0:
+        if not reference_cpu_mla_enabled and cache_config.block_size % 32 != 0:
             logger.warning(
                 "CPU backend prefers block_size is multiples of 32, "
                 "otherwise the performance is not optimized."
             )
 
-        scheduler_config = vllm_config.scheduler_config
+        # Accelerated GDN uses AMX tiles or AVX-512BF16 VDPBF16PS.
         if (
-            scheduler_config.enable_chunked_prefill
-            or cache_config.enable_prefix_caching
-        ) and cache_config.cache_dtype != "auto":
-            raise RuntimeError(
-                "Chunked-prefill and prefix-cache on the CPU "
-                "backend is not compatible with FP8 KV cache."
-            )
+            torch.cpu._is_avx512_bf16_supported()
+            and cache_config.mamba_ssm_cache_dtype != "float32"
+        ):
+            mamba_backend = _cpu_mamba_backend(vllm_config)
+            if (
+                cache_config.mamba_ssm_cache_dtype in ("float16", "bfloat16")
+                and mamba_backend == "gdn"
+            ):
+                logger.info(
+                    "Using %s SSM state storage for the CPU accelerated GDN backend.",
+                    cache_config.mamba_ssm_cache_dtype,
+                )
+            else:
+                cache_config.mamba_ssm_cache_dtype = "float32"
+                logger.warning(
+                    "Reset SSM cache type to float32 for accelerated GDN mamba "
+                    "backend '%s'.",
+                    mamba_backend,
+                )
 
-        if cache_config.cache_dtype != "auto":
-            logger.warning(
-                "CPU backend doesn't support KV cache quantization fallback to auto."
-            )
-            cache_config.cache_dtype = "auto"
+        # Lagecy setting
+        env_key = "VLLM_CPU_KVCACHE_SPACE"
+        if env_key in os.environ and os.environ[env_key] != "":
+            kv_cache_space = int(os.environ[env_key])
+            cache_config.kv_cache_memory_bytes = kv_cache_space * GiB_bytes
 
-        cache_config.cpu_kvcache_space_bytes = CpuPlatform.get_device_total_memory()
+        scheduler_config = vllm_config.scheduler_config
+        # async scheduling is not required on CPU
+        scheduler_config.async_scheduling = False
 
         parallel_config = vllm_config.parallel_config
         if (
-            parallel_config.world_size > 1
-            and parallel_config.distributed_executor_backend is not None
-            and parallel_config.distributed_executor_backend != "mp"
+            os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1") == "1"
+            and parallel_config.distributed_executor_backend == "uni"
         ):
-            logger.warning(
-                (
-                    "%s is not supported on CPU, fallback to mp "
-                    "distributed executor backend."
-                ),
-                parallel_config.distributed_executor_backend,
-            )
+            # OMP requires the MP executor to function correctly, UniProc
+            # is not supported as it is not possible to set the OMP
+            # environment correctly
             parallel_config.distributed_executor_backend = "mp"
+
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm.v1.worker.cpu_worker.CPUWorker"
         # Disable DBO
         if parallel_config.enable_dbo:
-            logger.warning("Dual-Batch Overlap is not supported on CPU, disabled.")
+            logger.warning_once("Dual-Batch Overlap is not supported on CPU, disabled.")
             parallel_config.enable_dbo = False
 
         # Note: workaround for v1 gpu_model_runner
@@ -240,10 +344,7 @@ class CpuPlatform(Platform):
             # cache. So use VLLM_CPU_CI_ENV to indicate the CI environment,
             # and just execute model with dynamo + eager mode to save time.
             # VLLM_CPU_CI_ENV is only used as an internal variable.
-            if os.environ.get("VLLM_CPU_CI_ENV", "0") != "0":
-                backend = "eager"
-            else:
-                backend = "inductor"
+            backend = "eager" if envs.VLLM_CPU_CI_ENV else "inductor"
 
             compilation_config.mode = CompilationMode.DYNAMO_TRACE_ONCE
             compilation_config.backend = backend
@@ -253,11 +354,34 @@ class CpuPlatform(Platform):
                     "size_asserts": False,
                     "nan_asserts": False,
                     "epilogue_fusion": True,
+                    "cpp.dynamic_threads": True,
                 }
             )
+            compilation_config.ir_enable_torch_wrap = False
 
         if vllm_config.lora_config is not None:
             compilation_config.mode = CompilationMode.NONE
+
+        if (
+            cls.get_cpu_architecture() == CpuArchEnum.ARM
+            and "+gelu" not in compilation_config.custom_ops
+            and "-gelu" not in compilation_config.custom_ops
+        ):
+            compilation_config.custom_ops.append("+gelu")
+        if (
+            cls.get_cpu_architecture() == CpuArchEnum.ARM
+            and "+gelu_tanh" not in compilation_config.custom_ops
+            and "-gelu_tanh" not in compilation_config.custom_ops
+        ):
+            compilation_config.custom_ops.append("+gelu_tanh")
+        if (
+            cls.get_cpu_architecture() == CpuArchEnum.ARM
+            and "+gelu_and_mul" not in compilation_config.custom_ops
+            and "-gelu_and_mul" not in compilation_config.custom_ops
+        ):
+            compilation_config.custom_ops.append("+gelu_and_mul")
+
+        vllm_config.profiler_config.torch_profiler_dump_cuda_time_total = False
 
         assert vllm_config.device_config.device_type == "cpu"
 
@@ -271,38 +395,50 @@ class CpuPlatform(Platform):
         # variable "NUMEXPR_MAX_THREADS" (64)'.
         os.environ["NUMEXPR_MAX_THREADS"] = str(get_max_threads())
 
-        if envs.VLLM_CPU_OMP_THREADS_BIND != "nobind":
-            # Set default threads num for OpenMP parallel
-            os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
-        else:
-            # In this case, setting the OpenMP configuration via
-            # OMP_NUM_THREADS is up to the user.
-            logger.info("Disabling binding processes to CPU cores...")
-
         # Disable torch async compiling which won't work with daemonic processes
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 
         # Disable multi-stream for shared experts as no Stream on CPU
         os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
-        # Intel OpenMP setting
+        # Avoid inductor generates num_thread() and breaks the thread binding
+        os.environ["TORCHINDUCTOR_CPP_DYNAMIC_THREADS"] = "1"
+
+        # NIXL's Mamba descriptors require DS conv state storage. Select it
+        # before cache shapes are created, while preserving an explicit layout.
+        conv_state_layout_env = "VLLM_SSM_CONV_STATE_LAYOUT"
+        if conv_state_layout_env not in os.environ:
+            kv_transfer_config = vllm_config.kv_transfer_config
+            uses_nixl = kv_transfer_config is not None and any(
+                kv_transfer_config.has_connector(name)
+                for name in (
+                    "NixlConnector",
+                    "NixlPullConnector",
+                    "NixlPushConnector",
+                )
+            )
+            if uses_nixl:
+                os.environ[conv_state_layout_env] = "DS"
+            elif torch.cpu._is_avx512_bf16_supported():
+                os.environ[conv_state_layout_env] = "SD"
+
         ld_preload_str = os.getenv("LD_PRELOAD", "")
-        if "libiomp5.so" in ld_preload_str:
-            # The time(milliseconds) that a thread should wait after
-            # completing the execution of a parallel region, before sleeping.
-            os.environ["KMP_BLOCKTIME"] = "1"
-            # Prevents the CPU to run into low performance state
-            os.environ["KMP_TPAUSE"] = "0"
-            # Provides fine granularity parallelism
-            os.environ["KMP_FORKJOIN_BARRIER_PATTERN"] = "dist,dist"
-            os.environ["KMP_PLAIN_BARRIER_PATTERN"] = "dist,dist"
-            os.environ["KMP_REDUCTION_BARRIER_PATTERN"] = "dist,dist"
+        cpu_architecture = Platform.get_cpu_architecture()
 
         if (
             platform.system() == "Linux"
-            and Platform.get_cpu_architecture()
-            in (CpuArchEnum.ARM, CpuArchEnum.POWERPC)
-            and not ("libomp" in ld_preload_str or "libgomp" in ld_preload_str)
+            and cpu_architecture
+            in (
+                CpuArchEnum.ARM,
+                CpuArchEnum.POWERPC,
+                CpuArchEnum.X86,
+                CpuArchEnum.S390X,
+            )
+            and not (
+                "libomp" in ld_preload_str
+                or "libgomp" in ld_preload_str
+                or "libiomp" in ld_preload_str
+            )
         ):
             # We need to LD_PRELOAD PyTorch's libgomp, otherwise only
             # one core will be properly utilized when we thread-bind
@@ -313,10 +449,17 @@ class CpuPlatform(Platform):
             # We need to find the location of PyTorch's libgomp
             torch_pkg = os.path.dirname(torch.__file__)
             site_root = os.path.dirname(torch_pkg)
-            torch_libs = os.path.join(site_root, "torch.libs")
-            pytorch_libgomp_so_candidates = glob.glob(
-                os.path.join(torch_libs, "libgomp-*.so*")
-            )
+            # Search both torch.libs and torch/lib - See:
+            # https://github.com/vllm-project/vllm/issues/30470
+            torch_libs_paths = [
+                os.path.join(site_root, "torch.libs"),
+                os.path.join(torch_pkg, "lib"),
+            ]
+            pytorch_libgomp_so_candidates = []
+            for torch_libs in torch_libs_paths:
+                pytorch_libgomp_so_candidates.extend(
+                    glob.glob(os.path.join(torch_libs, "libgomp*.so*"))
+                )
             if pytorch_libgomp_so_candidates:
                 pytorch_libgomp_so = pytorch_libgomp_so_candidates[0]
                 if ld_preload_str:
@@ -324,63 +467,117 @@ class CpuPlatform(Platform):
                 ld_preload_str += pytorch_libgomp_so
                 os.environ["LD_PRELOAD"] = ld_preload_str
 
-        # To hint IPEX uses shared memory based AllReduce
+        # LD_PRELOAD libtcmalloc, bundled under vllm/libs to reduce
+        # memory allocation overhead
+        if (
+            platform.system() == "Linux"
+            and cpu_architecture
+            in (CpuArchEnum.ARM, CpuArchEnum.X86, CpuArchEnum.S390X)
+            and "libtcmalloc" not in ld_preload_str
+        ):
+            vllm_pkg = os.path.dirname(os.path.dirname(__file__))
+            tcmalloc_so = None
+            for pattern in ("libtcmalloc_minimal*.so*", "libtcmalloc.so*"):
+                tcmalloc_so_candidates = glob.glob(
+                    os.path.join(vllm_pkg, "libs", pattern)
+                )
+                if tcmalloc_so_candidates:
+                    tcmalloc_so = tcmalloc_so_candidates[0]
+                    break
+
+            if tcmalloc_so is not None:
+                if ld_preload_str:
+                    ld_preload_str = f"{tcmalloc_so}:{ld_preload_str}"
+                else:
+                    ld_preload_str = tcmalloc_so
+                os.environ["LD_PRELOAD"] = ld_preload_str
+
         os.environ["LOCAL_WORLD_SIZE"] = str(
             vllm_config.parallel_config.tensor_parallel_size
         )
 
-        if model_config is not None and model_config.use_mla:
-            logger.info(
+        if (
+            model_config is not None
+            and model_config.use_mla
+            and not amx_mla_or_dsv4_enabled
+        ):
+            logger.info_once(
                 "MLA is enabled on a non-GPU platform; forcing chunked "
                 "prefill and prefix caching to be disabled."
             )
             vllm_config.scheduler_config.enable_chunked_prefill = False
+            vllm_config.cache_config.enable_prefix_caching = False
             vllm_config.scheduler_config.max_num_batched_tokens = max(
                 vllm_config.model_config.max_model_len,
                 vllm_config.scheduler_config.DEFAULT_MAX_NUM_BATCHED_TOKENS,
             )
 
     @classmethod
-    def get_allowed_cpu_core_node_list(cls) -> tuple[list[int], list[LogicalCPUInfo]]:
-        assert platform.system() == "Linux"
+    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+        model_config = vllm_config.model_config
+        if model_config is None or not model_config.is_hybrid:
+            return
 
-        # Init LogicalCPUInfo from lscpu
-        lscpu_output = subprocess.check_output(
-            "lscpu -J -e=CPU,CORE,NODE", shell=True, text=True
-        )
-        lscpu_output = re.sub(r'"node":\s*-\s*(,|\n)', r'"node": 0\1', lscpu_output)
-        logical_cpu_list: list[LogicalCPUInfo] = json.loads(
-            lscpu_output, object_hook=LogicalCPUInfo.json_decoder
-        )["cpus"]
+        # reconcile attention and mamba page sizes
+        backend_classes = cls._find_non_ssm_backends(vllm_config)
+        if not backend_classes:
+            return
 
-        # Filter CPUs with invalid attributes
-        logical_cpu_list = [
-            x
-            for x in logical_cpu_list
-            if -1 not in (x.id, x.physical_core, x.numa_node)
-        ]
+        cls._align_hybrid_block_size(vllm_config, backend_classes[0])
 
-        # Filter allowed CPUs
-        if hasattr(os, "sched_getaffinity"):
-            allowed_cpu_id_list = os.sched_getaffinity(0)
-        else:
-            raise NotImplementedError("Unsupported OS")
-        logical_cpu_list = [x for x in logical_cpu_list if x.id in allowed_cpu_id_list]
+    @classmethod
+    def discover_numa_topology(cls) -> list[list[int]]:
+        """Discover NUMA topology and keep the last physical core of each numa
+        into one core group list for nixl start_kv_load()
+        """
+        SYS_NODE = "/sys/devices/system/node"
+        SYS_CPU = "/sys/devices/system/cpu"
 
-        # Get allowed NUMA nodes
-        allowed_numa_nodes = set()
-        for x in logical_cpu_list:
-            allowed_numa_nodes.add(x.numa_node)  # type: ignore
-        allowed_numa_nodes_list = sorted(allowed_numa_nodes)
+        if not (os.path.exists(SYS_NODE) and os.path.exists(SYS_CPU)):
+            return []
 
-        env_key = CpuPlatform.device_control_env_var
-        if env_key in os.environ and os.environ[env_key] != "":
-            visible_nodes = [int(s) for s in os.environ[env_key].split(",")]
-            allowed_numa_nodes_list = [
-                x for x in visible_nodes if x in allowed_cpu_id_list
-            ]
+        use_highest_sibling = cls.get_cpu_architecture() == CpuArchEnum.X86
+        core_rsv_for_kv = []
+        for node in os.listdir(SYS_NODE):
+            if not node.startswith("node") or not node[4:].isdigit():
+                continue
+            node_path = f"{SYS_NODE}/{node}"
 
-        return allowed_numa_nodes_list, logical_cpu_list
+            seen_phys = set()
+            for cpu in os.listdir(node_path):
+                if not cpu.startswith("cpu") or not cpu[3:].isdigit():
+                    continue
+
+                cpu_id = int(cpu[3:])
+                # thread_siblings based on cpu_id
+                path = f"{SYS_CPU}/cpu{cpu_id}/topology/thread_siblings_list"
+
+                if os.path.exists(path):
+                    try:
+                        with open(path) as f:
+                            s = f.read()
+                        cpus: list[int] = []
+                        for part in s.strip().split(","):
+                            if "-" in part:
+                                a, b = map(int, part.split("-"))
+                                cpus.extend(range(a, b + 1))
+                            else:
+                                cpus.append(int(part))
+                        siblings = cpus if cpus else [cpu_id]
+                    except (OSError, ValueError):
+                        siblings = [cpu_id]
+                else:
+                    siblings = [cpu_id]
+
+                phys = max(siblings) if use_highest_sibling else min(siblings)
+
+                if phys not in seen_phys:
+                    seen_phys.add(phys)
+
+            if len(seen_phys) > 0:
+                core_rsv_for_kv.append(list(seen_phys))
+
+        return core_rsv_for_kv
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
@@ -392,9 +589,7 @@ class CpuPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        """
-        Get device specific communicator class for distributed communication.
-        """
+        """Get device specific communicator class for distributed communication."""
         return "vllm.distributed.device_communicators.cpu_communicator.CpuCommunicator"  # noqa
 
     @classmethod
@@ -408,3 +603,114 @@ class CpuPlatform(Platform):
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
         return True
+
+    @classmethod
+    def num_compute_units(cls, device_id: int = 0) -> int:
+        return torch.get_num_threads()
+
+    @classmethod
+    def import_kernels(cls) -> None:
+        if Platform.get_cpu_architecture() in (CpuArchEnum.X86,):
+            # Note: The lib name is _C_AVX2/AVX512, but the module name is _C.
+            # This will cause a exception "dynamic module does define
+            # module export function". But the library is imported
+            # successfully. So ignore the exception for now, until we find
+            # a solution.
+            ignored_msg = "dynamic module does not define module export function"
+            if torch.cpu._is_avx512_supported():
+                if torch.cpu._is_avx512_bf16_supported():
+                    try:
+                        import vllm._C  # noqa: F401
+                    except ImportError as e:
+                        logger.warning_once(
+                            "Failed to import from vllm._C: %s", repr(e)
+                        )
+                else:
+                    try:
+                        import vllm._C_AVX512  # noqa: F401
+                    except ImportError as e:
+                        if ignored_msg not in e.msg:
+                            logger.warning_once(
+                                "Failed to import from vllm._C_AVX512: %s", repr(e)
+                            )
+            else:
+                try:
+                    import vllm._C_AVX2  # noqa: F401
+                except ImportError as e:
+                    if ignored_msg not in e.msg:
+                        logger.warning_once(
+                            "Failed to import from vllm._C_AVX2: %s", repr(e)
+                        )
+        else:
+            try:
+                import vllm._C  # noqa: F401
+            except ImportError as e:
+                logger.warning_once("Failed to import from vllm._C: %s", repr(e))
+
+    @classmethod
+    def pack_kv_cache(
+        cls,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> None:
+        """Rewrite the kv cache shape for the current platform."""
+        # Import lazily: cpu_attn pulls in _custom_ops, which needs a fully
+        # initialized vllm.platforms (avoid circular import while CpuPlatform loads).
+        from vllm._custom_ops import cpu_attn_reshape_and_cache
+        from vllm.v1.attention.backends.cpu_attn import _get_attn_isa
+
+        # MLA uses a single latent cache of shape [N, block_size, head_size],
+        # so the classic key/value split does not apply. The MLA backend
+        # writes the cache itself via `concat_and_cache_mla` inside
+        # `do_kv_cache_update`, so there is nothing to pack here.
+        if kv_cache.dim() == 3:
+            return
+
+        num_blocks, num_kv_heads, block_size, fused_head_size = kv_cache.shape
+        head_size = fused_head_size // 2
+
+        # Fused path used by heterogeneous NIXL CPU_ATTN post-processing.
+        blocks_to_update = kv_cache.index_select(0, indices)
+        key = blocks_to_update[..., :head_size]
+        value = blocks_to_update[..., head_size:]
+
+        key_cache, value_cache = kv_cache.view(
+            num_blocks, num_kv_heads, block_size * 2, head_size
+        ).chunk(2, dim=2)
+
+        dtype = key.dtype
+        # For CPU_ATTN, the shape is [N, num_kv_heads, block_size, head_size]
+        key = key.permute(0, 2, 1, 3).flatten(0, 1)
+        value = value.permute(0, 2, 1, 3).flatten(0, 1)
+
+        isa = _get_attn_isa(dtype, block_size, head_size)
+        block_offsets = torch.arange(block_size, device="cpu", dtype=torch.long)
+        num_blocks = indices.numel()
+        slot_mapping = (
+            block_offsets.reshape(1, block_size)
+            + indices.reshape(num_blocks, 1) * block_size
+        ).flatten()
+        if key_cache.dtype == torch.uint8:
+            raise NotImplementedError(
+                "FP8 KV cache is not yet supported with KV transfer on CPU"
+            )
+        cpu_attn_reshape_and_cache(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            isa,
+        )
+
+    @classmethod
+    def get_current_memory_usage(
+        cls, device: torch.types.Device | None = None
+    ) -> float:
+        allowed_mem_node_list = get_visible_memory_node()
+        mem_status_list = [get_memory_node_info(i) for i in allowed_mem_node_list]
+        memory_usage = 0
+        for s in mem_status_list:
+            memory_usage += s.total_memory - s.available_memory
+
+        return memory_usage

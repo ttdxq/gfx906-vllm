@@ -5,7 +5,7 @@ import os
 import uuid
 from collections.abc import Generator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 from lmcache import utils
@@ -27,9 +27,15 @@ from lmcache.v1.lookup_client.lmcache_async_lookup_client import (
     LMCacheAsyncLookupServer,
 )
 from lmcache.v1.offload_server.zmq_server import ZMQOffloadServer
-from lmcache.v1.plugin.plugin_launcher import PluginLauncher
 
-from vllm.attention.backends.abstract import AttentionMetadata
+try:
+    from lmcache.v1.plugin.runtime_plugin_launcher import RuntimePluginLauncher
+except ImportError:
+    # Backwards compatibility for lmcache <= 0.3.10-post1
+    from lmcache.v1.plugin.plugin_launcher import (
+        PluginLauncher as RuntimePluginLauncher,
+    )
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -47,6 +53,7 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank, get_
 from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_kv_cache_torch_dtype
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -164,6 +171,7 @@ class RequestTracker:
             lmcache_cached_tokens (int): the number of tokens that are
                 cached in LMCache.
             skip_save (bool): whether the request cache should be saved
+
         """
         # vLLM 0.9.0 update: request.block_ids changed from list[int] to
         # list[list[int]]
@@ -212,7 +220,6 @@ class RequestTracker:
         """Update the request tracker when a running request is
         scheduled again
         """
-
         self.token_ids.extend(new_token_ids)
 
         if new_block_ids is None:
@@ -226,7 +233,10 @@ class RequestTracker:
         elif isinstance(new_block_ids, list):
             pass
         else:
-            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
+            raise ValueError(
+                f"Unsupported new_block_ids type {type(new_block_ids)}: "
+                f"should be None[list[int], ...], tuple or list[int]."
+            )
         self.allocated_block_ids.extend(new_block_ids)
 
         # When a request is scheduled again, and the number of new tokens
@@ -264,7 +274,7 @@ class ReqMeta:
         load_spec: LoadSpec | None = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
-    ) -> Optional["ReqMeta"]:
+    ) -> "ReqMeta | None":
         """Create the request metadata from a request tracker.
 
         Args:
@@ -278,6 +288,7 @@ class ReqMeta:
         Returns:
             the request metadata if we need to perform load/save
             operations, None otherwise.
+
         """
         input_token_ids = tracker.token_ids
         input_token_len = len(input_token_ids)
@@ -388,7 +399,7 @@ class ReqMeta:
         )
 
 
-def need_gpu_interm_buffer(lmcache_config: LMCacheEngineConfig):
+def need_gpu_interim_buffer(lmcache_config: LMCacheEngineConfig):
     return not lmcache_config.enable_pd
 
 
@@ -429,13 +440,13 @@ def _init_lmcache_engine(
     `LMCACHE_CONFIG_FILE` to load the configuration file. If that environment
     variable is not set, this function will return None.
 
-    :param lmcache_config: The LMCache configuration.
-    :type lmcache_config: LMCacheEngineConfig
-    :param vllm_config: The vLLM configuration.
-    :type vllm_config: VllmConfig
+    Args:
+        lmcache_config: The LMCache configuration.
+        vllm_config: The vLLM configuration.
 
-    :return: The initialized LMCache engine
-    :rtype: LMCacheEngine
+    Returns:
+        The initialized LMCache engine
+
     """
     if curr_engine := LMCacheEngineBuilder.get(ENGINE_NAME):
         return curr_engine
@@ -473,10 +484,11 @@ def _init_lmcache_engine(
     )
 
     # Change current device.
-    num_gpus = torch.cuda.device_count()
-    local_rank = parallel_config.rank % num_gpus
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
+    from vllm.distributed.parallel_state import get_world_group
+
+    device_index = get_world_group().device_index
+    torch.accelerator.set_device_index(device_index)
+    device = torch.device(f"cuda:{device_index}")
     metadata = LMCacheEngineMetadata(
         model_config.model,
         parallel_config.world_size,
@@ -487,7 +499,7 @@ def _init_lmcache_engine(
         use_mla,
     )
 
-    use_gpu = need_gpu_interm_buffer(lmcache_config)
+    use_gpu = need_gpu_interim_buffer(lmcache_config)
     vllm_gpu_connector: (
         VLLMBufferLayerwiseGPUConnector
         | VLLMPagedMemGPUConnectorV2
@@ -553,6 +565,7 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
 
         Args:
             req_meta (ReqMeta): the request metadata.
+
         """
         self.requests.append(req_meta)
 
@@ -683,7 +696,7 @@ class LMCacheConnectorV1Impl:
             self.api_server = InternalAPIServer(self)
             self.api_server.start()
             # Launch plugins
-            self.plugin_launcher = PluginLauncher(
+            self.plugin_launcher = RuntimePluginLauncher(
                 self.config,
                 role,
                 self.worker_count,
@@ -709,6 +722,7 @@ class LMCacheConnectorV1Impl:
 
         Returns:
             dict: Dictionary containing inference information
+
         """
         # Get vLLM config information
         vllm_config = self._vllm_config
@@ -756,6 +770,7 @@ class LMCacheConnectorV1Impl:
 
         Returns:
             str: vLLM version string
+
         """
         return VLLM_VERSION
 
@@ -768,13 +783,32 @@ class LMCacheConnectorV1Impl:
                 continue
 
             if layer_name not in self.kv_caches:
-                self.kv_caches[layer_name] = attn_layer.kv_cache[
-                    forward_context.virtual_engine
-                ]
+                self.kv_caches[layer_name] = attn_layer.kv_cache
 
     ####################
     # Worker side APIs
     ####################
+    def bind_connector_metadata(self, metadata: "KVConnectorMetadata") -> None:
+        """Per-step init, called when the runner binds this step's metadata.
+
+        The layerwise hooks fire during every forward once metadata is
+        bound, while start_load_kv may run after the forward launch on
+        steps without sync loads (SchedulerOutput.has_sync_kv_loads), so
+        the per-step state they consume must be reset here.
+        """
+        self.current_layer = 0
+        self.layerwise_retrievers = []
+
+    @_lmcache_nvtx_annotate
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        logger.info("Registering KV caches")
+        # TODO(chunxiaozheng): `_init_kv_caches_from_forward_context` is
+        #  not called, we should consider removing it.
+        assert len(self.kv_caches) == 0 and len(kv_caches) > 0
+        self.kv_caches = kv_caches
+        if self.lmcache_engine is not None:
+            kvcaches = list(self.kv_caches.values())
+            self.lmcache_engine.post_init(kvcaches=kvcaches)
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -787,9 +821,8 @@ class LMCacheConnectorV1Impl:
         Note:
             The number of elements in kv_caches and layer_names should be
             the same.
-        """
-        self.current_layer = 0
 
+        """
         if len(self.kv_caches) == 0:
             self._init_kv_caches_from_forward_context(forward_context)
 
@@ -807,8 +840,6 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         self.lmcache_engine.post_init(kvcaches=kvcaches)
-
-        self.layerwise_retrievers = []
 
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is None:
@@ -895,6 +926,7 @@ class LMCacheConnectorV1Impl:
 
         Args:
             layer_name: the name of that layer
+
         """
         if self.layerwise_retrievers:
             logger.debug("Waiting for layer %s to be loaded", self.current_layer)
@@ -926,6 +958,7 @@ class LMCacheConnectorV1Impl:
             kv_layer (torch.Tensor): the paged KV buffer of the current
                 layer in vLLM.
             attn_metadata (AttentionMetadata): the attention metadata.
+
         """
         assert self.lmcache_engine is not None
 
@@ -1014,7 +1047,6 @@ class LMCacheConnectorV1Impl:
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
-
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
@@ -1125,8 +1157,7 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         num_computed_tokens: int,
     ) -> int | None:
-        """
-        Check for external KV cache hit.
+        """Check for external KV cache hit.
 
         Args:
             request (Request): the request object.
@@ -1136,6 +1167,7 @@ class LMCacheConnectorV1Impl:
         Returns:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
+
         """
         if self.kv_role == "kv_producer" and not hasattr(
             self.lookup_client, "supports_producer_reuse"
@@ -1211,13 +1243,11 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def update_state_after_alloc(self, request: "Request", num_external_tokens: int):
-        """
-        Update KVConnector state after temporary buffer alloc.
+        """Update KVConnector state after temporary buffer alloc.
 
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
-
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
         self.lookup_client.clear_lookup_status(request.request_id)
@@ -1286,8 +1316,8 @@ class LMCacheConnectorV1Impl:
 
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
-        """
 
+        """
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
         meta = LMCacheConnectorMetadata()

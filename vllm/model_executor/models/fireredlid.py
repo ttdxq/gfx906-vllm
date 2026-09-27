@@ -780,7 +780,7 @@ class FireRedLIDForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=[
+            ignore_unexpected_prefixes=[
                 # Position encoding buffers are rebuilt at init
                 "model.encoder.positional_encoding.pe",
                 "model.decoder.positional_encoding.pe",

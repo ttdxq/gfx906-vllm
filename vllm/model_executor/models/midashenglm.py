@@ -26,7 +26,7 @@
 import collections
 import collections.abc
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Annotated, Any, TypeAlias, cast
+from typing import Annotated, TypeAlias, cast
 
 import numpy as np
 import torch
@@ -36,8 +36,9 @@ from torch.nn.functional import scaled_dot_product_attention
 from transformers import BatchFeature
 
 from vllm.config import VllmConfig
-from vllm.config.multimodal import BaseDummyOptions
+from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.linear import (
@@ -48,19 +49,19 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.multimodal.processing.processor import HFMultiModalInputs
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.midashenglm import DashengConfig
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -229,10 +230,10 @@ class DashengAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
-        B, N, C = x.shape
+        B, N, _ = x.shape
 
         qkv, _ = self.qkv(x)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
@@ -243,7 +244,7 @@ class DashengAttention(nn.Module):
             attn_mask=mask[:, None, None, :] if mask is not None else None,
         )
 
-        x = x.transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).reshape(B, N, self.q_size)
         x, _ = self.proj(x)
         return x
 
@@ -511,11 +512,9 @@ class AudioProjectorSubsample(nn.Module):
 
 # === Audio Inputs === #
 class MiDashengLMAudioInputs(TensorSchema):
-    """
-
-    Dimensions:
-        - bn: Batch size * number of audios
-        - p: Number of sampling points
+    """Dimensions:
+    - bn: Batch size * number of audios
+    - p: Number of sampling points
     """
 
     input_values: Annotated[torch.Tensor, TensorShape("n", "p")]
@@ -530,6 +529,14 @@ class MiDashengLMProcessingInfo(BaseProcessingInfo):
         hf_processor = self.get_hf_processor()
         feature_extractor = hf_processor.feature_extractor
         return feature_extractor
+
+    def get_data_parser(self):
+        feature_extractor = self.get_feature_extractor()
+
+        return MultiModalDataParser(
+            target_sr=feature_extractor.sampling_rate,
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None}
@@ -557,17 +564,13 @@ class MiDashengLMDummyInputsBuilder(BaseDummyInputsBuilder[MiDashengLMProcessing
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
-        num_audios = mm_counts.get("audio", 0)
-
-        audio_overrides = mm_options.get("audio") if mm_options else None
-
         return {
             "audio": self._get_dummy_audios(
                 length=self.info.get_max_audio_len(),
-                num_audios=num_audios,
-                overrides=audio_overrides,
+                num_audios=mm_counts.get("audio", 0),
+                overrides=mm_options.get("audio"),
             )
         }
 
@@ -575,51 +578,33 @@ class MiDashengLMDummyInputsBuilder(BaseDummyInputsBuilder[MiDashengLMProcessing
 class MiDashengLMMultiModalProcessor(
     BaseMultiModalProcessor[MiDashengLMProcessingInfo]
 ):
-    def _get_data_parser(self) -> MultiModalDataParser:
-        feature_extractor = self.info.get_feature_extractor()
-        return MultiModalDataParser(target_sr=feature_extractor.sampling_rate)
+    def _get_hf_mm_text(self, mm_counts: Mapping[str, int]) -> str:
+        return self.dummy_inputs.get_dummy_text(mm_counts)
 
-    def _call_hf_processor(
+    def _get_hf_mm_inputs(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, Any],
-        tok_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        audios = mm_data.pop("audios", [])
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
+    ) -> HFMultiModalInputs:
+        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_kwargs)
 
-        # + Padding
-        min_audio_len = self.info.get_min_audio_len()
-        processed_audios = [
-            np.pad(
-                audio,
-                (0, min_audio_len - audio.shape[-1]),
-                mode="constant",
-                constant_values=0,
-            )
-            if isinstance(audio, np.ndarray) and audio.shape[-1] < min_audio_len
-            else audio
-            for audio in audios
-        ]
+        if audios := hf_inputs.hf_data.get("audio"):
+            assert isinstance(audios, list)
 
-        if processed_audios:
-            mm_data["audio"] = processed_audios
+            min_audio_len = self.info.get_min_audio_len()
+            hf_inputs.hf_data["audio"] = [
+                np.pad(
+                    audio,
+                    (0, min_audio_len - audio.shape[-1]),
+                    mode="constant",
+                    constant_values=0,
+                )
+                if isinstance(audio, np.ndarray) and audio.shape[-1] < min_audio_len
+                else audio
+                for audio in audios
+            ]
 
-        if not mm_data.get("audio", []):
-            prompt_ids = self.info.get_tokenizer().encode(prompt)
-            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
-            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
-
-        mm_kwargs = dict(
-            **mm_kwargs,
-        )
-
-        return super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
-        )
+        return hf_inputs
 
     def _get_mm_fields_config(
         self,
@@ -646,6 +631,7 @@ class MiDashengLMMultiModalProcessor(
 
         out_mm_data = out_mm_kwargs.get_data()
         audio_length = out_mm_data.get("audio_length")
+        audio_output_lengths: list[int]
         if audio_length is None:
             audio_output_lengths = []
         else:
@@ -654,10 +640,13 @@ class MiDashengLMMultiModalProcessor(
                 if isinstance(audio_length, torch.Tensor)
                 else audio_length
             )
-            audio_output_lengths = [
-                max(1, calculate_mel_frames_dasheng(int(length)))  # at least one frame
-                for length in audio_length_np
-            ]
+            assert isinstance(audio_length_np, (list, tuple, np.ndarray))
+            audio_output_lengths = []
+            for length in audio_length_np:
+                assert isinstance(length, (int, np.integer))
+                audio_output_lengths.append(
+                    max(1, calculate_mel_frames_dasheng(int(length)))
+                )
 
         def get_replacement_midashenglm(item_idx: int):
             num_features = audio_output_lengths[item_idx]
@@ -671,7 +660,7 @@ class MiDashengLMMultiModalProcessor(
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=[audio_token_id],
                 replacement=get_replacement_midashenglm,
             )
         ]
@@ -683,8 +672,6 @@ class MiDashengLMMultiModalProcessor(
     dummy_inputs=MiDashengLMDummyInputsBuilder,
 )
 class MiDashengLMModel(nn.Module, SupportsMultiModal, SupportsPP):
-    merge_by_field_config = True
-
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -709,30 +696,30 @@ class MiDashengLMModel(nn.Module, SupportsMultiModal, SupportsPP):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
-
-        # Initialize audio components
-        self.audio_encoder = DashengAudioTransformer(
-            config.audio_encoder_config,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "audio_encoder"),
-        )
-        self.audio_projector = AudioProjectorSubsample(
-            in_dim=config.audio_encoder_config.embed_dim,
-            out_dim=config.text_config.hidden_size,
-            downsample_rate=config.subsample_factor,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "audio_projector"),
-        )
-
-        # Initialize language model (decoder)
-        self.decoder = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=config.text_config,
-            prefix=maybe_prefix(prefix, "decoder"),
-            architectures=["Qwen2ForCausalLM"],
-        )
-
         self.quant_config = quant_config
+
+        with self._mark_tower_model(vllm_config, "audio"):
+            self.audio_encoder = DashengAudioTransformer(
+                config.audio_encoder_config,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "audio_encoder"),
+            )
+            self.audio_projector = AudioProjectorSubsample(
+                in_dim=config.audio_encoder_config.embed_dim,
+                out_dim=config.text_config.hidden_size,
+                downsample_rate=config.subsample_factor,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "audio_projector"),
+            )
+
+        with self._mark_language_model(vllm_config):
+            self.decoder = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "decoder"),
+                architectures=["Qwen2ForCausalLM"],
+            )
+
         self.make_empty_intermediate_tensors = (
             self.decoder.make_empty_intermediate_tensors
         )
@@ -789,9 +776,6 @@ class MiDashengLMModel(nn.Module, SupportsMultiModal, SupportsPP):
 
         return torch.split(masked_audio_features, audio_output_lengths.tolist())
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.decoder
-
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         audio_input = self._parse_and_validate_audio_input(**kwargs)
 
@@ -801,7 +785,7 @@ class MiDashengLMModel(nn.Module, SupportsMultiModal, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

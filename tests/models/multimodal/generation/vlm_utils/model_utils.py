@@ -22,9 +22,11 @@ from transformers import (
     GenerationConfig,
     GenerationMixin,
 )
+from transformers.masking_utils import create_causal_mask
 from transformers.video_utils import VideoMetadata
 
 from vllm.logprobs import SampleLogprobs
+from vllm.platforms import current_platform
 from vllm.utils.collection_utils import is_list_of
 
 from .....conftest import HfRunner, ImageAsset, ImageTestAssets
@@ -44,15 +46,6 @@ def blip2_vllm_to_hf_output(vllm_output: RunnerOutput, model: str) -> RunnerOutp
     hf_output_ids = hf_output_ids[1:]
 
     return hf_output_ids, hf_output_str, out_logprobs
-
-
-def fuyu_vllm_to_hf_output(vllm_output: RunnerOutput, model: str) -> RunnerOutput:
-    """Sanitize vllm output [fuyu models] to be comparable with hf output."""
-    output_ids, output_str, out_logprobs = vllm_output
-
-    hf_output_str = output_str.lstrip() + "|ENDOFTEXT|"
-
-    return output_ids, hf_output_str, out_logprobs
 
 
 def qwen_vllm_to_hf_output(
@@ -119,8 +112,10 @@ def _llava_vllm_to_hf_output(
         if token_id != mm_token_id or output_ids[idx - 1] != mm_token_id
     ]
 
-    assert output_str[0] == " "
-    hf_output_str = output_str[1:]
+    # output_str[0] is not " " in some cases, e.g., Granite Vision,
+    # but for most llava based models, this is the case
+    hf_output_str = output_str[1:] if output_str[0] == " " else output_str
+
     if hf_output_ids[-1] == eos_token_id:
         hf_output_str = hf_output_str + tokenizer.decode(eos_token_id)
 
@@ -157,15 +152,6 @@ def llava_onevision_vllm_to_hf_output(
         hf_output_str = hf_output_str + tokenizer.decode(eos_token_id)
 
     return hf_output_ids, hf_output_str, out_logprobs
-
-
-def mantis_vllm_to_hf_output(vllm_output: RunnerOutput, model: str) -> RunnerOutput:
-    """Sanitize vllm output [mantis] to compare with hf output."""
-    output_ids, output_str, out_logprobs = vllm_output
-
-    hf_output_str = output_str + "<|eot_id|>"
-
-    return output_ids, hf_output_str, out_logprobs
 
 
 def phi3v_vllm_to_hf_output(vllm_output: RunnerOutput, model: str) -> RunnerOutput:
@@ -237,13 +223,6 @@ def minicpmv_trunc_hf_output(hf_output: RunnerOutput, model: str) -> RunnerOutpu
     return output_ids, output_str, out_logprobs
 
 
-def minimax_vl_01_hf_output(hf_output: RunnerOutput, model: str) -> RunnerOutput:
-    output_ids, output_str, out_logprobs = hf_output
-    if output_str.endswith("<end_of_sentence>"):
-        output_str = output_str.split("<end_of_sentence>")[0]
-    return output_ids, output_str, out_logprobs
-
-
 def ultravox_trunc_hf_output(hf_output: RunnerOutput, model: str) -> RunnerOutput:
     output_ids, output_str, out_logprobs = hf_output
 
@@ -273,6 +252,7 @@ def qwen_prompt_path_encoder(
         tmp_path: Tempdir for test under consideration.
         prompt: Prompt with image placeholders.
         assets: list of image assets whose len equals the num placeholders.
+
     """
     # Ensure that the number of placeholders matches the number of assets;
     # If this is not true, the test is probably written incorrectly.
@@ -328,16 +308,6 @@ def gemma3_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
 
     hf_model.processor = processor
 
-    orig_generate = hf_model.model.generate
-
-    def _generate(self, *args, **kwargs):
-        # FIXME: https://github.com/huggingface/transformers/issues/38333
-        kwargs["disable_compile"] = True
-
-        return orig_generate(*args, **kwargs)
-
-    hf_model.model.generate = types.MethodType(_generate, hf_model.model)
-
     return hf_model
 
 
@@ -366,6 +336,40 @@ def gemma3_vllm_to_hf_output(vllm_output: RunnerOutput, model: str) -> RunnerOut
 
 def glm4v_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     """Patches and returns an instance of the HfRunner to use for GLM4V."""
+    if current_platform.is_rocm():
+        import types
+
+        config = hf_model.model.config
+        if hasattr(config, "num_layers") and not hasattr(config, "num_hidden_layers"):
+            config.num_hidden_layers = config.num_layers
+        config.output_hidden_states = True
+
+        def patched_prepare_cache(
+            self, generation_config, model_kwargs, *args, **kwargs
+        ):
+            model_kwargs["past_key_values"] = None
+            model_kwargs["use_cache"] = False
+            return model_kwargs
+
+        hf_model.model._prepare_cache_for_generation = types.MethodType(
+            patched_prepare_cache, hf_model.model
+        )
+        original_generate = hf_model.model.generate
+
+        def patched_generate(*args, **kwargs):
+            kwargs["output_hidden_states"] = True
+            kwargs["return_dict_in_generate"] = True
+            return original_generate(*args, **kwargs)
+
+        hf_model.model.generate = patched_generate
+        original_forward = hf_model.model.forward
+
+        def patched_forward(*args, **kwargs):
+            kwargs["output_hidden_states"] = True
+            return original_forward(*args, **kwargs)
+
+        hf_model.model.forward = patched_forward
+
     hf_processor = hf_model.processor
 
     def processor(*args, text="", images=None, **kwargs):
@@ -406,7 +410,15 @@ def glm4_1v_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
         if videos is not None and is_list_of(videos, tuple):
             # If videos is a list of tuples, we assume each tuple contains
             # (video_array, metadata) as in the case of GLM4.1V.
-            video_metadata = [[VideoMetadata(**video[1])] for video in videos]
+            # Filter out 'do_sample_frames' as it's not a valid VideoMetadata arg
+            video_metadata = [
+                [
+                    VideoMetadata(
+                        **{k: v for k, v in video[1].items() if k != "do_sample_frames"}
+                    )
+                ]
+                for video in videos
+            ]
             videos = [[video[0]] for video in videos]
         else:
             video_metadata = None
@@ -440,12 +452,13 @@ def h2ovl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
             self.image_size = self.vision_config.image_size
 
         def __call__(self, text: str, images: Image | list[Image], **kwargs):
-            from vllm.model_executor.models.h2ovl import (
-                IMG_CONTEXT,
-                IMG_END,
-                IMG_START,
+            from vllm.transformers_utils.processors.h2ovl import (
                 image_to_pixel_values_h2ovl,
             )
+
+            IMG_START = "<img>"
+            IMG_END = "</img>"
+            IMG_CONTEXT = "<IMG_CONTEXT>"
 
             images = [images] if isinstance(images, Image) else images
             pixel_values = [
@@ -479,6 +492,183 @@ def h2ovl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     return hf_model
 
 
+def isaac_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
+    """Patch HF runner for Isaac:
+    1) Move processor outputs to model device
+    2) Ensure IsaacModel.forward returns hidden_states
+    for compatibility with hidden_states_to_seq_logprobs()
+    """
+    from perceptron.tensorstream import TextType
+    from perceptron.tensorstream.ops import compute_mrope_pos_tensor, modality_mask
+    from transformers.modeling_outputs import BaseModelOutputWithPast
+
+    def compute_position_ids_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
+        """Create 3D positional indices for token input."""
+        batch_size, seq_length = input_ids.shape
+        position_ids = torch.arange(seq_length, device=input_ids.device)
+        position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+        position_ids = position_ids.unsqueeze(2).expand(-1, -1, 3)  # Add 3D for MRoPE
+        return position_ids
+
+    model_device = next(hf_model.model.parameters()).device
+
+    # ----------------------------
+    # 1) Patch processor: move BatchFeature input_ids and TensorStream to model device
+    # ----------------------------
+    original_processor = hf_model.processor
+
+    def patched_processor(*args, **kwargs):
+        result = original_processor(*args, **kwargs)
+        for k, v in result.data.items():
+            result[k] = v.to(model_device)
+        return result
+
+    hf_model.processor = patched_processor
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        hf_model.model_name, trust_remote_code=True
+    )
+
+    original_generate = hf_model.model.generate
+
+    def patched_generate(*args, **kwargs):
+        kwargs["pad_token_id"] = tokenizer.eos_token_id
+        kwargs["eos_token_id"] = tokenizer.eos_token_id
+        return original_generate(*args, **kwargs)
+
+    hf_model.model.generate = patched_generate
+
+    # ----------------------------
+    # 2) Patch IsaacModel.forward: add hidden_states to the output
+    # ----------------------------
+    isaac_model = hf_model.model.model
+
+    def patched_forward(
+        self,
+        input_ids=None,
+        tensor_stream=None,
+        attention_mask=None,
+        position_ids=None,
+        modality_tensor=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        """Forward pass with MRoPE position embeddings.
+        Computes position embeddings once and passes them through all layers.
+        """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        # Get inputs
+        if tensor_stream is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both tensor_stream and inputs_embeds")
+        elif tensor_stream is not None:
+            # Embed TensorStream directly
+            inputs_embeds = self.embed_stream(tensor_stream)
+            # Create modality tensor if not provided
+            if modality_tensor is None:
+                modality_tensor = modality_mask(tensor_stream)
+        elif input_ids is not None and inputs_embeds is not None:
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time"
+            )
+        elif input_ids is not None:
+            inputs_embeds = self.embed_tokens(input_ids)
+            # Create text modality tensor if not provided
+            if modality_tensor is None:
+                batch_size, seq_length = input_ids.shape
+                modality_tensor = torch.full(
+                    (batch_size, seq_length),
+                    TextType.text.value,
+                    device=input_ids.device,
+                    dtype=torch.long,
+                )
+        elif inputs_embeds is None:
+            raise ValueError(
+                "You have to specify either tensor_stream, input_ids or inputs_embeds"
+            )
+
+        # Create default position_ids if not provided
+        if position_ids is None:
+            if tensor_stream is not None:
+                position_ids = compute_mrope_pos_tensor(tensor_stream)  # (B,L,3)
+            else:
+                position_ids = compute_position_ids_input_ids(input_ids)
+
+        # Compute MRoPE position embeddings if we have custom rotary_emb
+        cos, sin = self.rotary_emb(position_ids, modality_tensor)
+        cos = cos.to(inputs_embeds.dtype)
+        sin = sin.to(inputs_embeds.dtype)
+
+        # Prepare attention mask
+        attention_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            cache_position=cache_position,
+        )
+
+        # Initialize and collect hidden states
+        hidden_states = inputs_embeds
+        hidden_states_list: list[torch.Tensor] = []
+
+        if output_hidden_states:
+            hidden_states_list.append(hidden_states)
+
+        for decoder_layer in self.layers:
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=(cos, sin),
+                **kwargs,
+            )
+
+            hidden_states = (
+                layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
+            )
+
+            if output_hidden_states:
+                hidden_states_list.append(hidden_states)
+
+        # Final layer norm
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            hidden_states_list.append(hidden_states)
+
+        # Convert to tuple or None
+        all_hidden_states = tuple(hidden_states_list) if output_hidden_states else None
+
+        # Include hidden_states for compatibility with hidden_states_to_seq_logprobs()
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+        )
+
+    isaac_model.forward = types.MethodType(patched_forward, isaac_model)
+
+    return hf_model
+
+
 def skyworkr1v_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     """Patches and returns an instance of the HfRunner to use for SkyworkR1V."""
 
@@ -499,16 +689,17 @@ def skyworkr1v_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
             self.image_size = self.vision_config.image_size
 
         def __call__(self, text: str, images: Image | list[Image], **kwargs):
-            from vllm.model_executor.models.skyworkr1v import (
-                IMG_CONTEXT,
-                IMG_END,
-                IMG_START,
-                image_to_pixel_values_skyworkr1v,
+            from vllm.transformers_utils.processors.internvl import (
+                image_to_pixel_values_internvl,
             )
+
+            IMG_START = "<img>"
+            IMG_END = "</img>"
+            IMG_CONTEXT = "<IMG_CONTEXT>"
 
             images = [images] if isinstance(images, Image) else images
             pixel_values = [
-                image_to_pixel_values_skyworkr1v(
+                image_to_pixel_values_internvl(
                     image,
                     input_size=self.image_size,
                     min_num=self.min_num,
@@ -563,13 +754,14 @@ def internvl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
             videos: npt.NDArray | list[npt.NDArray] = None,
             **kwargs,
         ):
-            from vllm.model_executor.models.internvl import (
-                IMG_CONTEXT,
-                IMG_END,
-                IMG_START,
+            from vllm.transformers_utils.processors.internvl import (
                 image_to_pixel_values_internvl,
                 video_to_pixel_values_internvl,
             )
+
+            IMG_START = "<img>"
+            IMG_END = "</img>"
+            IMG_CONTEXT = "<IMG_CONTEXT>"
 
             images = [images] if isinstance(images, Image) else images
             videos = [videos] if isinstance(videos, np.ndarray) else videos
@@ -687,27 +879,20 @@ def _internvl_generate(
     return outputs
 
 
-def mantis_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
-    from mantis.models.mllava import MLlavaProcessor
+def _restore_resampler_pos_cache(hf_model: HfRunner) -> None:
+    """Recompute the resampler's 2D sin/cos position cache after loading.
 
-    hf_model.processor = MLlavaProcessor.from_pretrained(hf_model.model_name)
-
-    orig_generate = hf_model.model.generate
-    tokenizer = hf_model.processor.tokenizer
-
-    def _generate(self, *args, **kwargs):
-        return orig_generate(
-            *args,
-            **kwargs,
-            eos_token_id=[
-                tokenizer.eos_token_id,
-                tokenizer.convert_tokens_to_ids("<|eot_id|>"),
-            ],
-        )
-
-    hf_model.model.generate = types.MethodType(_generate, hf_model.model)
-
-    return hf_model
+    `from_pretrained` materializes non-persistent buffers as uninitialized
+    memory, leaving `pos_embed` as zeros or NaN instead of the values computed
+    in `__init__`.
+    """
+    restored = 0
+    for module in hf_model.model.modules():
+        if not hasattr(module, "_set_2d_pos_cache"):
+            continue
+        module._set_2d_pos_cache(module.max_size, module.pos_embed.device)
+        restored += 1
+    assert restored, "no resampler pos cache found to restore"
 
 
 def minicpmv_25_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
@@ -753,17 +938,8 @@ def minicpmo_26_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
 
 
 def minicpmv_26_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
-    orig_generate = hf_model.model.generate
+    _restore_resampler_pos_cache(hf_model)
 
-    def _generate(self, *args, image_sizes=None, **kwargs):
-        return orig_generate(*args, decode_text=False, **kwargs)
-
-    hf_model.model.generate = types.MethodType(_generate, hf_model.model)
-
-    return hf_model
-
-
-def minimax_vl_01_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     orig_generate = hf_model.model.generate
 
     def _generate(self, *args, image_sizes=None, **kwargs):
@@ -897,6 +1073,31 @@ def ovis2_5_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     return hf_model
 
 
+def paddleocr_vl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
+    """Patches the HfRunner to fix create_causal_mask API mismatch.
+
+    The PaddleOCR-VL HF model passes `inputs_embeds` to create_causal_mask,
+    but transformers renamed this parameter to `input_embeds`.
+    """
+    import sys
+
+    model_module = sys.modules.get(type(hf_model.model.model).__module__)
+    if model_module is None:
+        return hf_model
+
+    original_create_causal_mask = getattr(model_module, "create_causal_mask", None)
+    if original_create_causal_mask is None:
+        return hf_model
+
+    def patched_create_causal_mask(*args, **kwargs):
+        if "inputs_embeds" in kwargs:
+            kwargs["input_embeds"] = kwargs.pop("inputs_embeds")
+        return original_create_causal_mask(*args, **kwargs)
+
+    model_module.create_causal_mask = patched_create_causal_mask  # type: ignore[attr-defined]
+    return hf_model
+
+
 def qwen2_5_omni_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     """Patches and returns an instance of the HfRunner for Qwen2.5-Omni."""
     thinker = hf_model.model.thinker
@@ -953,13 +1154,306 @@ def qwen3_vl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     return hf_model
 
 
-def tarsier_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
-    from vllm.model_executor.models.tarsier import get_vision_encoder_info
+def voxtral_patch_hf_runner(hf_model: "HfRunner") -> "HfRunner":
+    """Patch HfRunner for Voxtral's conversation-based processor.
 
-    vision_encoder_info = get_vision_encoder_info(hf_model.config)
+    Two issues in HfRunner require patching:
 
-    hf_processor = hf_model.processor
-    if hf_processor.patch_size is None:
-        hf_processor.patch_size = vision_encoder_info.get_patch_size()
+    1. VoxtralProcessor requires ``apply_chat_template()`` with conversation
+       dicts (accepting ``url``, ``path``, or ``base64`` audio) rather than
+       the standard ``processor(text=, audio=, sampling_rate=)`` interface.
+    2. HfRunner.get_inputs cannot handle multi-audio per prompt because it
+       incorrectly unpacks ``[(arr1, sr1), (arr2, sr2)]`` via a ``len == 2`` check.
 
+    We override ``get_inputs`` to build conversation dicts and call
+    ``apply_chat_template`` directly, bypassing both issues. We also wrap
+    ``model.generate`` to strip prompt tokens before decoding, since
+    HfRunner.generate calls batch_decode on the full sequence (prompt +
+    generated).
+    """
+    import io
+
+    import pybase64 as base64
+    import soundfile as sf
+
+    processor = hf_model.processor
+
+    def _audio_to_base64(audio_array, sample_rate: int) -> str:
+        """Encode a numpy audio array as a base64 WAV string."""
+        buf = io.BytesIO()
+        sf.write(buf, audio_array, int(sample_rate), format="WAV")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def patched_get_inputs(prompts, images=None, videos=None, audios=None, **kwargs):
+        all_inputs = []
+        for i, prompt in enumerate(prompts):
+            content: list[dict] = []
+
+            if audios is not None and audios[i] is not None:
+                items = audios[i]
+                if not isinstance(items, list):
+                    items = [items]
+                for item in items:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        arr, sr = item
+                    else:
+                        arr, sr = item, 16_000
+                    content.append(
+                        {
+                            "type": "audio",
+                            "base64": _audio_to_base64(arr, sr),
+                        }
+                    )
+
+            content.append({"type": "text", "text": prompt})
+
+            inputs = processor.apply_chat_template(
+                [{"role": "user", "content": content}]
+            )
+            if hasattr(inputs, "to"):
+                inputs = inputs.to(dtype=hf_model.dtype)
+            all_inputs.append(inputs)
+
+        return all_inputs
+
+    _orig_generate = hf_model.model.generate
+
+    def patched_generate(*args, **kwargs):
+        """Strip prompt tokens so only generated tokens are decoded."""
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        prompt_len = input_ids.shape[1] if input_ids is not None else 0
+
+        output = _orig_generate(*args, **kwargs)
+        if prompt_len:
+            if isinstance(output, torch.Tensor):
+                output = output[:, prompt_len:]
+            else:
+                # GenerateDecoderOnlyOutput - trim sequences but preserve
+                # scores/logits so generate_greedy_logprobs_limit can
+                # extract per-token logprobs.
+                output.sequences = output.sequences[:, prompt_len:]
+        return output
+
+    hf_model.get_inputs = patched_get_inputs  # type: ignore[method-assign, assignment]
+    hf_model.model.generate = patched_generate  # type: ignore[method-assign]
+    return hf_model
+
+
+def moondream3_processor(model: str):
+    from vllm.transformers_utils.processors.moondream3 import Moondream3Processor
+
+    return Moondream3Processor.from_pretrained(model, trust_remote_code=True)
+
+
+def moondream3_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
+    """Patch HfRunner for Moondream3."""
+    moondream_processor = hf_model.processor
+
+    def processor(*args, text="", images=None, **kwargs):
+        if images is None:
+            return moondream_processor(text=text, **kwargs)
+
+        images_list = [images] if isinstance(images, Image) else images
+        return moondream_processor(images=images_list, text=text, **kwargs)
+
+    hf_model.processor = processor
+
+    # Expose the LM head for logprob extraction.
+    hf_model.model.get_output_embeddings = lambda: hf_model.model.model.text.lm_head
+
+    native_model = hf_model.model.model  # MoondreamModel instance
+
+    from torch.nn import functional as F
+
+    from vllm.model_executor.models.moondream3 import reconstruct_from_crops
+
+    # Resolve the placeholder tokens from the tokenizer instead of hard-coding.
+    image_placeholder_ids = moondream_processor.tokenizer.encode(
+        "<image>", add_special_tokens=False
+    )
+
+    def _normalize_tiling(tilings):
+        """Extract (h, w) tuple from various tiling container formats."""
+        tiling = tilings
+        if isinstance(tiling, torch.Tensor):
+            tiling = tuple(tiling.squeeze().tolist())
+        elif isinstance(tiling, (list, tuple)):
+            t0 = tiling[0]
+            if isinstance(t0, torch.Tensor):
+                tiling = tuple(t0.tolist())
+            elif isinstance(t0, (list, tuple)):
+                tiling = tuple(t0)
+        return tiling
+
+    def _encode_vision(pixel_values, tilings):
+        """Run preprocessed crops through vision encoder + projection."""
+        device = native_model.device
+        dtype = native_model.vision.pos_emb.dtype
+        config = native_model.config
+
+        pv = pixel_values
+        while pv.dim() > 4:
+            pv = pv.squeeze(0)
+        pv = pv.to(device=device, dtype=dtype)
+
+        features = native_model._vis_enc(pv)
+        grid_size = config.vision.crop_size // config.vision.enc_patch_size
+        global_feat = features[0]
+
+        if features.shape[0] > 1 and tilings is not None:
+            tiling = _normalize_tiling(tilings)
+            local = features[1:].view(-1, grid_size, grid_size, config.vision.enc_dim)
+            reconstructed = reconstruct_from_crops(
+                local,
+                tiling,
+                config.vision.overlap_margin,
+                patch_size=1,
+            )
+        else:
+            reconstructed = global_feat.view(
+                grid_size, grid_size, config.vision.enc_dim
+            )
+
+        return native_model._vis_proj(global_feat, reconstructed)
+
+    def _find_subsequence(seq, subseq):
+        """Find start index of subseq in seq, or None."""
+        n = len(subseq)
+        for i in range(len(seq) - n + 1):
+            if seq[i : i + n] == subseq:
+                return i
+        return None
+
+    def _generate(
+        self,
+        input_ids=None,
+        pixel_values=None,
+        tilings=None,
+        attention_mask=None,
+        **kwargs,
+    ):
+        max_new_tokens = kwargs.get("max_new_tokens", 128)
+        return_dict = kwargs.get("return_dict_in_generate", False)
+        output_hs = kwargs.get("output_hidden_states", False)
+
+        if pixel_values is None:
+            sequences = input_ids
+            if return_dict:
+                return types.SimpleNamespace(
+                    sequences=sequences,
+                    hidden_states=() if output_hs else None,
+                )
+            return sequences
+
+        # Processor may return lists; extract the single element.
+        if isinstance(pixel_values, (list, tuple)):
+            pixel_values = pixel_values[0]
+        if (
+            isinstance(tilings, (list, tuple))
+            and tilings
+            and not isinstance(tilings[0], int)
+        ):
+            tilings = tilings[0]
+
+        hf_model.model._setup_caches()
+        native_model.use_flex_decoding = False
+
+        device = native_model.device
+        config = native_model.config
+
+        with torch.inference_mode():
+            for block in native_model.text.blocks:
+                block.kv_cache.k_cache.zero_()
+                block.kv_cache.v_cache.zero_()
+
+            img_emb = _encode_vision(pixel_values, tilings)
+
+            bos_emb = F.embedding(
+                torch.tensor([[config.tokenizer.bos_id]], device=device),
+                native_model.text.wte,
+            )
+            img_input = torch.cat([bos_emb, img_emb.unsqueeze(0)], dim=1)
+            prefix_len = img_input.size(1)
+
+            mask = native_model.attn_mask[:, :, :prefix_len, :]
+            pos_ids = torch.arange(prefix_len, dtype=torch.long, device=device)
+            native_model._prefill(img_input, mask, pos_ids, None)
+
+            ids = input_ids.squeeze(0).tolist()
+            img_start = _find_subsequence(ids, image_placeholder_ids)
+
+            if img_start is None:
+                sequences = input_ids
+                if return_dict:
+                    return types.SimpleNamespace(
+                        sequences=sequences,
+                        hidden_states=() if output_hs else None,
+                    )
+                return sequences
+
+            prompt_tokens = ids[img_start + len(image_placeholder_ids) :]
+
+            if not prompt_tokens:
+                sequences = input_ids
+                if return_dict:
+                    return types.SimpleNamespace(
+                        sequences=sequences,
+                        hidden_states=() if output_hs else None,
+                    )
+                return sequences
+
+            prompt_tensor = torch.tensor([prompt_tokens], device=device)
+            prompt_emb = F.embedding(prompt_tensor, native_model.text.wte)
+            prompt_len = prompt_emb.size(1)
+
+            mask = native_model.attn_mask[:, :, prefix_len : prefix_len + prompt_len, :]
+            pos_ids = torch.arange(
+                prefix_len,
+                prefix_len + prompt_len,
+                dtype=torch.long,
+                device=device,
+            )
+            hidden = native_model._prefill(prompt_emb, mask, pos_ids, None)
+            pos = prefix_len + prompt_len
+
+            hidden_last = native_model.text.post_ln(hidden[:, -1:, :])
+            logits = native_model.text.lm_head(hidden_last.squeeze(1))
+
+            generated = []
+            all_hidden_states = []
+            # Record the hidden state that predicted each generated token.
+            prev_hs = hidden_last
+            for _ in range(max_new_tokens):
+                next_token = logits.argmax(dim=-1).item()
+                if next_token == 0:
+                    break
+                generated.append(next_token)
+                if output_hs:
+                    all_hidden_states.append((prev_hs,))
+
+                next_emb = F.embedding(
+                    torch.tensor([[next_token]], device=device),
+                    native_model.text.wte,
+                )
+                mask = native_model.attn_mask[:, :, pos : pos + 1, :]
+                pos_ids_step = torch.tensor([pos], dtype=torch.long, device=device)
+                hidden = native_model._prefill(next_emb, mask, pos_ids_step, None)
+                hidden_last = native_model.text.post_ln(hidden[:, -1:, :])
+                prev_hs = hidden_last
+                logits = native_model.text.lm_head(hidden_last.squeeze(1))
+                pos += 1
+
+            result_ids = ids + generated
+            sequences = torch.tensor([result_ids], device=device)
+
+            if return_dict:
+                return types.SimpleNamespace(
+                    sequences=sequences,
+                    hidden_states=tuple(all_hidden_states) if output_hs else None,
+                )
+            return sequences
+
+    hf_model.model.generate = types.MethodType(_generate, hf_model.model)
     return hf_model

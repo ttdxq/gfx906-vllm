@@ -9,7 +9,7 @@ import torch.nn as nn
 from transformers.models.qwen3_vl import Qwen3VLProcessor
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.pooler import Pooler
+from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
@@ -67,14 +67,18 @@ class ColQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
         return limits
 
 
-@default_pooling_type("ALL")
+@default_pooling_type(tok_pooling_type="ALL")
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3VLMultiModalProcessor,
     info=ColQwen3_5ProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class ColQwen3_5Model(Qwen3_5ForConditionalGeneration):
-    """Qwen3.5 backbone with a ColBERT-style per-token projection head."""
+    """Qwen3.5 backbone with a ColBERT-style per-token projection head.
+
+    Projection and L2-normalization are applied by the pooler
+    (``pooler.head.projector`` is the model's ``custom_text_proj``).
+    """
 
     is_pooling_model = True
     score_type = "late-interaction"
@@ -116,7 +120,10 @@ class ColQwen3_5Model(Qwen3_5ForConditionalGeneration):
 
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
-        self.pooler = Pooler.for_token_embed(pooler_config)
+        self.pooler = pooler_for_token_embed(
+            pooler_config,
+            projector=self.custom_text_proj,
+        )
 
     def forward(
         self,
@@ -126,18 +133,13 @@ class ColQwen3_5Model(Qwen3_5ForConditionalGeneration):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
-        hidden_states = super().forward(
+        """Run forward pass returning hidden states for the pooler."""
+        return super().forward(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **kwargs,
-        )
-        if not isinstance(hidden_states, torch.Tensor):
-            return hidden_states  # type: ignore[return-value]
-
-        return self.custom_text_proj(
-            hidden_states.to(self.custom_text_proj.weight.dtype)
         )
 
     _PROJ_LAYER_NAMES = {
@@ -155,7 +157,7 @@ class ColQwen3_5Model(Qwen3_5ForConditionalGeneration):
             target = proj_weights if self._is_proj_weight(name) else model_weights
             target.append((name, weight))
 
-        loader = AutoWeightsLoader(self, skip_prefixes=["mtp."])
+        loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=["mtp."])
         loaded = loader.load_weights(model_weights, mapper=self.hf_to_vllm_mapper)
 
         for name, weight in proj_weights:
@@ -167,5 +169,8 @@ class ColQwen3_5Model(Qwen3_5ForConditionalGeneration):
                     weight.to(device=param.device, dtype=param.dtype),
                 )
                 loaded.add(f"custom_text_proj.{param_name}")
+                # Also mark as loaded under pooler path since custom_text_proj
+                # is assigned to pooler.head.projector
+                loaded.add(f"pooler.head.projector.{param_name}")
 
         return loaded

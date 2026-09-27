@@ -7,6 +7,7 @@ from concurrent.futures.process import ProcessPoolExecutor
 from functools import cache
 from typing import Any
 
+import regex as re
 import torch
 
 
@@ -22,11 +23,6 @@ def xpu_is_initialized() -> bool:
     if not torch.xpu._is_compiled():
         return False
     return torch.xpu.is_initialized()
-
-
-def get_cu_count(device_id: int = 0) -> int:
-    """Returns the total number of compute units (CU) on single GPU."""
-    return torch.cuda.get_device_properties(device_id).multi_processor_count
 
 
 def cuda_get_device_properties(
@@ -55,10 +51,24 @@ def is_pin_memory_available() -> bool:
 def is_uva_available() -> bool:
     """Check if Unified Virtual Addressing (UVA) is available."""
     # UVA requires pinned memory.
+    from vllm.platforms import current_platform
+
     # TODO: Add more requirements for UVA if needed.
-    return is_pin_memory_available()
+    return is_pin_memory_available() or current_platform.is_cpu()
 
 
 @cache
 def num_compute_units(device_id: int = 0) -> int:
-    return get_cu_count(device_id)
+    """Get the number of compute units of the current device."""
+    from vllm.platforms import current_platform
+
+    return current_platform.num_compute_units(device_id)
+
+
+@cache
+def get_device_name_as_file_name(device_id: int = 0) -> str:
+    from vllm.platforms import current_platform
+
+    name = current_platform.get_device_name(device_id)
+    name = re.sub(r"[\s/]+", "_", name)
+    return name

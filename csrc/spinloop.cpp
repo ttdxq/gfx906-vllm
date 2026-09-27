@@ -7,7 +7,7 @@ extern "C" {
 
 #if defined(__i386__) || defined(__x86_64__)
   #include <cpuid.h>
-  #include <mwaitxintrin.h>
+  #include <x86intrin.h>
 #endif
 
 #if defined(CLOCK_MONOTONIC_RAW)
@@ -33,6 +33,7 @@ static void determine_cpu_support(spinloop_state_t* state) {
 #if defined(__i386__) || defined(__x86_64__)
   unsigned int eax, ebx, ecx, edx;
   if (__get_cpuid(0, &eax, &ebx, &ecx, &edx) == 1) {
+    // AMD CPU (possible monitorx/mwaitx support)
     if (ebx == 0x68747541 && edx == 0x69746e65 && ecx == 0x444d4163) {
       if (__get_cpuid(0x80000000, &eax, &ebx, &ecx, &edx) == 1 &&
           eax >= 0x80000001 &&
@@ -103,6 +104,8 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
       break;
     }
 
+    // Check timeout at most every 16 iterations to avoid clock_gettime and
+    // comparison cost
     if (have_timeout && (iteration & 15u) == 0) {
       struct timespec t_now;
       if (clock_gettime(TIMEOUT_CLOCK, &t_now) != 0) {
@@ -121,9 +124,12 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
     ++iteration;
 
 #if defined(__i386__) || defined(__x86_64__)
+    // monitorx + mwaitx with qualified buffer
     if (buffer_qualifies && state->cpu_support == CPU_SUPPORT_MONITORX) {
       _mm_monitorx(buffer.buf, 0, 0);
 
+      // Check once more in case the buffer has been modified while we were
+      // arming the monitor hardware
       res = PyObject_CallNoArgs(callback);
       if (res == NULL) {
         error = true;
@@ -137,13 +143,18 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
         break;
       }
 
+      // Run mwaitx with enabled timeout (bit 1). The actual timeout value
+      // is not very important, we just want to ensure we don't lock up
+      // here for too long.
       Py_BEGIN_ALLOW_THREADS _mm_mwaitx((1 << 1), 0,
                                         MWAITX_DEFAULT_TIMEOUT_CYCLES);
       Py_END_ALLOW_THREADS
     }
 
+    // Fallback: Busy poll
     else {
 #endif
+      // Give other threads a chance to be scheduled
       Py_BEGIN_ALLOW_THREADS
 #if defined(__i386__) || defined(__x86_64__)
       __builtin_ia32_pause();

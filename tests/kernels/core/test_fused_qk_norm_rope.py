@@ -8,11 +8,13 @@ from tests.kernels.utils import opcheck
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_random_seed
 
 DTYPES = [torch.bfloat16, torch.float16]
 IS_NEOX = [True, False]
 EPS_VALUES = [1e-5, 1e-6]
 SEEDS = [13]
+PARTIAL_ROPE = [True, False]
 CUDA_DEVICES = ["cuda:0"]
 
 
@@ -33,10 +35,12 @@ def _apply_qk_norm_rope(
 
     q_by_head = q.view(*q.shape[:-1], q.shape[-1] // head_dim, head_dim)
     q_by_head = q_norm.forward_native(q_by_head)
+    assert isinstance(q_by_head, torch.Tensor)
     q = q_by_head.view(q.shape)
 
     k_by_head = k.view(*k.shape[:-1], k.shape[-1] // head_dim, head_dim)
     k_by_head = k_norm.forward_native(k_by_head)
+    assert isinstance(k_by_head, torch.Tensor)
     k = k_by_head.view(k.shape)
 
     q, k = rope.forward_native(positions, q, k)
@@ -52,16 +56,19 @@ def _apply_qk_norm_rope(
 @pytest.mark.parametrize("is_neox", IS_NEOX)
 @pytest.mark.parametrize("eps", EPS_VALUES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("rotary_ratio", [1.0, 0.5, 0.25])
 @torch.inference_mode()
 def test_fused_qk_norm_rope_matches_reference(
+    default_vllm_config,
     device: str,
     dtype: torch.dtype,
     is_neox: bool,
     eps: float,
     seed: int,
+    rotary_ratio: float,
 ):
     torch.set_default_device(device)
-    current_platform.seed_everything(seed)
+    set_random_seed(seed)
     num_heads, num_kv_heads, head_dim = 16, 4, 128
     num_tokens = 4
 
@@ -76,10 +83,10 @@ def test_fused_qk_norm_rope_matches_reference(
     k_norm.weight.data.normal_(mean=1.0, std=0.1)
     q_weight = q_norm.weight.data
     k_weight = k_norm.weight.data
-
+    rotary_dim = int(head_dim * rotary_ratio)
     rope = RotaryEmbedding(
         head_size=head_dim,
-        rotary_dim=head_dim,
+        rotary_dim=rotary_dim,
         max_position_embeddings=4096,
         base=10000.0,
         is_neox_style=is_neox,

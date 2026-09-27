@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+from collections.abc import Generator
 
 import torch
 
@@ -11,12 +12,10 @@ logger = init_logger(__name__)
 
 
 def should_split(node: torch.fx.Node, splitting_ops: list[str]) -> bool:
-    """
-    Check if a node should be split for dynamo graph partition.
+    """Check if a node should be split for dynamo graph partition.
     It operates on dynamo graph, so the node.target can be anything.
     We need to check and split only on OpOverload and OpOverloadPacket.
     """
-
     if node.op != "call_function":
         return False
 
@@ -38,7 +37,9 @@ def should_split(node: torch.fx.Node, splitting_ops: list[str]) -> bool:
 
 
 @contextlib.contextmanager
-def inductor_partition_rule_context(splitting_ops: list[str]):
+def inductor_partition_rule_context(
+    splitting_ops: list[str] | None,
+) -> Generator[None, None, None]:
     """Context manager to temporarily register Inductor partition rules.
 
     Registers custom partition rules for specified operators, forcing the
@@ -47,6 +48,7 @@ def inductor_partition_rule_context(splitting_ops: list[str]):
 
     Args:
         splitting_ops: List of operator names to partition on.
+
     """
     if not splitting_ops:
         logger.debug("No partition ops provided; skipping rule registration.")
