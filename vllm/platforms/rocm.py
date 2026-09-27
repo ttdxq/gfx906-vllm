@@ -875,9 +875,10 @@ class RocmPlatform(Platform):
             logger.info_once(f"Using backend {backend} for vit attention")
             return backend
 
-        from importlib.util import find_spec
-
         from vllm._aiter_ops import rocm_aiter_ops
+        from vllm.v1.attention.backends.fa_utils import (
+            is_flash_attn_varlen_func_available,
+        )
 
         if rocm_aiter_ops.is_mha_enabled() and on_cdna():
             logger.info_once("Using AITER Flash Attention backend for ViT model.")
@@ -885,11 +886,21 @@ class RocmPlatform(Platform):
 
         if (
             on_cdna()
-            and find_spec("flash_attn") is not None
+            and is_flash_attn_varlen_func_available()
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):
             logger.info_once("Using Flash Attention backend for ViT model.")
             return AttentionBackendEnum.FLASH_ATTN
+
+        # CDNA GPUs without usable upstream flash-attn ROCm kernels (e.g.
+        # gfx906, where the flash-attn shim install has no HIP kernels): use
+        # the Triton ViT attention. Torch SDPA falls back to the dense math
+        # path on these GPUs and OOMs on long ViT patch sequences.
+        if on_cdna() and (dtype == torch.float16 or dtype == torch.bfloat16):
+            logger.info_once(
+                "Using Flash Attention (Triton backend) for ViT model on CDNA."
+            )
+            return AttentionBackendEnum.TRITON_ATTN
 
         # RDNA3/RDNA4 (gfx11xx/gfx12xx): Use Flash Attention Triton backend
         if (

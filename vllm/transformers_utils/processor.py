@@ -22,6 +22,7 @@ from typing_extensions import TypeVar
 
 from vllm.logger import init_logger
 from vllm.transformers_utils import processors
+from vllm.transformers_utils.gguf_utils import gguf_multimodal_processor_repo
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 from vllm.transformers_utils.utils import convert_model_repo_to_path
 from vllm.utils.func_utils import get_allowed_kwarg_only_overrides
@@ -378,8 +379,15 @@ def cached_processor_from_config(
     processor_cls: type[_P] | tuple[type[_P], ...] = ProcessorMixin,
     **kwargs: Any,
 ) -> _P:
+    processor_name = model_config.model
+    # Multimodal GGUF checkpoints ship no processor files; the original HF
+    # repository recorded in the GGUF metadata (the same source ModelConfig
+    # uses to resolve the tokenizer) provides the processor instead.
+    processor_repo = gguf_multimodal_processor_repo(processor_name)
+    if processor_repo is not None:
+        processor_name = processor_repo
     return cached_get_processor_without_dynamic_kwargs(
-        model_config.model,
+        processor_name,
         revision=model_config.revision,
         trust_remote_code=model_config.trust_remote_code,
         processor_cls=processor_cls,  # type: ignore[arg-type]
