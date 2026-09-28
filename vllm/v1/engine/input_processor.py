@@ -466,43 +466,69 @@ class InputProcessor:
                 f"is out of range [0, {data_parallel_size})."
             )
 
-        if arrival_time is None:
-            arrival_time = time.time()
-
-        # Optionally generate multimodal hash overrides to avoid hashing
-        # multimodal data items by their content as their identifiers.
-
-        # NOTE: when users explicitly turn off BOTH prefix caching and input
-        # processing caching, no multimodal features or embeddings will be
-        # reused across requests, therefore identifying multimodal data items
-        # by their content is no longer necessary, and we create uuids with
-        # request id-modality-index as multimodal hash overrides.
-        if (
-            self.model_config.multimodal_config
-            and self.model_config.multimodal_config.mm_processor_cache_gb == 0
-            and not self.cache_config.enable_prefix_caching
-        ):
-            mm_uuids = self._maybe_build_mm_uuids(request_id, prompt)
-        else:
-            # Otherwise, use user-provided uuids as multimodal hash overrides
-            # if provided.
-            self._validate_multi_modal_uuids(prompt)
-            if isinstance(prompt, dict):
-                mm_uuids = cast(
-                    MultiModalUUIDDict | None, prompt.get("multi_modal_uuids")
+        if isinstance(prompt, dict) and "type" in prompt:
+            # Already-rendered EngineInput (output of Renderer.render_cmpl()
+            # or render_chat()): pass it through untouched. Running it through
+            # input_preprocessor.preprocess() again would treat the renderer's
+            # MultiModalInput as a raw prompt, silently dropping mm_kwargs /
+            # mm_placeholders in _process_tokens.
+            if tokenization_kwargs:
+                logger.warning_once(
+                    "Passing tokenization_kwargs to InputProcessor is "
+                    "deprecated and will be removed in v0.18. You should "
+                    "instead pass them to Renderer.render_cmpl() or "
+                    "Renderer.render_chat()."
                 )
-            else:
-                mm_uuids = None
 
-        # Process inputs, which includes:
-        # 1. Tokenize text prompt, with LoRA request if one exists.
-        # 2. For multimodal models with a merged preprocessor, preprocess
-        #   multimodal data and expand prompt token ids accordingly.
-        processed_inputs: EngineInput = self.input_preprocessor.preprocess(
-            prompt,
-            tokenization_kwargs=tokenization_kwargs,
-            mm_uuids=mm_uuids,
-        )
+            if arrival_time is None:
+                arrival_time = prompt.get("arrival_time", time.time())  # type: ignore[assignment]
+
+            processed_inputs: EngineInput = prompt  # type: ignore[assignment]
+        else:
+            logger.warning_once(
+                "Passing raw prompts to InputProcessor is deprecated "
+                "and will be removed in v0.18. You should instead pass "
+                "the outputs of Renderer.render_cmpl() or Renderer.render_chat()."
+            )
+
+            if arrival_time is None:
+                arrival_time = time.time()
+
+            # Optionally generate multimodal hash overrides to avoid hashing
+            # multimodal data items by their content as their identifiers.
+
+            # NOTE: when users explicitly turn off BOTH prefix caching and
+            # input processing caching, no multimodal features or embeddings
+            # will be reused across requests, therefore identifying
+            # multimodal data items by their content is no longer necessary,
+            # and we create uuids with request id-modality-index as
+            # multimodal hash overrides.
+            if (
+                self.model_config.multimodal_config
+                and self.model_config.multimodal_config.mm_processor_cache_gb == 0
+                and not self.cache_config.enable_prefix_caching
+            ):
+                mm_uuids = self._maybe_build_mm_uuids(request_id, prompt)
+            else:
+                # Otherwise, use user-provided uuids as multimodal hash
+                # overrides if provided.
+                self._validate_multi_modal_uuids(prompt)
+                if isinstance(prompt, dict):
+                    mm_uuids = cast(
+                        MultiModalUUIDDict | None, prompt.get("multi_modal_uuids")
+                    )
+                else:
+                    mm_uuids = None
+
+            # Process inputs, which includes:
+            # 1. Tokenize text prompt, with LoRA request if one exists.
+            # 2. For multimodal models with a merged preprocessor, preprocess
+            #   multimodal data and expand prompt token ids accordingly.
+            processed_inputs = self.input_preprocessor.preprocess(
+                prompt,
+                tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
+            )
         from vllm.platforms import current_platform
 
         current_platform.validate_request(
