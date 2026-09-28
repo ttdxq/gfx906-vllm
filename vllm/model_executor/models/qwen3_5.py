@@ -72,6 +72,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    maybe_remap_moe_expert_param_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
@@ -1427,6 +1428,11 @@ class Qwen3_5Model(Qwen3NextModel):
                         continue
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    # Post-#41184 the expert params live under
+                    # ``experts.routed_experts.*``; remap old-style names.
+                    name_mapped = maybe_remap_moe_expert_param_name(
+                        name_mapped, params_dict
+                    )
                     # Skip layers on other devices.
                     if is_pp_missing_parameter(name_mapped, self):
                         continue
@@ -1873,13 +1879,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         inputs_embeds = self._embed_text_input_ids(
             input_ids,
             self.language_model.embed_input_ids,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:

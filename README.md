@@ -25,6 +25,10 @@
 
 ## 最新更新
 
+### ✅ 2026年9月更新
+
+- **Qwen3.5 MoE 架构 GGUF 支持（多模态、MTP 可用）** - 补齐 qwen35moe 架构 GGUF 的模型构建、专家权重加载与多模态输入链路；mmproj 图片输入与 MTP 投机解码均已在单张 32 GiB gfx906 GPU 上实测可用。
+
 ### ✅ 2026年8月更新
 
 - **Qwen3.5 多模态 GGUF 支持** - 补齐 Qwen3.5 GGUF 主模型与 `mmproj` 的视觉配置、权重名称映射、Conv3d patch embedding 合并和多模态输入处理链路。
@@ -44,6 +48,7 @@
 - ✅ unsloth/Qwen3.5-27B-GGUF
 - ✅ unsloth/Qwen3.6-27B-GGUF
 - ✅ unsloth/Qwen3.8-27B-GGUF
+- ✅ unsloth/Qwen3.6-35B-A3B-GGUF
 
 **已知无法运行：**
 - ❌ **Qwen/Qwen3.5-35B-A3B-GPTQ-Int4** - MoE + GPTQ Int4 量化组合存在兼容性问题，导致服务无法正常启动或推理失败

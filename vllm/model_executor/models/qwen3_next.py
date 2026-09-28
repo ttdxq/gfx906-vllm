@@ -42,7 +42,9 @@ from vllm.model_executor.layers.fla.ops import (
     fused_sigmoid_gating_delta_rule_update_kv_cache_gfx906,
 )
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, RoutedExperts
-from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.utils import (
+    resolve_layer_fused_shared_expert,
+)
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
@@ -149,7 +151,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
         self.ep_group = get_ep_group().device_group
-        self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
 
@@ -162,7 +163,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
 
         # Load balancing settings.
-        vllm_config = get_current_vllm_config()
         eplb_config = vllm_config.parallel_config.eplb_config
         self.enable_eplb = parallel_config.enable_eplb
 
@@ -171,22 +171,36 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
 
-        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = (
-            self.physical_expert_start + self.n_local_physical_experts
-        )
-
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.gate",
         )
 
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        self.shared_expert_gate = ReplicatedLinear(
+            config.hidden_size,
+            1,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.shared_expert_gate",
+        )
 
+        self.is_fused_shared_expert_enabled = False
         if config.shared_expert_intermediate_size > 0:
+            self.is_fused_shared_expert_enabled = resolve_layer_fused_shared_expert(
+                quant_config,
+                prefix,
+                shared_expert_name="shared_expert",
+            )
+
+        if (
+            self.is_fused_shared_expert_enabled
+            or config.shared_expert_intermediate_size <= 0
+        ):
+            self.shared_expert = None
+        else:
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -194,10 +208,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 expert_gate=self.shared_expert_gate,
+                is_sequence_parallel=self.is_sequence_parallel,
                 prefix=f"{prefix}.shared_expert",
             )
-        else:
-            self.shared_expert = None
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_expert,
@@ -206,50 +219,41 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
-            renormalize=config.norm_topk_prob,
+            renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
-            routing_method_type=RoutingMethodType.Renormalize,
+            n_shared_experts=1 if self.shared_expert is None else None,
+            fuse_shared_experts=self.is_fused_shared_expert_enabled,
+            shared_expert_gate=self.shared_expert_gate
+            if self.shared_expert is None
+            else None,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if self.is_sequence_parallel:
+        if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        if self.experts.is_internal_router:
-            # In this case, the gate/router runs inside the FusedMoE class
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
-            )
-        else:
-            # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
-            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=hidden_states
+        )
 
-        if self.shared_expert is not None:
-            shared_hidden_states, routed_hidden_states = final_hidden_states
-            final_hidden_states = routed_hidden_states.add_(shared_hidden_states)
-
-        if self.is_sequence_parallel:
+        if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
-                final_hidden_states
-            )
 
         return final_hidden_states.view(orig_shape)
 
@@ -1192,6 +1196,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 and capability.major == 9
                 and capability.minor == 0
             ):
+                # Match query_non_spec/key_non_spec/value_non_spec, which are
+                # already sliced to the non-spec tokens: slice the gating
+                # inputs the same way (same pattern as the spec and prefill
+                # branches above) so token counts line up under spec decoding.
+                if spec_sequence_masks is not None:
+                    a = a.index_select(0, non_spec_token_indx)
+                    b = b.index_select(0, non_spec_token_indx)
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
