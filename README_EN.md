@@ -25,6 +25,10 @@ See [NOTICE](NOTICE) for the complete attribution statement.
 
 ## Latest Updates
 
+### ✅ September 2026 Update
+
+- **Qwen3.5 MoE architecture GGUF support (multimodal and MTP working)** - Added model construction, expert weight loading, and the multimodal input pipeline for qwen35moe GGUF checkpoints; both `mmproj` image input and MTP speculative decoding are verified working on a single 32 GiB gfx906 GPU.
+
 ### ✅ August 2026 Update
 
 - **Qwen3.5 multimodal GGUF support** - Added vision configuration, weight-name mapping, Conv3d patch-embedding merging, and multimodal input processing for Qwen3.5 GGUF main models and `mmproj` files.
@@ -44,6 +48,7 @@ Many new model implementations (49+) have been synchronized from upstream vLLM, 
 - ✅ unsloth/Qwen3.5-27B-GGUF
 - ✅ unsloth/Qwen3.6-27B-GGUF
 - ✅ unsloth/Qwen3.8-27B-GGUF
+- ✅ unsloth/Qwen3.6-35B-A3B-GGUF
 
 **Known not to work:**
 
