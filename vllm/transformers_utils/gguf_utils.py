@@ -4,6 +4,7 @@
 
 import hashlib
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import gguf
@@ -424,8 +425,14 @@ def qwen35_gguf_tokenizer_path(model: str) -> str | None:
     return str(tokenizer_dir)
 
 
+@lru_cache
 def gguf_multimodal_processor_repo(model: str) -> str | None:
-    """Return the original HF repo needed for multimodal GGUF processing."""
+    """Return the original HF repo needed for multimodal GGUF processing.
+
+    Reads one fixed metadata field from the (potentially very large) GGUF
+    file, so the result is cached per model path; constructing GGUFReader
+    re-parses the whole file and must not run per request.
+    """
     if detect_gguf_multimodal(model) is None:
         return None
 
