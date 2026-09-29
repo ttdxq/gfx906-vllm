@@ -20,6 +20,28 @@ from vllm.triton_utils import tl, triton
 
 _GFX906_MTP_CONV_DEBUG_REPORTED = False
 
+# gfx906 escape hatch: set VLLM_GFX906_TRITON_CAUSAL_CONV1D=0 to keep
+# routing prefill causal-conv1d through the per-sequence PyTorch fallback.
+ENABLE_GFX906_TRITON_CAUSAL_CONV1D = os.getenv(
+    "VLLM_GFX906_TRITON_CAUSAL_CONV1D", "1"
+).lower() in {"1", "true", "yes", "on"}
+
+# gfx906 launch-safety sync: synchronize the stream right after the Triton
+# prefill kernel launch. On gfx906, serving long chunked prefills with the
+# fully-async Triton conv (no per-layer .item() syncs like the fallback)
+# deterministically wedges the GPU compute ring mid-prefill: the ring spins
+# at 100% while the queued work never completes, and only killing the
+# process recovers the card. The kernel itself is correct and completes on
+# its own in every isolated shape, so the wedge comes from the deep
+# in-flight launch window it participates in, not from its results. Draining
+# the stream at each conv launch bounds that window and provably removes the
+# hang (64K-token prefill: hang without sync, clean pass with it); the cost
+# is within noise (~1.5% prefill wall time) because the GPU remains the
+# bottleneck. Set VLLM_GFX906_TRITON_CAUSAL_CONV1D_SYNC=0 to disable.
+ENABLE_GFX906_TRITON_CAUSAL_CONV1D_SYNC = os.getenv(
+    "VLLM_GFX906_TRITON_CAUSAL_CONV1D_SYNC", "1"
+).lower() in {"1", "true", "yes", "on"}
+
 
 def _causal_conv1d_gfx906_fallback(
     x: torch.Tensor,
@@ -753,13 +775,23 @@ def causal_conv1d_fn(
         activation = "silu"
 
     capability = current_platform.get_device_capability()
-    if (
+    on_gfx906 = (
         current_platform.is_rocm()
         and capability is not None
         and capability.major == 9
         and capability.minor == 0
-    ):
-        return _causal_conv1d_gfx906_fallback(
+    )
+    if on_gfx906:
+        # The attention-metadata builder precomputes the launch schedule
+        # (nums_dict/batch_ptr/token_chunk_offset_ptr) on the CPU copy of
+        # query_start_loc, so the Triton kernel below can run without any
+        # DtoH sync. Without that metadata, keep the per-sequence fallback.
+        metadata_ready = (
+            metadata is not None
+            and getattr(metadata, "nums_dict", None) is not None
+        )
+        if not ENABLE_GFX906_TRITON_CAUSAL_CONV1D or not metadata_ready:
+            return _causal_conv1d_gfx906_fallback(
             x=x,
             weight=weight,
             bias=bias,
@@ -975,6 +1007,14 @@ def causal_conv1d_fn(
         BLOCK_N=256,
         num_stages=2,
     )
+    if (
+        on_gfx906
+        and ENABLE_GFX906_TRITON_CAUSAL_CONV1D_SYNC
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # gfx906 launch-safety sync (see comment at module top); skipped
+        # under graph capture.
+        torch.cuda.current_stream().synchronize()
     return out.to(original_x_dtype)
 
 

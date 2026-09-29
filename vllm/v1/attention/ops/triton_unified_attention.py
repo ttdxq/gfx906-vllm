@@ -33,9 +33,84 @@ ENABLE_GFX906_ATTN_SCHED_TUNING = os.getenv(
     "VLLM_GFX906_TRITON_ATTN_TUNING", "1"
 ).lower() in {"1", "true", "yes", "on"}
 
+# Route tuned prefill shapes through the split-KV (3D) kernel on gfx906.
+# Independent switch so prefill can be routed independently of the decode
+# policy. Opt-in: kernel-level interleaved A/B shows the split-KV kernel
+# ~8-9% faster than the 2D kernel at 4k-16k serving shapes, but attention is
+# only a fraction of prefill wall time, so the end-to-end gain measured on a
+# 27B head-256/GQA6 model was ~1% at 4k and ~2% at 16k tokens. The path also
+# costs up to ~0.4 GiB of lazily allocated fp32 segment workspace at the
+# default chunk size. Only applies to plain causal attention (no sliding
+# window, sinks, alibi, softcap, qq-bias, mm-prefix or fused fp8 output) on
+# the tuned head-256/GQA6 shape, and never during CUDA-graph capture (the
+# workspace is allocated lazily on first use).
+ENABLE_GFX906_ATTN_PREFILL_3D = os.getenv(
+    "VLLM_GFX906_TRITON_ATTN_PREFILL_3D", "0"
+).lower() in {"1", "true", "yes", "on"}
+
 # Upper bound for split-KV segments the decode policy may request. The
 # backend sizes its softmax segment buffers with this value on gfx906.
 GFX906_MAX_DECODE_SEGMENTS = 128
+
+# Split-KV segments for the gfx906 prefill 3D path. Prefill already fills the
+# GPU with q-block x kv-head CTAs; a small fixed split balances the causal
+# load skew between early and late query blocks. Interleaved sweeps over
+# segments {2,4,8,16} at 4k-16k serving shapes put 2 and 4 within ~1% of
+# each other (8+ regress); 2 halves the fp32 segment workspace, which keeps
+# gpu_memory_utilization=0.95 runs within budget at the default chunk size.
+GFX906_PREFILL_SEGMENTS = 2
+
+# Lazily grown workspace for the prefill split-KV path. Unlike the decode
+# segment buffers (sized for the decode batch threshold and provided by the
+# backend), prefill needs one row per scheduled token, so the workspace is
+# allocated on first use and grown to the largest batch seen. Allocation
+# happens outside CUDA-graph capture only, and never runs before KV-cache
+# profiling (the profiling forward passes attention metadata as None).
+_prefill_segm_state: dict | None = None
+
+
+def _prefill_segment_buffers(
+    num_tokens: int,
+    num_query_heads: int,
+    num_segments: int,
+    headdim_padded: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    global _prefill_segm_state
+    rows = triton.next_power_of_2(num_tokens)
+    st = _prefill_segm_state
+    if (
+        st is None
+        or st["rows"] < rows
+        or st["heads"] != num_query_heads
+        or st["segs"] != num_segments
+        or st["dim"] != headdim_padded
+        or st["device"] != device
+    ):
+        _prefill_segm_state = {
+            "rows": rows,
+            "heads": num_query_heads,
+            "segs": num_segments,
+            "dim": headdim_padded,
+            "device": device,
+            "output": torch.empty(
+                (rows, num_query_heads, num_segments, headdim_padded),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "max": torch.empty(
+                (rows, num_query_heads, num_segments),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "expsum": torch.empty(
+                (rows, num_query_heads, num_segments),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        st = _prefill_segm_state
+    return st["output"], st["max"], st["expsum"]
 
 
 @lru_cache(maxsize=1)
@@ -71,6 +146,16 @@ def _decode_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
     # 8-row block covers a single token without padding a second one.
     if head_size == 256 and num_queries_per_kv == 6:
         return 8
+    return None
+
+
+def _prefill_block_m(head_size: int, num_queries_per_kv: int) -> int | None:
+    # GQA6 with 256-dim heads: a 32-row block spans 5 query tokens (30 of 32
+    # rows carry work) and reuses each K/V tile across them, versus only 2
+    # tokens per 16-row block. Sweeps over BLOCK_M/TILE/num_warps/num_stages
+    # at 4k-16k prefill shapes favor 32/32/4/1 uniformly on gfx906.
+    if head_size == 256 and num_queries_per_kv == 6:
+        return 32
     return None
 
 
@@ -1069,7 +1154,12 @@ def unified_attention(
         if gfx906_sched and max_seqlen_q == 1
         else None
     )
-    BLOCK_M = decode_block_m or (
+    prefill_block_m = (
+        _prefill_block_m(head_size, num_queries_per_kv)
+        if gfx906_sched and max_seqlen_q > 1
+        else None
+    )
+    BLOCK_M = decode_block_m or prefill_block_m or (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
@@ -1103,6 +1193,127 @@ def unified_attention(
         q.element_size(),
         is_prefill=False,
     )
+
+    def _launch_split_kv(
+        segm_output,
+        segm_max,
+        segm_expsum,
+        num_segments,
+        tile_size,
+        num_warps,
+    ):
+        kernel_unified_attention_3d[
+            (total_num_q_blocks, num_kv_heads, num_segments)
+        ](
+            segm_output_ptr=segm_output,
+            segm_max_ptr=segm_max,
+            segm_expsum_ptr=segm_expsum,
+            query_ptr=q,
+            key_cache_ptr=k,
+            value_cache_ptr=v,
+            sink_ptr=sinks,
+            block_tables_ptr=block_table,
+            seq_lens_ptr=seqused_k,
+            alibi_slopes_ptr=alibi_slopes,
+            qq_bias_ptr=qq_bias,
+            scale=softmax_scale,
+            k_scale=k_descale,
+            v_scale=v_descale,
+            softcap=softcap,
+            num_query_heads=num_query_heads,
+            num_queries_per_kv=num_queries_per_kv,
+            block_table_stride=block_table.stride(0),
+            query_stride_0=q.stride(0),
+            query_stride_1=q.stride(1),
+            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+            BLOCK_SIZE=block_size,
+            TILE_SIZE=tile_size,
+            HEAD_SIZE=head_size,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            USE_ALIBI_SLOPES=use_alibi_slopes,
+            USE_ALIBI_SQRT=use_alibi_sqrt,
+            USE_QQ_BIAS=use_qq_bias,
+            USE_SOFTCAP=(softcap > 0),
+            USE_SINKS=(sinks is not None),
+            USE_MM_PREFIX=use_mm_prefix,
+            MAX_MM_RANGES=max_mm_ranges,
+            mm_prefix_range_ptr=mm_prefix_range,
+            SLIDING_WINDOW=(1 + window_size[0]),
+            stride_k_cache_0=k.stride(0),
+            stride_k_cache_1=k.stride(1),
+            stride_k_cache_2=k.stride(2),
+            stride_k_cache_3=k.stride(3),
+            stride_v_cache_0=v.stride(0),
+            stride_v_cache_1=v.stride(1),
+            stride_v_cache_2=v.stride(2),
+            stride_v_cache_3=v.stride(3),
+            query_start_len_ptr=cu_seqlens_q,
+            BLOCK_Q=BLOCK_Q,
+            num_seqs=num_seqs,
+            BLOCK_M=BLOCK_M,
+            NUM_SEGMENTS_PER_SEQ=num_segments,
+            # num_warps=None keeps the Triton defaults on non-gfx906 platforms
+            **({"num_warps": num_warps, "num_stages": 1} if num_warps else {}),
+        )
+        reduce_segments[(q.shape[0], num_query_heads)](
+            output_ptr=out,
+            segm_output_ptr=segm_output,
+            segm_max_ptr=segm_max,
+            segm_expsum_ptr=segm_expsum,
+            seq_lens_ptr=seqused_k,
+            num_seqs=num_seqs,
+            num_query_heads=num_query_heads,
+            out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+            output_stride_0=out.stride(0),
+            output_stride_1=out.stride(1),
+            block_table_stride=block_table.stride(0),
+            TILE_SIZE=tile_size,
+            HEAD_SIZE=head_size,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            query_start_len_ptr=cu_seqlens_q,
+            BLOCK_Q=BLOCK_Q,
+            NUM_SEGMENTS_PER_SEQ=num_segments,
+            USE_FP8=output_scale is not None,
+        )
+
+    # gfx906: run tuned-shape prefill through the split-KV (3D) kernel. The
+    # path is restricted to plain causal attention so the swept configuration
+    # (BLOCK_M 32 / TILE 32 / 4 warps / 1 stage / 2 segments) is the only one
+    # exercised, and is disabled under CUDA-graph capture because the segment
+    # workspace cannot be allocated inside a capture.
+    use_prefill_3d = (
+        ENABLE_GFX906_ATTN_PREFILL_3D
+        and gfx906_sched
+        and prefill_block_m is not None
+        and sliding_window_val == 0
+        and not use_mm_prefix
+        and not use_qq_bias
+        and not use_alibi_slopes
+        and sinks is None
+        and softcap == 0
+        and output_scale is None
+        and not is_batch_invariant
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+    if use_prefill_3d:
+        num_segments = GFX906_PREFILL_SEGMENTS
+        segm_output, segm_max, segm_expsum = _prefill_segment_buffers(
+            q.shape[0],
+            num_query_heads,
+            num_segments,
+            triton.next_power_of_2(head_size),
+            q.device,
+        )
+        _launch_split_kv(
+            segm_output,
+            segm_max,
+            segm_expsum,
+            num_segments,
+            TILE_SIZE_PREFILL,
+            4,
+        )
+        return
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
@@ -1173,7 +1384,13 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
-            **({"num_warps": 2, "num_stages": 1} if gfx906_sched else {}),
+            **(
+                # tuned prefill shapes run 4 warps; everything else (incl. the
+                # decode fallback through the 2D kernel) keeps 2 warps
+                {"num_warps": 4 if prefill_block_m else 2, "num_stages": 1}
+                if gfx906_sched
+                else {}
+            ),
         )
     else:
         # gfx906: scale split-KV parallelism with the decode batch shape and
@@ -1190,80 +1407,11 @@ def unified_attention(
                 ),
                 softmax_segm_output.shape[2],
             )
-        kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, num_segments)](
-            segm_output_ptr=softmax_segm_output,
-            segm_max_ptr=softmax_segm_max,
-            segm_expsum_ptr=softmax_segm_expsum,
-            query_ptr=q,
-            key_cache_ptr=k,
-            value_cache_ptr=v,
-            sink_ptr=sinks,
-            block_tables_ptr=block_table,
-            seq_lens_ptr=seqused_k,
-            alibi_slopes_ptr=alibi_slopes,
-            qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            softcap=softcap,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            BLOCK_SIZE=block_size,
-            TILE_SIZE=TILE_SIZE_DECODE,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_ALIBI_SQRT=use_alibi_sqrt,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
-            USE_MM_PREFIX=use_mm_prefix,
-            MAX_MM_RANGES=max_mm_ranges,
-            mm_prefix_range_ptr=mm_prefix_range,
-            SLIDING_WINDOW=(1 + window_size[0]),
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
-            NUM_SEGMENTS_PER_SEQ=num_segments,
-            **(
-                {
-                    "num_warps": _decode_num_warps(head_size, max_seqlen_k),
-                    "num_stages": 1,
-                }
-                if gfx906_sched
-                else {}
-            ),
-        )
-        reduce_segments[(q.shape[0], num_query_heads)](
-            output_ptr=out,
-            segm_output_ptr=softmax_segm_output,
-            segm_max_ptr=softmax_segm_max,
-            segm_expsum_ptr=softmax_segm_expsum,
-            seq_lens_ptr=seqused_k,
-            num_seqs=num_seqs,
-            num_query_heads=num_query_heads,
-            out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            block_table_stride=block_table.stride(0),
-            TILE_SIZE=TILE_SIZE_DECODE,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            NUM_SEGMENTS_PER_SEQ=num_segments,
-            USE_FP8=output_scale is not None,
+        _launch_split_kv(
+            softmax_segm_output,
+            softmax_segm_max,
+            softmax_segm_expsum,
+            num_segments,
+            TILE_SIZE_DECODE,
+            _decode_num_warps(head_size, max_seqlen_k) if gfx906_sched else None,
         )

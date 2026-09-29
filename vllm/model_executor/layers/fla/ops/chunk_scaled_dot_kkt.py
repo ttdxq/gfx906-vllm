@@ -15,6 +15,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
+from .utils import GFX906_GDN_TRITON_PREFILL_ENABLED
 
 
 def _is_gfx906_rocm() -> bool:
@@ -192,7 +193,7 @@ def chunk_scaled_dot_kkt_fwd(
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    if _is_gfx906_rocm():
+    if _is_gfx906_rocm() and not GFX906_GDN_TRITON_PREFILL_ENABLED:
         return _chunk_scaled_dot_kkt_fwd_eager(
             k=k,
             g=g,

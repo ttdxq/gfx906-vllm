@@ -15,6 +15,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
+from .utils import GFX906_GDN_TRITON_PREFILL_ENABLED
 
 
 def _is_gfx906_rocm() -> bool:
@@ -199,7 +200,7 @@ def recompute_w_u_fwd(
     BK = 64
     BV = 64
 
-    if _is_gfx906_rocm():
+    if _is_gfx906_rocm() and not GFX906_GDN_TRITON_PREFILL_ENABLED:
         return _recompute_w_u_fwd_eager(
             k=k,
             v=v,
