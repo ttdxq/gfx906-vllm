@@ -301,11 +301,17 @@ def _is_gfx906_gguf(model_config: ModelConfig | None) -> bool:
 def _auto_enable_async_scheduling_for_gfx906_gguf(
     model_config: ModelConfig | None,
 ) -> bool:
-    if os.getenv("VLLM_GGUF_GFX906_AUTO_ASYNC_SCHEDULING", "1").lower() in {
-        "0",
-        "false",
-        "no",
-        "off",
+    # Opt-in only: async scheduling runs the 2-deep batch-queue pipeline with
+    # non-blocking submits, and on gfx906 long-running requests (64K-class
+    # prefills plus long decodes) can desync the ROCm userspace queue under
+    # it, freezing the engine while the GPU is idle. The synchronous step
+    # path measures identical prefill/decode throughput, so there is no
+    # performance reason to risk it by default.
+    if os.getenv("VLLM_GGUF_GFX906_AUTO_ASYNC_SCHEDULING", "0").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
     }:
         return False
     return _is_gfx906_gguf(model_config)
@@ -1719,10 +1725,10 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             elif _auto_enable_async_scheduling_for_gfx906_gguf(self.model_config):
                 logger.info(
-                    "Enabling async scheduling by default for GGUF on gfx906 "
-                    "ROCm to reduce batch=1 scheduler/token synchronization "
-                    "overhead. Use --no-async-scheduling or set "
-                    "VLLM_GGUF_GFX906_AUTO_ASYNC_SCHEDULING=0 to disable."
+                    "Enabling async scheduling for GGUF on gfx906 ROCm "
+                    "(VLLM_GGUF_GFX906_AUTO_ASYNC_SCHEDULING=1). Note: the "
+                    "batch-queue pipeline this enables can hang long-running "
+                    "requests on this platform."
                 )
                 self.scheduler_config.async_scheduling = True
             else:
