@@ -127,10 +127,9 @@ from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
-from vllm.utils.math_utils import cdiv, round_up
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
-from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import (
     PIN_MEMORY,
     async_tensor_h2d,
@@ -160,15 +159,12 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
-    FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
-    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
@@ -199,7 +195,6 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
-from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
@@ -233,7 +228,6 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm.v1.worker.utils import (
     EncoderTimingStats,
-    is_residual_scattered_for_sp,
     raise_if_nan_logits,
 )
 from vllm.v1.worker.workspace import lock_workspace
@@ -557,13 +551,11 @@ class GPUModelRunner(
         )
 
         # Model-related.
-        self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
-        # Only relevant for models using ALiBi (e.g, MPT)
-        self.use_alibi = model_config.uses_alibi
-
-        self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
+        # Deprecated: cascade attention has been removed. Kept for
+        # out-of-tree model runners.
+        self.cascade_attn_enabled = False
 
         # Multi-modal data support
         self.mm_registry = MULTIMODAL_REGISTRY
@@ -628,7 +620,6 @@ class GPUModelRunner(
                 | EagleProposer
                 | DFlashProposer
                 | DraftModelProposer
-                | MedusaProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer
                 | Step3p5MTPProposer
@@ -679,10 +670,6 @@ class GPUModelRunner(
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
                     )
-            elif self.speculative_config.method == "medusa":
-                self.drafter = MedusaProposer(
-                    vllm_config=self.vllm_config, device=self.device
-                )
             elif self.speculative_config.method == "extract_hidden_states":
                 self.drafter = ExtractHiddenStatesProposer(
                     vllm_config=self.vllm_config, device=self.device
@@ -802,9 +789,6 @@ class GPUModelRunner(
             )
         else:
             self.cudagraph_batch_sizes = []
-
-        # Cache the device properties.
-        self._init_device_properties()
 
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
@@ -1317,11 +1301,6 @@ class GPUModelRunner(
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
-
-    # Note: used for model runner override.
-    def _init_device_properties(self) -> None:
-        """Initialize attributes from torch.cuda.get_device_properties"""
-        self.num_sms = num_compute_units(self.device.index)
 
     # Note: used for model runner override.
     def _sync_device(self) -> None:
@@ -2574,7 +2553,6 @@ class GPUModelRunner(
         use_spec_decode: bool = False,
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
-        cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """Returns:
@@ -2773,12 +2751,6 @@ class GPUModelRunner(
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(builder))
 
-            cascade_attn_prefix_len = (
-                cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
-                if cascade_attn_prefix_lens
-                else 0
-            )
-
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
                 builder,
@@ -2821,7 +2793,7 @@ class GPUModelRunner(
                 )
             else:
                 attn_metadata_i = builder.build(
-                    common_prefix_len=cascade_attn_prefix_len,
+                    common_prefix_len=0,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
                 )
@@ -2899,144 +2871,6 @@ class GPUModelRunner(
             )
 
         return attn_metadata, spec_decode_common_attn_metadata
-
-    def _compute_cascade_attn_prefix_lens(
-        self,
-        num_scheduled_tokens: np.ndarray,
-        num_computed_tokens: np.ndarray,
-        num_common_prefix_blocks: list[int],
-    ) -> list[list[int]] | None:
-        """Returns:
-        Optional[cascade_attn_prefix_lens]
-            cascade_attn_prefix_lens is 2D:
-            ``[kv_cache_group_id][attn_group_idx]``,
-            None if we should not use cascade attention
-
-        """
-        use_cascade_attn = False
-        num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
-        cascade_attn_prefix_lens: list[list[int]] = [
-            [] for _ in range(num_kv_cache_groups)
-        ]
-
-        for kv_cache_gid in range(num_kv_cache_groups):
-            for attn_group in self.attn_groups[kv_cache_gid]:
-                if isinstance(attn_group.kv_cache_spec, EncoderOnlyAttentionSpec):
-                    cascade_attn_prefix_len = 0
-                else:
-                    # 0 if cascade attention should not be used
-                    cascade_attn_prefix_len = self._compute_cascade_attn_prefix_len(
-                        num_scheduled_tokens,
-                        num_computed_tokens,
-                        num_common_prefix_blocks[kv_cache_gid],
-                        attn_group.kv_cache_spec,
-                        attn_group.get_metadata_builder(),
-                    )
-                cascade_attn_prefix_lens[kv_cache_gid].append(cascade_attn_prefix_len)
-                use_cascade_attn |= cascade_attn_prefix_len > 0
-
-        return cascade_attn_prefix_lens if use_cascade_attn else None
-
-    def _compute_cascade_attn_prefix_len(
-        self,
-        num_scheduled_tokens: np.ndarray,
-        num_computed_tokens: np.ndarray,
-        num_common_prefix_blocks: int,
-        kv_cache_spec: KVCacheSpec,
-        attn_metadata_builder: AttentionMetadataBuilder,
-    ) -> int:
-        """Compute the length of the common prefix for cascade attention.
-
-        NOTE(woosuk): The common prefix length returned by this function
-        represents the length used specifically for cascade attention, not the
-        actual number of tokens shared between requests. When cascade attention
-        is disabled (use_cascade=False), this function returns 0 even if
-        requests share common tokens. Additionally, the common prefix length is
-        truncated to a multiple of the block size and may be further truncated
-        due to implementation details explained below.
-
-        Args:
-            num_scheduled_tokens: Number of tokens scheduled per request.
-            num_computed_tokens: Number of tokens already computed per request.
-            num_common_prefix_blocks: Number of shared KV cache blocks.
-            kv_cache_spec: The KV cache spec of the group being considered.
-            attn_metadata_builder: Builder used to decide whether cascade
-                attention can be used.
-
-        Returns:
-            int: Length of common prefix in tokens.
-
-        """
-        common_prefix_len = num_common_prefix_blocks * kv_cache_spec.block_size
-        if common_prefix_len == 0:
-            # Common case.
-            return 0
-
-        # NOTE(woosuk): Cascade attention uses two attention kernels: one
-        # for the common prefix and the other for the rest. For the first
-        # kernel, we concatenate all the query tokens (possibly from
-        # different requests) and treat them as if they are from the same
-        # request. Then, we use bi-directional attention to process the
-        # common prefix in the KV cache. Importantly, this means that the
-        # first kernel does not do any masking.
-
-        # Consider the following example:
-        # Request 1's input query: [D, E, X]
-        # Request 1's kv cache: [A, B, C, D, E, X]
-        # Request 1's num_computed_tokens: 3 (i.e., [A, B, C])
-        # Request 2's input query: [E, Y]
-        # Request 2's kv cache: [A, B, C, D, E, Y]
-        # Request 2's num_computed_tokens: 4 (i.e., [A, B, C, D])
-
-        # If we use [A, B, C, D, E] as the common prefix, then the
-        # first kernel will compute the bi-directional attention between
-        # input query [D, E, X, E, Y] and common prefix [A, B, C, D, E].
-        # However, this is wrong because D in Request 1 should not attend to
-        # E in the common prefix (i.e., we need masking).
-        # To avoid this, [A, B, C, D] should be the common prefix.
-        # That is, the common prefix should be capped by the minimum
-        # num_computed_tokens among the requests, and plus one to include
-        # the first token of the query.
-
-        # In practice, we use [A, B, C] as the common prefix, instead of
-        # [A, B, C, D] (i.e., the common prefix is capped by the minimum
-        # num_computed_tokens, without plus one).
-        # This is because of an implementation detail: We want to always
-        # use two kernels for cascade attention. Let's imagine:
-        # Request 3's input query: [D]
-        # Request 3's kv cache: [A, B, C, D]
-        # Request 3's num_computed_tokens: 3 (i.e., [A, B, C])
-        # If we use [A, B, C, D] as the common prefix for Request 1-3,
-        # then Request 3 will be processed only by the first kernel,
-        # and the second kernel will get an empty input. While this is not
-        # a fundamental problem, our current implementation does not support
-        # this case.
-        common_prefix_len = min(common_prefix_len, num_computed_tokens.min())
-        # common_prefix_len should be a multiple of the block size.
-        common_prefix_len = (
-            common_prefix_len // kv_cache_spec.block_size * kv_cache_spec.block_size
-        )
-        use_sliding_window = isinstance(kv_cache_spec, SlidingWindowSpec) or (
-            isinstance(kv_cache_spec, FullAttentionSpec)
-            and kv_cache_spec.sliding_window is not None
-        )
-        use_local_attention = isinstance(kv_cache_spec, ChunkedLocalAttentionSpec) or (
-            isinstance(kv_cache_spec, FullAttentionSpec)
-            and kv_cache_spec.attention_chunk_size is not None
-        )
-        assert isinstance(kv_cache_spec, AttentionSpec)
-        use_cascade = attn_metadata_builder.use_cascade_attention(
-            common_prefix_len=common_prefix_len,
-            query_lens=num_scheduled_tokens,
-            num_query_heads=self.num_query_heads,
-            num_kv_heads=kv_cache_spec.num_kv_heads,
-            use_alibi=self.use_alibi,
-            use_sliding_window=use_sliding_window,
-            use_local_attention=use_local_attention,
-            num_sms=self.num_sms,
-            dcp_world_size=self.dcp_world_size,
-        )
-        return common_prefix_len if use_cascade else 0
 
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
         mrope_pos_ptr = 0
@@ -3677,20 +3511,9 @@ class GPUModelRunner(
     ) -> IntermediateTensors:
         assert self.intermediate_tensors is not None
 
-        tp = self.vllm_config.parallel_config.tensor_parallel_size
-        is_rs = is_residual_scattered_for_sp(self.vllm_config, num_tokens)
-
-        # When sequence parallelism is enabled, the "residual" tensor is
-        # sharded across TP ranks. All-gather it here because downstream
-        # QKV + Attention needs the full residual before the SP split point.
         if sync_self:
             assert intermediate_tensors is not None
             for k, v in intermediate_tensors.items():
-                is_scattered = k == "residual" and is_rs
-                if is_scattered:
-                    local_len = num_tokens // tp
-                    v = get_tp_group().all_gather(v[:local_len], dim=0)
-
                 self.intermediate_tensors[k][:num_tokens].copy_(
                     v[:num_tokens], non_blocking=True
                 )
@@ -3784,14 +3607,6 @@ class GPUModelRunner(
             finished_mask=finished_mask,
             async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
         )
-
-    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
-        # Pad tokens to multiple of tensor_parallel_size when
-        # enabled collective fusion for SP
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if self.compilation_config.pass_config.enable_sp and tp_size > 1:
-            return round_up(num_scheduled_tokens, tp_size)
-        return num_scheduled_tokens
 
     def _prepare_padding_mask(
         self, num_tokens_unpadded: int, num_tokens_padded: int
@@ -4281,7 +4096,8 @@ class GPUModelRunner(
         num_reqs: int,
         num_scheduled_tokens_np: np.ndarray,
         max_num_scheduled_tokens: int,
-        use_cascade_attn: bool,
+        # Deprecated and ignored. Kept for out-of-tree model runners.
+        use_cascade_attn: bool = False,
         allow_microbatching: bool = True,
         force_eager: bool = False,
         # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
@@ -4318,11 +4134,10 @@ class GPUModelRunner(
         )
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
-        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
-            num_tokens=num_tokens_padded,
+            num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
         )
@@ -4338,18 +4153,9 @@ class GPUModelRunner(
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+            num_tokens_padded, disable_full=has_encoder_output
         )
         num_tokens_padded = batch_descriptor.num_tokens
-        if self.compilation_config.pass_config.enable_sp:
-            assert (
-                batch_descriptor.num_tokens
-                % self.vllm_config.parallel_config.tensor_parallel_size
-                == 0
-            ), (
-                "Sequence parallelism requires num_tokens to be "
-                "a multiple of tensor parallel size"
-            )
 
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
@@ -4599,16 +4405,6 @@ class GPUModelRunner(
                 self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
             )
 
-            cascade_attn_prefix_lens = None
-            # Disable cascade attention when using microbatching (DBO)
-            if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
-                # Pre-compute cascade attention prefix lengths
-                cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
-                    num_scheduled_tokens_np,
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
-                    scheduler_output.num_common_prefix_blocks,
-                )
-
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4620,7 +4416,7 @@ class GPUModelRunner(
                 num_reqs=num_reqs,
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
-                use_cascade_attn=cascade_attn_prefix_lens is not None,
+                use_cascade_attn=False,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 allow_microbatching=self._allow_microbatching(
                     num_reqs, num_scheduled_tokens_np
@@ -4737,7 +4533,6 @@ class GPUModelRunner(
                     max_num_sampled_tokens=max_num_sampled_tokens,
                     use_spec_decode=use_spec_decode,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
                 )
             )
@@ -4834,15 +4629,9 @@ class GPUModelRunner(
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {
-                        "residual": not is_residual_scattered_for_sp(
-                            self.vllm_config, num_tokens_padded
-                        )
-                    }
                     get_pp_group().send_tensor_dict(
                         hidden_states.tensors,
                         all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
                     )
                     logits = None
                 else:
@@ -5437,33 +5226,6 @@ class GPUModelRunner(
                 num_spec_tokens_to_schedule,
                 self.input_batch,
                 sampled_token_ids,
-                slot_mappings=slot_mappings,
-            )
-        elif spec_config.method == "medusa":
-            assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, MedusaProposer)
-
-            if sample_hidden_states.shape[0] == len(sampled_token_ids):
-                # The input to the target model does not include draft tokens.
-                hidden_states = sample_hidden_states
-            else:
-                indices = []
-                offset = 0
-                assert spec_decode_metadata is not None, (
-                    "No spec decode metadata for medusa"
-                )
-                for num_draft, tokens in zip(
-                    spec_decode_metadata.num_draft_tokens, sampled_token_ids
-                ):
-                    indices.append(offset + len(tokens) - 1)
-                    offset += num_draft + 1
-                indices = async_tensor_h2d(indices, device=self.device)
-                hidden_states = sample_hidden_states[indices]
-
-            draft_token_ids = self.drafter.propose(
-                num_speculative_tokens=num_spec_tokens_to_schedule,
-                target_hidden_states=hidden_states,
-                sampling_metadata=sampling_metadata,
                 slot_mappings=slot_mappings,
             )
         elif spec_config.uses_extract_hidden_states():
@@ -7528,7 +7290,6 @@ class GPUModelRunner(
             min_cg_attn_backend,
             self.uniform_decode_query_len,
             use_v2_model_runner=False,
-            tensor_parallel_size=self.parallel_config.tensor_parallel_size,
             kv_cache_config=self.kv_cache_config,
             max_num_reqs=self.max_num_reqs,
             is_profiling=is_profiling,

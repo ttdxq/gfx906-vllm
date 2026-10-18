@@ -35,17 +35,38 @@ ENABLE_GFX906_ATTN_SCHED_TUNING = os.getenv(
 
 # Route tuned prefill shapes through the split-KV (3D) kernel on gfx906.
 # Independent switch so prefill can be routed independently of the decode
-# policy. Opt-in: kernel-level interleaved A/B shows the split-KV kernel
-# ~8-9% faster than the 2D kernel at 4k-16k serving shapes, but attention is
-# only a fraction of prefill wall time, so the end-to-end gain measured on a
-# 27B head-256/GQA6 model was ~1% at 4k and ~2% at 16k tokens. The path also
-# costs up to ~0.4 GiB of lazily allocated fp32 segment workspace at the
-# default chunk size. Only applies to plain causal attention (no sliding
-# window, sinks, alibi, softcap, qq-bias, mm-prefix or fused fp8 output) on
-# the tuned head-256/GQA6 shape, and never during CUDA-graph capture (the
-# workspace is allocated lazily on first use).
+# policy. Enabled by default: interleaved process-level A/B on a 27B
+# head-256/GQA6 GGUF model shows +8% end-to-end prefill throughput at 64k
+# prompts (growing from ~1-3% at 4k-16k shapes) with greedy outputs
+# bit-identical to the 2D path. The path costs up to ~0.4 GiB of lazily
+# allocated fp32 segment workspace at the default chunk size; verified to
+# fit at gpu-memory-utilization=0.95 with 132k context. Set the env var to
+# 0 to restore the 2D-only prefill. Only applies to plain causal attention
+# (no sliding window, sinks, alibi, softcap, qq-bias, mm-prefix or fused
+# fp8 output) on the tuned head-256/GQA6 shape, and never during CUDA-graph
+# capture (the workspace is allocated lazily on first use).
 ENABLE_GFX906_ATTN_PREFILL_3D = os.getenv(
-    "VLLM_GFX906_TRITON_ATTN_PREFILL_3D", "0"
+    "VLLM_GFX906_TRITON_ATTN_PREFILL_3D", "1"
+).lower() in {"1", "true", "yes", "on"}
+
+# Route the plain-causal prefill 3D path through a specialized slim kernel
+# on gfx906. Same math and launch grid as kernel_unified_attention_3d
+# (bitwise-identical outputs verified at 32k/64k/128k contexts on the
+# head-256/GQA6 shape), with three structural changes that measure
+# 1.46-1.86x kernel-level on long-context prefill shapes:
+#   - two-phase causal loop: tiles fully below the block's causal diagonal
+#     skip mask construction and masked loads entirely;
+#   - int32 cache-offset arithmetic when the caches fit below 2^31 elements
+#     (halves the offset-vector register footprint);
+#   - scalar per-tile page-index load when BLOCK_SIZE % TILE_SIZE == 0 (a
+#     32-token tile never straddles an 800-token page, so the per-tile
+#     physical-block gather reduces to one scalar load).
+# Additional gates beyond the 3D path: exact GQA packing
+# (num_query_heads == num_kv_heads * num_queries_per_kv), power-of-two
+# head_size, and innermost cache strides of 1. Set to 0 to restore the
+# generic 3D kernel.
+ENABLE_GFX906_ATTN_PREFILL_SLIM = os.getenv(
+    "VLLM_GFX906_TRITON_ATTN_PREFILL_SLIM", "1"
 ).lower() in {"1", "true", "yes", "on"}
 
 # Upper bound for split-KV segments the decode policy may request. The
@@ -556,7 +577,15 @@ def kernel_unified_attention_2d(
             )
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        # Keep softmax weights representable when the P @ V dot uses FP8
+        # tensor cores. Undo the power-of-two scale after the dot.
+        if V.dtype == tl.float8e4nv:
+            p_scale = 256.0
+        elif V.dtype.is_fp8():
+            p_scale = 128.0
+        else:
+            p_scale = 1.0
+        acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
 
     # epilogue
     acc = acc / L[:, None]
@@ -910,7 +939,15 @@ def kernel_unified_attention_3d(
             )
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        # Keep softmax weights representable when the P @ V dot uses FP8
+        # tensor cores. Undo the power-of-two scale after the dot.
+        if V.dtype == tl.float8e4nv:
+            p_scale = 256.0
+        elif V.dtype.is_fp8():
+            p_scale = 128.0
+        else:
+            p_scale = 1.0
+        acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
@@ -931,6 +968,292 @@ def kernel_unified_attention_3d(
     )
     tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
     tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
+
+
+@triton.jit
+def kernel_unified_attention_3d_slim(
+    segm_output_ptr,  # [num_tokens, num_query_heads, num_segments, head_size] fp32
+    segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
+    segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
+    query_ptr,  # [num_tokens, num_query_heads, head_size]
+    key_cache_ptr,  # [num_blks, num_kv_heads, head_size//x, blk_size, x]
+    value_cache_ptr,  # [num_blks, num_kv_heads, head_size, blk_size]
+    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    seq_lens_ptr,  # [num_seqs]
+    query_start_len_ptr,  # [num_seqs+1]
+    scale,  # float32
+    num_query_heads: tl.constexpr,  # int
+    num_queries_per_kv: tl.constexpr,  # int
+    block_table_stride: tl.int64,  # int
+    query_stride_0: tl.int64,  # int
+    query_stride_1: tl.int64,  # int, should be equal to head_size
+    stride_k_cache_0: tl.int64,  # int
+    stride_k_cache_1: tl.int64,  # int
+    stride_k_cache_2: tl.int64,  # int
+    stride_k_cache_3: tl.constexpr,  # int (== 1 on the gated shape)
+    stride_v_cache_0: tl.int64,  # int
+    stride_v_cache_1: tl.int64,  # int
+    stride_v_cache_2: tl.int64,  # int
+    stride_v_cache_3: tl.constexpr,  # int (== 1 on the gated shape)
+    BLOCK_SIZE: tl.constexpr,  # int
+    TILE_SIZE: tl.constexpr,  # int, must be power of 2
+    HEAD_SIZE: tl.constexpr,  # int, power of 2 (== padded; gate guarantees)
+    BLOCK_Q: tl.constexpr,  # int
+    num_seqs,  # int
+    BLOCK_M: tl.constexpr,  # int
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    OFFSETS_I32: tl.constexpr,  # bool: cache offsets computed in int32
+    SCALAR_PHYS: tl.constexpr,  # bool: tile never straddles a page
+):
+    # Specialized plain-causal prefill variant of kernel_unified_attention_3d.
+    # The launcher gates it to shapes where every feature branch of the
+    # generic kernel is compile-time dead, and verifies bitwise-identical
+    # outputs against it.
+    q_block_global_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    segm_idx = tl.program_id(2)
+
+    seq_idx = find_seq_idx(
+        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+    )
+
+    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+    q_block_local_idx = q_block_global_idx - q_block_start_idx
+
+    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+
+    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+        return
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    num_segments = NUM_SEGMENTS_PER_SEQ
+    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+
+    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_SIZE)
+    offs_t = tl.arange(0, TILE_SIZE)
+    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+
+    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    # exact GQA packing is a gate: num_kv_heads * num_queries_per_kv covers
+    # every (token, query head) row, so no query_mask_1 is needed
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d[None, :]
+    )
+    query_mask_0 = query_pos < cur_batch_query_len
+
+    # Q : (BLOCK_M, HEAD_SIZE), rows past the query length read as 0
+    Q = tl.load(query_ptr + query_offset, mask=query_mask_0[:, None], other=0.0)
+
+    if OFFSETS_I32:
+        bt_stride = block_table_stride.to(tl.int32)
+        sk0 = stride_k_cache_0.to(tl.int32)
+        sk1 = stride_k_cache_1.to(tl.int32)
+        sk2 = stride_k_cache_2.to(tl.int32)
+        sv0 = stride_v_cache_0.to(tl.int32)
+        sv1 = stride_v_cache_1.to(tl.int32)
+        sv2 = stride_v_cache_2.to(tl.int32)
+    else:
+        bt_stride = block_table_stride
+        sk0 = stride_k_cache_0
+        sk1 = stride_k_cache_1
+        sk2 = stride_k_cache_2
+        sv0 = stride_v_cache_0
+        sv1 = stride_v_cache_1
+        sv2 = stride_v_cache_2
+    block_table_offset = seq_idx * bt_stride
+
+    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE], dtype=tl.float32)
+
+    context_len = seq_len - cur_batch_query_len
+
+    max_seq_prefix_len = tl.minimum(
+        context_len
+        + q_block_local_idx * BLOCK_Q
+        + (BLOCK_M - 1) // num_queries_per_kv
+        + 1,
+        seq_len,
+    )
+    num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
+
+    q_lo = q_block_local_idx * BLOCK_Q
+
+    seg_lo = segm_idx * tiles_per_segment
+    seg_hi = tl.minimum((segm_idx + 1) * tiles_per_segment, num_tiles)
+    # tiles strictly below the block's causal diagonal are fully visible to
+    # every real row and fully in-bounds: no masks of any kind needed there
+    full_end = (context_len + q_lo) // TILE_SIZE
+
+    # ---- phase A: fully-unmasked tiles ----
+    for j in range(seg_lo, tl.minimum(seg_hi, full_end)):
+        seq_offset = j * TILE_SIZE + offs_t
+        if SCALAR_PHYS:
+            page_idx = (j * TILE_SIZE) // BLOCK_SIZE
+            pbi_s = tl.load(block_tables_ptr + block_table_offset + page_idx)
+            if not OFFSETS_I32:
+                pbi_s = pbi_s.to(tl.int64)
+            in_page = seq_offset - page_idx * BLOCK_SIZE
+
+            k_offset = (
+                pbi_s * sk0
+                + kv_head_idx * sk2
+                + offs_d[:, None] * stride_k_cache_3
+                + in_page[None, :] * sk1
+            )
+            v_offset = (
+                pbi_s * sv0
+                + kv_head_idx * sv2
+                + offs_d[None, :] * stride_v_cache_3
+                + in_page[:, None] * sv1
+            )
+        else:
+            pbi = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            )
+            if OFFSETS_I32:
+                physical_block_idx = pbi
+            else:
+                physical_block_idx = pbi.to(tl.int64)
+
+            k_offset = (
+                physical_block_idx[None, :] * sk0
+                + kv_head_idx * sk2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * sk1
+            )
+            v_offset = (
+                physical_block_idx[:, None] * sv0
+                + kv_head_idx * sv2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * sv1
+            )
+
+        K = tl.load(key_cache_ptr + k_offset)
+        V = tl.load(value_cache_ptr + v_offset)
+
+        S = scale * tl.dot(Q, K)
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        P = tl.exp(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.exp(M - m_j)
+
+        L = L * alpha + l_j
+        acc = acc * alpha[:, None]
+        # Keep softmax weights representable when the P @ V dot uses FP8
+        # tensor cores. Undo the power-of-two scale after the dot.
+        if V.dtype == tl.float8e4nv:
+            p_scale = 256.0
+        elif V.dtype.is_fp8():
+            p_scale = 128.0
+        else:
+            p_scale = 1.0
+        acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
+        M = m_j
+
+    # ---- phase B: diagonal band, masked (generic path) ----
+    for j in range(tl.maximum(seg_lo, full_end), seg_hi):
+        seq_offset = j * TILE_SIZE + offs_t
+        tile_mask = seq_offset < max_seq_prefix_len
+
+        if SCALAR_PHYS:
+            page_idx = (j * TILE_SIZE) // BLOCK_SIZE
+            pbi_s = tl.load(block_tables_ptr + block_table_offset + page_idx)
+            if not OFFSETS_I32:
+                pbi_s = pbi_s.to(tl.int64)
+            in_page = seq_offset - page_idx * BLOCK_SIZE
+
+            k_offset = (
+                pbi_s * sk0
+                + kv_head_idx * sk2
+                + offs_d[:, None] * stride_k_cache_3
+                + in_page[None, :] * sk1
+            )
+            v_offset = (
+                pbi_s * sv0
+                + kv_head_idx * sv2
+                + offs_d[None, :] * stride_v_cache_3
+                + in_page[:, None] * sv1
+            )
+        else:
+            pbi = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            )
+            if OFFSETS_I32:
+                physical_block_idx = pbi
+            else:
+                physical_block_idx = pbi.to(tl.int64)
+
+            k_offset = (
+                physical_block_idx[None, :] * sk0
+                + kv_head_idx * sk2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * sk1
+            )
+            v_offset = (
+                physical_block_idx[:, None] * sv0
+                + kv_head_idx * sv2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * sv1
+            )
+
+        K = tl.load(key_cache_ptr + k_offset, mask=tile_mask[None, :], other=0.0)
+        V = tl.load(value_cache_ptr + v_offset, mask=tile_mask[:, None], other=0.0)
+
+        query_abs_pos = context_len + query_pos[:, None]
+        seq_mask = seq_offset[None, :] <= query_abs_pos
+
+        S = scale * tl.dot(Q, K)
+        S = tl.where(query_mask_0[:, None] & seq_mask, S, float("-inf"))
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.exp(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.exp(M - m_j)
+
+        L = L * alpha + l_j
+        acc = acc * alpha[:, None]
+        # Keep softmax weights representable when the P @ V dot uses FP8
+        # tensor cores. Undo the power-of-two scale after the dot.
+        if V.dtype == tl.float8e4nv:
+            p_scale = 256.0
+        elif V.dtype.is_fp8():
+            p_scale = 128.0
+        else:
+            p_scale = 1.0
+        acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
+        M = m_j
+
+    # ---- epilogue into the fp32 segment workspace ----
+    segm_output_offset = (
+        query_offset_0[:, None].to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE)
+        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE)
+        + segm_idx * HEAD_SIZE
+        + offs_d[None, :]
+    )
+    tl.store(
+        segm_output_ptr + segm_output_offset, acc, mask=query_mask_0[:, None]
+    )
+    segm_offset = (
+        query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+        + segm_idx
+    )
+    tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0)
+    tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0)
 
 
 @triton.jit
@@ -960,12 +1283,18 @@ def reduce_segments(
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
+    # Graph padding must be rejected before sequence lookup or scratch access.
+    if query_token_idx >= tl.load(query_start_len_ptr + num_seqs):
+        return
+
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
     )
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
+    if seq_len <= 0:
+        return
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
@@ -985,11 +1314,16 @@ def reduce_segments(
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    overall_max = tl.max(segm_max)
 
     # load and rescale segment exp sums
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
+    # Empty segments must not set the maximum. Unvisited segments retain
+    # the M=-inf,L=1 initial state.
+    valid_segment = segm_mask & (segm_expsum > 0) & (segm_max != float("-inf"))
+    segm_max = tl.where(valid_segment, segm_max, float("-inf"))
+    overall_max = tl.max(segm_max)
+    segment_scale = tl.where(valid_segment, tl.exp(segm_max - overall_max), 0.0)
+    segm_expsum = segm_expsum * segment_scale
     overall_expsum = tl.sum(segm_expsum)
 
     # load, rescale, and add segment attention outputs
@@ -1005,7 +1339,7 @@ def reduce_segments(
         mask=segm_mask[:, None] & dim_mask[None, :],
         other=0.0,
     )
-    segm_output *= tl.exp(segm_max - overall_max)[:, None]
+    segm_output *= segment_scale[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
@@ -1202,7 +1536,47 @@ def unified_attention(
         tile_size,
         num_warps,
     ):
-        kernel_unified_attention_3d[
+        if use_slim_3d:
+            kernel_unified_attention_3d_slim[
+                (total_num_q_blocks, num_kv_heads, num_segments)
+            ](
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                query_ptr=q,
+                key_cache_ptr=k,
+                value_cache_ptr=v,
+                block_tables_ptr=block_table,
+                seq_lens_ptr=seqused_k,
+                query_start_len_ptr=cu_seqlens_q,
+                scale=softmax_scale,
+                num_query_heads=num_query_heads,
+                num_queries_per_kv=num_queries_per_kv,
+                block_table_stride=block_table.stride(0),
+                query_stride_0=q.stride(0),
+                query_stride_1=q.stride(1),
+                stride_k_cache_0=k.stride(0),
+                stride_k_cache_1=k.stride(1),
+                stride_k_cache_2=k.stride(2),
+                stride_k_cache_3=k.stride(3),
+                stride_v_cache_0=v.stride(0),
+                stride_v_cache_1=v.stride(1),
+                stride_v_cache_2=v.stride(2),
+                stride_v_cache_3=v.stride(3),
+                BLOCK_SIZE=block_size,
+                TILE_SIZE=tile_size,
+                HEAD_SIZE=head_size,
+                BLOCK_Q=BLOCK_Q,
+                num_seqs=num_seqs,
+                BLOCK_M=BLOCK_M,
+                NUM_SEGMENTS_PER_SEQ=num_segments,
+                OFFSETS_I32=True,
+                SCALAR_PHYS=scalar_phys,
+                num_warps=num_warps,
+                num_stages=1,
+            )
+        else:
+            kernel_unified_attention_3d[
             (total_num_q_blocks, num_kv_heads, num_segments)
         ](
             segm_output_ptr=segm_output,
@@ -1295,6 +1669,32 @@ def unified_attention(
         and not is_batch_invariant
         and not torch.cuda.is_current_stream_capturing()
     )
+
+    # Slim plain-causal prefill kernel: same math as the gated 3D path,
+    # specialized for exact-GQA packing with power-of-two heads (see the
+    # ENABLE_GFX906_ATTN_PREFILL_SLIM comment for the structural
+    # changes). The slim kernel has no descale branch, and its tl.dot
+    # cannot take an fp8 KV cache, so a 1-byte-element KV cache (fp8
+    # e4m3/e5m2, which the backend always pairs with descale tensors)
+    # must fall back to the generic 3D kernel. Descale tensors on a
+    # 2-byte fp16/bf16 cache are inert (the generic kernel only applies
+    # them when the loaded cache is fp8; the GGUF backend passes unit
+    # scales unconditionally), so slim still takes those shapes.
+    use_slim_3d = (
+        use_prefill_3d
+        and ENABLE_GFX906_ATTN_PREFILL_SLIM
+        and k.element_size() > 1
+        and v.element_size() > 1
+        and num_query_heads == num_kv_heads * num_queries_per_kv
+        and head_size == triton.next_power_of_2(head_size)
+        and k.stride(3) == 1
+        and v.stride(3) == 1
+        and k.numel() < 2**31
+        and v.numel() < 2**31
+    )
+    # a 32-token tile never straddles an 800-token page, so the per-tile
+    # physical-block gather collapses to one scalar load
+    scalar_phys = block_size % TILE_SIZE_PREFILL == 0
 
     if use_prefill_3d:
         num_segments = GFX906_PREFILL_SEGMENTS

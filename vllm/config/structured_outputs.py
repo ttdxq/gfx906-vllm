@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Any, Literal
+from typing_extensions import Self
 
 from pydantic import model_validator
-from typing_extensions import Self
 
 from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash

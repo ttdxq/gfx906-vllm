@@ -8,9 +8,10 @@ This is similar in concept to the `collections` module.
 import math
 from collections import defaultdict
 from collections.abc import Callable, Generator, Hashable, Iterable, Mapping, Sequence
-from typing import Generic, Literal, TypeVar
+from typing import Generic, Literal, TypeVar, overload
+from typing_extensions import assert_never
 
-from typing_extensions import TypeIs, assert_never, overload
+from typing_extensions import TypeIs
 
 T = TypeVar("T")
 

@@ -557,6 +557,10 @@ class _DecoratedTritonJitKernel(_AutomaticTritonJitKernel):
         return cast(Callable[..., Any], self.kernel[grid])
 
     def __getattr__(self, name: str) -> Any:
+        # Older Triton versions lack the parallel-compile capability flag;
+        # treat it as disabled instead of raising.
+        if name == "supports_parallel_compile":
+            return getattr(self.kernel, name, False)
         return getattr(self.kernel, name)
 
     def get_warmup_keys(
@@ -821,3 +825,24 @@ def trace_triton_kernel_specialization_args(
         if name in constexpr_args
         or (name not in pointer_args and name not in do_not_specialize_args)
     )
+
+
+# --- ported for newer callers ---
+def compile_triton_warmup(compile_all: Callable[[], None], num_keys: int) -> None:
+    """Share one compiler pool across all eligible warmup kernels."""
+    num_threads = min(envs.VLLM_TRITON_JIT_WARMUP_NUM_THREADS, num_keys)
+    if num_threads <= 1:
+        compile_all()
+        return
+
+    def compile_in_context() -> None:
+        _shared_compile_pool.set(True)
+        with (
+            ThreadPoolExecutor(max_workers=num_threads) as executor,
+            triton.AsyncCompileMode(executor),
+        ):
+            # Dispatch mutates owner state and must stay on this thread.
+            compile_all()
+
+    # Older Triton versions leave async mode active on compilation failure.
+    copy_context().run(compile_in_context)

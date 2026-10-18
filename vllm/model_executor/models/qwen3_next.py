@@ -86,7 +86,7 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs import Qwen3NextConfig
+from transformers import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -227,6 +227,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             n_shared_experts=1 if self.shared_expert is None else None,
             fuse_shared_experts=self.is_fused_shared_expert_enabled,
+            shared_expert_prefix=f"{prefix}.shared_expert",
             shared_expert_gate=self.shared_expert_gate
             if self.shared_expert is None
             else None,
@@ -1310,6 +1311,7 @@ class Qwen3NextAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        mrope_positions_factor: int = 4,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1360,6 +1362,7 @@ class Qwen3NextAttention(nn.Module):
             max_position=config.max_position_embeddings,
             rope_parameters=config.rope_parameters,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
+            mrope_positions_factor=mrope_positions_factor,
         )
 
         attn_type = (
@@ -2076,3 +2079,36 @@ def fused_gdn_gating(
         num_warps=1,
     )
     return g, beta_output
+
+
+# --- ported for newer callers ---
+def _should_replicate_misaligned_shared_expert(
+    intermediate_size: int,
+    tp_size: int,
+    group_size: int | None,
+    enable_expert_parallel: bool,
+    is_sequence_parallel: bool,
+) -> bool:
+    if intermediate_size <= 0 or group_size is None:
+        return False
+
+    partition_size, remainder = divmod(intermediate_size, tp_size)
+    if remainder == 0 and partition_size % group_size == 0:
+        return False
+
+    if enable_expert_parallel or is_sequence_parallel:
+        return True
+
+    if remainder != 0:
+        raise ValueError(
+            f"Shared-expert intermediate size {intermediate_size} must be "
+            f"divisible by tensor-parallel size {tp_size}."
+        )
+
+    raise ValueError(
+        "The Quark OCP MX shared expert cannot be tensor-parallelized: "
+        f"intermediate size {intermediate_size} with TP size {tp_size} "
+        f"produces a partition of {partition_size}, which is not divisible by "
+        f"the OCP MX group size {group_size}. Choose a compatible "
+        "tensor-parallel size or enable expert parallelism."
+    )

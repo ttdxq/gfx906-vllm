@@ -426,11 +426,56 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
     return chunkk, fits
 
 
+# On gfx11 a weight row stride that is a multiple of 2048 B makes the multi-row global
+# loads of a GEMM collide on the L2/MALL channel hash. Offsetting the stride by one
+# 128 B cache line dodges the collision and keeps each row cache-line aligned.
+def cache_aliasing_pad_elems(k: int, element_size: int) -> int:
+    """Row-stride pad, in elements, that stops an ``[n, k]`` weight aliasing on gfx11,
+    or 0 when the stride does not alias.
+
+    Args:
+        k: Number of elements per weight row.
+        element_size: Size of one element in bytes.
+
+    Returns:
+        The number of elements to add to the row stride.
+
+    """
+    if (k * element_size) % 2048 != 0:
+        return 0
+    return 128 // element_size
+
+
+def maybe_pad_weight_avoid_cache_aliasing(weight: torch.Tensor) -> torch.Tensor:
+    """Offset a dense weight's row stride so it stops aliasing.
+
+    Returns a view with the original shape whose row stride is one cache line
+    wider, or ``weight`` unchanged when the pad does not apply.
+    """
+    from vllm.platforms.rocm import on_gfx11
+
+    if not (current_platform.is_rocm() and on_gfx11()):
+        return weight
+    if weight.dim() != 2 or not weight.is_contiguous():
+        return weight
+    pad = cache_aliasing_pad_elems(weight.shape[1], weight.element_size())
+    if pad == 0:
+        return weight
+    return torch.nn.functional.pad(weight, (0, pad))[..., :-pad]
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if envs.VLLM_BATCH_INVARIANT:
+        from vllm.model_executor.determinism.batch_invariant import (
+            linear_batch_invariant,
+        )
+
+        return linear_batch_invariant(x, weight, bias)
+
     x_view = x.reshape(-1, x.size(-1))
     n = x_view.shape[0]
     m = weight.shape[0]
@@ -440,6 +485,7 @@ def rocm_unquantized_gemm_impl(
     if (
         x.dtype in [torch.float16, torch.bfloat16]
         and bias is None
+        and weight.is_contiguous()
         and m % 4 == 0
         and n == 1
         and k <= 8192
@@ -470,6 +516,13 @@ def rocm_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # dispatch_unquantized_gemm() picks this backend for any ROCm build,
+    # regardless of the tensor's actual device; the custom op below is only
+    # registered for the CUDA/HIP dispatch key, so route CPU tensors (e.g.
+    # from unit tests that build layers without moving them to the GPU)
+    # through the device-agnostic fallback instead of hard-crashing.
+    if not x.is_cuda:
+        return default_unquantized_gemm(layer, x, weight, bias)
     return torch.ops.vllm.rocm_unquantized_gemm(x, weight, bias)
 
 

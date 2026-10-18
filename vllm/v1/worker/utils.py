@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import share_replayssm_ring_trackers
@@ -24,6 +24,7 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadataBuilder,
+    CommonAttentionMetadata,
     MultipleOf,
 )
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
@@ -267,6 +268,10 @@ class AttentionGroup:
     metadata_builders: list[AttentionMetadataBuilder] = field(
         default_factory=lambda: []
     )
+    # Effective kernel block size when the group sits in a packed KV cache
+    # group split into smaller kernel blocks (None = spec block size).
+    kernel_block_size: int | None = None
+    kernel_block_table: torch.Tensor | None = None
 
     def create_metadata_builders(
         self,
@@ -307,9 +312,116 @@ class AttentionGroup:
             )
             for _ in range(num_metadata_builders)
         ]
-        if kernel_block_size is not None:
-            for builder in self.metadata_builders:
-                builder.set_kernel_block_size(kernel_block_size)
+
+    def build_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        ubatch_idx: int = 0,
+        common_prefix_len: int = 0,
+        **kwargs,
+    ) -> Any:
+        return self.get_metadata_builder(ubatch_idx).build(
+            common_prefix_len,
+            self._with_kernel_block_table(common_attn_metadata, ubatch_idx),
+            **kwargs,
+        )
+
+
+    def build_metadata_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata, ubatch_idx: int = 0
+    ) -> Any:
+        return self.get_metadata_builder(ubatch_idx).build_for_cudagraph_capture(
+            self._with_kernel_block_table(common_attn_metadata, ubatch_idx)
+        )
+
+
+    def build_metadata_for_drafting(
+        self, common_attn_metadata: CommonAttentionMetadata, draft_index: int
+    ) -> Any:
+        return self.get_metadata_builder().build_for_drafting(
+            self._with_kernel_block_table(common_attn_metadata), draft_index
+        )
+
+
+    def _with_kernel_block_table(
+        self, common_attn_metadata: CommonAttentionMetadata, ubatch_idx: int = 0
+    ) -> CommonAttentionMetadata:
+        if self.kernel_block_size is None:
+            return common_attn_metadata
+        return replace(
+            common_attn_metadata,
+            block_table_tensor=self.map_to_kernel_block_table(
+                common_attn_metadata.block_table_tensor, ubatch_idx
+            ),
+        )
+
+
+    def map_to_kernel_block_table(
+        self, block_table: torch.Tensor, ubatch_idx: int = 0
+    ) -> torch.Tensor:
+        if self.kernel_block_size is None:
+            return block_table
+        assert self.kernel_block_table is not None
+        blocks_per_kv_block = self.kv_cache_spec.block_size // self.kernel_block_size
+        rows, cols = block_table.shape
+        out = self.kernel_block_table[ubatch_idx, :rows, : cols * blocks_per_kv_block]
+        torch.add(
+            self.kernel_block_offsets,
+            block_table.unsqueeze(-1),
+            alpha=self.kernel_block_stride or blocks_per_kv_block,
+            out=out.unflatten(1, (cols, -1)),
+        )
+        return out
+
+
+    def map_kv_cache_to_kernel_blocks(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        """Views a packed cache in manager blocks as kernel blocks."""
+        assert self.kernel_block_size is not None
+        spec = self.kv_cache_spec
+        kernel_rows = spec.get_num_kernel_states(self.kernel_block_size)
+        if kv_cache.shape[-2] == kernel_rows:
+            return kv_cache
+        # Token and pooled caches are written through manager-block slot
+        # mappings, so only compressed caches (written from their block table)
+        # can be mapped.
+        if (
+            spec.tokens_per_state <= 1
+            or kv_cache.shape[1] != 1
+            or kv_cache.stride(0) % (kernel_rows * kv_cache.stride(-2))
+        ):
+            raise ValueError(
+                f"{self.backend.get_name()} needs {self.kernel_block_size}-token "
+                f"kernel blocks, which packed {spec.block_size}-token KV cache "
+                f"blocks cannot be split into. Reduce --block-size to "
+                f"{self.kernel_block_size} or set VLLM_KV_CACHE_LAYOUT to a "
+                "layer-compact layout (e.g. LBNHC)."
+            )
+        # Kernel block j of block b is b * kernel_block_stride + j. The view
+        # spans the other layers' pages between blocks (never addressing them),
+        # which ``view`` cannot express.
+        page_stride = kernel_rows * kv_cache.stride(-2)
+        self.kernel_block_stride = kv_cache.stride(0) // page_stride
+        num_pages = (kv_cache.shape[0] - 1) * self.kernel_block_stride + (
+            kv_cache.shape[-2] // kernel_rows
+        )
+        return kv_cache.as_strided(
+            (num_pages, *kv_cache.shape[1:-2], kernel_rows, kv_cache.shape[-1]),
+            (page_stride, *kv_cache.stride()[1:]),
+        )
+
+
+    def map_kv_cache_to_manager_blocks(
+        self, kv_cache: torch.Tensor, num_blocks: int
+    ) -> torch.Tensor:
+        """Views a packed cache in kernel blocks as manager blocks."""
+        assert self.kernel_block_stride
+        spec = self.kv_cache_spec
+        rows = spec.get_num_kernel_states(spec.block_size)
+        return kv_cache.as_strided(
+            (num_blocks, *kv_cache.shape[1:-2], rows, kv_cache.shape[-1]),
+            (kv_cache.stride(0) * self.kernel_block_stride, *kv_cache.stride()[1:]),
+        )
+
 
     def get_metadata_builder(self, ubatch_id: int = 0) -> AttentionMetadataBuilder:
         assert len(self.metadata_builders) > ubatch_id
@@ -325,6 +437,30 @@ class AttentionGroup:
     ) -> None:
         metadata = attn_metadata[self.layer_names[0]]
         self.get_metadata_builder().update_draft_decode_metadata(metadata)
+
+
+def _block_size_is_supported(
+    backends: list[type[AttentionBackend]], block_size: int
+) -> bool:
+    """Check if the block size is supported by all backends.
+
+    An exact ``int`` declaration must match exactly; a ``MultipleOf``
+    declaration accepts any multiple of its base.
+    """
+    for backend in backends:
+        is_supported = False
+        for supported_size in backend.get_supported_kernel_block_sizes():
+            if isinstance(supported_size, int):
+                if block_size == supported_size:
+                    is_supported = True
+            elif isinstance(supported_size, MultipleOf):
+                if block_size % supported_size.base == 0:
+                    is_supported = True
+            else:
+                raise ValueError(f"Unknown supported size: {supported_size}")
+        if not is_supported:
+            return False
+    return True
 
 
 def select_common_block_size(
@@ -348,27 +484,7 @@ def select_common_block_size(
         ValueError: If no valid block size found.
 
     """
-
-    def block_size_is_supported(
-        backends: list[type[AttentionBackend]], block_size: int
-    ) -> bool:
-        """Check if the block size is supported by all backends."""
-        for backend in backends:
-            is_supported = False
-            for supported_size in backend.get_supported_kernel_block_sizes():
-                if isinstance(supported_size, int):
-                    if block_size == supported_size:
-                        is_supported = True
-                elif isinstance(supported_size, MultipleOf):
-                    if block_size % supported_size.base == 0:
-                        is_supported = True
-                else:
-                    raise ValueError(f"Unknown supported size: {supported_size}")
-            if not is_supported:
-                return False
-        return True
-
-    if block_size_is_supported(backends, kv_manager_block_size):
+    if _block_size_is_supported(backends, kv_manager_block_size):
         return kv_manager_block_size
 
     # MultipleOf constraints also accept the manager size if they accept a divisor.
@@ -381,7 +497,7 @@ def select_common_block_size(
     }
 
     for size in sorted(candidates, reverse=True):
-        if block_size_is_supported(backends, size):
+        if _block_size_is_supported(backends, size):
             return size
     raise ValueError(f"No common block size for {kv_manager_block_size}.")
 
@@ -412,8 +528,8 @@ def allocate_kv_cache(
         warmup_rocm_skinny_gemm_workspaces(device)
         # Pad to the page granularity MoRIIO needs to register the shared
         # backing as a single RDMA memory region. Other platforms keep the
-        # exact-size allocation: NIXL and SimpleCPUOffload rely on
-        # storage.nbytes() matching the logical KV size (see #53974).
+        # exact-size allocation (see #53974), so anything reading
+        # storage.nbytes() has to tolerate the tail on ROCm alone.
         page_size = 4096
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
@@ -487,9 +603,24 @@ def prepare_kernel_block_sizes(
             # This is an attention backend that supports virtual block splitting.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
-            selected_kernel_size = select_common_block_size(
-                kv_manager_block_size, group_backends
+            storage_block_size = (
+                kv_cache_spec.storage_block_size
+                if isinstance(kv_cache_spec, MLAAttentionSpec)
+                else None
             )
+            if storage_block_size is not None and _block_size_is_supported(
+                group_backends, storage_block_size
+            ):
+                # Storage-block specs (e.g. the GLM-5.3-Flash kpool indexer
+                # cache) address the cache in pool pages, and every other
+                # consumer (cache views, metadata builders, hisparse) already
+                # uses storage_block_size as the kernel block. Fall back to the
+                # backend vote when the group's backends do not accept it.
+                selected_kernel_size = storage_block_size
+            else:
+                selected_kernel_size = select_common_block_size(
+                    kv_manager_block_size, group_backends
+                )
             kernel_block_sizes.append(selected_kernel_size)
         elif isinstance(kv_cache_spec, MambaSpec):
             # This is likely Mamba or other non-attention cache, no splitting.
@@ -740,41 +871,14 @@ def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> 
 
 
 def get_uniform_decode_token_count(
-    num_reqs: int, num_tokens: int, max_query_len: int, has_prefill: bool
+    num_reqs: int, num_tokens: int, max_query_len: int, decode_graph_eligible: bool
 ) -> int | None:
     """Per-request token count of a uniform decode batch, or None."""
-    if not has_prefill and is_uniform_query_len(num_reqs, num_tokens, max_query_len):
+    if decode_graph_eligible and is_uniform_query_len(
+        num_reqs, num_tokens, max_query_len
+    ):
         return max_query_len
     return None
-
-
-def is_residual_scattered_for_sp(
-    vllm_config: VllmConfig, num_input_tokens: int
-) -> bool:
-    """Check if the residual tensor is scattered for sequence parallelism.
-
-    The residual tensor is scattered across tensor parallel ranks when sequence
-    parallelism and tensor parallelism is enabled. SP is only supported in
-    full-graph compilation mode.
-    """
-    if not vllm_config.compilation_config.pass_config.enable_sp:
-        return False
-
-    tp = vllm_config.parallel_config.tensor_parallel_size
-
-    if tp == 1:
-        return False
-
-    assert (
-        vllm_config.compilation_config.use_inductor_graph_partition
-        or not vllm_config.compilation_config.splitting_ops
-    ), "Sequence parallelism requires full-graph compilation"
-
-    # When sequence parallelism is enabled, we always pad num_input_tokens
-    # to be a multiple of tensor_parallel_size (tp) earlier.
-    assert num_input_tokens % tp == 0
-
-    return True
 
 
 @dataclass
@@ -792,3 +896,34 @@ class EncoderTimingStats:
             "encoder_forward_secs": self.encoder_forward_secs,
             "num_encoder_calls": self.num_encoder_calls,
         }
+
+
+# --- ported for newer callers ---
+def customize_attention_spec(
+    backend: type[AttentionBackend], spec: AttentionSpec
+) -> AttentionSpec:
+    """The backend's spec. Blocks larger than every kernel block size a backend
+    takes are split into kernel blocks, which packed blocks must keep whole."""
+    spec = backend.customize_spec(spec)
+    sizes = backend.get_supported_kernel_block_sizes(spec)
+    fixed_sizes = [s for s in sizes if isinstance(s, int)]
+    if spec.block_stride_alignment is None and sizes and fixed_sizes == sizes:
+        spec = replace(spec, block_stride_alignment=MultipleOf(max(fixed_sizes)))
+    return spec
+
+
+# --- ported for newer callers ---
+def map_kv_caches_to_kernel_blocks(
+    kv_caches: dict[str, torch.Tensor], attn_groups: Iterable[AttentionGroup]
+) -> dict[str, torch.Tensor]:
+    """The views to bind to layers. The manager views in ``kv_caches`` stay for
+    KV connectors."""
+    mapped = dict(kv_caches)
+    for group in attn_groups:
+        if group.kernel_block_size is not None:
+            mapped.update(
+                (name, group.map_kv_cache_to_kernel_blocks(kv_caches[name]))
+                for name in group.layer_names
+                if name in kv_caches
+            )
+    return mapped

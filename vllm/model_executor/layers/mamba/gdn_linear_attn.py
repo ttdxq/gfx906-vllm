@@ -60,7 +60,7 @@ from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+from transformers import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum

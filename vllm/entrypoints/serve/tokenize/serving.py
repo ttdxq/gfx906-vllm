@@ -5,7 +5,7 @@ from typing import Any, Final
 
 from fastapi import Request
 
-from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
+from vllm.renderers.chat_utils import ChatTemplateContentFormatOption
 from vllm.entrypoints.openai.models.serving import (
     OpenAIModelRegistry,
     OpenAIServingModels,

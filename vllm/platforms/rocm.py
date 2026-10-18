@@ -213,6 +213,7 @@ _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
 _ON_GFX11 = "gfx11" in _GCN_ARCH
 _ON_GFX1100 = "gfx1100" in _GCN_ARCH
 _ON_GFX1151 = "gfx1151" in _GCN_ARCH
+_ON_GFX115X = "gfx115" in _GCN_ARCH
 _ON_GFX12X = any(arch in _GCN_ARCH for arch in ["gfx12"])
 _ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])
 _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
@@ -344,6 +345,10 @@ def on_gfx1100() -> bool:
 
 def on_gfx1151() -> bool:
     return _ON_GFX1151
+
+
+def on_gfx115x() -> bool:
+    return _ON_GFX115X
 
 
 def on_gfx12x() -> bool:
@@ -880,7 +885,11 @@ class RocmPlatform(Platform):
             is_flash_attn_varlen_func_available,
         )
 
-        if rocm_aiter_ops.is_mha_enabled() and on_cdna():
+        if (
+            rocm_aiter_ops.is_mha_enabled()
+            and on_cdna()
+            and (dtype == torch.float16 or dtype == torch.bfloat16)
+        ):
             logger.info_once("Using AITER Flash Attention backend for ViT model.")
             return AttentionBackendEnum.ROCM_AITER_FA
 
@@ -1025,6 +1034,15 @@ class RocmPlatform(Platform):
         if use_aiter_fp8_linear and "-quant_fp8" not in compilation_config.custom_ops:
             compilation_config.custom_ops.append("+quant_fp8")
 
+        # Only RMSNorm's custom op reaches rms_norm_batch_invariant. Inductor
+        # lowers the native one to a reduction whose block size it picks by
+        # benchmarking, so the summation order varies with the batch and run.
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and "-rms_norm" not in compilation_config.custom_ops
+        ):
+            compilation_config.custom_ops.append("+rms_norm")
+
         if use_aiter_fused_se and "-grouped_topk" in compilation_config.custom_ops:
             logger.warning_once(
                 "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled, which "
@@ -1130,7 +1148,7 @@ class RocmPlatform(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return on_cdna() or on_rdna4()
+        return on_cdna() or on_rdna()
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:
@@ -1156,6 +1174,27 @@ class RocmPlatform(Platform):
     @classmethod
     def is_navi(cls) -> bool:
         return "gfx1" in _GCN_ARCH
+
+    @classmethod
+    def enable_multi_stream_overlap(
+        cls,
+        aux_stream_list: list[torch.cuda.Stream] | None,
+        attn_metadata: object,
+    ) -> bool:
+        """ROCm multi-stream gates: streams and capture region.
+
+        Dict metadata marks piecewise cudagraph, whose eager breaks rebuild
+        the attention inputs on the owning stream. Forking side streams
+        there would rely on runtime HIP event sync, which is unreliable in
+        this overlap on ROCm (event waits can hang), so multi-stream only
+        runs where the fork/join becomes static graph edges: inside capture,
+        or with non-dict metadata (full cudagraph or the profile run), which
+        has no eager breaks.
+        """
+        return aux_stream_list is not None and (
+            torch.cuda.is_current_stream_capturing()
+            or not isinstance(attn_metadata, dict)
+        )
 
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:
@@ -1286,12 +1325,14 @@ class RocmPlatform(Platform):
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
         #  Aiter rms norm perform best when CUDA Graph capture is enabled.
-        # TODO(luka/TJ) remove env vars completely
+        # TODO(Rohan138/dllehr-amd/rasmith) Change this to be an inclusive
+        # check instead of exclusive check in the future.
         if (
             cc.cudagraph_mode != CUDAGraphMode.NONE
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_RMSNORM
             and not on_rdna4()
+            and not on_gfx90a()  # AITER not built for gfx90a, rmsnorm -> SEGV.
         ):
             rms_norm = ["aiter"] + default
         else:

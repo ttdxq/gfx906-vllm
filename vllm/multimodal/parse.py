@@ -4,20 +4,11 @@
 from abc import ABC, abstractmethod
 from collections import UserDict
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Generic,
-    Literal,
-    NamedTuple,
-    TypeAlias,
-    TypeGuard,
-    TypeVar,
-)
+from typing import TYPE_CHECKING, Any, Generic, Literal, NamedTuple, TypeAlias, TypeGuard, TypeVar
+from typing_extensions import assert_never
 
 import numpy as np
 import torch
-from typing_extensions import assert_never
 
 from vllm.inputs import ModalityData, MultiModalDataDict, MultiModalUUIDDict
 from vllm.utils.collection_utils import is_list_of

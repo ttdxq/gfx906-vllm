@@ -12,7 +12,7 @@ affine==2.4.0
     # via rasterio
 aiohappyeyeballs==2.6.1
     # via aiohttp
-aiohttp==3.13.0
+aiohttp==3.14.3
     # via
     #   aiohttp-cors
     #   datasets
@@ -36,7 +36,7 @@ antlr4-python3-runtime==4.9.3
     # via
     #   hydra-core
     #   omegaconf
-anyio==4.6.2.post1
+anyio==4.14.2
     # via
     #   httpx
     #   starlette
@@ -66,7 +66,7 @@ bitsandbytes==0.46.1
     # via
     #   -r requirements/test.in
     #   lightning
-black==24.10.0
+black==26.5.1
     # via datamodel-code-generator
 blinker==1.9.0
     # via flask
@@ -100,7 +100,7 @@ certifi==2024.8.30
     #   pyproj
     #   rasterio
     #   requests
-cffi==1.17.1
+cffi==2.1.1
     # via soundfile
 chardet==5.2.0
     # via mbstrdecoder
@@ -152,7 +152,7 @@ cycler==0.12.1
     # via matplotlib
 databricks-sdk==0.59.0
     # via mlflow-skinny
-datamodel-code-generator==0.26.3
+datamodel-code-generator==0.79.0
     # via -r requirements/test.in
 dataproperty==1.0.1
     # via
@@ -167,6 +167,8 @@ decorator==5.1.1
     # via librosa
 decord==0.6.0
     # via -r requirements/test.in
+defusedxml==0.7.1
+    # via nltk
 dill==0.3.8
     # via
     #   datasets
@@ -213,7 +215,7 @@ fastrlock==0.8.2
     # via cupy-cuda12x
 fastsafetensors==0.1.10
     # via -r requirements/test.in
-filelock==3.16.1
+filelock==4.0.7
     # via
     #   blobfile
     #   datasets
@@ -226,7 +228,7 @@ fiona==1.10.1
     # via torchgeo
 flask==3.1.1
     # via mlflow
-fonttools==4.55.0
+fonttools==4.66.1
     # via matplotlib
 fqdn==1.5.1
     # via jsonschema
@@ -443,12 +445,12 @@ llvmlite==0.44.0
     # via numba
 lm-eval @ git+https://github.com/EleutherAI/lm-evaluation-harness.git@206b7722158f58c35b7ffcd53b035fdbdda5126d
     # via -r requirements/test.in
-lxml==5.3.0
+lxml==6.1.3
     # via
     #   blobfile
     #   gpt-oss
     #   sacrebleu
-mako==1.3.10
+mako==1.4.3
     # via alembic
 markdown==3.8.2
     # via mlflow
@@ -484,7 +486,7 @@ more-itertools==10.5.0
     # via lm-eval
 mpmath==1.3.0
     # via sympy
-msgpack==1.1.0
+msgpack==1.2.3
     # via
     #   librosa
     #   ray
@@ -506,8 +508,10 @@ networkx==3.2.1
     # via
     #   scikit-image
     #   torch
-nltk==3.9.1
-    # via rouge-score
+nltk==3.10.3
+    # via
+    #   -r requirements/test.in
+    #   rouge-score
 num2words==0.5.14
     # via -r requirements/test.in
 numba==0.61.2
@@ -651,7 +655,6 @@ packaging==24.2
     # via
     #   accelerate
     #   black
-    #   datamodel-code-generator
     #   datasets
     #   evaluate
     #   fastparquet
@@ -692,7 +695,7 @@ pandas==2.2.3
     #   statsmodels
     #   torchgeo
     #   xarray
-pathspec==0.12.1
+pathspec==1.1.1
     # via black
 pathvalidate==3.2.1
     # via pytablewriter
@@ -702,7 +705,7 @@ peft==0.16.0
     # via
     #   -r requirements/test.in
     #   lm-eval
-pillow==10.4.0
+pillow==12.3.0
     # via
     #   genai-perf
     #   imageio
@@ -765,12 +768,12 @@ py==1.11.0
     # via pytest-forked
 py-spy==0.4.0
     # via ray
-pyarrow==18.0.0
+pyarrow==25.0.1
     # via
     #   datasets
     #   genai-perf
     #   mlflow
-pyasn1==0.6.1
+pyasn1==0.6.4
     # via
     #   pyasn1-modules
     #   rsa
@@ -804,7 +807,7 @@ pydantic-core==2.41.1
     # via pydantic
 pydantic-extra-types==2.10.5
     # via mistral-common
-pygments==2.18.0
+pygments==2.21.0
     # via rich
 pyogrio==0.11.0
     # via geopandas
@@ -919,7 +922,7 @@ regex==2024.9.11
     #   sacrebleu
     #   tiktoken
     #   transformers
-requests==2.32.3
+requests==2.34.2
     # via
     #   buildkite-test-collector
     #   databricks-sdk
@@ -1015,7 +1018,7 @@ sentence-transformers==3.2.1
     # via
     #   -r requirements/test.in
     #   mteb
-setuptools==77.0.3
+setuptools==80.10.2
     # via
     #   lightning-utilities
     #   pytablewriter
@@ -1226,6 +1229,7 @@ typeshed-client==2.8.2
     # via jsonargparse
 typing-extensions==4.15.0
     # via
+    #   aiohttp
     #   aiosignal
     #   albumentations
     #   alembic
@@ -1259,7 +1263,7 @@ tzdata==2024.2
     # via pandas
 uri-template==1.3.0
     # via jsonschema
-urllib3==2.2.3
+urllib3==2.8.0
     # via
     #   blobfile
     #   botocore
@@ -1274,7 +1278,7 @@ uvicorn==0.35.0
     #   mlflow-skinny
 vector-quantize-pytorch==1.21.2
     # via -r requirements/test.in
-virtualenv==20.31.2
+virtualenv==21.14.0
     # via ray
 vocos==0.1.0
     # via -r requirements/test.in
@@ -1282,7 +1286,7 @@ wcwidth==0.2.13
     # via ftfy
 webcolors==24.11.1
     # via jsonschema
-werkzeug==3.1.3
+werkzeug==3.1.9
     # via
     #   flask
     #   schemathesis

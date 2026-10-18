@@ -22,7 +22,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    # Lazy export: .mistral pulls in entrypoints.chat_utils, which circles
+    # Lazy export: .mistral pulls in renderers.chat_utils, which circles
     # back here through config.reasoning during package init.
     if name == "MistralTokenizer":
         from .mistral import MistralTokenizer
