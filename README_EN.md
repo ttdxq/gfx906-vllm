@@ -25,6 +25,12 @@ See [NOTICE](NOTICE) for the complete attribution statement.
 
 ## Latest Updates
 
+### ✅ October 2026 Update
+
+- **Upstream vLLM synced to 08a65e287e (two merge rounds, 1382 upstream commits)** - Measured on Qwen3.8-27B GGUF: real prefill of a 9.2k-token prompt improves from 134.8 to ≥213 tok/s, decode stays at parity, and prefix caching is now on by default (warm prefill 3537 tok/s).
+- **Specialized split-KV prefill attention kernel enabled by default on gfx906** - replaces the previous opt-in path, with automatic fallback for fp8 KV caches.
+- **Security and compatibility** - both rounds of upstream security fixes and dependency floors; extended Python 3.10 compatibility shims; platform-safe flash-attention utils stubs; removal of cascade attention, Medusa/MLP speculator, torch.compile sequence parallelism / async TP, and the legacy Ray executor.
+
 ### ✅ September 2026 Update
 
 - **Qwen3.5 MoE architecture GGUF support (multimodal and MTP working)** - Added model construction, expert weight loading, and the multimodal input pipeline for qwen35moe GGUF checkpoints; both `mmproj` image input and MTP speculative decoding are verified working on a single 32 GiB gfx906 GPU.

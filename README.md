@@ -25,6 +25,12 @@
 
 ## 最新更新
 
+### ✅ 2026年10月更新
+
+- **上游 vLLM 同步至 08a65e287e（两轮合并，共 1382 个上游提交）** - 集成后 Qwen3.8-27B GGUF 实测：9.2k-token 长上下文真实 prefill 从 134.8 提升至 ≥213 tok/s，decode 持平，前缀缓存默认开启（热请求 prefill 3537 tok/s）。
+- **gfx906 专用 split-KV prefill 注意力内核默认启用** - 取代上一版本的 opt-in 路径，并对 fp8 KV cache 自动回退。
+- **安全与兼容性** - 合入两轮上游安全修复与依赖下限；扩展 Python 3.10 兼容；flash-attn 工具改为平台安全桩；移除 cascade attention、Medusa/MLP speculator、torch.compile 序列并行/异步 TP 与旧版 Ray executor。
+
 ### ✅ 2026年9月更新
 
 - **Qwen3.5 MoE 架构 GGUF 支持（多模态、MTP 可用）** - 补齐 qwen35moe 架构 GGUF 的模型构建、专家权重加载与多模态输入链路；mmproj 图片输入与 MTP 投机解码均已在单张 32 GiB gfx906 GPU 上实测可用。
