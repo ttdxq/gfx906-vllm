@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from unittest.mock import Mock
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,6 +26,19 @@ def _create_stateless_builder(full_cuda_graph: bool = False):
     builder.use_spec_decode = False
     builder.use_full_cuda_graph = full_cuda_graph
     builder._building_for_capture = False
+    builder.num_spec = 0
+    # build() consults these on the locally customized path; "none" cache
+    # mode keeps mamba_get_block_table_tensor a pass-through, and
+    # pad_for_cudagraph is only reached on the full-graph branches.
+    builder.kv_cache_spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((16, 64),),
+        dtypes=(torch.float16,),
+    )
+    builder.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        pad_for_cudagraph=lambda n: n,
+    )
     return builder
 
 
@@ -34,12 +47,12 @@ def test_decode_does_not_transfer_context_lens():
 
     batch = BatchSpec(seq_lens=[80, 96], query_lens=[1, 1])
     common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
-    context_lens_to = Mock(wraps=common.num_computed_tokens_cpu.to)
-    common.num_computed_tokens_cpu.to = context_lens_to
 
+    # CommonAttentionMetadata no longer carries a CPU copy of the computed
+    # token counts; the builder derives them via compute_num_computed_tokens(),
+    # so only the classification contract is asserted here.
     meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
 
-    context_lens_to.assert_not_called()
     assert meta.num_prefills == 0
     assert meta.has_initial_state is None
 

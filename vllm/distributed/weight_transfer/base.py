@@ -5,18 +5,10 @@
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    ClassVar,
-    Generic,
-    Protocol,
-    TypeVar,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
+from typing_extensions import Self
 
 import torch
-from typing_extensions import Self
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -514,9 +506,7 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
 
     @abstractmethod
     def shutdown(self) -> None:
-        """Shutdown the weight transfer engine.
-        This should be called when the worker is shutting down.
-        """
+        """Release transfer resources without shutting down the inference worker."""
         raise NotImplementedError
 
 

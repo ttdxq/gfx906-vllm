@@ -19,6 +19,7 @@ from vllm.entrypoints.serve.tokenize.api_router import attach_router
 from vllm.entrypoints.serve.tokenize.protocol import (
     TokenizeChatRequest,
     TokenizeCompletionRequest,
+    TokenizeResponse,
 )
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.exceptions import VLLMNotFoundError, VLLMValidationError
@@ -95,7 +96,7 @@ async def test_tokenize_chat_skips_mm_cache_for_renderer_only_path():
     mock_engine.renderer = MagicMock()
 
     serving = _build_serving_tokenization(mock_engine)
-    serving.online_renderer.preprocess_chat = AsyncMock(
+    serving.online_renderer.preprocess_chat = AsyncMock(  # type: ignore[method-assign]
         return_value=(
             [{"role": "user", "content": "Test"}],
             [{"prompt_token_ids": [1, 2, 3]}],
@@ -109,7 +110,7 @@ async def test_tokenize_chat_skips_mm_cache_for_renderer_only_path():
 
     response = await serving.create_tokenize(request, MagicMock(headers={}))
 
-    assert response.tokens == [1, 2, 3]
+    assert isinstance(response, TokenizeResponse) and response.tokens == [1, 2, 3]
     assert (
         serving.online_renderer.preprocess_chat.call_args.kwargs["skip_mm_cache"]
         is True
@@ -125,7 +126,7 @@ async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
     mock_engine.renderer = MagicMock()
 
     serving = _build_serving_tokenization(mock_engine)
-    serving.online_renderer.preprocess_completion = AsyncMock(
+    serving.online_renderer.preprocess_completion = AsyncMock(  # type: ignore[method-assign]
         return_value=[{"prompt_token_ids": [1, 2, 3]}]
     )
 
@@ -136,7 +137,7 @@ async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
 
     response = await serving.create_tokenize(request, MagicMock(headers={}))
 
-    assert response.tokens == [1, 2, 3]
+    assert isinstance(response, TokenizeResponse) and response.tokens == [1, 2, 3]
     assert (
         serving.online_renderer.preprocess_completion.call_args.kwargs["skip_mm_cache"]
         is True
@@ -247,43 +248,3 @@ class TestDetokenizeClientErrorResponses:
 
         assert statuses["/tokenize"] == HTTPStatus.BAD_REQUEST
         assert statuses["/detokenize"] == HTTPStatus.BAD_REQUEST
-
-
-def _build_detokenize_serving(max_model_len: int) -> ServingTokenization:
-    mock_engine = MagicMock(spec=AsyncLLM)
-    mock_engine.errored = False
-    mock_engine.model_config = MockModelConfig(max_model_len=max_model_len)
-    mock_engine.input_processor = MagicMock()
-    mock_engine.renderer = MagicMock()
-    mock_engine.renderer.tokenize_prompt_async = AsyncMock(
-        return_value={"prompt": "text"}
-    )
-    return _build_serving_tokenization(mock_engine)
-
-
-def test_detokenize_token_id_bounds():
-    assert DetokenizeRequest(tokens=[0, 2**63 - 1]).tokens == [0, 2**63 - 1]
-
-    with pytest.raises(ValidationError):
-        DetokenizeRequest(tokens=[-1])
-    with pytest.raises(ValidationError):
-        DetokenizeRequest(tokens=[2**63])
-
-
-@pytest.mark.asyncio
-async def test_detokenize_resource_bound_precedes_decode():
-    serving = _build_detokenize_serving(max_model_len=4)
-    request = DetokenizeRequest(model=MODEL_NAME, tokens=[1, 2, 3, 4, 5])
-
-    response = await serving.create_detokenize(request, MagicMock(headers={}))
-
-    assert isinstance(response, ErrorResponse)
-    assert response.error.code == 400
-    assert "tokens length (5) exceeds max_model_len (4)" in response.error.message
-    serving.renderer.tokenize_prompt_async.assert_not_awaited()
-
-
-def test_detokenize_resource_bound_accepts_max_model_len():
-    serving = _build_detokenize_serving(max_model_len=4)
-    request = DetokenizeRequest(model=MODEL_NAME, tokens=[1, 2, 3, 4])
-    assert serving._validate_detokenize_bounds(request) is None

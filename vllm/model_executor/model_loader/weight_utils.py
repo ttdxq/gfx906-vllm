@@ -14,9 +14,9 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator, Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, Callable
 
 import filelock
 import huggingface_hub.constants
@@ -779,6 +779,42 @@ def filter_mm_encoder_only_safetensors_files(
     return kept
 
 
+def filter_safetensors_files_by_weight_name(
+    hf_weights_files: list[str],
+    is_unused_weight: Callable[[str], bool],
+) -> list[str]:
+    """Drop safetensors shards in which `is_unused_weight` accepts every tensor.
+
+    Loaders that read whole files (InstantTensor, fastsafetensors, multi-thread,
+    eager, prefetch) cannot skip single tensors, so dropping shards is their
+    only way to avoid reading weights the model does not load.
+
+    Args:
+        hf_weights_files: Safetensors shard paths.
+        is_unused_weight: Returns True for checkpoint weight names the model does
+            not load.
+
+    Returns:
+        The shards holding at least one wanted tensor, or `hf_weights_files`
+        unchanged when no shard does.
+
+    """
+    kept: list[str] = []
+    for st_file in hf_weights_files:
+        with safe_open(st_file, framework="pt") as f:
+            if not all(is_unused_weight(name) for name in f.keys()):  # noqa: SIM118
+                kept.append(st_file)
+    if not kept:
+        return hf_weights_files
+    if len(kept) < len(hf_weights_files):
+        logger.info_once(
+            "Skipped %d/%d safetensors shard(s) holding no weights the model loads",
+            len(hf_weights_files) - len(kept),
+            len(hf_weights_files),
+        )
+    return kept
+
+
 # explicitly use pure text format, with a newline at the end
 # this makes it impossible to see the animation in the progress bar
 # but will avoid messing up with ray or multiprocessing, which wraps
@@ -836,6 +872,40 @@ def np_cache_weights_iterator(
         with open(param_path, "rb") as f:
             param = np.load(f)
         yield name, torch.from_numpy(param)
+
+
+def drop_checkpoint_cache(
+    model_name_or_path: str,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+) -> None:
+    checkpoint_dir: Path | None = None
+    if os.path.isdir(model_name_or_path):
+        checkpoint_dir = Path(model_name_or_path)
+    else:
+        with suppress(OSError, ValueError):
+            checkpoint_dir = Path(
+                hf_api().snapshot_download(
+                    model_name_or_path,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    local_files_only=True,
+                )
+            )
+    if checkpoint_dir is None:
+        logger.info_once(
+            "No local checkpoint found for %s; skipping page-cache eviction",
+            model_name_or_path,
+        )
+        return
+    for path in checkpoint_dir.glob("*.safetensors"):
+        try:
+            with path.open("rb") as file:
+                os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError as exc:
+            logger.warning(
+                "Could not release checkpoint page cache for %s: %s", path, exc
+            )
 
 
 def _get_checkpoints_size_bytes(files: list[str]) -> int:
@@ -1963,3 +2033,15 @@ def initialize_dummy_weights(
                 param.data.copy_(tmp_param)
             else:
                 param.uniform_(low, high, generator=generator)
+
+
+# --- ported for newer callers ---
+def make_attention_sink(
+    num_heads: int, dtype: torch.dtype | None = None
+) -> torch.nn.Parameter:
+    """Create a sink with -inf padding and register its TP weight loader."""
+    sink = torch.nn.Parameter(
+        torch.full((num_heads,), -float("inf"), dtype=dtype), requires_grad=False
+    )
+    sink.weight_loader = load_attention_sink
+    return sink

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import datetime
+from datetime import timezone as _tz
+UTC = _tz.utc
 import json
 import logging
 import os

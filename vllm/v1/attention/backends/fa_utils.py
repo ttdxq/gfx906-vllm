@@ -376,3 +376,14 @@ def is_flash_attn_varlen_func_available() -> bool:
         return _ROCM_FLASH_ATTN_AVAILABLE
 
     return False
+
+
+# --- Compatibility stubs for newer callers (unavailable on gfx906: the
+# flash-attn package pulls in aiter, which does not support this chip) ---
+def _fa_unavailable(*args, **kwargs):
+    raise ImportError("flash_attn is not available on this platform")
+
+
+flash_attn_varlen_func = _fa_unavailable
+get_scheduler_metadata = _fa_unavailable
+compile_flash_attn_varlen_func_from_specs = None

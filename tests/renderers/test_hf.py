@@ -7,7 +7,7 @@ import torch
 from types import SimpleNamespace
 
 from vllm.config import ModelConfig
-from vllm.entrypoints.chat_utils import load_chat_template
+from vllm.renderers.chat_utils import load_chat_template
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EmbedsPrompt

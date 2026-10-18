@@ -20,6 +20,10 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
+# FlashInfer's GDN prefill emits states every N tokens, N a multiple of its
+# 64-token chunk, so checkpoint offsets must be multiples of 64.
+FLASHINFER_GDN_CHECKPOINT_ALIGNMENT = 64
+
 
 class GDNAttentionBackend(AttentionBackend):
     @staticmethod
@@ -64,6 +68,7 @@ class GDNAttentionMetadata:
     non_spec_token_indx: torch.Tensor | None = None
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
+    uniform_spec_sequence_length: int | None = None  # None for ragged batches
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -169,6 +174,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.vllm_config.cache_config.mamba_cache_mode,
         )
 
+        uniform_spec_sequence_length = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
@@ -231,6 +237,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             non_spec_sequence_masks = ~spec_sequence_masks
+            # Detect uniform speculative sequence lengths on the CPU copy so
+            # consumers can specialize without a GPU->CPU sync; None for
+            # ragged batches.
+            query_lens_cpu = m.query_start_loc_cpu.diff()
+            spec_query_lens_cpu = query_lens_cpu[spec_sequence_masks_cpu]
+            if spec_query_lens_cpu.numel() > 0:
+                first_spec_sequence_length = int(spec_query_lens_cpu[0])
+                if first_spec_sequence_length > 0 and bool(
+                    torch.all(spec_query_lens_cpu == first_spec_sequence_length)
+                ):
+                    uniform_spec_sequence_length = first_spec_sequence_length
 
             non_spec_query_lens = query_lens[non_spec_sequence_masks]
             num_decodes = (non_spec_query_lens == 1).sum().item()
@@ -348,7 +365,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decodes <= self.decode_cudagraph_max_bs
             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
         ):
-            num_actual_tokens = self.vllm_config.pad_for_cudagraph(m.num_actual_tokens)
+            # m.num_actual_tokens is already token-padded for FULL graph
+            # replay by the model runner.
+            num_actual_tokens = m.num_actual_tokens
             # Token buffers are padded for FULL graph replay, but GDN state,
             # sequence, query-start, and accepted-token metadata is per request.
             batch_size = m.num_reqs
@@ -397,7 +416,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decodes == 0
             and num_decodes <= self.decode_cudagraph_max_bs
         ):
-            num_actual_tokens = self.vllm_config.pad_for_cudagraph(m.num_actual_tokens)
+            # m.num_actual_tokens is already token-padded for FULL graph
+            # replay by the model runner.
+            num_actual_tokens = m.num_actual_tokens
             batch_size = m.num_reqs
 
             self.non_spec_state_indices_tensor[:num_decodes].copy_(
@@ -435,6 +456,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
+            uniform_spec_sequence_length=uniform_spec_sequence_length,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,

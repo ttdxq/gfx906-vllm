@@ -6,9 +6,9 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, ClassVar
+from typing_extensions import Self
 
 import torch
-from typing_extensions import Self
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -230,7 +230,7 @@ class NCCLWeightTransferEngine(
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:
-            # Clean up the communicator by removing the reference
+            self.model_update_group.destroy()
             self.model_update_group = None
 
 
@@ -457,4 +457,6 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             torch.cuda.current_stream().synchronize()
 
     def shutdown(self) -> None:
-        self.model_update_group = None
+        if self.model_update_group is not None:
+            self.model_update_group.destroy()
+            self.model_update_group = None

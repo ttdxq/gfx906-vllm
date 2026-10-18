@@ -37,7 +37,7 @@ from vllm.logger import init_logger
 from vllm.tokenizers.protocol import TokenizerLike
 
 if TYPE_CHECKING:
-    from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
+    from vllm.renderers.chat_utils import ChatCompletionMessageParam
     import llguidance
     from transformers import BatchEncoding
 

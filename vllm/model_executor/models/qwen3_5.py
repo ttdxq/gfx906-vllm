@@ -45,6 +45,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
@@ -114,6 +115,7 @@ from .qwen3_vl import (
     Qwen3VLForConditionalGeneration,
     Qwen3VLMultiModalProcessor,
     Qwen3VLProcessingInfo,
+    mrope_positions_factor,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -770,6 +772,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                mrope_positions_factor=mrope_positions_factor(vllm_config),
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
@@ -1859,6 +1862,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                     config.vision_config,
                     norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                     quant_config=quant_config,
+                    input_norm=build_mm_input_norm(self.model_config),
                     prefix=maybe_prefix(prefix, "visual"),
                 )
         else:
@@ -2130,6 +2134,7 @@ class Qwen3_5MoeForConditionalGeneration(
                     config.vision_config,
                     norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                     quant_config=quant_config,
+                    input_norm=build_mm_input_norm(self.model_config),
                     prefix=maybe_prefix(prefix, "visual"),
                 )
         else:
