@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import gguf
 import torch
+import torch.nn as nn
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
@@ -2174,6 +2175,20 @@ class GGUFLinearMethod(LinearMethodBase):
         )
         set_weight_attrs(qweight_type, extra_weight_attrs)
         layer.register_parameter("qweight_type", qweight_type)
+
+    def tie_weights(self, layer: torch.nn.Module, embed_tokens: nn.Module):
+        """Tie a GGUF-quantized LM head to a GGUF-quantized embedding.
+
+        Tied GGUF models (e.g. Gemma) keep the vocabulary only as a quantized
+        ``token_embd``, so both modules must share the quantized parameter
+        pair instead of the dense ``weight`` tensor.
+        """
+        if hasattr(embed_tokens, "qweight"):
+            layer.qweight = embed_tokens.qweight
+            layer.qweight_type = embed_tokens.qweight_type
+            return layer
+        layer.weight = embed_tokens.weight
+        return layer
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         qweight_type = layer.qweight_type.weight_type
