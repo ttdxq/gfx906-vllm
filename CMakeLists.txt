@@ -376,6 +376,7 @@ set(VLLM_EXT_SRC
   "csrc/attention/paged_attention_v1.cu"
   "csrc/attention/paged_attention_v2.cu"
   "csrc/attention/merge_attn_states.cu"
+  "csrc/attention/gfx906_prefill_attn.cu"
   "csrc/attention/vertical_slash_index.cu"
   "csrc/pos_encoding_kernels.cu"
   "csrc/activation_kernels.cu"

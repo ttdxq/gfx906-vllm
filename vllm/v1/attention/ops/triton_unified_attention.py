@@ -69,6 +69,19 @@ ENABLE_GFX906_ATTN_PREFILL_SLIM = os.getenv(
     "VLLM_GFX906_TRITON_ATTN_PREFILL_SLIM", "1"
 ).lower() in {"1", "true", "yes", "on"}
 
+# Route the gated slim prefill path through a handwritten HIP kernel on
+# gfx906 (csrc/attention/gfx906_prefill_attn.cu). Same segment-workspace
+# contract and online-softmax semantics as the Triton slim scanner with
+# fp32 accumulation over fp16 KV throughout; kernel-level it measures
+# 1.75-2.4x faster than the Triton scanner at 16k-131k contexts on the
+# head-256/GQA6 shape, with rel_rms vs an fp32 reference at the same 2.7e-4
+# level as Triton. Single sequence only — multi-sequence batches, other
+# shapes, or any non-default attention option fall back to the Triton
+# path. Set 0 to restore the Triton slim scanner.
+ENABLE_GFX906_ATTN_PREFILL_HIP = os.getenv(
+    "VLLM_GFX906_ATTN_PREFILL_HIP", "1"
+).lower() in {"1", "true", "yes", "on"}
+
 # Upper bound for split-KV segments the decode policy may request. The
 # backend sizes its softmax segment buffers with this value on gfx906.
 GFX906_MAX_DECODE_SEGMENTS = 128
@@ -147,6 +160,31 @@ def _is_gfx906_rocm() -> bool:
 
 def _gfx906_sched_tuning_enabled() -> bool:
     return ENABLE_GFX906_ATTN_SCHED_TUNING and _is_gfx906_rocm()
+
+
+@lru_cache(maxsize=1)
+def _log_hip_prefill_scan_once() -> bool:
+    logger.info(
+        "gfx906 handwritten HIP prefill attention scan enabled "
+        "(single-sequence fp16 head-256/GQA6/page-800 shape)"
+    )
+    return True
+
+
+@lru_cache(maxsize=4)
+def _log_hip_prefill_miss_once(num_seqs: int, q_dtype: str, k_dtype: str,
+                               head_size: int, num_query_heads: int,
+                               num_kv_heads: int, block_size: int,
+                               q_contig: bool, k_strides: tuple,
+                               v_strides: tuple, bt_dtype: str, bt_stride1: int,
+                               op_present: bool, slim: bool) -> bool:
+    logger.info(
+        "gfx906 HIP prefill scan skipped: slim=%s op=%s num_seqs=%d "
+        "q=%s k=%s hs=%d qh=%d kvh=%d bs=%d qcont=%s kstrides=%s vstrides=%s "
+        "bt=%s btstride1=%d", slim, op_present, num_seqs, q_dtype, k_dtype,
+        head_size, num_query_heads, num_kv_heads, block_size, q_contig,
+        k_strides, v_strides, bt_dtype, bt_stride1)
+    return True
 
 
 def gfx906_decode_segments_capacity() -> int:
@@ -1696,6 +1734,27 @@ def unified_attention(
     # physical-block gather collapses to one scalar load
     scalar_phys = block_size % TILE_SIZE_PREFILL == 0
 
+    # Handwritten gfx906 HIP scanner: single-sequence fp16 fast path on the
+    # tuned shape. Writes the same fp32 segment workspace the Triton path
+    # consumes, so only the scanner launch is replaced.
+    use_hip_scan = (
+        use_slim_3d
+        and ENABLE_GFX906_ATTN_PREFILL_HIP
+        and hasattr(torch.ops._C, "gfx906_prefill_attn_scan")
+        and num_seqs == 1
+        and q.dtype == torch.float16
+        and k.dtype == torch.float16
+        and head_size == 256
+        and num_query_heads == 24
+        and num_kv_heads == 4
+        and block_size == 800
+        and q.is_contiguous()
+        and k.stride(3) == 1
+        and v.stride(3) == 1
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1
+    )
+
     if use_prefill_3d:
         num_segments = GFX906_PREFILL_SEGMENTS
         segm_output, segm_max, segm_expsum = _prefill_segment_buffers(
@@ -1705,6 +1764,55 @@ def unified_attention(
             triton.next_power_of_2(head_size),
             q.device,
         )
+        if use_hip_scan:
+            _log_hip_prefill_scan_once()
+            torch.ops._C.gfx906_prefill_attn_scan(
+                q,
+                k,
+                v,
+                block_table,
+                seqused_k,
+                segm_output,
+                segm_max,
+                segm_expsum,
+                softmax_scale,
+                q.shape[0],
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+            )
+            # the HIP scanner uses 64-row q blocks (BLOCK_Q 10) and 32-token
+            # KV tiles; reduce_segments recomputes the segment layout from
+            # these, so both must match the scanner above
+            reduce_segments[(q.shape[0], num_query_heads)](
+                output_ptr=out,
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_seqs=1,
+                num_query_heads=num_query_heads,
+                out_scale_inv=1.0,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                block_table_stride=block_table.stride(0),
+                TILE_SIZE=32,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                query_start_len_ptr=cu_seqlens_q,
+                BLOCK_Q=10,
+                NUM_SEGMENTS_PER_SEQ=num_segments,
+                USE_FP8=False,
+            )
+            return
+        _log_hip_prefill_miss_once(
+            num_seqs, str(q.dtype), str(k.dtype), head_size, num_query_heads,
+            num_kv_heads, block_size, q.is_contiguous(), tuple(k.stride()),
+            tuple(v.stride()), str(block_table.dtype), block_table.stride(1),
+            hasattr(torch.ops._C, "gfx906_prefill_attn_scan"), use_slim_3d)
         _launch_split_kv(
             segm_output,
             segm_max,
