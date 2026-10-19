@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 _MULTIMODAL_GGUF_ARCHITECTURES = frozenset(
     {
         "Gemma3ForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
     }
@@ -190,6 +191,180 @@ class GGUFModelLoader(BaseModelLoader):
                 )
         return weights_map
 
+    @staticmethod
+    def _get_gemma4_weights_map(model_config: ModelConfig) -> dict[str, str]:
+        text_config = model_config.hf_config.get_text_config()
+        architecture = model_config.architecture
+        prefix = (
+            "model.language_model."
+            if architecture == "Gemma4ForConditionalGeneration"
+            else "model."
+        )
+        weights_map = {
+            "token_embd.weight": f"{prefix}embed_tokens.weight",
+            "output_norm.weight": f"{prefix}norm.weight",
+        }
+        for layer_idx, layer_type in enumerate(text_config.layer_types):
+            gguf_prefix = f"blk.{layer_idx}"
+            hf_prefix = f"{prefix}layers.{layer_idx}"
+            weights_map.update(
+                {
+                    f"{gguf_prefix}.layer_output_scale.weight": (
+                        f"{hf_prefix}.layer_scalar"
+                    ),
+                    f"{gguf_prefix}.attn_norm.weight": (
+                        f"{hf_prefix}.input_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.attn_q.weight": (
+                        f"{hf_prefix}.self_attn.q_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_q_norm.weight": (
+                        f"{hf_prefix}.self_attn.q_norm.weight"
+                    ),
+                    f"{gguf_prefix}.attn_k.weight": (
+                        f"{hf_prefix}.self_attn.k_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_k_norm.weight": (
+                        f"{hf_prefix}.self_attn.k_norm.weight"
+                    ),
+                    f"{gguf_prefix}.attn_output.weight": (
+                        f"{hf_prefix}.self_attn.o_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_gate.weight": (
+                        f"{hf_prefix}.mlp.gate_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_up.weight": (
+                        f"{hf_prefix}.mlp.up_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_down.weight": (
+                        f"{hf_prefix}.mlp.down_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_norm.weight": (
+                        f"{hf_prefix}.pre_feedforward_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.post_attention_norm.weight": (
+                        f"{hf_prefix}.post_attention_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.post_ffw_norm.weight": (
+                        f"{hf_prefix}.post_feedforward_layernorm.weight"
+                    ),
+                }
+            )
+            if layer_type == "sliding_attention":
+                weights_map[f"{gguf_prefix}.attn_v.weight"] = (
+                    f"{hf_prefix}.self_attn.v_proj.weight"
+                )
+        if architecture == "Gemma4ForConditionalGeneration":
+            vision_prefix = "model.vision_tower."
+            weights_map["mm.input_projection.weight"] = (
+                "model.embed_vision.embedding_projection.weight"
+            )
+            weights_map["v.patch_embd.weight"] = (
+                f"{vision_prefix}patch_embedder.input_proj.weight"
+            )
+            weights_map["v.position_embd.weight"] = (
+                f"{vision_prefix}patch_embedder.position_embedding_table"
+            )
+            vision_layers = model_config.hf_config.vision_config.num_hidden_layers
+            for layer_idx in range(vision_layers):
+                gguf_prefix = f"v.blk.{layer_idx}"
+                hf_prefix = f"{vision_prefix}encoder.layers.{layer_idx}"
+                weights_map.update(
+                    {
+                        f"{gguf_prefix}.ln1.weight": (
+                            f"{hf_prefix}.input_layernorm.weight"
+                        ),
+                        f"{gguf_prefix}.attn_q.weight": (
+                            f"{hf_prefix}.self_attn.q_proj.linear.weight"
+                        ),
+                        f"{gguf_prefix}.attn_k.weight": (
+                            f"{hf_prefix}.self_attn.k_proj.linear.weight"
+                        ),
+                        f"{gguf_prefix}.attn_v.weight": (
+                            f"{hf_prefix}.self_attn.v_proj.linear.weight"
+                        ),
+                        f"{gguf_prefix}.attn_out.weight": (
+                            f"{hf_prefix}.self_attn.o_proj.linear.weight"
+                        ),
+                        f"{gguf_prefix}.attn_q_norm.weight": (
+                            f"{hf_prefix}.self_attn.q_norm.weight"
+                        ),
+                        f"{gguf_prefix}.attn_k_norm.weight": (
+                            f"{hf_prefix}.self_attn.k_norm.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_gate.weight": (
+                            f"{hf_prefix}.mlp.gate_proj.linear.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_up.weight": (
+                            f"{hf_prefix}.mlp.up_proj.linear.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_down.weight": (
+                            f"{hf_prefix}.mlp.down_proj.linear.weight"
+                        ),
+                        f"{gguf_prefix}.attn_post_norm.weight": (
+                            f"{hf_prefix}.post_attention_layernorm.weight"
+                        ),
+                        f"{gguf_prefix}.ffn_post_norm.weight": (
+                            f"{hf_prefix}.post_feedforward_layernorm.weight"
+                        ),
+                        f"{gguf_prefix}.ln2.weight": (
+                            f"{hf_prefix}.pre_feedforward_layernorm.weight"
+                        ),
+                    }
+                )
+        return weights_map
+
+    @staticmethod
+    def _get_gemma4_mtp_weights_map(model_config: ModelConfig) -> dict[str, str]:
+        text_config = model_config.hf_config.get_text_config()
+        weights_map = {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output_norm.weight": "model.norm.weight",
+            "nextn.pre_projection.weight": "pre_projection.weight",
+            "nextn.post_projection.weight": "post_projection.weight",
+        }
+        for layer_idx in range(text_config.num_hidden_layers):
+            gguf_prefix = f"blk.{layer_idx}"
+            hf_prefix = f"model.layers.{layer_idx}"
+            weights_map.update(
+                {
+                    f"{gguf_prefix}.attn_norm.weight": (
+                        f"{hf_prefix}.input_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.layer_output_scale.weight": (
+                        f"{hf_prefix}.layer_scalar"
+                    ),
+                    f"{gguf_prefix}.attn_q.weight": (
+                        f"{hf_prefix}.self_attn.q_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_q_norm.weight": (
+                        f"{hf_prefix}.self_attn.q_norm.weight"
+                    ),
+                    f"{gguf_prefix}.attn_output.weight": (
+                        f"{hf_prefix}.self_attn.o_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_gate.weight": (
+                        f"{hf_prefix}.mlp.gate_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_up.weight": (
+                        f"{hf_prefix}.mlp.up_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_down.weight": (
+                        f"{hf_prefix}.mlp.down_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_norm.weight": (
+                        f"{hf_prefix}.pre_feedforward_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.post_attention_norm.weight": (
+                        f"{hf_prefix}.post_attention_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.post_ffw_norm.weight": (
+                        f"{hf_prefix}.post_feedforward_layernorm.weight"
+                    ),
+                }
+            )
+        return weights_map
+
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """
         GGUF uses this naming convention for their tensors from HF checkpoint:
@@ -203,6 +378,13 @@ class GGUFModelLoader(BaseModelLoader):
         vllm_arch = model_config.architecture
         if vllm_arch in ("Qwen3_5MTP", "Qwen3_5MoeMTP"):
             return self._get_qwen35_mtp_weights_map(model_config)
+        if vllm_arch in (
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+        ):
+            return self._get_gemma4_weights_map(model_config)
+        if vllm_arch == "Gemma4MTPModel":
+            return self._get_gemma4_mtp_weights_map(model_config)
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
         # Gemma3Config, this returns config.text_config. For text-only

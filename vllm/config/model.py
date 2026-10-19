@@ -55,8 +55,10 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_utils import (
     detect_gguf_multimodal,
+    gemma4_gguf_tokenizer_path,
     gguf_multimodal_processor_repo,
     maybe_patch_hf_config_from_gguf,
+    qwen35_gguf_config_dict,
     qwen35_gguf_tokenizer_path,
 )
 from vllm.tasks import PoolingTask, ScoreType, SupportedTask
@@ -661,12 +663,18 @@ class ModelConfig:
         if not tokenizer_path.is_dir():
             return
 
+        if (tokenizer_path / ".vllm_gguf_metadata_tokenizer").is_file():
+            return
+
         if (tokenizer_path / "config.json").is_file():
             self.hf_config_path = str(tokenizer_path)
             logger.info("Using local GGUF companion config: %s", self.hf_config_path)
 
     def _maybe_use_qwen35_gguf_tokenizer(self) -> None:
         if self.tokenizer is None or self.tokenizer != self.model:
+            return
+
+        if qwen35_gguf_config_dict(self.model) is None:
             return
 
         processor_repo = gguf_multimodal_processor_repo(self.model)
@@ -682,6 +690,15 @@ class ModelConfig:
         if tokenizer_path is not None:
             self.tokenizer = tokenizer_path
             logger.info("Using qwen35 GGUF metadata tokenizer: %s", self.tokenizer)
+
+    def _maybe_use_gemma4_gguf_tokenizer(self) -> None:
+        if self.tokenizer is None or self.tokenizer != self.model:
+            return
+
+        tokenizer_path = gemma4_gguf_tokenizer_path(self.model)
+        if tokenizer_path is not None:
+            self.tokenizer = tokenizer_path
+            logger.info("Using Gemma4 GGUF metadata tokenizer: %s", self.tokenizer)
 
     def __post_init__(
         self,
@@ -724,6 +741,7 @@ class ModelConfig:
             self.tokenizer = self.model
         self._maybe_use_local_gguf_companion_tokenizer()
         self._maybe_use_qwen35_gguf_tokenizer()
+        self._maybe_use_gemma4_gguf_tokenizer()
         if self.tokenizer_revision is None:
             self.tokenizer_revision = self.revision
         self.tokenizer = maybe_model_redirect(self.tokenizer)
@@ -805,6 +823,13 @@ class ModelConfig:
             self.model,
             hf_config,
         )
+
+        is_gemma4_gguf = check_gguf_file(self.model) and getattr(
+            hf_config, "model_type", ""
+        ) == "gemma4"
+        if is_gemma4_gguf and language_model_only:
+            hf_config = hf_config.get_text_config()
+            hf_config.architectures = ["Gemma4ForCausalLM"]
 
         if (
             check_gguf_file(self.model)

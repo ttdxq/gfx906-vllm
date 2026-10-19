@@ -30,7 +30,11 @@ from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
 
 from vllm import envs
 from vllm.logger import init_logger
-from vllm.transformers_utils.gguf_utils import qwen35_gguf_config_dict
+from vllm.transformers_utils.gguf_utils import (
+    gemma4_gguf_config_dict,
+    gemma4_mtp_gguf_config_dict,
+    qwen35_gguf_config_dict,
+)
 from vllm.transformers_utils.repo_utils import is_mistral_model_repo
 from vllm.transformers_utils.utils import (
     check_gguf_file,
@@ -356,6 +360,27 @@ class HFConfigParser(ConfigParserBase):
         kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
         trust_remote_code |= kwargs.get("trust_remote_code", False)
         kwargs = without_trust_remote_code(kwargs)
+        gguf_file = kwargs.get("gguf_file")
+        if gguf_file is not None:
+            gguf_path = Path(model) / gguf_file
+            config_dict = qwen35_gguf_config_dict(str(gguf_path)) or (
+                gemma4_gguf_config_dict(str(gguf_path))
+                or gemma4_mtp_gguf_config_dict(str(gguf_path))
+            )
+            if config_dict is not None:
+                model_type = config_dict["model_type"]
+                if model_type in _CONFIG_REGISTRY:
+                    config = _CONFIG_REGISTRY[model_type].from_dict(config_dict)
+                else:
+                    config = AutoConfig.for_model(
+                        model_type,
+                        **{
+                            key: value
+                            for key, value in config_dict.items()
+                            if key != "model_type"
+                        },
+                    )
+                return config_dict, _maybe_remap_hf_config_attrs(config)
         try:
             config_dict, _ = PretrainedConfig.get_config_dict(
                 model,
@@ -375,10 +400,23 @@ class HFConfigParser(ConfigParserBase):
                 gguf_path = (
                     Path(model) / gguf_file if gguf_file is not None else Path(model)
                 )
-                if config_dict := qwen35_gguf_config_dict(str(gguf_path)):
-                    config = _CONFIG_REGISTRY[config_dict["model_type"]].from_dict(
-                        config_dict
-                    )
+                if config_dict := (
+                    qwen35_gguf_config_dict(str(gguf_path))
+                    or gemma4_gguf_config_dict(str(gguf_path))
+                    or gemma4_mtp_gguf_config_dict(str(gguf_path))
+                ):
+                    model_type = config_dict["model_type"]
+                    if model_type in _CONFIG_REGISTRY:
+                        config = _CONFIG_REGISTRY[model_type].from_dict(config_dict)
+                    else:
+                        config = AutoConfig.for_model(
+                            model_type,
+                            **{
+                                key: value
+                                for key, value in config_dict.items()
+                                if key != "model_type"
+                            },
+                        )
                     return config_dict, _maybe_remap_hf_config_attrs(config)
             raise
         # Use custom model class if it's in our registry
