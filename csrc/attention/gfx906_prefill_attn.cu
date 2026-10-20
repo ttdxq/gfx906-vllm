@@ -3,8 +3,9 @@
 // Replaces the Triton slim scanner on the single-sequence plain-causal
 // fp16-KV head-256/GQA6/800-page shape, writing the same fp32 split-KV
 // segment workspace that reduce_segments combines. fp32 accumulation over
-// fp16 inputs throughout (v_fma_mix_f32 selected per term), identical
-// online-softmax semantics including the m_new == -inf guard.
+// fp16 inputs throughout (v_dot2_f32_f16: exact fp16 products, fp32
+// accumulate), identical online-softmax semantics including the
+// m_new == -inf guard.
 //
 // Kernel-level validation vs the Triton slim scanner on the tuning shapes
 // (interleaved medians, single layer/chunk calls): 1.75-2.4x faster at
@@ -12,10 +13,12 @@
 // 2.7e-4 level as Triton (summation-order-only differences).
 //
 // Structure: one 64-row q tile (BLOCK_Q=10 tokens x GQA6) resident in LDS;
-// TILE=32 KV tiles staged through a padded (258-half) LDS buffer; QK rows
-// split across JGROUP=16 lane groups with warp-shuffle stat reduction; PV
-// interleaved d mapping (4-half2 stride) so consecutive threads hit
-// consecutive banks; 512 threads = 4 waves/SIMD for latency hiding.
+// TILE=32 KV tiles staged through a padded (258-half) LDS buffer; QK is a
+// 4x4 (row, col) block per thread on one of 4 interleaved d quarters (the
+// quarters fold with two shuffles, the row max spans the 8 col blocks); V
+// is transposed at staging into row pairs so PV runs dot2 over 4-row x
+// 8-d thread blocks (strided d keeps the wave bank-conflict-free); 512
+// threads = 4 waves/SIMD for latency hiding.
 //
 // KV staging is software-pipelined: each thread's 32B tile slice is loaded
 // from global with 16B vector reads into registers one tile ahead and
@@ -184,10 +187,20 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
                            const int k_s1, const int k_s2, const int v_s0,
                            const int v_s1, const int v_s2, int* dbg) {
   constexpr int BLOCK_Q = BM / GQA;
-  constexpr int JGROUP = TILE / 2;                // QK lanes per row
-  constexpr int QK_ROWS = BM * JGROUP / THREADS;  // QK rows per thread
-  constexpr int PV_T = THREADS / BM;              // PV threads per row
-  constexpr int PV_D = HEAD / PV_T;               // PV d-slice
+  // QK tiling: a thread owns a QK_R x QK_C (row, col) block on one of QK_DB
+  // interleaved d quarters, so every K/Q half2 is fetched once per row/col
+  // block instead of once per row; the quarter lanes fold with two shuffles
+  constexpr int QK_R = 4;
+  constexpr int QK_C = 4;
+  constexpr int QK_DB = 4;
+  static_assert(BM / QK_R * (TILE / QK_C) * QK_DB == THREADS,
+                "QK tiling mismatch");
+  // PV tiling: a thread owns PV_ROWS rows x PV_DS d's, so a Vt2 half2 is
+  // fetched once per row block instead of once per row
+  constexpr int PV_ROWS = 4;
+  constexpr int PV_DS = 8;
+  constexpr int PV_NDB = HEAD / PV_DS;            // d phases = 32
+  static_assert(BM / PV_ROWS * PV_NDB == THREADS, "PV tiling mismatch");
 
   const int qb = blockIdx.x;
   const int kvh = blockIdx.y;
@@ -201,13 +214,19 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     // so stale state must be invalidated here or reduce_segments merges
     // the previous layer's segment into this one (short prompts only:
     // seq_len <= NSEG * TILE leaves higher segments empty)
-    const int i_pv_e = tid / PV_T;
-    const int tok_e = qb * BLOCK_Q + i_pv_e / GQA;
-    if (tok_e < q_len && tid % PV_T == 0) {
-      const int head_e = kvh * GQA + i_pv_e % GQA;
-      const size_t base = ((size_t)tok_e * QHEADS + head_e) * NSEG + segm;
-      segm_max[base] = -INFINITY;
-      segm_expsum[base] = 0.f;
+    const int rb_e = tid / PV_NDB;
+    if (tid % PV_NDB == 0) {
+#pragma unroll
+      for (int r = 0; r < PV_ROWS; ++r) {
+        const int i = rb_e * PV_ROWS + r;
+        const int tok_e = qb * BLOCK_Q + i / GQA;
+        if (tok_e < q_len) {
+          const int head_e = kvh * GQA + i % GQA;
+          const size_t base = ((size_t)tok_e * QHEADS + head_e) * NSEG + segm;
+          segm_max[base] = -INFINITY;
+          segm_expsum[base] = 0.f;
+        }
+      }
     }
     return;
   }
@@ -254,16 +273,22 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
   }
   __syncthreads();
 
-  // persistent fp32 accumulator: row i_pv, d in the thread's PV_D slice
-  const int i_pv = tid / PV_T;
-  float acc[PV_D];
+  // persistent fp32 accumulator: rows [r0, r0+PV_ROWS), d = db + 32*j
+  const int r0 = (tid / PV_NDB) * PV_ROWS;
+  const int db = tid % PV_NDB;
+  float acc[PV_ROWS][PV_DS];
 #pragma unroll
-  for (int d = 0; d < PV_D; ++d) acc[d] = 0.f;
+  for (int r = 0; r < PV_ROWS; ++r)
+#pragma unroll
+    for (int j = 0; j < PV_DS; ++j) acc[r][j] = 0.f;
 
-  // QK mapping: rows [i_qk0, +QK_ROWS) x cols {j_qk0, j_qk0+1}
-  const int jh = tid % JGROUP;
-  const int i_qk0 = (tid / JGROUP) * QK_ROWS;
-  const int j_qk0 = jh * 2;
+  // QK mapping: rows [i_qk0, +QK_R) x cols [j_qk0, +QK_C) x the interleaved
+  // d quarter {qk_db, +QK_DB, ...}; the quarter lanes of a block are the 4
+  // adjacent threads, the col blocks of a row sit 4 lanes apart
+  const int qk_db = tid % QK_DB;
+  const int qk_cb = (tid / QK_DB) % (TILE / QK_C);
+  const int i_qk0 = (tid / (QK_DB * TILE / QK_C)) * QK_R;
+  const int j_qk0 = qk_cb * QK_C;
 
   const int a_end = min(seg_hi, full_end);
   const int b_beg = max(seg_lo, full_end);
@@ -296,68 +321,92 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
                              kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
                              k_s1, tid, tnext, INT_MAX);
 
-    // QK dot (fp32 acc over fp16 inputs)
-    float s[QK_ROWS][2];
+    // QK dot (fp32 acc over fp16 inputs): 4x4 (row, col) block on the
+    // thread's interleaved d quarter; K and Q half2 fetches drop ~3x vs the
+    // per-row mapping
+    float s[QK_R][QK_C];
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a) s[a][0] = s[a][1] = 0.f;
+    for (int r = 0; r < QK_R; ++r)
+#pragma unroll
+      for (int c = 0; c < QK_C; ++c) s[r][c] = 0.f;
     {
       const __half2* K2 = reinterpret_cast<const __half2*>(KV_lds);
       const __half2* Q2 = reinterpret_cast<const __half2*>(Q_lds);
-#pragma unroll 8
-      for (int d2 = 0; d2 < HEAD / 2; ++d2) {
-        const __half2 k0 = K2[j_qk0 * (KSTRIDE / 2) + d2];
-        const __half2 k1 = K2[(j_qk0 + 1) * (KSTRIDE / 2) + d2];
+#pragma unroll 4
+      for (int i = 0; i < (HEAD / 2) / QK_DB; ++i) {
+        const int d2 = qk_db + QK_DB * i;
+        __half2 qv[QK_R], kv[QK_C];
 #pragma unroll
-        for (int a = 0; a < QK_ROWS; ++a) {
-          const __half2 qv = Q2[(i_qk0 + a) * (QSTRIDE / 2) + d2];
-          s[a][0] = dot2_f32_f16(qv, k0, s[a][0]);
-          s[a][1] = dot2_f32_f16(qv, k1, s[a][1]);
-        }
+        for (int r = 0; r < QK_R; ++r)
+          qv[r] = Q2[(i_qk0 + r) * (QSTRIDE / 2) + d2];
+#pragma unroll
+        for (int c = 0; c < QK_C; ++c)
+          kv[c] = K2[(j_qk0 + c) * (KSTRIDE / 2) + d2];
+#pragma unroll
+        for (int r = 0; r < QK_R; ++r)
+#pragma unroll
+          for (int c = 0; c < QK_C; ++c)
+            s[r][c] = dot2_f32_f16(qv[r], kv[c], s[r][c]);
       }
     }
+    // fold the d quarters of the block; all 4 lanes end with the full sum
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a) {
-      s[a][0] *= scale;
-      s[a][1] *= scale;
-    }
+    for (int r = 0; r < QK_R; ++r)
+#pragma unroll
+      for (int c = 0; c < QK_C; ++c) {
+        s[r][c] += __shfl_xor(s[r][c], 1);
+        s[r][c] += __shfl_xor(s[r][c], 2);
+      }
+    if (qk_db == 0) {
+#pragma unroll
+      for (int r = 0; r < QK_R; ++r)
+#pragma unroll
+        for (int c = 0; c < QK_C; ++c) s[r][c] *= scale;
 
-    // row stats (fold old M; reduce across the JGROUP lanes)
-    float m_new[QK_ROWS], l_loc[QK_ROWS];
+      // row stats on the summed lanes; the max spans the 8 col blocks four
+      // lanes apart (shfl partners share qk_db == 0)
+      float m_new[QK_R], l_loc[QK_R];
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a) {
-      m_new[a] = fmaxf(M_lds[i_qk0 + a], fmaxf(s[a][0], s[a][1]));
-      l_loc[a] = 0.f;
-    }
+      for (int r = 0; r < QK_R; ++r) {
+        m_new[r] = M_lds[i_qk0 + r];
 #pragma unroll
-    for (int off = JGROUP / 2; off > 0; off >>= 1) {
+        for (int c = 0; c < QK_C; ++c) m_new[r] = fmaxf(m_new[r], s[r][c]);
+        l_loc[r] = 0.f;
+      }
 #pragma unroll
-      for (int a = 0; a < QK_ROWS; ++a)
-        m_new[a] = fmaxf(m_new[a], __shfl_xor(m_new[a], off));
-    }
+      for (int off = QK_DB; off < (TILE / QK_C) * QK_DB; off <<= 1) {
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a)
-      if (m_new[a] == -INFINITY) m_new[a] = 0.f;  // Triton's guard
+        for (int r = 0; r < QK_R; ++r)
+          m_new[r] = fmaxf(m_new[r], __shfl_xor(m_new[r], off));
+      }
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a) {
-      const float p0 = __expf(s[a][0] - m_new[a]);
-      const float p1 = __expf(s[a][1] - m_new[a]);
-      P2_lds[i_qk0 + a][jh] = __floats2half2_rn(p0, p1);
-      l_loc[a] = p0 + p1;
-    }
+      for (int r = 0; r < QK_R; ++r)
+        if (m_new[r] == -INFINITY) m_new[r] = 0.f;  // Triton's guard
 #pragma unroll
-    for (int off = JGROUP / 2; off > 0; off >>= 1) {
+      for (int r = 0; r < QK_R; ++r) {
 #pragma unroll
-      for (int a = 0; a < QK_ROWS; ++a)
-        l_loc[a] += __shfl_xor(l_loc[a], off);
-    }
-    if (jh == 0) {
+        for (int c = 0; c < QK_C; c += 2) {
+          const float p0 = __expf(s[r][c] - m_new[r]);
+          const float p1 = __expf(s[r][c + 1] - m_new[r]);
+          P2_lds[i_qk0 + r][j_qk0 / 2 + c / 2] = __floats2half2_rn(p0, p1);
+          l_loc[r] += p0 + p1;
+        }
+      }
 #pragma unroll
-      for (int a = 0; a < QK_ROWS; ++a) {
-        const float m_old = M_lds[i_qk0 + a];
-        const float alpha = __expf(m_old - m_new[a]);
-        L_lds[i_qk0 + a] = L_lds[i_qk0 + a] * alpha + l_loc[a];
-        alpha_lds[i_qk0 + a] = alpha;
-        M_lds[i_qk0 + a] = m_new[a];
+      for (int off = QK_DB; off < (TILE / QK_C) * QK_DB; off <<= 1) {
+#pragma unroll
+        for (int r = 0; r < QK_R; ++r)
+          l_loc[r] += __shfl_xor(l_loc[r], off);
+      }
+      if (qk_cb == 0) {
+#pragma unroll
+        for (int r = 0; r < QK_R; ++r) {
+          const float m_old = M_lds[i_qk0 + r];
+          const float alpha = __expf(m_old - m_new[r]);
+          L_lds[i_qk0 + r] = L_lds[i_qk0 + r] * alpha + l_loc[r];
+          alpha_lds[i_qk0 + r] = alpha;
+          M_lds[i_qk0 + r] = m_new[r];
+        }
       }
     }
     __syncthreads();
@@ -370,24 +419,27 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     __syncthreads();
 
     // PV: acc = acc*alpha + P16 @ V (fp32 acc)
-    const float alpha = alpha_lds[i_pv];
 #pragma unroll
-    for (int d = 0; d < PV_D; ++d) acc[d] *= alpha;
-    const __half2* P2r = P2_lds[i_pv];
-    const int dq = tid % PV_T;
+    for (int r = 0; r < PV_ROWS; ++r) {
+      const float alpha = alpha_lds[r0 + r];
+#pragma unroll
+      for (int j = 0; j < PV_DS; ++j) acc[r][j] *= alpha;
+    }
+    // each Vt2 half2 feeds PV_ROWS rows at once (LDS bytes drop ~2.8x);
+    // the d stride 32 spreads the 32 d phases of a wave over distinct banks
+    const __half2* Vt2 = reinterpret_cast<const __half2*>(KV_lds);
+#pragma unroll 4
     for (int m = 0; m < TILE / 2; ++m) {
-      const __half2 pp = P2r[m];
-      const uint2* Vt4 = reinterpret_cast<const uint2*>(KV_lds) +
-                         m * (HEAD / 2);
+      __half2 pp[PV_ROWS];
 #pragma unroll
-      for (int d2 = 0; d2 < PV_D / 2; ++d2) {
-        // d mapping matches the epilogue: acc[2*d2 + e] owns d
-        // 2*dq + 2*PV_T*d2 + e; one uint2 covers the adjacent pair
-        const uint2 v01 = Vt4[dq + PV_T * d2];
-        acc[2 * d2] = dot2_f32_f16(
-            pp, *reinterpret_cast<const __half2*>(&v01.x), acc[2 * d2]);
-        acc[2 * d2 + 1] = dot2_f32_f16(
-            pp, *reinterpret_cast<const __half2*>(&v01.y), acc[2 * d2 + 1]);
+      for (int r = 0; r < PV_ROWS; ++r) pp[r] = P2_lds[r0 + r][m];
+      const __half2* Vm = Vt2 + m * HEAD + db;
+#pragma unroll
+      for (int j = 0; j < PV_DS; ++j) {
+        const __half2 v = Vm[32 * j];
+#pragma unroll
+        for (int r = 0; r < PV_ROWS; ++r)
+          acc[r][j] = dot2_f32_f16(pp[r], v, acc[r][j]);
       }
     }
     __syncthreads();
@@ -415,72 +467,93 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
       kv_load<TILE, THREADS>(pre_k,
                              kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
                              k_s1, tid, tnext, max_prefix);
-    // QK dot + causal/query masks
-    float s[QK_ROWS][2];
+    // QK dot + causal/query masks (same 4x4 block / d-quarter mapping)
+    float s[QK_R][QK_C];
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a) s[a][0] = s[a][1] = 0.f;
+    for (int r = 0; r < QK_R; ++r)
+#pragma unroll
+      for (int c = 0; c < QK_C; ++c) s[r][c] = 0.f;
     {
       const __half2* K2 = reinterpret_cast<const __half2*>(KV_lds);
       const __half2* Q2 = reinterpret_cast<const __half2*>(Q_lds);
-#pragma unroll 8
-      for (int d2 = 0; d2 < HEAD / 2; ++d2) {
-        const __half2 k0 = K2[j_qk0 * (KSTRIDE / 2) + d2];
-        const __half2 k1 = K2[(j_qk0 + 1) * (KSTRIDE / 2) + d2];
+#pragma unroll 4
+      for (int i = 0; i < (HEAD / 2) / QK_DB; ++i) {
+        const int d2 = qk_db + QK_DB * i;
+        __half2 qv[QK_R], kv[QK_C];
 #pragma unroll
-        for (int a = 0; a < QK_ROWS; ++a) {
-          const __half2 qv = Q2[(i_qk0 + a) * (QSTRIDE / 2) + d2];
-          s[a][0] = dot2_f32_f16(qv, k0, s[a][0]);
-          s[a][1] = dot2_f32_f16(qv, k1, s[a][1]);
-        }
+        for (int r = 0; r < QK_R; ++r)
+          qv[r] = Q2[(i_qk0 + r) * (QSTRIDE / 2) + d2];
+#pragma unroll
+        for (int c = 0; c < QK_C; ++c)
+          kv[c] = K2[(j_qk0 + c) * (KSTRIDE / 2) + d2];
+#pragma unroll
+        for (int r = 0; r < QK_R; ++r)
+#pragma unroll
+          for (int c = 0; c < QK_C; ++c)
+            s[r][c] = dot2_f32_f16(qv[r], kv[c], s[r][c]);
       }
     }
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a) {
-      const int i = i_qk0 + a;
-      const int tok = q_lo + i / GQA;
-      const int abs_pos = context + tok;
-      s[a][0] = (tok < q_len && tbase + j_qk0 <= abs_pos) ? s[a][0] * scale
-                                                          : -INFINITY;
-      s[a][1] = (tok < q_len && tbase + j_qk0 + 1 <= abs_pos) ? s[a][1] * scale
-                                                              : -INFINITY;
-    }
+    for (int r = 0; r < QK_R; ++r)
+#pragma unroll
+      for (int c = 0; c < QK_C; ++c) {
+        s[r][c] += __shfl_xor(s[r][c], 1);
+        s[r][c] += __shfl_xor(s[r][c], 2);
+      }
+    if (qk_db == 0) {
+#pragma unroll
+      for (int r = 0; r < QK_R; ++r) {
+        const int tok = q_lo + (i_qk0 + r) / GQA;
+        const int abs_pos = context + tok;
+#pragma unroll
+        for (int c = 0; c < QK_C; ++c)
+          s[r][c] = (tok < q_len && tbase + j_qk0 + c <= abs_pos)
+                        ? s[r][c] * scale
+                        : -INFINITY;
+      }
 
-    float m_new[QK_ROWS], l_loc[QK_ROWS];
+      float m_new[QK_R], l_loc[QK_R];
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a) {
-      m_new[a] = fmaxf(M_lds[i_qk0 + a], fmaxf(s[a][0], s[a][1]));
-      l_loc[a] = 0.f;
-    }
+      for (int r = 0; r < QK_R; ++r) {
+        m_new[r] = M_lds[i_qk0 + r];
 #pragma unroll
-    for (int off = JGROUP / 2; off > 0; off >>= 1) {
+        for (int c = 0; c < QK_C; ++c) m_new[r] = fmaxf(m_new[r], s[r][c]);
+        l_loc[r] = 0.f;
+      }
 #pragma unroll
-      for (int a = 0; a < QK_ROWS; ++a)
-        m_new[a] = fmaxf(m_new[a], __shfl_xor(m_new[a], off));
-    }
+      for (int off = QK_DB; off < (TILE / QK_C) * QK_DB; off <<= 1) {
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a)
-      if (m_new[a] == -INFINITY) m_new[a] = 0.f;
+        for (int r = 0; r < QK_R; ++r)
+          m_new[r] = fmaxf(m_new[r], __shfl_xor(m_new[r], off));
+      }
 #pragma unroll
-    for (int a = 0; a < QK_ROWS; ++a) {
-      const float p0 = __expf(s[a][0] - m_new[a]);
-      const float p1 = __expf(s[a][1] - m_new[a]);
-      P2_lds[i_qk0 + a][jh] = __floats2half2_rn(p0, p1);
-      l_loc[a] = p0 + p1;
-    }
+      for (int r = 0; r < QK_R; ++r)
+        if (m_new[r] == -INFINITY) m_new[r] = 0.f;  // Triton's guard
 #pragma unroll
-    for (int off = JGROUP / 2; off > 0; off >>= 1) {
+      for (int r = 0; r < QK_R; ++r) {
 #pragma unroll
-      for (int a = 0; a < QK_ROWS; ++a)
-        l_loc[a] += __shfl_xor(l_loc[a], off);
-    }
-    if (jh == 0) {
+        for (int c = 0; c < QK_C; c += 2) {
+          const float p0 = __expf(s[r][c] - m_new[r]);
+          const float p1 = __expf(s[r][c + 1] - m_new[r]);
+          P2_lds[i_qk0 + r][j_qk0 / 2 + c / 2] = __floats2half2_rn(p0, p1);
+          l_loc[r] += p0 + p1;
+        }
+      }
 #pragma unroll
-      for (int a = 0; a < QK_ROWS; ++a) {
-        const float m_old = M_lds[i_qk0 + a];
-        const float alpha = __expf(m_old - m_new[a]);
-        L_lds[i_qk0 + a] = L_lds[i_qk0 + a] * alpha + l_loc[a];
-        alpha_lds[i_qk0 + a] = alpha;
-        M_lds[i_qk0 + a] = m_new[a];
+      for (int off = QK_DB; off < (TILE / QK_C) * QK_DB; off <<= 1) {
+#pragma unroll
+        for (int r = 0; r < QK_R; ++r)
+          l_loc[r] += __shfl_xor(l_loc[r], off);
+      }
+      if (qk_cb == 0) {
+#pragma unroll
+        for (int r = 0; r < QK_R; ++r) {
+          const float m_old = M_lds[i_qk0 + r];
+          const float alpha = __expf(m_old - m_new[r]);
+          L_lds[i_qk0 + r] = L_lds[i_qk0 + r] * alpha + l_loc[r];
+          alpha_lds[i_qk0 + r] = alpha;
+          M_lds[i_qk0 + r] = m_new[r];
+        }
       }
     }
     __syncthreads();
@@ -491,22 +564,25 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
                              v_s1, tid, tnext, max_prefix);
     __syncthreads();
 
-    const float alpha = alpha_lds[i_pv];
 #pragma unroll
-    for (int d = 0; d < PV_D; ++d) acc[d] *= alpha;
-    const __half2* P2r = P2_lds[i_pv];
-    const int dq = tid % PV_T;
+    for (int r = 0; r < PV_ROWS; ++r) {
+      const float alpha = alpha_lds[r0 + r];
+#pragma unroll
+      for (int j = 0; j < PV_DS; ++j) acc[r][j] *= alpha;
+    }
+    const __half2* Vt2 = reinterpret_cast<const __half2*>(KV_lds);
+#pragma unroll 4
     for (int m = 0; m < TILE / 2; ++m) {
-      const __half2 pp = P2r[m];
-      const uint2* Vt4 = reinterpret_cast<const uint2*>(KV_lds) +
-                         m * (HEAD / 2);
+      __half2 pp[PV_ROWS];
 #pragma unroll
-      for (int d2 = 0; d2 < PV_D / 2; ++d2) {
-        const uint2 v01 = Vt4[dq + PV_T * d2];
-        acc[2 * d2] = dot2_f32_f16(
-            pp, *reinterpret_cast<const __half2*>(&v01.x), acc[2 * d2]);
-        acc[2 * d2 + 1] = dot2_f32_f16(
-            pp, *reinterpret_cast<const __half2*>(&v01.y), acc[2 * d2 + 1]);
+      for (int r = 0; r < PV_ROWS; ++r) pp[r] = P2_lds[r0 + r][m];
+      const __half2* Vm = Vt2 + m * HEAD + db;
+#pragma unroll
+      for (int j = 0; j < PV_DS; ++j) {
+        const __half2 v = Vm[32 * j];
+#pragma unroll
+        for (int r = 0; r < PV_ROWS; ++r)
+          acc[r][j] = dot2_f32_f16(pp[r], v, acc[r][j]);
       }
     }
     __syncthreads();
@@ -515,22 +591,21 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
   }
 
   // epilogue into the fp32 segment workspace
-  const int tok = q_lo + i_pv / GQA;
-  if (tok < q_len) {
-    const int head = kvh * GQA + i_pv % GQA;
-    float* dst =
-        segm_out + (((size_t)tok * QHEADS + head) * NSEG + segm) * HEAD;
-    const int dq = tid % PV_T;
 #pragma unroll
-    for (int d2 = 0; d2 < PV_D / 2; ++d2) {
-      const int ddx = 2 * dq + 2 * PV_T * d2;  // matches the PV mapping
-      dst[ddx] = acc[2 * d2];
-      dst[ddx + 1] = acc[2 * d2 + 1];
-    }
-    if (tid % PV_T == 0) {
-      const size_t base = ((size_t)tok * QHEADS + head) * NSEG + segm;
-      segm_max[base] = M_lds[i_pv];
-      segm_expsum[base] = L_lds[i_pv];
+  for (int r = 0; r < PV_ROWS; ++r) {
+    const int i = r0 + r;
+    const int tok = q_lo + i / GQA;
+    if (tok < q_len) {
+      const int head = kvh * GQA + i % GQA;
+      float* dst =
+          segm_out + (((size_t)tok * QHEADS + head) * NSEG + segm) * HEAD;
+#pragma unroll
+      for (int j = 0; j < PV_DS; ++j) dst[db + 32 * j] = acc[r][j];
+      if (db == 0) {
+        const size_t base = ((size_t)tok * QHEADS + head) * NSEG + segm;
+        segm_max[base] = M_lds[i];
+        segm_expsum[base] = L_lds[i];
+      }
     }
   }
 }
