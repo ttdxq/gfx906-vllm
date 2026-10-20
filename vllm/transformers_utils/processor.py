@@ -4,6 +4,7 @@
 import importlib
 import inspect
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, get_args, get_type_hints
 
 from transformers import (
@@ -20,6 +21,7 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.video_processing_utils import BaseVideoProcessor
 from typing_extensions import TypeVar
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.transformers_utils import processors
 from vllm.transformers_utils.gguf_utils import gguf_multimodal_processor_repo
@@ -199,6 +201,25 @@ def get_video_processor_cls_name(
     return _cached_get_video_processor_cls_name(model, revision=revision)
 
 
+@lru_cache
+def _resolve_processor_path(processor_name: str, revision: str | None) -> str:
+    if not envs.VLLM_USE_MODELSCOPE or Path(processor_name).exists():
+        return processor_name
+
+    from modelscope.hub.snapshot_download import snapshot_download
+
+    from vllm.model_executor.model_loader.weight_utils import get_lock
+
+    # Mirror tokenizer resolution: materialize the repository from ModelScope
+    # and skip weight files, which the processor does not need.
+    with get_lock(processor_name):
+        return snapshot_download(
+            model_id=processor_name,
+            revision=None if revision == "main" else revision,
+            ignore_file_pattern=[".*.pt", ".*.safetensors", ".*.bin"],
+        )
+
+
 def get_processor(
     processor_name: str,
     *args: Any,
@@ -211,7 +232,7 @@ def get_processor(
     if revision is None:
         revision = "main"
     try:
-        processor_name = convert_model_repo_to_path(processor_name)
+        processor_name = _resolve_processor_path(processor_name, revision)
         registered_cls_name = get_processor_cls_name_from_config(
             processor_name, revision=revision
         )
