@@ -309,55 +309,17 @@ def _auto_enable_async_scheduling_for_gfx906_gguf(
     return _is_gfx906_gguf(model_config)
 
 
-def needs_qwen35_gguf_piecewise_cudagraph(model_config: ModelConfig | None) -> bool:
-    if os.getenv("VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        logger.warning_once(
-            "VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH is set. This bypasses "
-            "the gfx906 Qwen3.5 GGUF PIECEWISE CUDA graph safety guard and "
-            "is intended only for debugging known FULL decode graph "
-            "correctness issues."
-        )
-        return False
+def needs_qwen35_gguf_full_decode_default(model_config: ModelConfig | None) -> bool:
+    """Whether gfx906 Qwen3.5 GGUF should default to FULL_DECODE_ONLY graphs.
+
+    The GDN recurrent state updates run through request-indexed in-place
+    custom ops that are safe under decode full-graph capture, so decode uses
+    FULL CUDA graphs to cut per-token launch overhead, while prefill/mixed
+    batches keep piecewise compilation without cudagraphs to preserve
+    dynamic-shape flexibility (piecewise cudagraphs measured slower than
+    eager on this path).
+    """
     return _is_gfx906_qwen35_gguf(model_config)
-
-
-def needs_qwen35_gguf_eager_decode(model_config: ModelConfig | None) -> bool:
-    if os.getenv("VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return False
-    if os.getenv("VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        logger.warning_once(
-            "VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH is set. This "
-            "restores the old compiled gfx906 Qwen3.5 GGUF PIECEWISE CUDA "
-            "graph fallback for debugging, although local benchmarks showed "
-            "it is slower than eager decode for this path."
-        )
-        return False
-    return _is_gfx906_qwen35_gguf(model_config)
-
-
-def prefer_eager_custom_ops_for_qwen35_gguf(
-    compilation_config: CompilationConfig,
-) -> None:
-    custom_ops = compilation_config.custom_ops
-    while "none" in custom_ops:
-        custom_ops.remove("none")
-    if "all" not in custom_ops:
-        custom_ops.append("all")
 
 
 OPTIMIZATION_LEVEL_00 = {
@@ -1833,6 +1795,26 @@ class VllmConfig:
         # but before fusion defaults are applied as those may depend on op priority.
         self.kernel_config.set_platform_defaults(self)
 
+        # gfx906 Qwen3.5 GGUF defaults to FULL decode CUDA graphs with
+        # piecewise-compiled prefill. Inject before optimization-level
+        # defaults fill cudagraph_mode so an explicit user setting wins.
+        if (
+            current_platform.support_static_graph_mode()
+            and self.model_config is not None
+            and self.speculative_config is None
+            and self.compilation_config.cudagraph_mode is None
+            and self.compilation_config.mode
+            in (None, CompilationMode.VLLM_COMPILE)
+            and needs_qwen35_gguf_full_decode_default(self.model_config)
+        ):
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            logger.info_once(
+                "Using FULL decode CUDA graphs with piecewise-compiled "
+                "prefill for Qwen3.5 GGUF on gfx906 by default. Set "
+                "cudagraph_mode explicitly to override, or --enforce-eager "
+                "to disable."
+            )
+
         default_config = OPTIMIZATION_LEVEL_TO_CONFIG[self.optimization_level]
         self._apply_optimization_level_defaults(default_config)
         if self.kernel_config.enable_flashinfer_autotune is None:
@@ -1905,32 +1887,6 @@ class VllmConfig:
         self._set_max_num_scheduled_tokens()
 
         if current_platform.support_static_graph_mode():
-            if (
-                self.model_config is not None
-                and needs_qwen35_gguf_eager_decode(self.model_config)
-                and (
-                    self.compilation_config.mode != CompilationMode.NONE
-                    or self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-                )
-            ):
-                logger.warning_once(
-                    "Qwen3.5 GGUF on gfx906 is faster and avoids known "
-                    "GatedDeltaNet state update graph hazards with eager "
-                    "decode. Overriding compilation mode and cudagraph_mode "
-                    "to NONE. Set "
-                    "VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH=1 to restore "
-                    "the previous compiled PIECEWISE fallback for debugging."
-                )
-                self.compilation_config.mode = CompilationMode.NONE
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-                self.compilation_config.max_cudagraph_capture_size = 0
-                self.compilation_config.cudagraph_capture_sizes = []
-                self.compilation_config.cudagraph_num_of_warmups = 0
-                self.model_config.enforce_eager = True
-                prefer_eager_custom_ops_for_qwen35_gguf(
-                    self.compilation_config
-                )
-
             # if cudagraph_mode has full cudagraphs, we need to check support
             if model_config := self.model_config:
                 if (
@@ -1955,14 +1911,6 @@ class VllmConfig:
                     self.compilation_config.cudagraph_mode = (
                         CUDAGraphMode.FULL_DECODE_ONLY
                     )
-                elif needs_qwen35_gguf_piecewise_cudagraph(self.model_config):
-                    logger.warning_once(
-                        "Qwen3.5 GGUF on gfx906 updates GatedDeltaNet state "
-                        "through a custom op that is not safe under full "
-                        "decode CUDA graphs. Overriding cudagraph_mode to "
-                        "PIECEWISE."
-                    )
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
             # Check if KV connector requires PIECEWISE mode for CUDA graphs
             if (

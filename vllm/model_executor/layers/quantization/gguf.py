@@ -2231,6 +2231,9 @@ class GGUFLinearMethod(LinearMethodBase):
             # _gguf_shard_cache; there is no padded qweight to repack, and
             # any tensor-method access on the uninitialized parameter raises.
             return
+        if qweight.numel() == 0:
+            # Zero-element placeholder over mixed-width shard cache entries.
+            return
         if not qweight.is_cuda or not qweight.is_contiguous():
             return
 
@@ -2312,6 +2315,22 @@ class GGUFLinearMethod(LinearMethodBase):
                     cache[idx] = shard
                 qweight.data_container.clear()
                 layer._gguf_shard_cache = cache
+                # Replace the GGUFUninitializedParameter with a zero-element
+                # placeholder that keeps the shard metadata attrs. apply() and
+                # the shard collectors only read `qweight.shard_id` here; any
+                # tensor-method access on an UninitializedParameter raises,
+                # which breaks dynamo tracing of the compiled path.
+                placeholder = Parameter(
+                    torch.empty(
+                        0,
+                        0,
+                        dtype=cache[shard_id[0]].dtype,
+                        device=cache[shard_id[0]].device,
+                    ),
+                    requires_grad=False,
+                )
+                set_weight_attrs(placeholder, vars(qweight))
+                layer.register_parameter("qweight", placeholder)
                 return
             dtype = {data.dtype for data in data_container}
             assert len(dtype) == 1, ValueError(
