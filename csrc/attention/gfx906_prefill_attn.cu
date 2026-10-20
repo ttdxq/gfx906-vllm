@@ -80,6 +80,40 @@ __device__ __forceinline__ void kv_stage(const uint4* pre, __half* lds,
   }
 }
 
+// V is consumed as row pairs: Vt2[m][d] packs (V[2m][d], V[2m+1][d]) so PV
+// runs on v_dot2_f32_f16 with an fp32 accumulator. The pair partner (the
+// adjacent KV row, same 16B column slice) always lives in lane tid^32 of
+// the same wave, so the transpose is a shuffle plus byte permutes -- no
+// LDS round trip and no extra buffer (Vt2 reuses the K staging region,
+// which is dead after the QK barrier).
+template <int TILE, int THREADS>
+__device__ __forceinline__ void kv_stage_vt(const uint4* pre, __half* lds,
+                                            int tid) {
+#pragma unroll
+  for (int s = 0; s < TILE * KV_ROW16 / THREADS; ++s) {
+    const int u = tid + s * THREADS;
+    const int r = u / KV_ROW16;
+    const int c16 = u % KV_ROW16;
+    const bool even = (r & 1) == 0;
+    // a 16B slice holds 8 halves; word i covers d's c16*8+2i and c16*8+2i+1
+    // and expands to two half2 units (even row's half low, odd row's high),
+    // so a Vt2 row keeps HEAD half2 units and word i stores at half2 offset
+    // c16*8 + 2i
+    __half2* dst =
+        reinterpret_cast<__half2*>(lds) + (r >> 1) * HEAD + c16 * 8;
+    const unsigned* w = reinterpret_cast<const unsigned*>(&pre[s]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const unsigned mine = w[i];
+      const unsigned other = __shfl_xor(mine, 32);
+      const unsigned x = even ? mine : other;
+      const unsigned y = even ? other : mine;
+      reinterpret_cast<uint2*>(dst)[i] =
+          make_uint2(__byte_perm(x, y, 0x5410), __byte_perm(x, y, 0x7632));
+    }
+  }
+}
+
 __device__ __forceinline__ const __half* kv_row(
     const __half* base, int s0, int s1, int s2,
     const int* __restrict__ bt, int kvh, int tbase, int nb_tbl, int nb_cache,
@@ -110,6 +144,29 @@ __device__ __forceinline__ const __half* kv_row(
     tin = 0;
   }
   return base + (size_t)pbi * s0 + (size_t)tin * s1 + (size_t)kvh * s2;
+}
+
+// v_dot2_f32_f16: both fp16 products are computed exactly (11x11-bit
+// mantissas fit in fp32) and accumulated in fp32 -- the same error class
+// as the per-term fma chain it replaces, one instruction instead of two
+__device__ __forceinline__ float dot2_f32_f16(const __half2 a,
+                                              const __half2 b,
+                                              const float c) {
+#if defined(__clang__) && __has_builtin(__builtin_amdgcn_fdot2)
+  return __builtin_amdgcn_fdot2(a, b, c, false);
+#else
+  union {
+    __half2 h;
+    unsigned u;
+  } ua, ub;
+  ua.h = a;
+  ub.h = b;
+  float r;
+  __asm__("v_dot2_f32_f16 %0, %1, %2, %3"
+          : "=v"(r)
+          : "v"(ua.u), "v"(ub.u), "v"(c));
+  return r;
+#endif
 }
 
 template <int BM, int TILE, int THREADS>
@@ -168,10 +225,9 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
   // is a multiple of the 128B LDS bank period and would 4-way conflict)
   constexpr int QSTRIDE = HEAD + 2;
   constexpr int KSTRIDE = HEAD + 2;
-  constexpr int PSTRIDE = TILE + 2;
   __shared__ __half Q_lds[BM * QSTRIDE];
-  __shared__ __half KV_lds[TILE * KSTRIDE];
-  __shared__ __half P_lds[BM * PSTRIDE];
+  __shared__ __align__(16) __half KV_lds[TILE * KSTRIDE];
+  __shared__ __half2 P2_lds[BM][TILE / 2 + 1];
   __shared__ float M_lds[BM], L_lds[BM], alpha_lds[BM];
 
   // stage Q (invalid rows read as 0) and init softmax state
@@ -249,18 +305,13 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
       const __half2* Q2 = reinterpret_cast<const __half2*>(Q_lds);
 #pragma unroll 8
       for (int d2 = 0; d2 < HEAD / 2; ++d2) {
-        const float2 k0 = __half22float2(K2[j_qk0 * (KSTRIDE / 2) + d2]);
-        const float2 k1 = __half22float2(K2[(j_qk0 + 1) * (KSTRIDE / 2) + d2]);
+        const __half2 k0 = K2[j_qk0 * (KSTRIDE / 2) + d2];
+        const __half2 k1 = K2[(j_qk0 + 1) * (KSTRIDE / 2) + d2];
 #pragma unroll
         for (int a = 0; a < QK_ROWS; ++a) {
-          const float2 qv =
-              __half22float2(Q2[(i_qk0 + a) * (QSTRIDE / 2) + d2]);
-          // single-term statements so every fp-contract fold selects
-          // v_fma_mix_f32 (a two-term chain leaves the first as mul+add)
-          s[a][0] += qv.x * k0.x;
-          s[a][0] += qv.y * k0.y;
-          s[a][1] += qv.x * k1.x;
-          s[a][1] += qv.y * k1.y;
+          const __half2 qv = Q2[(i_qk0 + a) * (QSTRIDE / 2) + d2];
+          s[a][0] = dot2_f32_f16(qv, k0, s[a][0]);
+          s[a][1] = dot2_f32_f16(qv, k1, s[a][1]);
         }
       }
     }
@@ -290,8 +341,7 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     for (int a = 0; a < QK_ROWS; ++a) {
       const float p0 = __expf(s[a][0] - m_new[a]);
       const float p1 = __expf(s[a][1] - m_new[a]);
-      P_lds[(i_qk0 + a) * PSTRIDE + j_qk0] = __float2half(p0);
-      P_lds[(i_qk0 + a) * PSTRIDE + j_qk0 + 1] = __float2half(p1);
+      P2_lds[i_qk0 + a][jh] = __floats2half2_rn(p0, p1);
       l_loc[a] = p0 + p1;
     }
 #pragma unroll
@@ -311,7 +361,7 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
       }
     }
     __syncthreads();
-    kv_stage<TILE, THREADS, KSTRIDE>(pre_v, KV_lds, tid);
+    kv_stage_vt<TILE, THREADS>(pre_v, KV_lds, tid);
     // V(j+1) in flight across PV plus the next tile's QK/softmax
     if (more)
       kv_load<TILE, THREADS>(pre_v,
@@ -323,19 +373,21 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     const float alpha = alpha_lds[i_pv];
 #pragma unroll
     for (int d = 0; d < PV_D; ++d) acc[d] *= alpha;
-    for (int r = 0; r < TILE; ++r) {
-      // interleaved d mapping (4-half2 stride): consecutive threads of a
-      // row hit consecutive banks instead of one bank 4 ways
-      const float p = __half2float(P_lds[i_pv * PSTRIDE + r]);
-      const __half2* V2 = reinterpret_cast<const __half2*>(KV_lds) +
-                          r * (KSTRIDE / 2) + (tid % PV_T);
+    const __half2* P2r = P2_lds[i_pv];
+    const int dq = tid % PV_T;
+    for (int m = 0; m < TILE / 2; ++m) {
+      const __half2 pp = P2r[m];
+      const uint2* Vt4 = reinterpret_cast<const uint2*>(KV_lds) +
+                         m * (HEAD / 2);
 #pragma unroll
       for (int d2 = 0; d2 < PV_D / 2; ++d2) {
-        // interleaved d mapping: thread dq owns h2 {dq + PV_T*d2}; a fixed
-        // stride of 4 only covers half the row when PV_T != 4
-        const float2 vv = __half22float2(V2[PV_T * d2]);
-        acc[2 * d2] += p * vv.x;
-        acc[2 * d2 + 1] += p * vv.y;
+        // d mapping matches the epilogue: acc[2*d2 + e] owns d
+        // 2*dq + 2*PV_T*d2 + e; one uint2 covers the adjacent pair
+        const uint2 v01 = Vt4[dq + PV_T * d2];
+        acc[2 * d2] = dot2_f32_f16(
+            pp, *reinterpret_cast<const __half2*>(&v01.x), acc[2 * d2]);
+        acc[2 * d2 + 1] = dot2_f32_f16(
+            pp, *reinterpret_cast<const __half2*>(&v01.y), acc[2 * d2 + 1]);
       }
     }
     __syncthreads();
@@ -372,16 +424,13 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
       const __half2* Q2 = reinterpret_cast<const __half2*>(Q_lds);
 #pragma unroll 8
       for (int d2 = 0; d2 < HEAD / 2; ++d2) {
-        const float2 k0 = __half22float2(K2[j_qk0 * (KSTRIDE / 2) + d2]);
-        const float2 k1 = __half22float2(K2[(j_qk0 + 1) * (KSTRIDE / 2) + d2]);
+        const __half2 k0 = K2[j_qk0 * (KSTRIDE / 2) + d2];
+        const __half2 k1 = K2[(j_qk0 + 1) * (KSTRIDE / 2) + d2];
 #pragma unroll
         for (int a = 0; a < QK_ROWS; ++a) {
-          const float2 qv =
-              __half22float2(Q2[(i_qk0 + a) * (QSTRIDE / 2) + d2]);
-          s[a][0] += qv.x * k0.x;
-          s[a][0] += qv.y * k0.y;
-          s[a][1] += qv.x * k1.x;
-          s[a][1] += qv.y * k1.y;
+          const __half2 qv = Q2[(i_qk0 + a) * (QSTRIDE / 2) + d2];
+          s[a][0] = dot2_f32_f16(qv, k0, s[a][0]);
+          s[a][1] = dot2_f32_f16(qv, k1, s[a][1]);
         }
       }
     }
@@ -415,8 +464,7 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     for (int a = 0; a < QK_ROWS; ++a) {
       const float p0 = __expf(s[a][0] - m_new[a]);
       const float p1 = __expf(s[a][1] - m_new[a]);
-      P_lds[(i_qk0 + a) * PSTRIDE + j_qk0] = __float2half(p0);
-      P_lds[(i_qk0 + a) * PSTRIDE + j_qk0 + 1] = __float2half(p1);
+      P2_lds[i_qk0 + a][jh] = __floats2half2_rn(p0, p1);
       l_loc[a] = p0 + p1;
     }
 #pragma unroll
@@ -436,7 +484,7 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
       }
     }
     __syncthreads();
-    kv_stage<TILE, THREADS, KSTRIDE>(pre_v, KV_lds, tid);
+    kv_stage_vt<TILE, THREADS>(pre_v, KV_lds, tid);
     if (more)
       kv_load<TILE, THREADS>(pre_v,
                              kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
@@ -446,17 +494,19 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     const float alpha = alpha_lds[i_pv];
 #pragma unroll
     for (int d = 0; d < PV_D; ++d) acc[d] *= alpha;
-    for (int r = 0; r < TILE; ++r) {
-      const float p = __half2float(P_lds[i_pv * PSTRIDE + r]);
-      const __half2* V2 = reinterpret_cast<const __half2*>(KV_lds) +
-                          r * (KSTRIDE / 2) + (tid % PV_T);
+    const __half2* P2r = P2_lds[i_pv];
+    const int dq = tid % PV_T;
+    for (int m = 0; m < TILE / 2; ++m) {
+      const __half2 pp = P2r[m];
+      const uint2* Vt4 = reinterpret_cast<const uint2*>(KV_lds) +
+                         m * (HEAD / 2);
 #pragma unroll
       for (int d2 = 0; d2 < PV_D / 2; ++d2) {
-        // interleaved d mapping: thread dq owns h2 {dq + PV_T*d2}; a fixed
-        // stride of 4 only covers half the row when PV_T != 4
-        const float2 vv = __half22float2(V2[PV_T * d2]);
-        acc[2 * d2] += p * vv.x;
-        acc[2 * d2 + 1] += p * vv.y;
+        const uint2 v01 = Vt4[dq + PV_T * d2];
+        acc[2 * d2] = dot2_f32_f16(
+            pp, *reinterpret_cast<const __half2*>(&v01.x), acc[2 * d2]);
+        acc[2 * d2 + 1] = dot2_f32_f16(
+            pp, *reinterpret_cast<const __half2*>(&v01.y), acc[2 * d2 + 1]);
       }
     }
     __syncthreads();
