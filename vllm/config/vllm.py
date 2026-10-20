@@ -1808,6 +1808,10 @@ class VllmConfig:
             and needs_qwen35_gguf_full_decode_default(self.model_config)
         ):
             self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            # Marker for graceful degradation under memory pressure (see
+            # resolve_cudagraph_mode_and_sizes): auto-enabled graphs may be
+            # clamped or disabled, user-requested ones keep hard errors.
+            self.compilation_config._auto_graph_default = True
             logger.info_once(
                 "Using FULL decode CUDA graphs with piecewise-compiled "
                 "prefill for Qwen3.5 GGUF on gfx906 by default. Set "

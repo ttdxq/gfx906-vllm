@@ -1049,6 +1049,30 @@ def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
         min(runner.max_num_reqs, runner.compilation_config.max_cudagraph_capture_size)
         or 1
     )
+    # The profiling cache shares the device with the model weights; when the
+    # one-block-per-sequence cache does not fit next to them (large GGUF
+    # checkpoints on 32 GiB gfx906 parts), clamp it to the affordable block
+    # count instead of OOMing before profiling even starts. Capture uses
+    # zeroed dummy block tables, so graphs record fine with fewer blocks
+    # than the largest capture batch; only profiling fidelity of the FULL
+    # graph cost sample is unaffected.
+    one_block_config = builder.get_kv_cache_config_from_groups(
+        runner.vllm_config, kv_cache_groups, num_blocks=1
+    )
+    if one_block_config.kv_cache_tensors:
+        bytes_per_block = one_block_config.kv_cache_tensors[0].size
+        free_bytes, _total = torch.cuda.mem_get_info()
+        capture_reserve = 2 << 30
+        affordable_blocks = max(1, (free_bytes - capture_reserve) // bytes_per_block)
+        if affordable_blocks < min_blocks:
+            logger.info_once(
+                "Clamping cudagraph memory-profiling KV cache from %d to %d "
+                "blocks to fit %.2f GiB free memory.",
+                min_blocks,
+                affordable_blocks,
+                free_bytes / (1 << 30),
+            )
+            min_blocks = affordable_blocks
     minimal_config = builder.get_kv_cache_config_from_groups(
         runner.vllm_config, kv_cache_groups, num_blocks=min_blocks
     )
