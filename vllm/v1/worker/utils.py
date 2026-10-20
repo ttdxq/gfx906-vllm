@@ -3,7 +3,7 @@
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import product as iprod
 from typing import Any
 
@@ -282,13 +282,6 @@ class AttentionGroup:
     ):
         if kernel_block_size is None:
             kv_cache_spec_builder = self.kv_cache_spec
-        elif (
-            isinstance(self.kv_cache_spec, MLAAttentionSpec)
-            and self.kv_cache_spec.storage_block_size is not None
-        ):
-            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
-                self.kv_cache_spec.storage_block_size
-            )
         else:
             kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
                 kernel_block_size
@@ -556,8 +549,6 @@ def allocate_kv_cache(
         kernel_block_size = None
         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[group_id]
-        if isinstance(spec, MLAAttentionSpec) and spec.storage_block_size is not None:
-            kernel_block_size = spec.storage_block_size
 
         views = create_kv_cache_views(
             buf,
