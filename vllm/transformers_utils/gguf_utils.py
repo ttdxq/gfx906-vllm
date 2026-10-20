@@ -213,6 +213,10 @@ def extract_gemma4_vision_config_from_gguf(
         patch_size=int(scalar("patch_size")),
         position_embedding_size=int(position_tensor.shape[1]),
         pooling_kernel_size=3,
+        # The projector carries the learned standardization constants; without
+        # this flag the tower never registers std_bias/std_scale and the
+        # post-pooler rescaling is skipped.
+        standardize=any(t.name == "v.std_bias" for t in reader.tensors),
     )
     config.default_output_length = 280
     config.projector_dim = int(_read_gguf_scalar(reader, "clip.vision.projection_dim"))
@@ -446,6 +450,10 @@ def gemma4_gguf_config_dict(model: str) -> dict | None:
         "rms_norm_eps": float(scalar("attention.layer_norm_rms_epsilon")),
         "sliding_window": int(scalar("attention.sliding_window")),
         "layer_types": layer_types,
+        # Gemma4 image soft tokens attend bidirectionally within each
+        # image block on sliding-attention layers; without this the
+        # vision embeddings integrate as plain causal tokens.
+        "use_bidirectional_attention": "vision",
         "attention_k_eq_v": True,
         "vocab_size_per_layer_input": 0,
         "hidden_size_per_layer_input": 0,
@@ -604,6 +612,23 @@ def gemma4_gguf_tokenizer_path(model: str) -> str | None:
             for key, token_id in special_ids.items()
             if token_id is not None and 0 <= token_id < len(tokens)
         },
+        # Gemma4Processor reads these off the tokenizer; the ids are the
+        # Gemma4TextConfig defaults (boi 255999, eoi 258882, image 258880).
+        # The audio ones matter even for image-only models: the processor's
+        # validate_inputs treats a missing boa/eoa token as a hard error.
+        **{
+            name: tokens[token_id]
+            for name, token_id in (
+                ("boi_token", 255_999),
+                ("eoi_token", 258_882),
+                ("image_token", 258_880),
+                ("boa_token", 256_000),
+                ("eoa_token", 258_883),
+                ("audio_token", 258_881),
+                ("video_token", 258_884),
+            )
+            if 0 <= token_id < len(tokens)
+        },
         "chat_template": _strip_gemma4_template_bos(
             _read_gguf_scalar(reader, "tokenizer.chat_template")
         ),
@@ -618,7 +643,7 @@ def gemma4_gguf_tokenizer_path(model: str) -> str | None:
     if (
         (tokenizer_dir / "tokenizer.json").is_file()
         and marker.is_file()
-        and marker.read_text() == "gemma4-gguf-tokenizer-v3\n"
+        and marker.read_text() == "gemma4-gguf-tokenizer-v5\n"
     ):
         return str(tokenizer_dir)
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
@@ -646,7 +671,7 @@ def gemma4_gguf_tokenizer_path(model: str) -> str | None:
     (tokenizer_dir / "config.json").write_text(
         '{"architectures":["Gemma4ForCausalLM"],"model_type":"gemma4_text"}\n'
     )
-    marker.write_text("gemma4-gguf-tokenizer-v3\n")
+    marker.write_text("gemma4-gguf-tokenizer-v5\n")
     return str(tokenizer_dir)
 
 

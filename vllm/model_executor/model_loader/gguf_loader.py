@@ -289,6 +289,11 @@ class GGUFModelLoader(BaseModelLoader):
             weights_map["mm.input_projection.weight"] = (
                 "model.embed_vision.embedding_projection.weight"
             )
+            # The tower registers these as buffers with torch.empty init;
+            # skipping them feeds uninitialized values into the
+            # post-pooler standardization.
+            weights_map["v.std_bias"] = f"{vision_prefix}std_bias"
+            weights_map["v.std_scale"] = f"{vision_prefix}std_scale"
             weights_map["v.patch_embd.weight"] = (
                 f"{vision_prefix}patch_embedder.input_proj.weight"
             )
@@ -749,15 +754,19 @@ class GGUFModelLoader(BaseModelLoader):
                         weight = torch.stack((weight, temporal_patch), dim=2)
                     yield name, weight
             elif model_config.architecture == "Gemma4ForConditionalGeneration":
-                # The vision patch projection ships as a conv kernel
-                # [out, 3, patch, patch]; the model consumes the flattened
-                # [out, 3*patch*patch] Linear form.
+                # The vision patch projection ships as a conv kernel in
+                # ggml order [kw, kh, channels, out], i.e. [out, channels,
+                # kh, kw] once read as a torch tensor. HF patchifies each
+                # image as (patch_h, patch_w, channel) flattened with the
+                # channel fastest, so the Linear weight must be permuted to
+                # [out, kh, kw, channels] before flattening; flattening the
+                # raw layout scrambles the patch pixels.
                 for name, weight in mmproj_weights:
                     if (
                         name.endswith("patch_embedder.input_proj.weight")
                         and weight.ndim == 4
                     ):
-                        weight = weight.flatten(1)
+                        weight = weight.permute(0, 2, 3, 1).flatten(1)
                     yield name, weight
             else:
                 yield from mmproj_weights

@@ -1478,7 +1478,12 @@ def unified_attention(
     # fork never uses tensor descriptors, so the flag is accepted and
     # ignored.
     use_td: bool = False,
-    # Gemma4 mm_prefix + sliding-window clamping is not implemented here.
+    # Gemma4's backend sets this for sliding-attention layers. The mask this
+    # kernel builds is already (causal AND sliding window) OR mm_prefix, which
+    # is what Transformers composes for Gemma4 (masking_utils: or_masks(
+    # sliding_window_causal_mask_function, blockwise_overlay)), so the
+    # bidirectional image block already overrides the window and no separate
+    # clamping is needed. Accepted for call compatibility; inert by design.
     mm_prefix_clamp_sliding_window: bool = False,
 ):
     assert causal, "Only causal attention is supported"
@@ -1488,7 +1493,6 @@ def unified_attention(
         rswa_prefix_lens is not None
         or rswa_window is not None
         or chunk_lookback != -1
-        or mm_prefix_clamp_sliding_window
         or k_scale_cache is not None
         or v_scale_cache is not None
         or kv_quant_mode not in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR)
@@ -1497,9 +1501,9 @@ def unified_attention(
         # the k_descale / v_descale args above, as before the refactor.
         raise NotImplementedError(
             "The gfx906 Triton unified-attention fork does not implement "
-            "R-SWA, chunked attention, per-token-head/INT4 KV caches, or "
-            f"mm-prefix sliding-window clamping (kv_quant_mode={kv_quant_mode}, "
-            f"chunk_lookback={chunk_lookback}, rswa_window={rswa_window})."
+            "R-SWA, chunked attention or per-token-head/INT4 KV caches "
+            f"(kv_quant_mode={kv_quant_mode}, chunk_lookback={chunk_lookback}, "
+            f"rswa_window={rswa_window})."
         )
 
     if sinks is not None:
