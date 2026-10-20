@@ -16,6 +16,13 @@
 // split across JGROUP=16 lane groups with warp-shuffle stat reduction; PV
 // interleaved d mapping (4-half2 stride) so consecutive threads hit
 // consecutive banks; 512 threads = 4 waves/SIMD for latency hiding.
+//
+// KV staging is software-pipelined: each thread's 32B tile slice is loaded
+// from global with 16B vector reads into registers one tile ahead and
+// committed to LDS only after the barrier that frees the buffer, so DRAM/L2
+// latency hides behind QK/PV instead of stalling a barrier-separated
+// staging phase (counters showed the unpipelined kernel latency-bound at
+// ~37% VALU with DRAM fetch worth only ~3ms of a 1025ms call).
 
 #ifdef USE_ROCM
 
@@ -25,6 +32,8 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 
+#include <climits>
+
 namespace {
 
 constexpr int QHEADS = 24;
@@ -33,6 +42,75 @@ constexpr int GQA = 6;
 constexpr int HEAD = 256;
 constexpr int PAGE = 800;
 constexpr int NSEG = 2;
+
+// 16B staging granularity: a TILE x HEAD half tile is TILE * 32 uint4
+// slices, spread over the block as u = tid + s * THREADS (row = u / 32).
+constexpr int KV_ROW16 = HEAD / 8;
+
+template <int TILE, int THREADS>
+__device__ __forceinline__ void kv_load(uint4* pre, const __half* row0,
+                                        int s1, int tid, int tbase,
+                                        int valid) {
+  // rows at tbase + r >= valid (masked-phase tail) stage as +0.0 halves,
+  // bit-identical to the previous __floats2half2_rn(0, 0) fill
+#pragma unroll
+  for (int s = 0; s < TILE * KV_ROW16 / THREADS; ++s) {
+    const int u = tid + s * THREADS;
+    const int r = u / KV_ROW16;
+    pre[s] = (tbase + r < valid)
+                 ? *reinterpret_cast<const uint4*>(
+                       row0 + (size_t)r * s1 + (u % KV_ROW16) * 8)
+                 : make_uint4(0u, 0u, 0u, 0u);
+  }
+}
+
+template <int TILE, int THREADS, int KSTRIDE>
+__device__ __forceinline__ void kv_stage(const uint4* pre, __half* lds,
+                                         int tid) {
+  // the 258-half row stride keeps QK's 32-row reads bank-conflict-free but
+  // is not a 16B multiple, so the commit stays at half2 granularity
+#pragma unroll
+  for (int s = 0; s < TILE * KV_ROW16 / THREADS; ++s) {
+    const int u = tid + s * THREADS;
+    __half2* dst = reinterpret_cast<__half2*>(lds) +
+                   (u / KV_ROW16) * (KSTRIDE / 2) + (u % KV_ROW16) * 4;
+    const __half2* src = reinterpret_cast<const __half2*>(&pre[s]);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) dst[e] = src[e];
+  }
+}
+
+__device__ __forceinline__ const __half* kv_row(
+    const __half* base, int s0, int s1, int s2,
+    const int* __restrict__ bt, int kvh, int tbase, int nb_tbl, int nb_cache,
+    int* dbg) {
+  // all KV load addresses must stay inside the cache tensor by
+  // construction: a stale/torn block-table or seq_lens entry (upstream
+  // write racing this kernel) must degrade to wrong data, never to a wild
+  // address. Violations are counted in dbg[0]/dbg[1] for the dispatch to
+  // read; the clamps are no-ops on well-formed inputs.
+  //
+  // the column bound and the page-id bound are different numbers: the
+  // block table is sized by the longest sequence while page ids index the
+  // whole pool, so a table column may legitimately hold an id past the
+  // table width
+  int page = tbase / PAGE;
+  if ((unsigned)page >= (unsigned)nb_tbl) {
+    if (dbg) atomicAdd(dbg, 1);
+    page = 0;
+  }
+  int pbi = bt[page];
+  if ((unsigned)pbi >= (unsigned)nb_cache) {
+    if (dbg) atomicAdd(dbg + 1, 1);
+    pbi = 0;
+  }
+  int tin = tbase - page * PAGE;
+  if (tin >= PAGE) {
+    if (dbg) atomicAdd(dbg, 1);
+    tin = 0;
+  }
+  return base + (size_t)pbi * s0 + (size_t)tin * s1 + (size_t)kvh * s2;
+}
 
 template <int BM, int TILE, int THREADS>
 __global__ void __launch_bounds__(THREADS)
@@ -44,9 +122,10 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
                            float* __restrict__ segm_out,   // [rows, 24, NSEG, 256]
                            float* __restrict__ segm_max,   // [rows, 24, NSEG]
                            float* __restrict__ segm_expsum,  // [.., NSEG]
-                           const float scale, const int q_len, const int k_s0,
+                           const float scale, const int q_len,
+                           const int nb_tbl, const int nb_cache, const int k_s0,
                            const int k_s1, const int k_s2, const int v_s0,
-                           const int v_s1, const int v_s2) {
+                           const int v_s1, const int v_s2, int* dbg) {
   constexpr int BLOCK_Q = BM / GQA;
   constexpr int JGROUP = TILE / 2;                // QK lanes per row
   constexpr int QK_ROWS = BM * JGROUP / THREADS;  // QK rows per thread
@@ -102,8 +181,11 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     __half2 val;
     if (tok < q_len) {
       const int head = kvh * GQA + m % GQA;
+      // clamp the load address: the guard branch above must not rely on
+      // the compiler keeping the load predicated
+      const int tk = min(tok, q_len - 1);
       val = *reinterpret_cast<const __half2*>(
-          q + ((size_t)tok * QHEADS + head) * HEAD + d2 * 2);
+          q + ((size_t)tk * QHEADS + head) * HEAD + d2 * 2);
     } else {
       val = __floats2half2_rn(0.f, 0.f);
     }
@@ -130,22 +212,33 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
   const int a_end = min(seg_hi, full_end);
   const int b_beg = max(seg_lo, full_end);
 
-  for (int j = seg_lo; j < a_end; ++j) {
-    // stage K tile (unmasked)
-    const int tbase = j * TILE;
-    const int page = tbase / PAGE;
-    const int pbi = block_table[page];
-    const __half* krow = kc + (size_t)pbi * k_s0 +
-                         (size_t)(tbase - page * PAGE) * k_s1 +
-                         (size_t)kvh * k_s2;
-    for (int idx = tid; idx < TILE * (HEAD / 2); idx += THREADS) {
-      const int r = idx / (HEAD / 2);
-      reinterpret_cast<__half2*>(KV_lds)
-          [r * (KSTRIDE / 2) + idx % (HEAD / 2)] =
-              reinterpret_cast<const __half2*>(
-                  krow + (size_t)r * k_s1)[idx % (HEAD / 2)];
-    }
+  // per-thread prefetch slices for the next K and V tiles. The single KV
+  // buffer forces a K(j) -> V(j) -> K(j+1) handoff, so the pipeline keeps
+  // four barriers per tile: [softmax done] [V visible] [PV done] [K visible]
+  constexpr int SPT = TILE * KV_ROW16 / THREADS;
+  uint4 pre_k[SPT], pre_v[SPT];
+
+  // phase A prologue: K(seg_lo) into LDS, V(seg_lo) in flight
+  if (a_end > seg_lo) {
+    const int t0 = seg_lo * TILE;
+    kv_load<TILE, THREADS>(pre_k, kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, t0, nb_tbl, nb_cache, dbg),
+                           k_s1, tid, t0, INT_MAX);
+    kv_stage<TILE, THREADS, KSTRIDE>(pre_k, KV_lds, tid);
     __syncthreads();
+    kv_load<TILE, THREADS>(pre_v, kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, t0, nb_tbl, nb_cache, dbg),
+                           v_s1, tid, t0, INT_MAX);
+  }
+
+  for (int j = seg_lo; j < a_end; ++j) {
+    const int tbase = j * TILE;
+    const int tnext = tbase + TILE;
+    const bool more = tnext < a_end * TILE;
+
+    // K(j+1) in flight across the whole QK/softmax/PV cycle
+    if (more)
+      kv_load<TILE, THREADS>(pre_k,
+                             kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
+                             k_s1, tid, tnext, INT_MAX);
 
     // QK dot (fp32 acc over fp16 inputs)
     float s[QK_ROWS][2];
@@ -218,18 +311,12 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
       }
     }
     __syncthreads();
-
-    // stage V tile into the same LDS buffer
-    const __half* vrow = vc + (size_t)pbi * v_s0 +
-                         (size_t)(tbase - page * PAGE) * v_s1 +
-                         (size_t)kvh * v_s2;
-    for (int idx = tid; idx < TILE * (HEAD / 2); idx += THREADS) {
-      const int r = idx / (HEAD / 2);
-      reinterpret_cast<__half2*>(KV_lds)
-          [r * (KSTRIDE / 2) + idx % (HEAD / 2)] =
-              reinterpret_cast<const __half2*>(
-                  vrow + (size_t)r * v_s1)[idx % (HEAD / 2)];
-    }
+    kv_stage<TILE, THREADS, KSTRIDE>(pre_v, KV_lds, tid);
+    // V(j+1) in flight across PV plus the next tile's QK/softmax
+    if (more)
+      kv_load<TILE, THREADS>(pre_v,
+                             kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
+                             v_s1, tid, tnext, INT_MAX);
     __syncthreads();
 
     // PV: acc = acc*alpha + P16 @ V (fp32 acc)
@@ -252,32 +339,30 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
       }
     }
     __syncthreads();
+    if (more) kv_stage<TILE, THREADS, KSTRIDE>(pre_k, KV_lds, tid);
+    __syncthreads();
+  }
+
+  // phase B prologue: K(b_beg) into LDS, V(b_beg) in flight
+  if (b_beg < seg_hi) {
+    const int t0 = b_beg * TILE;
+    kv_load<TILE, THREADS>(pre_k, kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, t0, nb_tbl, nb_cache, dbg),
+                           k_s1, tid, t0, max_prefix);
+    kv_stage<TILE, THREADS, KSTRIDE>(pre_k, KV_lds, tid);
+    __syncthreads();
+    kv_load<TILE, THREADS>(pre_v, kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, t0, nb_tbl, nb_cache, dbg),
+                           v_s1, tid, t0, max_prefix);
   }
 
   for (int j = b_beg; j < seg_hi; ++j) {
-    // stage K tile (masked by max_prefix)
     const int tbase = j * TILE;
-    const int page = tbase / PAGE;
-    const int pbi = block_table[page];
-    const __half* krow = kc + (size_t)pbi * k_s0 +
-                         (size_t)(tbase - page * PAGE) * k_s1 +
-                         (size_t)kvh * k_s2;
-    for (int idx = tid; idx < TILE * (HEAD / 2); idx += THREADS) {
-      const int r = idx / (HEAD / 2);
-      if (tbase + r < max_prefix) {
-        reinterpret_cast<__half2*>(KV_lds)
-            [r * (KSTRIDE / 2) + idx % (HEAD / 2)] =
-                reinterpret_cast<const __half2*>(
-                    krow + (size_t)r * k_s1)[idx % (HEAD / 2)];
-      } else {
-        // must use the padded index: a raw flat idx aliases real rows
-        reinterpret_cast<__half2*>(KV_lds)
-            [r * (KSTRIDE / 2) + idx % (HEAD / 2)] =
-                __floats2half2_rn(0.f, 0.f);
-      }
-    }
-    __syncthreads();
+    const int tnext = tbase + TILE;
+    const bool more = tnext < seg_hi * TILE;
 
+    if (more)
+      kv_load<TILE, THREADS>(pre_k,
+                             kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
+                             k_s1, tid, tnext, max_prefix);
     // QK dot + causal/query masks
     float s[QK_ROWS][2];
 #pragma unroll
@@ -351,23 +436,11 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
       }
     }
     __syncthreads();
-
-    const __half* vrow = vc + (size_t)pbi * v_s0 +
-                         (size_t)(tbase - page * PAGE) * v_s1 +
-                         (size_t)kvh * v_s2;
-    for (int idx = tid; idx < TILE * (HEAD / 2); idx += THREADS) {
-      const int r = idx / (HEAD / 2);
-      if (tbase + r < max_prefix) {
-        reinterpret_cast<__half2*>(KV_lds)
-            [r * (KSTRIDE / 2) + idx % (HEAD / 2)] =
-                reinterpret_cast<const __half2*>(
-                    vrow + (size_t)r * v_s1)[idx % (HEAD / 2)];
-      } else {
-        reinterpret_cast<__half2*>(KV_lds)
-            [r * (KSTRIDE / 2) + idx % (HEAD / 2)] =
-                __floats2half2_rn(0.f, 0.f);
-      }
-    }
+    kv_stage<TILE, THREADS, KSTRIDE>(pre_v, KV_lds, tid);
+    if (more)
+      kv_load<TILE, THREADS>(pre_v,
+                             kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
+                             v_s1, tid, tnext, max_prefix);
     __syncthreads();
 
     const float alpha = alpha_lds[i_pv];
@@ -386,6 +459,8 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
         acc[2 * d2 + 1] += p * vv.y;
       }
     }
+    __syncthreads();
+    if (more) kv_stage<TILE, THREADS, KSTRIDE>(pre_k, KV_lds, tid);
     __syncthreads();
   }
 
@@ -421,7 +496,7 @@ void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
                               torch::Tensor segm_expsum, double scale,
                               int64_t q_len, int64_t k_s0, int64_t k_s1,
                               int64_t k_s2, int64_t v_s0, int64_t v_s1,
-                              int64_t v_s2) {
+                              int64_t v_s2, torch::Tensor dbg) {
   TORCH_CHECK(q.scalar_type() == at::kHalf, "q must be fp16");
   TORCH_CHECK(key_cache.scalar_type() == at::kHalf, "kv cache must be fp16");
   TORCH_CHECK(q.dim() == 3 && q.size(1) == QHEADS && q.size(2) == HEAD,
@@ -436,10 +511,20 @@ void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
   TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
   TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
               "kv cache head dim must be dense");
+  // staging reads K/V rows with 16B vector loads: every row stride (in
+  // halves) must be a multiple of 8 and the bases 16B-aligned (both the
+  // contiguous and the fused/interleaved serve layouts satisfy this)
+  TORCH_CHECK((k_s0 % 8 == 0) && (k_s1 % 8 == 0) && (k_s2 % 8 == 0) &&
+                  (v_s0 % 8 == 0) && (v_s1 % 8 == 0) && (v_s2 % 8 == 0) &&
+                  (reinterpret_cast<uintptr_t>(key_cache.data_ptr()) % 16 == 0) &&
+                  (reinterpret_cast<uintptr_t>(value_cache.data_ptr()) % 16 == 0),
+              "kv cache strides must be 16B-stageable");
   TORCH_CHECK(block_table.scalar_type() == at::kInt && block_table.is_contiguous(),
               "bad block table");
   TORCH_CHECK(seq_lens.scalar_type() == at::kInt && seq_lens.numel() == 1,
               "single-sequence only");
+  TORCH_CHECK(dbg.scalar_type() == at::kInt && dbg.numel() >= 2,
+              "dbg counter buffer");
 
   const at::cuda::OptionalCUDAGuard guard(device_of(q));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -456,7 +541,8 @@ void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
           block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
           segm_output.data_ptr<float>(), segm_max.data_ptr<float>(),
           segm_expsum.data_ptr<float>(), (float)scale, (int)q_len,
-          (int)k_s0, (int)k_s1, (int)k_s2, (int)v_s0, (int)v_s1, (int)v_s2);
+          (int)block_table.size(1), (int)key_cache.size(0), (int)k_s0, (int)k_s1, (int)k_s2, (int)v_s0, (int)v_s1, (int)v_s2,
+          dbg.data_ptr<int>());
 }
 
 #endif  // USE_ROCM

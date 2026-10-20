@@ -82,6 +82,13 @@ ENABLE_GFX906_ATTN_PREFILL_HIP = os.getenv(
     "VLLM_GFX906_ATTN_PREFILL_HIP", "1"
 ).lower() in {"1", "true", "yes", "on"}
 
+# Debug readout for the handwritten scanner's address guards: the kernel
+# clamps stale block-table/seq-lens inputs instead of faulting and counts
+# the events; with this env set the dispatch syncs and logs the counters.
+ENABLE_GFX906_HIP_ATTN_GUARD = os.getenv("VLLM_GFX906_HIP_ATTN_GUARD", "0") in {
+    "1", "true", "yes", "on"}
+_hip_dbg_buf: torch.Tensor | None = None
+
 # Upper bound for split-KV segments the decode policy may request. The
 # backend sizes its softmax segment buffers with this value on gfx906.
 GFX906_MAX_DECODE_SEGMENTS = 128
@@ -1751,6 +1758,15 @@ def unified_attention(
         and q.is_contiguous()
         and k.stride(3) == 1
         and v.stride(3) == 1
+        # the HIP scanner stages K/V rows with 16B vector loads; every row
+        # stride must be a multiple of 8 halves (contiguous and serve
+        # interleaved layouts both qualify; the strides are in the miss log)
+        and k.stride(0) % 8 == 0
+        and k.stride(1) % 8 == 0
+        and k.stride(2) % 8 == 0
+        and v.stride(0) % 8 == 0
+        and v.stride(1) % 8 == 0
+        and v.stride(2) % 8 == 0
         and block_table.dtype == torch.int32
         and block_table.stride(1) == 1
     )
@@ -1766,6 +1782,11 @@ def unified_attention(
         )
         if use_hip_scan:
             _log_hip_prefill_scan_once()
+            global _hip_dbg_buf
+            if _hip_dbg_buf is None or _hip_dbg_buf.device != q.device:
+                _hip_dbg_buf = torch.zeros(
+                    2, dtype=torch.int32, device=q.device)
+            _hip_dbg = _hip_dbg_buf
             torch.ops._C.gfx906_prefill_attn_scan(
                 q,
                 k,
@@ -1783,7 +1804,16 @@ def unified_attention(
                 v.stride(0),
                 v.stride(1),
                 v.stride(2),
+                _hip_dbg,
             )
+            if ENABLE_GFX906_HIP_ATTN_GUARD:
+                hits = int(_hip_dbg[0].item()) + int(_hip_dbg[1].item())
+                if hits:
+                    logger.warning(
+                        "gfx906 hip scan clamped %d stale page/tin and %d "
+                        "stale pbi inputs", int(_hip_dbg[0].item()),
+                        int(_hip_dbg[1].item()))
+                    _hip_dbg.zero_()
             # the HIP scanner uses 64-row q blocks (BLOCK_Q 10) and 32-token
             # KV tiles; reduce_segments recomputes the segment layout from
             # these, so both must match the scanner above
