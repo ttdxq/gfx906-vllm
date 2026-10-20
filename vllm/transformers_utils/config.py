@@ -381,6 +381,29 @@ class HFConfigParser(ConfigParserBase):
                         },
                     )
                 return config_dict, _maybe_remap_hf_config_attrs(config)
+        elif check_gguf_file(model):
+            # A direct local .gguf path is treated as a hub repo id by
+            # transformers and always fails resolution, so try the GGUF
+            # metadata builders first; the transformers attempt below stays
+            # as the fallback for architectures they do not cover.
+            config_dict = qwen35_gguf_config_dict(str(model)) or (
+                gemma4_gguf_config_dict(str(model))
+                or gemma4_mtp_gguf_config_dict(str(model))
+            )
+            if config_dict is not None:
+                model_type = config_dict["model_type"]
+                if model_type in _CONFIG_REGISTRY:
+                    config = _CONFIG_REGISTRY[model_type].from_dict(config_dict)
+                else:
+                    config = AutoConfig.for_model(
+                        model_type,
+                        **{
+                            key: value
+                            for key, value in config_dict.items()
+                            if key != "model_type"
+                        },
+                    )
+                return config_dict, _maybe_remap_hf_config_attrs(config)
         try:
             config_dict, _ = PretrainedConfig.get_config_dict(
                 model,

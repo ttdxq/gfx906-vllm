@@ -248,6 +248,36 @@ class GGUFModelLoader(BaseModelLoader):
                     f"{gguf_prefix}.post_ffw_norm.weight": (
                         f"{hf_prefix}.post_feedforward_layernorm.weight"
                     ),
+                    f"{gguf_prefix}.post_ffw_norm_1.weight": (
+                        f"{hf_prefix}.post_feedforward_layernorm_1.weight"
+                    ),
+                    f"{gguf_prefix}.post_ffw_norm_2.weight": (
+                        f"{hf_prefix}.post_feedforward_layernorm_2.weight"
+                    ),
+                    f"{gguf_prefix}.pre_ffw_norm_2.weight": (
+                        f"{hf_prefix}.pre_feedforward_layernorm_2.weight"
+                    ),
+                    # MoE: the fused gate_up expert tensor is split into
+                    # gate/up halves by _split_gguf_fused_gate_up_exps before
+                    # it reaches the MoE weight loader.
+                    f"{gguf_prefix}.ffn_gate_up_exps.weight": (
+                        f"{hf_prefix}.experts.0.gate_up_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_down_exps.weight": (
+                        f"{hf_prefix}.experts.0.down_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_gate_inp.weight": (
+                        f"{hf_prefix}.router.proj.weight"
+                    ),
+                    # Router input scale and per-expert output scale. The
+                    # model folds these into its routing math; skipping them
+                    # silently leaves both at their ones init.
+                    f"{gguf_prefix}.ffn_gate_inp.scale": (
+                        f"{hf_prefix}.router.scale"
+                    ),
+                    f"{gguf_prefix}.ffn_down_exps.scale": (
+                        f"{hf_prefix}.router.per_expert_scale"
+                    ),
                 }
             )
             if layer_type == "sliding_attention":
@@ -718,10 +748,59 @@ class GGUFModelLoader(BaseModelLoader):
                     ):
                         weight = torch.stack((weight, temporal_patch), dim=2)
                     yield name, weight
+            elif model_config.architecture == "Gemma4ForConditionalGeneration":
+                # The vision patch projection ships as a conv kernel
+                # [out, 3, patch, patch]; the model consumes the flattened
+                # [out, 3*patch*patch] Linear form.
+                for name, weight in mmproj_weights:
+                    if (
+                        name.endswith("patch_embedder.input_proj.weight")
+                        and weight.ndim == 4
+                    ):
+                        weight = weight.flatten(1)
+                    yield name, weight
             else:
                 yield from mmproj_weights
 
-        yield from gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        # Full-attention Gemma4 layers tie V to K; the model's own weights
+        # mapper (see _gemma4_layer_weights_mapper) loads their k_proj into
+        # both the K and V shards of qkv_proj, so no duplication is needed
+        # here.
+        yield from self._split_gguf_fused_gate_up_exps(
+            gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        )
+
+    @staticmethod
+    def _split_gguf_fused_gate_up_exps(
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Split fused GGUF MoE gate_up expert tensors into gate/up pairs.
+
+        Gemma4 GGUF stores one ``ffn_gate_up_exps`` tensor per layer holding
+        both projections of every expert.  The GGUF reader exposes it as an
+        expert-major ``[experts, 2 * intermediate, packed]`` block-packed
+        array; the MoE weight loader expects separate gate_proj/up_proj
+        shards, so re-emit each fused tensor as its two dim-1 halves (gate
+        first, up second) under both shard names.
+        """
+        for name, weight in weights:
+            if ".gate_up_proj." not in name:
+                yield name, weight
+                continue
+            stem, _, suffix = name.rpartition(".gate_up_proj.")
+            if suffix == "qweight_type":
+                yield f"{stem}.gate_proj.qweight_type", weight
+                yield f"{stem}.up_proj.qweight_type", weight
+                continue
+            if weight.dim() != 3 or weight.shape[1] % 2 != 0:
+                raise ValueError(
+                    f"Cannot split fused GGUF gate_up tensor {name!r} "
+                    f"with shape {tuple(weight.shape)}"
+                )
+            gate, up = weight.chunk(2, dim=1)
+            target = "qweight" if suffix == "qweight" else "weight"
+            yield f"{stem}.gate_proj.{target}", gate.contiguous()
+            yield f"{stem}.up_proj.{target}", up.contiguous()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)

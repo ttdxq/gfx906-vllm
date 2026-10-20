@@ -1721,6 +1721,8 @@ def _fused_moe_gguf(
             torch.ops._C.silu_and_mul(out, x)
         elif activation == "gelu":
             torch.ops._C.gelu_and_mul(out, x)
+        elif activation == "gelu_tanh":
+            torch.ops._C.gelu_tanh_and_mul(out, x)
         else:
             raise ValueError(f"Unsupported activation: {activation}")
         return out
@@ -2558,8 +2560,15 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         # Post-#41184 contract: expert selection (select_experts) runs in the
         # MoERunner router; this method only executes the routed experts.
         # Shared experts are computed by the runner via `shared_experts`.
-        assert self.moe.activation == MoEActivation.SILU, (
-            "Only SiLU activation is supported."
+        # The SiLU-fused decode shortcuts below are selected by activation
+        # string, so non-SiLU models take the unfused act() paths.
+        _MOE_ACTIVATION_TO_GGUF = {
+            MoEActivation.SILU: "silu",
+            MoEActivation.GELU_TANH: "gelu_tanh",
+        }
+        activation = _MOE_ACTIVATION_TO_GGUF.get(self.moe.activation)
+        assert activation is not None, (
+            f"Unsupported MoE activation: {self.moe.activation}"
         )
         return fused_moe_gguf(
             x,
@@ -2569,7 +2578,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             topk_ids,
             layer.w13_qweight_type.weight_type,
             layer.w2_qweight_type.weight_type,
-            "silu",
+            activation,
         )
 
 

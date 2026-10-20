@@ -1006,6 +1006,25 @@ class RoutedExperts(PluggableLayer):
                         f"Layer {self.layer_name} has no parameter {param_name!r} "
                         f"for checkpoint weight {qual_name!r}"
                     )
+                if (
+                    getattr(param, "is_gguf_weight", False)
+                    or getattr(param, "is_gguf_weight_type", False)
+                ):
+                    # GGUF expert tensors arrive as expert-major 3D shards
+                    # (and scalar weight types); the GGUF loader materializes
+                    # its parameters from the full shard shape, so it must
+                    # receive them whole rather than as per-expert 2D slices.
+                    success = param.weight_loader(
+                        param=param,
+                        loaded_weight=loaded_weight,
+                        weight_name=weight_name,
+                        shard_id=shard_id,
+                        expert_id=0,
+                        return_success=True,
+                    )
+                    if success:
+                        yield param_name
+                    break
                 if is_fused:
                     quant_method = getattr(param, "quant_method", None)
                     # Block scales share the weight's two-dimensional layout.

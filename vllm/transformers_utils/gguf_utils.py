@@ -399,25 +399,36 @@ def gemma4_gguf_config_dict(model: str) -> dict | None:
         return _read_gguf_scalar(reader, f"gemma4.{key}", default)
 
     block_count = int(scalar("block_count"))
-    kv_heads = [int(value) for value in scalar("attention.head_count_kv")]
-    sliding_pattern = [
-        bool(value) for value in scalar("attention.sliding_window_pattern")
-    ]
-    if len(kv_heads) != block_count or len(sliding_pattern) != block_count:
+    head_dim_swa = int(scalar("attention.key_length_swa"))
+    head_dim_full = int(scalar("attention.key_length"))
+    # Derive the per-layer attention layout from the checkpoint tensors:
+    # Gemma4 interleaves SWA layers (head_dim 256, separate V weights) with
+    # full-attention layers (head_dim 512, V tied to K).  The
+    # head_count_kv / sliding_window_pattern metadata does not describe this
+    # per layer reliably, so the attn_q_norm shape and the attn_k output
+    # width are the ground truth.
+    tensor_shapes = {
+        tensor.name: tuple(int(dim) for dim in tensor.shape)
+        for tensor in reader.tensors
+    }
+    layer_types: list[str] = []
+    kv_heads_swa: int | None = None
+    kv_heads_full: int | None = None
+    for idx in range(block_count):
+        norm_shape = tensor_shapes.get(f"blk.{idx}.attn_q_norm.weight")
+        k_shape = tensor_shapes.get(f"blk.{idx}.attn_k.weight")
+        if norm_shape is None or k_shape is None:
+            return None
+        if norm_shape[0] == head_dim_full:
+            layer_types.append("full_attention")
+            if kv_heads_full is None:
+                kv_heads_full = k_shape[1] // head_dim_full
+        else:
+            layer_types.append("sliding_attention")
+            if kv_heads_swa is None:
+                kv_heads_swa = k_shape[1] // head_dim_swa
+    if kv_heads_swa is None or kv_heads_full is None:
         return None
-
-    layer_types = [
-        "sliding_attention" if is_sliding else "full_attention"
-        for is_sliding in sliding_pattern
-    ]
-    global_kv_heads = next(
-        (
-            heads
-            for heads, is_sliding in zip(kv_heads, sliding_pattern)
-            if not is_sliding
-        ),
-        kv_heads[0],
-    )
     tokens = _read_gguf_scalar(reader, "tokenizer.ggml.tokens", [])
     text_config = {
         "model_type": "gemma4_text",
@@ -427,8 +438,8 @@ def gemma4_gguf_config_dict(model: str) -> dict | None:
         "intermediate_size": int(scalar("feed_forward_length")),
         "num_hidden_layers": block_count,
         "num_attention_heads": int(scalar("attention.head_count")),
-        "num_key_value_heads": kv_heads[0],
-        "num_global_key_value_heads": global_kv_heads,
+        "num_key_value_heads": kv_heads_swa,
+        "num_global_key_value_heads": kv_heads_full,
         "global_head_dim": int(scalar("attention.key_length")),
         "head_dim": int(scalar("attention.key_length_swa")),
         "max_position_embeddings": int(scalar("context_length")),
@@ -439,6 +450,10 @@ def gemma4_gguf_config_dict(model: str) -> dict | None:
         "vocab_size_per_layer_input": 0,
         "hidden_size_per_layer_input": 0,
         "final_logit_softcapping": float(scalar("final_logit_softcapping")),
+        "num_experts": int(scalar("expert_count")),
+        "top_k_experts": int(scalar("expert_used_count")),
+        "moe_intermediate_size": int(scalar("expert_feed_forward_length")),
+        "num_kv_shared_layers": int(scalar("attention.shared_kv_layers", 0)),
         "rope_parameters": {
             "sliding_attention": {
                 "rope_type": "default",
@@ -542,6 +557,21 @@ def gemma4_mtp_gguf_config_dict(model: str) -> dict | None:
     }
 
 
+def _strip_gemma4_template_bos(chat_template: str | None) -> str | None:
+    """Drop the template's own leading BOS emission for Gemma4 GGUF models.
+
+    Gemma needs a single ``<bos>`` at the start of every sequence. GGUF chat
+    templates emit it themselves (``{{- bos_token -}}``), so a tokenizer that
+    also prepends BOS would produce ``[2, 2, ...]``. We instead remove the
+    template's emission and let the tokenizer's post-processor add exactly
+    one BOS for both chat and raw-completion prompts.
+    """
+    if not chat_template:
+        return chat_template
+    stripped, n = re.subn(r"\{\{-?\s*bos_token\s*-?\}\}", "", chat_template, count=1)
+    return stripped if n else chat_template
+
+
 def gemma4_gguf_tokenizer_path(model: str) -> str | None:
     """Materialize a Transformers tokenizer from Gemma4 GGUF metadata."""
     try:
@@ -559,12 +589,24 @@ def gemma4_gguf_tokenizer_path(model: str) -> str | None:
     tokens = tokenizer_dict["tokens"]
     if not tokens:
         return None
-    tokenizer_config = {
+    special_ids = {
         "bos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.bos_token_id"),
         "eos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.eos_token_id"),
         "pad_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.padding_token_id"),
         "unk_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.unknown_token_id"),
-        "chat_template": _read_gguf_scalar(reader, "tokenizer.chat_template"),
+    }
+    tokenizer_config = {
+        **special_ids,
+        # Passing only the numeric ids leaves special_tokens_map empty and
+        # encode() without usable special tokens; register the strings too.
+        **{
+            key.removesuffix("_id"): tokens[token_id]
+            for key, token_id in special_ids.items()
+            if token_id is not None and 0 <= token_id < len(tokens)
+        },
+        "chat_template": _strip_gemma4_template_bos(
+            _read_gguf_scalar(reader, "tokenizer.chat_template")
+        ),
         "fix_mistral_regex": False,
     }
     stat = model_path.stat()
@@ -576,7 +618,7 @@ def gemma4_gguf_tokenizer_path(model: str) -> str | None:
     if (
         (tokenizer_dir / "tokenizer.json").is_file()
         and marker.is_file()
-        and marker.read_text() == "gemma4-gguf-tokenizer-v1\n"
+        and marker.read_text() == "gemma4-gguf-tokenizer-v3\n"
     ):
         return str(tokenizer_dir)
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
@@ -588,11 +630,23 @@ def gemma4_gguf_tokenizer_path(model: str) -> str | None:
         **additional_kwargs,
         **tokenizer_config,
     )
+    bos_id = special_ids["bos_token_id"]
+    if bos_id is not None and 0 <= bos_id < len(tokens):
+        # The GGUF converter ships no post-processor, so encode() would
+        # never prepend <bos>. Gemma models degenerate without it.
+        from tokenizers.processors import TemplateProcessing
+
+        bos_str = tokens[bos_id]
+        fast_tokenizer._tokenizer.post_processor = TemplateProcessing(
+            single=f"{bos_str} $A",
+            pair=f"{bos_str} $A $B",
+            special_tokens=[(bos_str, bos_id)],
+        )
     fast_tokenizer.save_pretrained(tokenizer_dir)
     (tokenizer_dir / "config.json").write_text(
         '{"architectures":["Gemma4ForCausalLM"],"model_type":"gemma4_text"}\n'
     )
-    marker.write_text("gemma4-gguf-tokenizer-v1\n")
+    marker.write_text("gemma4-gguf-tokenizer-v3\n")
     return str(tokenizer_dir)
 
 

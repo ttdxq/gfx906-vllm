@@ -678,9 +678,15 @@ class TritonAttentionImpl(AttentionImpl):
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            # The clamp only has an effect when the batch actually carries
+            # multimodal prefix ranges; without them it is a semantic no-op
+            # and this fork does not implement the clamped variant.  Keep
+            # the flag (and thus the loud NotImplementedError) only for the
+            # genuinely unsupported mm-prefix + sliding-window combination.
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
-            ),
+            )
+            and mm_prefix_range_tensor is not None,
         )
 
         return output

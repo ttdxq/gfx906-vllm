@@ -220,21 +220,34 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config(Gemma4Config)
 
     def get_default_tok_params(self):
-        """Gemma4's chat template already embeds a literal ``<bos>`` token in
-        the rendered text.  If ``add_special_tokens=True`` (the base-class
-        default), the tokenizer prepends *another* BOS, producing a
-        ``[2, 2, ...]`` double-BOS sequence that the model was not trained on.
+        """Gemma4 needs exactly one ``<bos>`` at the start of every sequence.
 
-        Setting ``add_special_tokens=False`` here prevents the duplicate and
-        ensures both ``llm.generate()`` and the chat/completions API behave
-        correctly for IT models. For PT models (without chat template), we
-        keep the default (True) to ensure BOS is added for raw prompts.
+        Chat templates usually emit ``<bos>`` themselves; when the rendered
+        template starts with it, the tokenizer must not prepend another
+        (double BOS), so specials are disabled on that tokenizer.
+
+        When the template does NOT provide the BOS (e.g. Gemma4 GGUF
+        tokenizers materialized with the template's own emission stripped),
+        keep specials enabled so both chat and raw-completion prompts get
+        their single BOS from the tokenizer.
         """
         tokenizer = self.ctx.get_tokenizer()
-        has_chat_template = getattr(tokenizer, "chat_template", None) is not None
+        template_provides_bos = False
+        chat_template = getattr(tokenizer, "chat_template", None)
+        if chat_template and getattr(tokenizer, "bos_token", None):
+            try:
+                rendered = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": "x"}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                template_provides_bos = rendered.startswith(tokenizer.bos_token)
+            except Exception:
+                # Be conservative: assume the template emits BOS.
+                template_provides_bos = True
 
         params = super().get_default_tok_params()
-        if has_chat_template:
+        if template_provides_bos:
             params = params.with_kwargs(add_special_tokens=False)
         return params
 
