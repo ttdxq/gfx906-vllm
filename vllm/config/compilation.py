@@ -133,6 +133,10 @@ class PassConfig:
     """Fuse the custom Attention and MLAAttention + quant ops."""
     eliminate_noops: bool = Field(default=True)
     """Eliminate no-op ops."""
+    enable_sp: bool = None  # type: ignore[assignment]
+    """Enable sequence parallelism. Requires TP>1."""
+    fuse_gemm_comms: bool = None  # type: ignore[assignment]
+    """Enable async TP."""
     fuse_allreduce_rms: bool = None  # type: ignore[assignment]
     """Enable flashinfer allreduce fusion."""
     enable_qk_norm_rope_fusion: bool = None  # type: ignore[assignment]
@@ -1217,6 +1221,11 @@ class CompilationConfig:
                     self.cudagraph_mode = CUDAGraphMode.FULL
                 self.splitting_ops = []
 
+        if (
+            not self.use_inductor_graph_partition
+            and (self.pass_config.enable_sp or self.pass_config.fuse_gemm_comms)
+            and self.splitting_ops
+        ):
             logger.warning_once(
                 "Sequence parallelism requires full-graph compilation when "
                 "use_inductor_graph_partition is off. Setting splitting_ops "
