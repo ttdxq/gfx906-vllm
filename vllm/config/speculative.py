@@ -1365,6 +1365,33 @@ class SpeculativeConfig:
                             "multiple times of forward on same MTP layer"
                             ",which may result in lower acceptance rate"
                         )
+                    # The ROCm GGUF MMVQ kernels combine multi-token
+                    # vectors only for batch sizes up to 4; a verify batch
+                    # of num_speculative_tokens + 1 beyond that loses the
+                    # combine fast path and re-reads the weights once per
+                    # row on every speculative forward (measured ~2.5x
+                    # slower end-to-end decode at n=4).
+                    if (
+                        self.num_speculative_tokens + 1 > 4
+                        and str(
+                            self.draft_model_config.quantization
+                        ) == "gguf"
+                    ):
+                        from vllm.platforms import current_platform
+
+                        if current_platform.is_rocm():
+                            logger.warning(
+                                "num_speculative_tokens=%d runs every "
+                                "verify forward as a %d-token GGUF batch; "
+                                "the ROCm MMVQ combine fast path only "
+                                "covers up to 4 tokens, so the weights are "
+                                "re-read once per token and speculative "
+                                "decoding runs several times slower. "
+                                "Batches of up to 4 tokens keep the "
+                                "combine fast path.",
+                                self.num_speculative_tokens,
+                                self.num_speculative_tokens + 1,
+                            )
                 elif self.method == "draft_model":
                     pass
                 else:
