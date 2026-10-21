@@ -1557,9 +1557,34 @@ def unified_attention(
 
     gfx906_sched = _gfx906_sched_tuning_enabled()
 
+    # Spec-decode forwards (verify + draft) look like tiny prefills to the
+    # max_seqlen_q > 1 dispatch below but scan the whole decode context;
+    # flag them so they take the split-KV decode path instead (see
+    # ENABLE_GFX906_ATTN_SPEC_SPLIT_KV). The segment workspace is indexed
+    # by absolute token position (one row per scheduled token) and the
+    # backend sizes it to the decode batch threshold, so batches whose
+    # total spec tokens exceed that (multi-sequence speculative decoding)
+    # keep the previous routing through this bound (tuned-prefill split-KV
+    # when eager, the 2D kernel under CUDA-graph capture).
+    _spec_decode_batch = (
+        ENABLE_GFX906_ATTN_SPEC_SPLIT_KV
+        and gfx906_sched
+        and 1 < max_seqlen_q <= GFX906_SPEC_MAX_QUERY_LEN
+        and softmax_segm_output is not None
+        and softmax_segm_max is not None
+        and softmax_segm_expsum is not None
+        and q.shape[0] <= softmax_segm_output.shape[0]
+    )
+
+    # Spec batches share the decode row packing (one query token per block,
+    # reusing the KV-scan shape the decode path is tuned for) rather than
+    # the prefill BLOCK_M: on gfx906 GQA6/head-256, sweeping the spec shape
+    # (q=3) shows the 8-row/16-token/2-warp split-KV configuration
+    # 1.7-1.9x faster than the prefill 32/32/4 one at 4k-64k contexts
+    # (475->260us at 4k, 1563->788us at 16k, ~5.0->2.9ms at 64k per call).
     decode_block_m = (
         _decode_block_m(head_size, num_queries_per_kv)
-        if gfx906_sched and max_seqlen_q == 1
+        if gfx906_sched and (max_seqlen_q == 1 or _spec_decode_batch)
         else None
     )
     prefill_block_m = (
@@ -1585,25 +1610,6 @@ def unified_attention(
         total_num_q_blocks = _num_query_blocks(q.shape[0], num_seqs, BLOCK_Q)
     else:
         total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-
-    # Spec-decode forwards (verify + draft) look like tiny prefills to the
-    # max_seqlen_q > 1 dispatch below but scan the whole decode context;
-    # flag them so they take the split-KV decode path instead (see
-    # ENABLE_GFX906_ATTN_SPEC_SPLIT_KV). The segment workspace is indexed
-    # by absolute token position (one row per scheduled token) and the
-    # backend sizes it to the decode batch threshold, so batches whose
-    # total spec tokens exceed that (multi-sequence speculative decoding)
-    # keep the previous routing through this bound (tuned-prefill split-KV
-    # when eager, the 2D kernel under CUDA-graph capture).
-    _spec_decode_batch = (
-        ENABLE_GFX906_ATTN_SPEC_SPLIT_KV
-        and gfx906_sched
-        and 1 < max_seqlen_q <= GFX906_SPEC_MAX_QUERY_LEN
-        and softmax_segm_output is not None
-        and softmax_segm_max is not None
-        and softmax_segm_expsum is not None
-        and q.shape[0] <= softmax_segm_output.shape[0]
-    )
 
     # Tile sizes for prefill and decode. Gemma3 models use optimized values.
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
@@ -2008,14 +2014,19 @@ def unified_attention(
         if _spec_decode_batch:
             # Fixed segment count: graph capture runs with seq_lens=1, so a
             # context-derived count would freeze at the capture-time context
-            # while replay scans the real one. The spec batch reuses the
-            # swept prefill tile/warp configuration (BLOCK_M 32 / TILE 32 /
-            # 4 warps), which its q blocks share with tuned prefill.
+            # while replay scans the real one. On the decode-tuned shape the
+            # batch shares the decode tile/warp configuration (see
+            # decode_block_m above); other shapes keep the swept prefill
+            # configuration their q blocks were sized against.
             num_segments = min(
                 GFX906_SPEC_ATTN_SEGMENTS, softmax_segm_output.shape[2]
             )
-            splitkv_tile_size = TILE_SIZE_PREFILL
-            splitkv_num_warps = 4
+            if decode_block_m is not None:
+                splitkv_tile_size = TILE_SIZE_DECODE
+                splitkv_num_warps = 2
+            else:
+                splitkv_tile_size = TILE_SIZE_PREFILL
+                splitkv_num_warps = 4
         else:
             splitkv_tile_size = TILE_SIZE_DECODE
             splitkv_num_warps = (
