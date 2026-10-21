@@ -302,6 +302,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
   ops.def(
+      "gfx906_prefill_attn_scan("
+      "    Tensor q, Tensor key_cache, Tensor value_cache,"
+      "    Tensor block_table, Tensor seq_lens,"
+      "    Tensor! segm_output, Tensor! segm_max, Tensor! segm_expsum,"
+      "    float scale, int q_len, int k_s0, int k_s1, int k_s2, "
+      "    int v_s0, int v_s1, int v_s2, Tensor! dbg)"
+      " -> ()");
+  ops.impl("gfx906_prefill_attn_scan", torch::kCUDA, &gfx906_prefill_attn_scan);
+
+  ops.def(
       "causal_conv1d_gfx906_decode_update("
       "Tensor x, Tensor conv_state, Tensor weight, Tensor? bias, "
       "Tensor? conv_state_indices, int pad_slot_id, bool silu_activation) "

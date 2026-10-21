@@ -484,6 +484,24 @@ mul_mat_q4_K(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// q4_K plane-split kernel: pairs allocate/load_tiles_q4_K_split with the
+// shift-free vec_dot (see vecdotq.cuh). 64x64 tile, 8 warps.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q4_K_split(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 64;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK_K, QR4_K, QI4_K, true, block_q4_K, mmq_x, mmq_y, nwarps, allocate_tiles_q4_K_split<mmq_y>,
+        load_tiles_q4_K_split<mmq_y, nwarps, need_check>, VDR_Q4_K_Q8_1_MMQ, vec_dot_q4_K_q8_1_mul_mat_split>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q4_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
@@ -496,6 +514,30 @@ static void ggml_mul_mat_q4_K_q8_1_cuda(
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
     const dim3 block_nums(block_num_x, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+    static int use_split = -1;
+    if (use_split < 0) {
+        // Plane-split q4_K path, bitwise-identical to the packed kernel and
+        // ~2.6x faster on gfx906 (the packed path re-applies a shift+mask
+        // inside every __dp4a for every output column). Set 0 to restore.
+        const char * env = getenv("VLLM_GFX906_MMQ_Q4K_SPLIT");
+        use_split = env ? atoi(env) : 1;
+    }
+
+    if (use_split) {
+        // plane-split variant on a 64x64 tile: the doubled x_ql tile stays
+        // within the 2-blocks-per-CU LDS budget on gfx906
+        constexpr int sx = 64, sy = 64;
+        const dim3 split_nums((nrows_x + sy - 1) / sy, (ncols_y + sx - 1) / sx, 1);
+        if (nrows_x % sy == 0) {
+            mul_mat_q4_K_split<scalar_t, false><<<split_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q4_K_split<scalar_t, true><<<split_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
 
     if (nrows_x % mmq_y == 0) {
         const bool need_check = false;

@@ -11,7 +11,7 @@ from huggingface_hub import snapshot_download
 import vllm._custom_ops as ops
 from vllm.model_executor.layers.fused_moe import fused_experts
 from vllm.model_executor.layers.quantization.gguf import _fused_moe_gguf
-from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_random_seed
 
 GGUF_SAMPLE = snapshot_download("Isotr0py/test-gguf-sample")
 GGUF_SAMPLE_MOE = snapshot_download("SzymonOzog/test-gguf-moe-sample")
@@ -91,7 +91,7 @@ def test_dequantize(
 @pytest.mark.parametrize("quant_type", QUANT_TYPES)
 @torch.inference_mode()
 def test_mmvq(hidden_size: int, dtype: torch.dtype, quant_type: GGMLQuantizationType):
-    current_platform.seed_everything(0)
+    set_random_seed(0)
 
     tensors = get_gguf_sample_tensors(hidden_size, quant_type)
     x = torch.rand((1, hidden_size), dtype=dtype, device="cuda")
@@ -115,7 +115,7 @@ def test_mmvq(hidden_size: int, dtype: torch.dtype, quant_type: GGMLQuantization
 def test_mmvq_small_batch_matches_single_vectors(
     quant_type: GGMLQuantizationType, num_vectors: int
 ):
-    current_platform.seed_everything(0)
+    set_random_seed(0)
 
     hidden_size = 1024
     x = torch.rand((num_vectors, hidden_size), dtype=torch.float16, device="cuda")
@@ -144,7 +144,7 @@ def test_iq4_xs_repack_to_q8_0_mmvq(hidden_size: int, dtype: torch.dtype):
     if not hasattr(torch.ops._C, "ggml_repack_iq4_xs_to_q8_0"):
         pytest.skip("IQ4_XS to Q8_0 repack op is not available")
 
-    current_platform.seed_everything(0)
+    set_random_seed(0)
     quant_type = GGMLQuantizationType.IQ4_XS
     tensors = get_gguf_sample_tensors(hidden_size, quant_type)
     x = torch.rand((1, hidden_size), dtype=dtype, device="cuda")
@@ -191,7 +191,7 @@ def test_mmq(
     dtype: torch.dtype,
     quant_type: GGMLQuantizationType,
 ):
-    current_platform.seed_everything(0)
+    set_random_seed(0)
 
     tensors = get_gguf_sample_tensors(hidden_size, quant_type)
     x = torch.rand((num_tokens, hidden_size), dtype=dtype, device="cuda")
@@ -226,7 +226,7 @@ def test_moe(
     quant_type: GGMLQuantizationType,
     top_k: int,
 ):
-    current_platform.seed_everything(0)
+    set_random_seed(0)
     H, E = 1024, 256
 
     x = torch.rand((num_tokens, H), dtype=dtype, device="cuda")

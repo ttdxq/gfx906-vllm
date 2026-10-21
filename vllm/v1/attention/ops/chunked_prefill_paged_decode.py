@@ -84,6 +84,7 @@ def kernel_paged_attention_2d(
     query_start_len_ptr,  # [num_seqs+1]
     USE_SINKS: tl.constexpr,  # bool
     USE_FP8: tl.constexpr,
+    INTERLEAVED_V_PACK_FACTOR: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -170,13 +171,24 @@ def kernel_paged_attention_2d(
             + (offs_d[:, None] % x) * stride_k_cache_4
         )
 
-        # 4D addressing logic of V (Slot is innermost)
-        v_offset = (
-            p_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_1
-            + offs_d[None, :] * stride_v_cache_2
-            + internal_offsets[:, None] * stride_v_cache_3
-        )
+        # V addressing: standard 4D or interleaved 5D
+        if INTERLEAVED_V_PACK_FACTOR > 0:
+            v_offset = (
+                p_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_1
+                + (internal_offsets[:, None] // INTERLEAVED_V_PACK_FACTOR)
+                * HEAD_SIZE
+                * INTERLEAVED_V_PACK_FACTOR
+                + offs_d[None, :] * INTERLEAVED_V_PACK_FACTOR
+                + (internal_offsets[:, None] % INTERLEAVED_V_PACK_FACTOR)
+            )
+        else:
+            v_offset = (
+                p_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_1
+                + offs_d[None, :] * stride_v_cache_2
+                + internal_offsets[:, None] * stride_v_cache_3
+            )
 
         # Only the final tile can straddle seq_len. Slots >= seq_len are
         # unwritten KV cache that may hold NaN/garbage; they are score-masked
@@ -304,10 +316,15 @@ def chunked_prefill_paged_decode(
     # Optional tensor for sinks
     sinks=None,
     is_block_table_ptr: bool = False,
+    use_interleaved_v_cache: bool = False,
     causal: bool = True,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[2] ** 0.5)
+
+    interleaved_v_pack_factor = (
+        (16 // value_cache.element_size()) if use_interleaved_v_cache else 0
+    )
 
     # The paged prefill kernel below applies causal masking inherently and
     # context_attention_fwd has no causal switch; reject non-causal callers.
@@ -323,6 +340,11 @@ def chunked_prefill_paged_decode(
         sliding_window = 0
 
     if max_query_len > 1:
+        if interleaved_v_pack_factor > 0:
+            raise NotImplementedError(
+                "chunked prefill with the interleaved V cache layout is not "
+                "supported by this kernel generation yet."
+            )
         context_attention_fwd(
             q=query,
             k=key,
@@ -511,4 +533,5 @@ def chunked_prefill_paged_decode(
             query_start_len_ptr=query_start_loc,
             USE_SINKS=sinks is not None,
             USE_FP8=output_scale is not None,
+            INTERLEAVED_V_PACK_FACTOR=interleaved_v_pack_factor,
         )

@@ -2103,6 +2103,21 @@ class EngineArgs:
             jit_monitor_verbose=self.jit_monitor_verbose,
         )
 
+    def create_logging_config(self) -> "LoggingConfig":
+        # Bridge for newer entrypoints (e.g. LLM.__init__) that build the
+        # LoggingConfig through EngineArgs; the frozen dataclass predates the
+        # logging_config/log_level/log_config_file fields, hence the guards.
+        from vllm.config.logging import LoggingConfig
+
+        config = getattr(self, "logging_config", None) or LoggingConfig()
+        if getattr(self, "log_level", None) is not None:
+            config = dataclasses.replace(config, log_level=self.log_level)
+        if getattr(self, "log_config_file", None) is not None:
+            config = dataclasses.replace(
+                config, pylogging_config_file=self.log_config_file
+            )
+        return config
+
     def create_engine_config(
         self,
         usage_context: UsageContext | None = None,

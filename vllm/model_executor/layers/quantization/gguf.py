@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import gguf
 import torch
+import torch.nn as nn
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
@@ -1720,6 +1721,8 @@ def _fused_moe_gguf(
             torch.ops._C.silu_and_mul(out, x)
         elif activation == "gelu":
             torch.ops._C.gelu_and_mul(out, x)
+        elif activation == "gelu_tanh":
+            torch.ops._C.gelu_tanh_and_mul(out, x)
         else:
             raise ValueError(f"Unsupported activation: {activation}")
         return out
@@ -2175,6 +2178,20 @@ class GGUFLinearMethod(LinearMethodBase):
         set_weight_attrs(qweight_type, extra_weight_attrs)
         layer.register_parameter("qweight_type", qweight_type)
 
+    def tie_weights(self, layer: torch.nn.Module, embed_tokens: nn.Module):
+        """Tie a GGUF-quantized LM head to a GGUF-quantized embedding.
+
+        Tied GGUF models (e.g. Gemma) keep the vocabulary only as a quantized
+        ``token_embd``, so both modules must share the quantized parameter
+        pair instead of the dense ``weight`` tensor.
+        """
+        if hasattr(embed_tokens, "qweight"):
+            layer.qweight = embed_tokens.qweight
+            layer.qweight_type = embed_tokens.qweight_type
+            return layer
+        layer.weight = embed_tokens.weight
+        return layer
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         qweight_type = layer.qweight_type.weight_type
         if not (qweight_type in UNQUANTIZED_TYPES or qweight_type in DEQUANT_TYPES):
@@ -2213,6 +2230,9 @@ class GGUFLinearMethod(LinearMethodBase):
             # Merged mixed-width layers keep standalone shard tensors in
             # _gguf_shard_cache; there is no padded qweight to repack, and
             # any tensor-method access on the uninitialized parameter raises.
+            return
+        if qweight.numel() == 0:
+            # Zero-element placeholder over mixed-width shard cache entries.
             return
         if not qweight.is_cuda or not qweight.is_contiguous():
             return
@@ -2295,6 +2315,22 @@ class GGUFLinearMethod(LinearMethodBase):
                     cache[idx] = shard
                 qweight.data_container.clear()
                 layer._gguf_shard_cache = cache
+                # Replace the GGUFUninitializedParameter with a zero-element
+                # placeholder that keeps the shard metadata attrs. apply() and
+                # the shard collectors only read `qweight.shard_id` here; any
+                # tensor-method access on an UninitializedParameter raises,
+                # which breaks dynamo tracing of the compiled path.
+                placeholder = Parameter(
+                    torch.empty(
+                        0,
+                        0,
+                        dtype=cache[shard_id[0]].dtype,
+                        device=cache[shard_id[0]].device,
+                    ),
+                    requires_grad=False,
+                )
+                set_weight_attrs(placeholder, vars(qweight))
+                layer.register_parameter("qweight", placeholder)
                 return
             dtype = {data.dtype for data in data_container}
             assert len(dtype) == 1, ValueError(
@@ -2543,8 +2579,15 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         # Post-#41184 contract: expert selection (select_experts) runs in the
         # MoERunner router; this method only executes the routed experts.
         # Shared experts are computed by the runner via `shared_experts`.
-        assert self.moe.activation == MoEActivation.SILU, (
-            "Only SiLU activation is supported."
+        # The SiLU-fused decode shortcuts below are selected by activation
+        # string, so non-SiLU models take the unfused act() paths.
+        _MOE_ACTIVATION_TO_GGUF = {
+            MoEActivation.SILU: "silu",
+            MoEActivation.GELU_TANH: "gelu_tanh",
+        }
+        activation = _MOE_ACTIVATION_TO_GGUF.get(self.moe.activation)
+        assert activation is not None, (
+            f"Unsupported MoE activation: {self.moe.activation}"
         )
         return fused_moe_gguf(
             x,
@@ -2554,7 +2597,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             topk_ids,
             layer.w13_qweight_type.weight_type,
             layer.w2_qweight_type.weight_type,
-            "silu",
+            activation,
         )
 
 

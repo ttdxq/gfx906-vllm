@@ -45,8 +45,14 @@ def test_merged_mixed_width_gguf_shards_use_standalone_shard_cache():
     assert not getattr(layer, "use_dense_gguf_fallback", False)
     assert not hasattr(layer, "weight")
     # Mixed packed widths keep the loader's standalone shard tensors as the
-    # single resident copy instead of materializing a zero-padded concat.
-    assert isinstance(layer.qweight, GGUFUninitializedParameter)
+    # single resident copy instead of materializing a zero-padded concat. The
+    # uninitialized parameter is replaced by a zero-element placeholder that
+    # keeps the shard metadata so dynamo can trace the compiled path.
+    assert isinstance(layer.qweight, torch.nn.Parameter)
+    assert not isinstance(layer.qweight, GGUFUninitializedParameter)
+    assert layer.qweight.numel() == 0
+    assert layer.qweight.shard_id == [0, 1]
+    assert layer.qweight.shard_id_map == {0: 0, 1: 1}
     assert len(layer.qweight.data_container) == 0
     assert not hasattr(layer.qweight, "shard_offset_map")
     assert set(layer._gguf_shard_cache) == {0, 1}

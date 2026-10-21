@@ -133,6 +133,10 @@ class PassConfig:
     """Fuse the custom Attention and MLAAttention + quant ops."""
     eliminate_noops: bool = Field(default=True)
     """Eliminate no-op ops."""
+    enable_sp: bool = None  # type: ignore[assignment]
+    """Enable sequence parallelism. Requires TP>1."""
+    fuse_gemm_comms: bool = None  # type: ignore[assignment]
+    """Enable async TP."""
     fuse_allreduce_rms: bool = None  # type: ignore[assignment]
     """Enable flashinfer allreduce fusion."""
     enable_qk_norm_rope_fusion: bool = None  # type: ignore[assignment]
@@ -1062,6 +1066,7 @@ class CompilationConfig:
         vllm_config: "VllmConfig",
         prefix: str = "",
         is_encoder: bool = False,
+        use_aot_compile: bool = True,
     ) -> str | Callable:
         """Initialize the backend for the compilation config from a vllm config.
 
@@ -1070,6 +1075,8 @@ class CompilationConfig:
             prefix: Cache directory prefix for this compiled module.
             is_encoder: Whether this module is used in an encoder (as
                 opposed to a text backbone).
+            use_aot_compile: Whether the module permits AOT and direct
+                artifacts.
 
         Returns:
             The backend for the compilation config.
@@ -1101,7 +1108,12 @@ class CompilationConfig:
 
         from vllm.compilation.backends import VllmBackend
 
-        return VllmBackend(vllm_config, prefix=prefix, is_encoder=is_encoder)
+        return VllmBackend(
+            vllm_config,
+            prefix=prefix,
+            is_encoder=is_encoder,
+            use_aot_compile=use_aot_compile,
+        )
 
     def post_init_cudagraph_sizes(self) -> None:
         """To complete the initialization after cudagraph related
@@ -1209,6 +1221,11 @@ class CompilationConfig:
                     self.cudagraph_mode = CUDAGraphMode.FULL
                 self.splitting_ops = []
 
+        if (
+            not self.use_inductor_graph_partition
+            and (self.pass_config.enable_sp or self.pass_config.fuse_gemm_comms)
+            and self.splitting_ops
+        ):
             logger.warning_once(
                 "Sequence parallelism requires full-graph compilation when "
                 "use_inductor_graph_partition is off. Setting splitting_ops "
@@ -1356,6 +1373,11 @@ class CompilationConfig:
             return f"-{op}" not in self.custom_ops
 
         return f"+{op}" in self.custom_ops
+
+    def _is_auto_graph_default(self) -> bool:
+        """Whether the current cudagraph_mode was auto-enabled by a
+        model-family default rather than requested by the user."""
+        return getattr(self, "_auto_graph_default", False)
 
     def resolve_cudagraph_mode_and_sizes(
         self,
@@ -1506,14 +1528,61 @@ class CompilationConfig:
             and kv_cache_config.has_mamba_layers
             and max_num_reqs > kv_cache_config.num_blocks
         ):
-            raise ValueError(
-                f"max_num_seqs ({max_num_reqs}) exceeds available Mamba cache "
-                f"blocks ({kv_cache_config.num_blocks}). Each decode sequence "
-                "requires one Mamba cache block, so CUDA graph capture cannot "
-                "proceed. Please lower max_num_seqs to at most "
-                f"{kv_cache_config.num_blocks} or increase "
-                "gpu_memory_utilization."
-            )
+            if self._is_auto_graph_default():
+                # The graph mode was auto-enabled (not user-requested) and
+                # memory pressure leaves fewer Mamba blocks than
+                # max_num_seqs. The scheduler never runs more concurrent
+                # requests than blocks, so for a FULL_DECODE_ONLY default
+                # (no PIECEWISE cudagraphs to restrict) clamping the
+                # capture sizes keeps graphs for every schedulable decode
+                # batch. Modes with PIECEWISE cudagraphs fall back to no
+                # graphs instead of silently restricting them.
+                if cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+                    num_blocks = kv_cache_config.num_blocks
+                    clamped = [
+                        s
+                        for s in (self.cudagraph_capture_sizes or [])
+                        if s <= num_blocks
+                    ] or [1]
+                    logger.warning(
+                        "Auto-enabled FULL decode CUDA graphs: max_num_seqs "
+                        "(%d) exceeds available Mamba cache blocks (%d). "
+                        "Clamping cudagraph capture sizes to %s (batches "
+                        "above %d run uncaptured). Lower --max-num-seqs to "
+                        "at most %d to remove this cap.",
+                        max_num_reqs,
+                        kv_cache_config.num_blocks,
+                        clamped,
+                        kv_cache_config.num_blocks,
+                        kv_cache_config.num_blocks,
+                    )
+                    self.cudagraph_capture_sizes = clamped
+                    self.max_cudagraph_capture_size = max(clamped)
+                else:
+                    logger.warning(
+                        "Auto-enabled CUDA graphs (%s) disabled: max_num_seqs "
+                        "(%d) exceeds available Mamba cache blocks (%d). "
+                        "Lower --max-num-seqs to at most %d, raise "
+                        "--gpu-memory-utilization, or pass --enforce-eager "
+                        "to silence this.",
+                        cudagraph_mode.name,
+                        max_num_reqs,
+                        kv_cache_config.num_blocks,
+                        kv_cache_config.num_blocks,
+                    )
+                    self.cudagraph_mode = CUDAGraphMode.NONE
+                    cudagraph_mode = CUDAGraphMode.NONE
+                    self.cudagraph_capture_sizes = []
+                    self.max_cudagraph_capture_size = 0
+            else:
+                raise ValueError(
+                    f"max_num_seqs ({max_num_reqs}) exceeds available Mamba cache "
+                    f"blocks ({kv_cache_config.num_blocks}). Each decode sequence "
+                    "requires one Mamba cache block, so CUDA graph capture cannot "
+                    "proceed. Please lower max_num_seqs to at most "
+                    f"{kv_cache_config.num_blocks} or increase "
+                    "gpu_memory_utilization."
+                )
 
         self.cudagraph_mode = cudagraph_mode
         return cudagraph_mode

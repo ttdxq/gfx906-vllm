@@ -309,55 +309,17 @@ def _auto_enable_async_scheduling_for_gfx906_gguf(
     return _is_gfx906_gguf(model_config)
 
 
-def needs_qwen35_gguf_piecewise_cudagraph(model_config: ModelConfig | None) -> bool:
-    if os.getenv("VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        logger.warning_once(
-            "VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH is set. This bypasses "
-            "the gfx906 Qwen3.5 GGUF PIECEWISE CUDA graph safety guard and "
-            "is intended only for debugging known FULL decode graph "
-            "correctness issues."
-        )
-        return False
+def needs_qwen35_gguf_full_decode_default(model_config: ModelConfig | None) -> bool:
+    """Whether gfx906 Qwen3.5 GGUF should default to FULL_DECODE_ONLY graphs.
+
+    The GDN recurrent state updates run through request-indexed in-place
+    custom ops that are safe under decode full-graph capture, so decode uses
+    FULL CUDA graphs to cut per-token launch overhead, while prefill/mixed
+    batches keep piecewise compilation without cudagraphs to preserve
+    dynamic-shape flexibility (piecewise cudagraphs measured slower than
+    eager on this path).
+    """
     return _is_gfx906_qwen35_gguf(model_config)
-
-
-def needs_qwen35_gguf_eager_decode(model_config: ModelConfig | None) -> bool:
-    if os.getenv("VLLM_QWEN35_GGUF_ALLOW_FULL_CUDAGRAPH", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return False
-    if os.getenv("VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        logger.warning_once(
-            "VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH is set. This "
-            "restores the old compiled gfx906 Qwen3.5 GGUF PIECEWISE CUDA "
-            "graph fallback for debugging, although local benchmarks showed "
-            "it is slower than eager decode for this path."
-        )
-        return False
-    return _is_gfx906_qwen35_gguf(model_config)
-
-
-def prefer_eager_custom_ops_for_qwen35_gguf(
-    compilation_config: CompilationConfig,
-) -> None:
-    custom_ops = compilation_config.custom_ops
-    while "none" in custom_ops:
-        custom_ops.remove("none")
-    if "all" not in custom_ops:
-        custom_ops.append("all")
 
 
 OPTIMIZATION_LEVEL_00 = {
@@ -841,16 +803,27 @@ class VllmConfig:
 
         return True
 
-    def _is_dflash2_draft(self) -> bool:
-        """Whether the DFlash draft is a DFlash2 one, by the architecture the
-        speculator selects on (v1/worker/gpu/spec_decode/__init__.py)."""
-        spec = self.speculative_config
+    @staticmethod
+    def _is_dflash_candidate_draft(config: "VllmConfig") -> bool:
+        """Whether the draft runs the DFlash2 candidate selector (DFlash2 or
+        LiLiCorr architectures); such drafts must use the V2 speculator, the
+        only one that invokes it (v1/worker/gpu/spec_decode/__init__.py)."""
+        spec = config.speculative_config
         if spec is None or spec.method != "dflash":
             return False
         draft_config = getattr(spec, "draft_model_config", None)
         if draft_config is None:
             return False
-        return "DFlash2DraftModel" in (draft_config.architectures or [])
+        architectures = getattr(draft_config, "architectures", None) or []
+        return any(
+            arch in architectures
+            for arch in ("DFlash2DraftModel", "LiLiCorrDraftModel")
+        )
+
+    def _is_dflash2_draft(self) -> bool:
+        """Whether the DFlash draft is a DFlash2 one, by the architecture the
+        speculator selects on (v1/worker/gpu/spec_decode/__init__.py)."""
+        return self._is_dflash_candidate_draft(self)
 
     def _dflash_needs_multi_kv_group(self) -> bool:
         """Whether a DFlash draft mixes sliding-window and full attention."""
@@ -1333,9 +1306,17 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("sampling distribution replay requires Model Runner V2")
         if self.speculative_config is not None:
-            raise ValueError(
-                "sampling distribution replay does not support speculative decoding"
-            )
+            spec_config = self.speculative_config
+            # Adaptive verification resamples within a verification batch,
+            # which breaks the fixed boundaries the replay mask assumes.
+            if spec_config.method == "dspark" and getattr(
+                spec_config, "enable_adaptive_verification", False
+            ):
+                raise ValueError(
+                    "sampling distribution replay requires fixed verification "
+                    "boundaries; disable adaptive verification to combine it "
+                    "with speculative decoding"
+                )
         if model_config.is_diffusion:
             raise ValueError(
                 "sampling distribution replay does not support diffusion models"
@@ -1358,7 +1339,29 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("trace replay requires Model Runner V2")
 
-    def _check_watermarking_unsupported(
+    def _reject_mismatched_float_kv_cache(self) -> None:
+        """Reject a float KV cache dtype that differs from the model dtype.
+
+        A 16-bit float KV cache reuses the model-dtype kernels, so the two
+        must match; "auto" follows the model dtype and quantized dtypes have
+        their own kernels.
+        """
+        cache_dtype = self.cache_config.cache_dtype
+        float_dtypes = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+        if cache_dtype not in float_dtypes:
+            return
+        model_dtype = self.model_config.dtype
+        model_dtype_name = (
+            str(model_dtype).removeprefix("torch.") if model_dtype else None
+        )
+        if model_dtype_name != cache_dtype:
+            raise ValueError(
+                f"kv_cache_dtype '{cache_dtype}' requires the model to run in "
+                f"'{cache_dtype}', but the model dtype is '{model_dtype}'."
+                " Use --kv-cache-dtype auto or match the model dtype."
+            )
+
+    def _check_supports_watermarking(
         self,
         *,
         beam_search: bool = False,
@@ -1501,7 +1504,7 @@ class VllmConfig:
         self.try_verify_and_update_config()
         self._resolve_and_verify_engram_config()
 
-        self._check_watermarking_unsupported()
+        self._check_supports_watermarking()
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
@@ -1833,6 +1836,30 @@ class VllmConfig:
         # but before fusion defaults are applied as those may depend on op priority.
         self.kernel_config.set_platform_defaults(self)
 
+        # gfx906 Qwen3.5 GGUF defaults to FULL decode CUDA graphs with
+        # piecewise-compiled prefill. Inject before optimization-level
+        # defaults fill cudagraph_mode so an explicit user setting wins.
+        if (
+            current_platform.support_static_graph_mode()
+            and self.model_config is not None
+            and self.speculative_config is None
+            and self.compilation_config.cudagraph_mode is None
+            and self.compilation_config.mode
+            in (None, CompilationMode.VLLM_COMPILE)
+            and needs_qwen35_gguf_full_decode_default(self.model_config)
+        ):
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            # Marker for graceful degradation under memory pressure (see
+            # resolve_cudagraph_mode_and_sizes): auto-enabled graphs may be
+            # clamped or disabled, user-requested ones keep hard errors.
+            self.compilation_config._auto_graph_default = True
+            logger.info_once(
+                "Using FULL decode CUDA graphs with piecewise-compiled "
+                "prefill for Qwen3.5 GGUF on gfx906 by default. Set "
+                "cudagraph_mode explicitly to override, or --enforce-eager "
+                "to disable."
+            )
+
         default_config = OPTIMIZATION_LEVEL_TO_CONFIG[self.optimization_level]
         self._apply_optimization_level_defaults(default_config)
         if self.kernel_config.enable_flashinfer_autotune is None:
@@ -1905,32 +1932,6 @@ class VllmConfig:
         self._set_max_num_scheduled_tokens()
 
         if current_platform.support_static_graph_mode():
-            if (
-                self.model_config is not None
-                and needs_qwen35_gguf_eager_decode(self.model_config)
-                and (
-                    self.compilation_config.mode != CompilationMode.NONE
-                    or self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-                )
-            ):
-                logger.warning_once(
-                    "Qwen3.5 GGUF on gfx906 is faster and avoids known "
-                    "GatedDeltaNet state update graph hazards with eager "
-                    "decode. Overriding compilation mode and cudagraph_mode "
-                    "to NONE. Set "
-                    "VLLM_QWEN35_GGUF_ALLOW_PIECEWISE_CUDAGRAPH=1 to restore "
-                    "the previous compiled PIECEWISE fallback for debugging."
-                )
-                self.compilation_config.mode = CompilationMode.NONE
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-                self.compilation_config.max_cudagraph_capture_size = 0
-                self.compilation_config.cudagraph_capture_sizes = []
-                self.compilation_config.cudagraph_num_of_warmups = 0
-                self.model_config.enforce_eager = True
-                prefer_eager_custom_ops_for_qwen35_gguf(
-                    self.compilation_config
-                )
-
             # if cudagraph_mode has full cudagraphs, we need to check support
             if model_config := self.model_config:
                 if (
@@ -1955,14 +1956,6 @@ class VllmConfig:
                     self.compilation_config.cudagraph_mode = (
                         CUDAGraphMode.FULL_DECODE_ONLY
                     )
-                elif needs_qwen35_gguf_piecewise_cudagraph(self.model_config):
-                    logger.warning_once(
-                        "Qwen3.5 GGUF on gfx906 updates GatedDeltaNet state "
-                        "through a custom op that is not safe under full "
-                        "decode CUDA graphs. Overriding cudagraph_mode to "
-                        "PIECEWISE."
-                    )
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
             # Check if KV connector requires PIECEWISE mode for CUDA graphs
             if (

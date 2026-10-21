@@ -447,7 +447,10 @@ def use_rocm_custom_paged_attention(
 ) -> bool:
     # custom paged attn always supported on V0. On V1, requires sliding window
     # disabled due to observed numerical discrepancy.
-    if on_cdna():
+    # The ll4mi kernels are only implemented for gfx90a/gfx942/gfx950 (and
+    # gfx11/gfx12 below); gfx906 compiles an assert-only stub, so it must stay
+    # on the Triton paged attention path.
+    if on_cdna() and not on_gfx906():
         return (
             (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)

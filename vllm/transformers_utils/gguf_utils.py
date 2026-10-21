@@ -11,6 +11,7 @@ import gguf
 from gguf.constants import Keys, VisionProjectorType
 from transformers import (
     Gemma3Config,
+    Gemma4VisionConfig,
     PretrainedConfig,
     PreTrainedTokenizerFast,
     SiglipVisionConfig,
@@ -174,6 +175,51 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
     else:
         logger.info("Extracted vision config from mmproj.gguf metadata")
 
+    return config
+
+
+def extract_gemma4_vision_config_from_gguf(
+    mmproj_path: str,
+) -> "Gemma4VisionConfig | None":
+    """Extract the Gemma4 vision tower config from a ``gemma4v`` projector."""
+    reader = gguf.GGUFReader(str(mmproj_path))
+    projector_type = _read_gguf_scalar(reader, "clip.vision.projector_type")
+    if projector_type != "gemma4v":
+        return None
+
+    def scalar(key: str) -> object | None:
+        return _read_gguf_scalar(reader, f"clip.vision.{key}")
+
+    hidden_size = int(scalar("embedding_length"))
+    num_heads = int(scalar("attention.head_count"))
+    position_tensor = next(
+        (
+            tensor
+            for tensor in reader.tensors
+            if tensor.name == "v.position_embd.weight"
+        ),
+        None,
+    )
+    if position_tensor is None:
+        return None
+    config = Gemma4VisionConfig(
+        hidden_size=hidden_size,
+        intermediate_size=int(scalar("feed_forward_length")),
+        num_hidden_layers=int(scalar("block_count")),
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads,
+        head_dim=hidden_size // num_heads,
+        rms_norm_eps=float(scalar("attention.layer_norm_epsilon")),
+        patch_size=int(scalar("patch_size")),
+        position_embedding_size=int(position_tensor.shape[1]),
+        pooling_kernel_size=3,
+        # The projector carries the learned standardization constants; without
+        # this flag the tower never registers std_bias/std_scale and the
+        # post-pooler rescaling is skipped.
+        standardize=any(t.name == "v.std_bias" for t in reader.tensors),
+    )
+    config.default_output_length = 280
+    config.projector_dim = int(_read_gguf_scalar(reader, "clip.vision.projection_dim"))
     return config
 
 
@@ -343,6 +389,292 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
     return config_dict
 
 
+def gemma4_gguf_config_dict(model: str) -> dict | None:
+    """Build a Gemma4 config from the model GGUF metadata."""
+    try:
+        reader = gguf.GGUFReader(str(model))
+    except Exception:
+        return None
+
+    if _read_gguf_scalar(reader, "general.architecture") != "gemma4":
+        return None
+
+    def scalar(key: str, default: object | None = None) -> object | None:
+        return _read_gguf_scalar(reader, f"gemma4.{key}", default)
+
+    block_count = int(scalar("block_count"))
+    head_dim_swa = int(scalar("attention.key_length_swa"))
+    head_dim_full = int(scalar("attention.key_length"))
+    # Derive the per-layer attention layout from the checkpoint tensors:
+    # Gemma4 interleaves SWA layers (head_dim 256, separate V weights) with
+    # full-attention layers (head_dim 512, V tied to K).  The
+    # head_count_kv / sliding_window_pattern metadata does not describe this
+    # per layer reliably, so the attn_q_norm shape and the attn_k output
+    # width are the ground truth.
+    tensor_shapes = {
+        tensor.name: tuple(int(dim) for dim in tensor.shape)
+        for tensor in reader.tensors
+    }
+    layer_types: list[str] = []
+    kv_heads_swa: int | None = None
+    kv_heads_full: int | None = None
+    for idx in range(block_count):
+        norm_shape = tensor_shapes.get(f"blk.{idx}.attn_q_norm.weight")
+        k_shape = tensor_shapes.get(f"blk.{idx}.attn_k.weight")
+        if norm_shape is None or k_shape is None:
+            return None
+        if norm_shape[0] == head_dim_full:
+            layer_types.append("full_attention")
+            if kv_heads_full is None:
+                kv_heads_full = k_shape[1] // head_dim_full
+        else:
+            layer_types.append("sliding_attention")
+            if kv_heads_swa is None:
+                kv_heads_swa = k_shape[1] // head_dim_swa
+    if kv_heads_swa is None or kv_heads_full is None:
+        return None
+    tokens = _read_gguf_scalar(reader, "tokenizer.ggml.tokens", [])
+    text_config = {
+        "model_type": "gemma4_text",
+        "architectures": ["Gemma4ForCausalLM"],
+        "vocab_size": len(tokens),
+        "hidden_size": int(scalar("embedding_length")),
+        "intermediate_size": int(scalar("feed_forward_length")),
+        "num_hidden_layers": block_count,
+        "num_attention_heads": int(scalar("attention.head_count")),
+        "num_key_value_heads": kv_heads_swa,
+        "num_global_key_value_heads": kv_heads_full,
+        "global_head_dim": int(scalar("attention.key_length")),
+        "head_dim": int(scalar("attention.key_length_swa")),
+        "max_position_embeddings": int(scalar("context_length")),
+        "rms_norm_eps": float(scalar("attention.layer_norm_rms_epsilon")),
+        "sliding_window": int(scalar("attention.sliding_window")),
+        "layer_types": layer_types,
+        # Gemma4 image soft tokens attend bidirectionally within each
+        # image block on sliding-attention layers; without this the
+        # vision embeddings integrate as plain causal tokens.
+        "use_bidirectional_attention": "vision",
+        "attention_k_eq_v": True,
+        "vocab_size_per_layer_input": 0,
+        "hidden_size_per_layer_input": 0,
+        "final_logit_softcapping": float(scalar("final_logit_softcapping")),
+        "num_experts": int(scalar("expert_count")),
+        "top_k_experts": int(scalar("expert_used_count")),
+        "moe_intermediate_size": int(scalar("expert_feed_forward_length")),
+        "num_kv_shared_layers": int(scalar("attention.shared_kv_layers", 0)),
+        "rope_parameters": {
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": float(scalar("rope.freq_base_swa")),
+            },
+            "full_attention": {
+                "rope_type": "proportional",
+                "partial_rotary_factor": 0.25,
+                "rope_theta": float(scalar("rope.freq_base")),
+            },
+        },
+        "bos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.bos_token_id"),
+        "eos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.eos_token_id"),
+        "pad_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.padding_token_id"),
+        "tie_word_embeddings": not any(
+            tensor.name == "output.weight" for tensor in reader.tensors
+        ),
+    }
+    return {
+        "model_type": "gemma4",
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "text_config": text_config,
+        "tie_word_embeddings": text_config["tie_word_embeddings"],
+    }
+
+
+def gemma4_mtp_gguf_config_dict(model: str) -> dict | None:
+    """Build the Gemma4 assistant config from an MTP GGUF."""
+    try:
+        reader = gguf.GGUFReader(str(model))
+    except Exception:
+        return None
+
+    if _read_gguf_scalar(reader, "general.architecture") != "gemma4-assistant":
+        return None
+
+    def scalar(key: str, default: object | None = None) -> object | None:
+        return _read_gguf_scalar(reader, f"gemma4-assistant.{key}", default)
+
+    block_count = int(scalar("block_count"))
+    kv_heads = [int(value) for value in scalar("attention.head_count_kv")]
+    sliding_pattern = [
+        bool(value) for value in scalar("attention.sliding_window_pattern")
+    ]
+    if len(kv_heads) != block_count or len(sliding_pattern) != block_count:
+        return None
+    layer_types = [
+        "sliding_attention" if is_sliding else "full_attention"
+        for is_sliding in sliding_pattern
+    ]
+    global_kv_heads = next(
+        (
+            heads
+            for heads, is_sliding in zip(kv_heads, sliding_pattern)
+            if not is_sliding
+        ),
+        kv_heads[0],
+    )
+    tokens = _read_gguf_scalar(reader, "tokenizer.ggml.tokens", [])
+    text_config = {
+        "model_type": "gemma4_text",
+        "architectures": ["Gemma4MTPModel"],
+        "vocab_size": len(tokens),
+        "hidden_size": int(scalar("embedding_length")),
+        "intermediate_size": int(scalar("feed_forward_length")),
+        "num_hidden_layers": block_count,
+        "num_attention_heads": int(scalar("attention.head_count")),
+        "num_key_value_heads": kv_heads[0],
+        "num_global_key_value_heads": global_kv_heads,
+        "global_head_dim": int(scalar("attention.key_length")),
+        "head_dim": int(scalar("attention.key_length_swa")),
+        "max_position_embeddings": int(scalar("context_length")),
+        "rms_norm_eps": float(scalar("attention.layer_norm_rms_epsilon")),
+        "sliding_window": int(scalar("attention.sliding_window")),
+        "layer_types": layer_types,
+        "attention_k_eq_v": True,
+        "vocab_size_per_layer_input": 0,
+        "hidden_size_per_layer_input": 0,
+        "rope_parameters": {
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": float(scalar("rope.freq_base_swa")),
+            },
+            "full_attention": {
+                "rope_type": "proportional",
+                "partial_rotary_factor": 0.25,
+                "rope_theta": float(scalar("rope.freq_base")),
+            },
+        },
+        "bos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.bos_token_id"),
+        "eos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.eos_token_id"),
+        "pad_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.padding_token_id"),
+        "tie_word_embeddings": True,
+    }
+    return {
+        "model_type": "gemma4_assistant",
+        "architectures": ["Gemma4MTPModel"],
+        "text_config": text_config,
+        "backbone_hidden_size": int(scalar("embedding_length_out")),
+        "tie_word_embeddings": True,
+    }
+
+
+def _strip_gemma4_template_bos(chat_template: str | None) -> str | None:
+    """Drop the template's own leading BOS emission for Gemma4 GGUF models.
+
+    Gemma needs a single ``<bos>`` at the start of every sequence. GGUF chat
+    templates emit it themselves (``{{- bos_token -}}``), so a tokenizer that
+    also prepends BOS would produce ``[2, 2, ...]``. We instead remove the
+    template's emission and let the tokenizer's post-processor add exactly
+    one BOS for both chat and raw-completion prompts.
+    """
+    if not chat_template:
+        return chat_template
+    stripped, n = re.subn(r"\{\{-?\s*bos_token\s*-?\}\}", "", chat_template, count=1)
+    return stripped if n else chat_template
+
+
+def gemma4_gguf_tokenizer_path(model: str) -> str | None:
+    """Materialize a Transformers tokenizer from Gemma4 GGUF metadata."""
+    try:
+        model_path = Path(model)
+        reader = gguf.GGUFReader(str(model_path))
+    except Exception:
+        return None
+
+    if _read_gguf_scalar(reader, "general.architecture") != "gemma4":
+        return None
+    tokenizer_dict = {
+        key: _read_gguf_scalar(reader, f"tokenizer.ggml.{key}", [])
+        for key in ("tokens", "merges", "scores", "token_type")
+    }
+    tokens = tokenizer_dict["tokens"]
+    if not tokens:
+        return None
+    special_ids = {
+        "bos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.bos_token_id"),
+        "eos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.eos_token_id"),
+        "pad_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.padding_token_id"),
+        "unk_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.unknown_token_id"),
+    }
+    tokenizer_config = {
+        **special_ids,
+        # Passing only the numeric ids leaves special_tokens_map empty and
+        # encode() without usable special tokens; register the strings too.
+        **{
+            key.removesuffix("_id"): tokens[token_id]
+            for key, token_id in special_ids.items()
+            if token_id is not None and 0 <= token_id < len(tokens)
+        },
+        # Gemma4Processor reads these off the tokenizer; the ids are the
+        # Gemma4TextConfig defaults (boi 255999, eoi 258882, image 258880).
+        # The audio ones matter even for image-only models: the processor's
+        # validate_inputs treats a missing boa/eoa token as a hard error.
+        **{
+            name: tokens[token_id]
+            for name, token_id in (
+                ("boi_token", 255_999),
+                ("eoi_token", 258_882),
+                ("image_token", 258_880),
+                ("boa_token", 256_000),
+                ("eoa_token", 258_883),
+                ("audio_token", 258_881),
+                ("video_token", 258_884),
+            )
+            if 0 <= token_id < len(tokens)
+        },
+        "chat_template": _strip_gemma4_template_bos(
+            _read_gguf_scalar(reader, "tokenizer.chat_template")
+        ),
+        "fix_mistral_regex": False,
+    }
+    stat = model_path.stat()
+    digest = hashlib.sha256(
+        f"{model_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()
+    ).hexdigest()[:16]
+    tokenizer_dir = Path.home() / ".cache" / "vllm" / "gemma4_gguf_tokenizers" / digest
+    marker = tokenizer_dir / ".vllm_gguf_metadata_tokenizer"
+    if (
+        (tokenizer_dir / "tokenizer.json").is_file()
+        and marker.is_file()
+        and marker.read_text() == "gemma4-gguf-tokenizer-v5\n"
+    ):
+        return str(tokenizer_dir)
+    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer_object, additional_kwargs = convert_gguf_tokenizer(
+        "gemma4_text", tokenizer_dict
+    )
+    fast_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer_object,
+        **additional_kwargs,
+        **tokenizer_config,
+    )
+    bos_id = special_ids["bos_token_id"]
+    if bos_id is not None and 0 <= bos_id < len(tokens):
+        # The GGUF converter ships no post-processor, so encode() would
+        # never prepend <bos>. Gemma models degenerate without it.
+        from tokenizers.processors import TemplateProcessing
+
+        bos_str = tokens[bos_id]
+        fast_tokenizer._tokenizer.post_processor = TemplateProcessing(
+            single=f"{bos_str} $A",
+            pair=f"{bos_str} $A $B",
+            special_tokens=[(bos_str, bos_id)],
+        )
+    fast_tokenizer.save_pretrained(tokenizer_dir)
+    (tokenizer_dir / "config.json").write_text(
+        '{"architectures":["Gemma4ForCausalLM"],"model_type":"gemma4_text"}\n'
+    )
+    marker.write_text("gemma4-gguf-tokenizer-v5\n")
+    return str(tokenizer_dir)
+
+
 def _qwen35_gguf_tokenizer_config(
     reader: gguf.GGUFReader,
 ) -> tuple[dict, dict] | None:
@@ -476,7 +808,14 @@ def maybe_patch_hf_config_from_gguf(
     # Patch multimodal config if mmproj.gguf exists
     mmproj_path = detect_gguf_multimodal(model)
     if mmproj_path is not None:
+        gemma4_vision_config = extract_gemma4_vision_config_from_gguf(
+            str(mmproj_path)
+        )
         vision_config = extract_vision_config_from_gguf(str(mmproj_path))
+
+        if gemma4_vision_config is not None and hf_config.model_type == "gemma4":
+            hf_config.vision_config = gemma4_vision_config
+            hf_config.architectures = ["Gemma4ForConditionalGeneration"]
 
         # Create HF config for Gemma3 multimodal
         text_config = hf_config.get_text_config()

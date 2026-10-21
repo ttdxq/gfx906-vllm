@@ -85,6 +85,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "InklingMMConfig": "vllm.models.inkling.configs",
     # Upstream Transformers classes registered in _CONFIG_REGISTRY
     "DeepseekV3Config": "transformers",
+    "DeepseekV4Config": "transformers",
+    "Qwen3NextConfig": "transformers",
     "HyperCLOVAXConfig": "transformers",
     "Kimi_K25Config": "transformers",
 }
@@ -110,6 +112,8 @@ __all__ = [
     "Cosmos3EdgeVisionConfig",
     "DeepseekVLV2Config",
     "DeepseekV3Config",
+    "DeepseekV4Config",
+    "Qwen3NextConfig",
     "Dots3NoteConfig",
     "K3DSparkConfig",
     "DotsOCRConfig",

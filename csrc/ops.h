@@ -206,6 +206,21 @@ torch::Tensor awq_dequantize(torch::Tensor _kernel,
 torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 #endif
 
+// gfx906 handwritten prefill attention scan (see
+// csrc/attention/gfx906_prefill_attn.cu): writes the fp32 split-KV segment
+// workspace for the gated single-sequence shape; the segment reduction
+// stays in the Triton reduce_segments kernel.
+void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
+                              torch::Tensor value_cache,
+                              torch::Tensor block_table,
+                              torch::Tensor seq_lens,
+                              torch::Tensor segm_output,
+                              torch::Tensor segm_max,
+                              torch::Tensor segm_expsum, double scale,
+                              int64_t q_len, int64_t k_s0, int64_t k_s1,
+                              int64_t k_s2, int64_t v_s0, int64_t v_s1,
+                              int64_t v_s2, torch::Tensor dbg);
+
 torch::Tensor ggml_dequantize(torch::Tensor W, int64_t type, int64_t m,
                               int64_t n,
                               std::optional<at::ScalarType> const& dtype);

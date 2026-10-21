@@ -678,6 +678,9 @@ class TritonAttentionImpl(AttentionImpl):
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            # Accepted for upstream parity; the kernel's (causal AND window)
+            # OR mm_prefix mask already matches Transformers' composition for
+            # Gemma4, so no extra clamping is applied.
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
