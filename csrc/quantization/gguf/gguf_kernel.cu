@@ -489,7 +489,7 @@ static std::mutex& gguf_planar_q6_k_mutex() {
   return m;
 }
 
-static bool gguf_planar_q6_k_is_planar(const void* w) {
+bool gguf_planar_q6_k_is_planar(const void* w) {
   std::lock_guard<std::mutex> lock(gguf_planar_q6_k_mutex());
   return gguf_planar_q6_k_buffers().count(w) > 0;
 }

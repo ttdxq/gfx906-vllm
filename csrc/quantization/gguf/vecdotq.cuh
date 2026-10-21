@@ -1829,6 +1829,86 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
+// Planar-repack variant of load_tiles_q6_K: identical tile contents, but the
+// weight bytes come from the four-plane layout produced by
+// ggml_planar_pack_q6_k (ql | qh | scales | d). Extended signature so the
+// loader can derive the plane bases (it needs the tensor row count, which the
+// original pointer-per-tile calling convention does not carry).
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q6_K_planar(
+    const void * __restrict__ vx, const int & nrows_x, const int & row_x_0, const int & ib0,
+    int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    const int kbx  = k / QI6_K; // == 0 if QK_K == 256
+    const int kqsx = k % QI6_K; // == k if QK_K == 256
+
+    const uint8_t * qlb = (const uint8_t *) vx;
+    const uint8_t * qhb = qlb + (size_t)nrows_x * blocks_per_row * 128;
+    const uint8_t * scb = qhb + (size_t)nrows_x * blocks_per_row * 64;
+    const half   * db  = (const half *)(scb + (size_t)nrows_x * blocks_per_row * 16);
+
+    // strength-reduced form of the row loop: the superblock index advances
+    // linearly, so the plane pointers are carried as increments instead of
+    // being recomputed with 64-bit multiplies (the MMQ tile loader is
+    // arithmetic-bound enough for that to matter on gfx906)
+    const size_t sb0   = (size_t)(row_x_0 + i_offset)*blocks_per_row + ib0 + kbx;
+    const size_t sb_stp = (size_t)nwarps*blocks_per_row;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        const int i = i0 + i_offset;
+        const size_t sb = need_check
+            ? (size_t)(row_x_0 + min(i, i_max))*blocks_per_row + ib0 + kbx
+            : sb0 + (size_t)(i0/nwarps)*nwarps*blocks_per_row;
+        const int ky = QR6_K*kqsx;
+
+        const int ql = *(const int *)(qlb + sb*128 + 4*kqsx);
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int qh = *(const int *)(qhb + sb*64 + 4*((QI6_K/4) * (kqsx / (QI6_K/2)) + kqsx % (QI6_K/4)));
+        const int qh0 = ((qh >> (2 * ((kqsx % (QI6_K/2)) / (QI6_K/4)))) << 4) & 0x30303030;
+        const int qh1 =  (qh >> (2 * ((kqsx % (QI6_K/2)) / (QI6_K/4))))       & 0x30303030;
+
+        const int kq0 = ky - ky % QI6_K + k % (QI6_K/2) + 0;
+        const int kq1 = ky - ky % QI6_K + k % (QI6_K/2) + (QI6_K/2);
+
+        const int ii = need_check ? min(i, i_max) : i;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq0] = __vsubss4(ql0 | qh0, 0x20202020);
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+    }
+    (void)sb_stp;
+
+    const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI6_K; // == 1 if QK_K == 256
+    const int kbxd = k % blocks_per_tile_x_row;          // == 0 if QK_K == 256
+    float * x_dmf = (float *) x_dm;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI6_K) {
+        int i = (i0 + i_offset * QI6_K + k / blocks_per_tile_x_row) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + kbxd;
+
+        x_dmf[i * (WARP_SIZE_GGUF/QI6_K) + i / QI6_K + kbxd] = __half2float(db[sb]);
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+        int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF/8)) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + (k % (WARP_SIZE_GGUF/8)) / 4;
+
+        x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + k % (WARP_SIZE_GGUF/8)] =
+            *(const int *)(scb + sb*16 + 4*(k % (QI6_K/8)));
+    }
+}
+
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_mul_mat(
     const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {

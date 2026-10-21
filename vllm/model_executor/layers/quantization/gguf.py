@@ -144,6 +144,22 @@ def _gguf_gfx906_q6_mmvq_max_batch() -> int:
 
 
 @lru_cache(maxsize=1)
+def _gguf_planar_q6_k_enabled() -> bool:
+    if not _env_flag("VLLM_GGUF_Q6_K_PLANAR", False):
+        return False
+    if ENABLE_GGUF_FORCE_DEQUANT_MATMUL:
+        return False
+    if not current_platform.is_rocm():
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx906
+
+        return on_gfx906()
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
 def _gguf_repack_iq4_xs_to_q8_0_enabled() -> bool:
     if not ENABLE_GGUF_REPACK_IQ4_XS_TO_Q8_0:
         return False
@@ -2213,9 +2229,43 @@ class GGUFLinearMethod(LinearMethodBase):
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
+        self._maybe_planar_pack_q6_k(layer)
         self._maybe_repack_iq4_xs_to_q8_0(layer)
         self._cache_gguf_shards(layer)
         self._cache_gguf_shard_metadata(layer)
+
+    def _maybe_planar_pack_q6_k(self, layer: torch.nn.Module) -> None:
+        """Rewrite plain (non-sharded) q6_K weights into the four-plane planar
+        layout. Byte count, tensor shape and the recorded quant type are all
+        unchanged; planar-aware MMVQ/MMQ kernels pick the buffer up through
+        the pointer registry in the C++ dispatch."""
+        if not _gguf_planar_q6_k_enabled():
+            return
+        if not hasattr(torch.ops._C, "ggml_planar_pack_q6_k"):
+            return
+        qweight = layer.qweight
+        qweight_type = layer.qweight_type
+        if qweight is None or qweight_type is None:
+            return
+        if isinstance(qweight, GGUFUninitializedParameter):
+            return
+        if qweight.numel() == 0:
+            return
+        if getattr(qweight, "shard_offset_map", None):
+            return  # repacked per shard in _cache_gguf_shards
+        if not qweight.is_cuda or not qweight.is_contiguous():
+            return
+        q6_k_type = int(WeightType.Q6_K)
+        if int(qweight_type.weight_type) != q6_k_type:
+            return
+        block_size, type_size = gguf.GGML_QUANT_SIZES[q6_k_type]
+        row = qweight.shape[0]
+        col = qweight.shape[1] // type_size * block_size
+        if col % block_size or col == 0 or row == 0:
+            return
+        packed = torch.ops._C.ggml_planar_pack_q6_k(qweight, row, col)
+        qweight.data = packed
+        logger.info_once("Packed GGUF q6_K weights into the planar layout.")
 
     def _maybe_repack_iq4_xs_to_q8_0(self, layer: torch.nn.Module) -> None:
         if not _gguf_repack_iq4_xs_to_q8_0_enabled():
@@ -2367,10 +2417,27 @@ class GGUFLinearMethod(LinearMethodBase):
             return
 
         cache = {}
+        layer_qweight_type = getattr(layer, "qweight_type", None)
+        pack_shard = (
+            _gguf_planar_q6_k_enabled()
+            and hasattr(torch.ops._C, "ggml_planar_pack_q6_k")
+            and layer_qweight_type is not None
+        )
+        q6_k_type = int(WeightType.Q6_K)
+        shard_weight_type = getattr(layer_qweight_type, "shard_weight_type", {})
         for idx, (start, end, offset) in shard_offset_map.items():
             shard = qweight[start:end, :offset]
             if not shard.is_contiguous():
                 shard = shard.contiguous()
+            if pack_shard and int(shard_weight_type.get(idx, -1)) == q6_k_type:
+                # repack each shard as its own planar tensor: the sharded
+                # MMVQ/MMQ dispatch receives shard base pointers, so the
+                # four-plane layout must be self-contained per shard
+                block_size, type_size = gguf.GGML_QUANT_SIZES[q6_k_type]
+                col = shard.shape[1] // type_size * block_size
+                if col % block_size == 0 and col > 0 and shard.shape[0] > 0:
+                    shard = torch.ops._C.ggml_planar_pack_q6_k(
+                        shard, shard.shape[0], col)
             cache[idx] = shard
         layer._gguf_shard_cache = cache
 
