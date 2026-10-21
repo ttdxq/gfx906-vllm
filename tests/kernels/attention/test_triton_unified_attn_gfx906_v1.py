@@ -32,6 +32,16 @@ def test_decode_num_warps_scales_with_head_and_context():
     assert unified_attn._decode_num_warps(128, 16384) == 2
 
 
+def test_decode_num_warps_two_on_one_token_per_block_shape():
+    # The 8-row GQA6-256 decode blocks cannot feed 4 warps; 2 warps
+    # measure ~1.7x faster there at every context length.
+    assert unified_attn._decode_num_warps(256, 4096, 6) == 2
+    assert unified_attn._decode_num_warps(256, 65536, 6) == 2
+    assert unified_attn._decode_num_warps(256, 1535, 6) == 2
+    # Other wide-head shapes keep the 4-warp choice
+    assert unified_attn._decode_num_warps(256, 4096, 8) == 4
+
+
 def test_decode_block_m_uses_eight_for_wide_head_gqa6():
     assert unified_attn._decode_block_m(256, 6) == 8
     assert unified_attn._decode_block_m(256, 8) is None

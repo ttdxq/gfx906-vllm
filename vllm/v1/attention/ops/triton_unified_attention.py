@@ -224,10 +224,21 @@ def gfx906_decode_segments_capacity() -> int:
     return GFX906_MAX_DECODE_SEGMENTS if _gfx906_sched_tuning_enabled() else 0
 
 
-def _decode_num_warps(head_size: int, max_seqlen_k: int) -> int:
-    # Wide-head decodes keep 4 warps busy once the KV scan is long enough;
-    # short contexts run faster with 2 warps on gfx906.
-    if head_size > 128 and max_seqlen_k >= 1536:
+def _decode_num_warps(
+    head_size: int, max_seqlen_k: int, num_queries_per_kv: int = 0
+) -> int:
+    # Wide-head decodes used to run 4 warps once the KV scan was long
+    # enough, but on the one-token-per-block shape (the 8-row GQA6-256
+    # blocks from _decode_block_m) the 8x16 tiles cannot feed 4 warps and
+    # the extra warps only add scheduling overhead: 2 warps measure ~1.7x
+    # faster at every context length (116 vs 206us at 4k, 313 vs 530us at
+    # 16k, 1140 vs 2009us at 64k per call through the decode dispatch).
+    # Other wide-head shapes keep the previous 4-warp choice.
+    if (
+        head_size > 128
+        and max_seqlen_k >= 1536
+        and _decode_block_m(head_size, num_queries_per_kv) is None
+    ):
         return 4
     return 2
 
@@ -2030,7 +2041,9 @@ def unified_attention(
         else:
             splitkv_tile_size = TILE_SIZE_DECODE
             splitkv_num_warps = (
-                _decode_num_warps(head_size, max_seqlen_k) if gfx906_sched else None
+                _decode_num_warps(head_size, max_seqlen_k, num_queries_per_kv)
+                if gfx906_sched
+                else None
             )
         _launch_split_kv(
             softmax_segm_output,
