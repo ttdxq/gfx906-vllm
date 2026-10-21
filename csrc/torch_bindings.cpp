@@ -154,6 +154,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "ggml_repack_iq4_xs_to_q8_0(Tensor W, SymInt row, SymInt col) -> Tensor");
   ops.impl("ggml_repack_iq4_xs_to_q8_0", torch::kCUDA,
            &ggml_repack_iq4_xs_to_q8_0);
+  ops.def("ggml_planar_pack_q6_k(Tensor W, SymInt row, SymInt col) -> Tensor");
+  ops.impl("ggml_planar_pack_q6_k", torch::kCUDA, &ggml_planar_pack_q6_k);
 
   // mmvq kernel for GGML.
   ops.def(

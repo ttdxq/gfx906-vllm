@@ -2,7 +2,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdlib>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -469,6 +471,80 @@ torch::Tensor ggml_repack_iq4_xs_to_q8_0(torch::Tensor W, int64_t row,
   repack_iq4_xs_to_q8_0_kernel<<<grid, block, 0, stream>>>(
       static_cast<const block_iq4_xs*>(W.data_ptr()),
       static_cast<block_q8_0*>(out.data_ptr()), row, blocks_per_row);
+  return out;
+}
+
+
+// ---- planar q6_K repack (load-time, byte-conserving, bit-exact) ----
+// Rewrites each 210-byte superblock into four per-tensor planes
+// (ql | qh | scales | d). Buffers produced here are registered and the
+// MMVQ dispatch routes registered pointers to the planar kernels.
+static std::unordered_set<const void*>& gguf_planar_q6_k_buffers() {
+  static std::unordered_set<const void*> buffers;
+  return buffers;
+}
+
+static std::mutex& gguf_planar_q6_k_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+static bool gguf_planar_q6_k_is_planar(const void* w) {
+  std::lock_guard<std::mutex> lock(gguf_planar_q6_k_mutex());
+  return gguf_planar_q6_k_buffers().count(w) > 0;
+}
+
+static bool q6_k_planar_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VLLM_GGUF_Q6_K_PLANAR");
+    return env == nullptr || env[0] != '0';
+  }();
+  return enabled;
+}
+
+
+__global__ void planar_pack_q6_k_kernel(const block_q6_K* __restrict__ src,
+                                        uint8_t* __restrict__ dst,
+                                        int64_t rows, int64_t nb,
+                                        int64_t total_blocks) {
+  const int64_t sb = blockIdx.x;  // global superblock index
+  if (sb >= total_blocks) return;
+  const int64_t row = sb / nb;
+  const int64_t in_row = sb % nb;
+  const size_t qh_base = (size_t)rows * nb * 128;
+  const size_t sc_base = qh_base + (size_t)rows * nb * 64;
+  const size_t d_base = sc_base + (size_t)rows * nb * 16;
+  const block_q6_K& b = src[sb];
+  const int t = threadIdx.x;
+  if (t < 128) {
+    dst[(size_t)row * nb * 128 + in_row * 128 + t] = b.ql[t];
+  } else if (t < 192) {
+    dst[qh_base + (size_t)row * nb * 64 + in_row * 64 + (t - 128)] = b.qh[t - 128];
+  } else if (t < 208) {
+    dst[sc_base + (size_t)row * nb * 16 + in_row * 16 + (t - 192)] = b.scales[t - 192];
+  } else if (t == 208) {
+    ((half*)(dst + d_base))[row * nb + in_row] = b.d;
+  }
+}
+
+torch::Tensor ggml_planar_pack_q6_k(torch::Tensor W, int64_t row, int64_t col) {
+  TORCH_CHECK(W.is_cuda(), "planar q6_K pack input must be a CUDA tensor");
+  TORCH_CHECK(W.is_contiguous(), "planar q6_K pack input must be contiguous");
+  TORCH_CHECK(col % QK_K == 0, "planar q6_K pack col must be divisible by QK_K");
+  const int64_t nb = col / QK_K;
+  TORCH_CHECK(W.numel() == row * nb * 210, "planar q6_K pack size mismatch");
+  auto options = torch::TensorOptions().dtype(torch::kUInt8).device(W.device());
+  at::Tensor out = torch::empty({row, nb * 210}, options);
+  const int64_t total_blocks = row * nb;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  planar_pack_q6_k_kernel<<<total_blocks, 256, 0, stream>>>(
+      static_cast<const block_q6_K*>(W.data_ptr()), out.data_ptr<uint8_t>(),
+      row, nb, total_blocks);
+  {
+    std::lock_guard<std::mutex> lock(gguf_planar_q6_k_mutex());
+    gguf_planar_q6_k_buffers().insert(out.data_ptr());
+  }
   return out;
 }
 
@@ -1099,6 +1175,27 @@ static void ggml_mul_mat_vec_q8_dispatch(
       break;
     }
     case 14: {
+      // planar routing is single-vector only; multi-vector batches (MTP
+      // verify) fall through to the original kernels below, whose combine
+      // variant measured ~10% faster than the planar one
+      if (q6_k_planar_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          gguf_planar_q6_k_is_planar(W)) {
+        static const int min_rows = [] {
+          const char* env = std::getenv("VLLM_GGUF_Q6_K_PLANAR_MIN_ROWS");
+          return env == nullptr ? 6144 : std::max(1, std::atoi(env));
+        }();
+        if (vecs == 1 && row >= min_rows) {
+          mul_mat_vec_q6_K_q8_1_planar_row_tile2_cuda<scalar_t>(
+              W, quant_X, dst, col, row, stream);
+        } else if (vecs == 1) {
+          mul_mat_vec_q6_K_q8_1_planar_v1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, stream);
+        } else {
+          mul_mat_vec_q6_K_q8_1_planar_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+        }
+        break;
+      }
       static const bool q6_k_col2560_fast = [] {
         const char* env = std::getenv("VLLM_GGUF_Q6_K_COL2560_FAST");
         return env == nullptr || env[0] != '0';

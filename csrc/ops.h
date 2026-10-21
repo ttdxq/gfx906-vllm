@@ -224,6 +224,8 @@ void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
 torch::Tensor ggml_dequantize(torch::Tensor W, int64_t type, int64_t m,
                               int64_t n,
                               std::optional<at::ScalarType> const& dtype);
+torch::Tensor ggml_planar_pack_q6_k(torch::Tensor W, int64_t row, int64_t col);
+
 torch::Tensor ggml_repack_iq4_xs_to_q8_0(torch::Tensor W, int64_t row,
                                          int64_t col);
 
