@@ -1752,6 +1752,29 @@ static void ggml_mul_mat_vec_q8_grouped_dispatch(
     const void* quant_X, scalar_t* dst, int col, int total_rows, int vecs,
     int64_t type, cudaStream_t stream, const int* rows,
     const int dst_stride = -1) {
+  // the grouped same-type kernel only understands the original block layout;
+  // planar q6_K shards are dispatched per shard instead (the plain dispatch
+  // routes registered planar pointers to the planar kernels)
+  if (type == 14 && q6_k_planar_enabled()) {
+    const void* ptrs[8] = {vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7};
+    bool any_planar = false;
+    for (int i = 0; i < 8 && !any_planar; ++i) {
+      any_planar = ptrs[i] != nullptr && gguf_planar_q6_k_is_planar(ptrs[i]);
+    }
+    if (any_planar) {
+      int row_offset = 0;
+      for (int i = 0; i < 8; ++i) {
+        if (ptrs[i] == nullptr || rows[i] <= 0) {
+          continue;
+        }
+        ggml_mul_mat_vec_q8_dispatch<scalar_t>(
+            ptrs[i], quant_X, dst + row_offset, col, rows[i], vecs, type,
+            stream, total_rows);
+        row_offset += rows[i];
+      }
+      return;
+    }
+  }
   switch (type) {
     case 2:
       mul_mat_vec_q_grouped_same_type_cuda<
