@@ -145,7 +145,7 @@ def _gguf_gfx906_q6_mmvq_max_batch() -> int:
 
 @lru_cache(maxsize=1)
 def _gguf_planar_q6_k_enabled() -> bool:
-    if not _env_flag("VLLM_GGUF_Q6_K_PLANAR", False):
+    if not _env_flag("VLLM_GGUF_Q6_K_PLANAR", True):
         return False
     if ENABLE_GGUF_FORCE_DEQUANT_MATMUL:
         return False
@@ -2242,6 +2242,11 @@ class GGUFLinearMethod(LinearMethodBase):
         if not _gguf_planar_q6_k_enabled():
             return
         if not hasattr(torch.ops._C, "ggml_planar_pack_q6_k"):
+            return
+        if isinstance(layer, VocabParallelEmbedding):
+            # Embedding rows are gathered and dequantized per row in the
+            # original block layout (_apply_gguf_embedding); only the matmul
+            # kernels can consume the planar layout.
             return
         qweight = layer.qweight
         qweight_type = layer.qweight_type
