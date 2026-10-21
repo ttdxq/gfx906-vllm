@@ -803,16 +803,27 @@ class VllmConfig:
 
         return True
 
-    def _is_dflash2_draft(self) -> bool:
-        """Whether the DFlash draft is a DFlash2 one, by the architecture the
-        speculator selects on (v1/worker/gpu/spec_decode/__init__.py)."""
-        spec = self.speculative_config
+    @staticmethod
+    def _is_dflash_candidate_draft(config: "VllmConfig") -> bool:
+        """Whether the draft runs the DFlash2 candidate selector (DFlash2 or
+        LiLiCorr architectures); such drafts must use the V2 speculator, the
+        only one that invokes it (v1/worker/gpu/spec_decode/__init__.py)."""
+        spec = config.speculative_config
         if spec is None or spec.method != "dflash":
             return False
         draft_config = getattr(spec, "draft_model_config", None)
         if draft_config is None:
             return False
-        return "DFlash2DraftModel" in (draft_config.architectures or [])
+        architectures = getattr(draft_config, "architectures", None) or []
+        return any(
+            arch in architectures
+            for arch in ("DFlash2DraftModel", "LiLiCorrDraftModel")
+        )
+
+    def _is_dflash2_draft(self) -> bool:
+        """Whether the DFlash draft is a DFlash2 one, by the architecture the
+        speculator selects on (v1/worker/gpu/spec_decode/__init__.py)."""
+        return self._is_dflash_candidate_draft(self)
 
     def _dflash_needs_multi_kv_group(self) -> bool:
         """Whether a DFlash draft mixes sliding-window and full attention."""
@@ -1295,9 +1306,17 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("sampling distribution replay requires Model Runner V2")
         if self.speculative_config is not None:
-            raise ValueError(
-                "sampling distribution replay does not support speculative decoding"
-            )
+            spec_config = self.speculative_config
+            # Adaptive verification resamples within a verification batch,
+            # which breaks the fixed boundaries the replay mask assumes.
+            if spec_config.method == "dspark" and getattr(
+                spec_config, "enable_adaptive_verification", False
+            ):
+                raise ValueError(
+                    "sampling distribution replay requires fixed verification "
+                    "boundaries; disable adaptive verification to combine it "
+                    "with speculative decoding"
+                )
         if model_config.is_diffusion:
             raise ValueError(
                 "sampling distribution replay does not support diffusion models"
@@ -1320,7 +1339,29 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("trace replay requires Model Runner V2")
 
-    def _check_watermarking_unsupported(
+    def _reject_mismatched_float_kv_cache(self) -> None:
+        """Reject a float KV cache dtype that differs from the model dtype.
+
+        A 16-bit float KV cache reuses the model-dtype kernels, so the two
+        must match; "auto" follows the model dtype and quantized dtypes have
+        their own kernels.
+        """
+        cache_dtype = self.cache_config.cache_dtype
+        float_dtypes = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+        if cache_dtype not in float_dtypes:
+            return
+        model_dtype = self.model_config.dtype
+        model_dtype_name = (
+            str(model_dtype).removeprefix("torch.") if model_dtype else None
+        )
+        if model_dtype_name != cache_dtype:
+            raise ValueError(
+                f"kv_cache_dtype '{cache_dtype}' requires the model to run in "
+                f"'{cache_dtype}', but the model dtype is '{model_dtype}'."
+                " Use --kv-cache-dtype auto or match the model dtype."
+            )
+
+    def _check_supports_watermarking(
         self,
         *,
         beam_search: bool = False,
@@ -1463,7 +1504,7 @@ class VllmConfig:
         self.try_verify_and_update_config()
         self._resolve_and_verify_engram_config()
 
-        self._check_watermarking_unsupported()
+        self._check_supports_watermarking()
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
