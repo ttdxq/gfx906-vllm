@@ -101,6 +101,31 @@ GFX906_MAX_DECODE_SEGMENTS = 128
 # gpu_memory_utilization=0.95 runs within budget at the default chunk size.
 GFX906_PREFILL_SEGMENTS = 2
 
+# Route speculative-decode forwards (target verify + draft steps) through
+# the split-KV path on gfx906. Those forwards carry only a handful of query
+# tokens per sequence but scan the full decode context; they arrive with
+# max_seqlen_q > 1, which used to push them into the tuned-prefill 3D route
+# (fixed 2 segments) or, under CUDA-graph capture, the no-split 2D fallback.
+# Either way the grid is ~q_blocks x kv_heads x <=2 CTAs and a 60-CU gfx906
+# streams the context KV at a few percent of achievable bandwidth, which is
+# what makes MTP decode collapse at long contexts (27B Q6 MTP=2: 20.8 tok/s
+# at 4k falling to 2.9 at 64k while draft acceptance stays ~93%; profiled
+# as kernel_unified_attention_3d_slim at ~14-43 GB/s per call). The spec
+# path reuses the backend-provided decode segment buffers with a fixed
+# segment count so warmup, capture and replay share one launch
+# configuration (graph capture runs with seq_lens=1, freezing any
+# context-derived count at the capture-time context). Set to 0 to restore
+# the prefill-3D / 2D routing.
+ENABLE_GFX906_ATTN_SPEC_SPLIT_KV = os.getenv(
+    "VLLM_GFX906_TRITON_ATTN_SPEC_SPLIT_KV", "1"
+).lower() in {"1", "true", "yes", "on"}
+# Query-tokens-per-sequence ceiling for treating a max_seqlen_q > 1 batch
+# as decode-like; spec-decode steps schedule num_spec_tokens + 1 or fewer.
+GFX906_SPEC_MAX_QUERY_LEN = 8
+# Fixed split-KV segments for the spec path, bounded by the decode segment
+# buffer capacity the backend allocates (GFX906_MAX_DECODE_SEGMENTS).
+GFX906_SPEC_ATTN_SEGMENTS = 128
+
 # Lazily grown workspace for the prefill split-KV path. Unlike the decode
 # segment buffers (sized for the decode batch threshold and provided by the
 # backend), prefill needs one row per scheduled token, so the workspace is
@@ -1561,6 +1586,25 @@ def unified_attention(
     else:
         total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
+    # Spec-decode forwards (verify + draft) look like tiny prefills to the
+    # max_seqlen_q > 1 dispatch below but scan the whole decode context;
+    # flag them so they take the split-KV decode path instead (see
+    # ENABLE_GFX906_ATTN_SPEC_SPLIT_KV). The segment workspace is indexed
+    # by absolute token position (one row per scheduled token) and the
+    # backend sizes it to the decode batch threshold, so batches whose
+    # total spec tokens exceed that (multi-sequence speculative decoding)
+    # keep the previous routing through this bound (tuned-prefill split-KV
+    # when eager, the 2D kernel under CUDA-graph capture).
+    _spec_decode_batch = (
+        ENABLE_GFX906_ATTN_SPEC_SPLIT_KV
+        and gfx906_sched
+        and 1 < max_seqlen_q <= GFX906_SPEC_MAX_QUERY_LEN
+        and softmax_segm_output is not None
+        and softmax_segm_max is not None
+        and softmax_segm_expsum is not None
+        and q.shape[0] <= softmax_segm_output.shape[0]
+    )
+
     # Tile sizes for prefill and decode. Gemma3 models use optimized values.
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
@@ -1703,8 +1747,10 @@ def unified_attention(
     # path is restricted to plain causal attention so the swept configuration
     # (BLOCK_M 32 / TILE 32 / 4 warps / 1 stage / 2 segments) is the only one
     # exercised, and is disabled under CUDA-graph capture because the segment
-    # workspace cannot be allocated inside a capture.
-    use_prefill_3d = (
+    # workspace cannot be allocated inside a capture. Spec-decode batches are
+    # excluded: they take the split-KV decode path with backend-provided
+    # buffers instead (see _spec_decode_batch above).
+    _prefill_3d_shape = (
         ENABLE_GFX906_ATTN_PREFILL_3D
         and gfx906_sched
         and prefill_block_m is not None
@@ -1716,13 +1762,20 @@ def unified_attention(
         and softcap == 0
         and output_scale is None
         and not is_batch_invariant
+    )
+    use_prefill_3d = (
+        _prefill_3d_shape
+        and not _spec_decode_batch
         and not torch.cuda.is_current_stream_capturing()
     )
 
     # Slim plain-causal prefill kernel: same math as the gated 3D path,
     # specialized for exact-GQA packing with power-of-two heads (see the
     # ENABLE_GFX906_ATTN_PREFILL_SLIM comment for the structural
-    # changes). The slim kernel has no descale branch, and its tl.dot
+    # changes). Gated on the plain-causal shape family rather than on
+    # use_prefill_3d itself so the spec-decode split-KV launch (which runs
+    # under CUDA-graph capture with backend-provided buffers) can also use
+    # it. The slim kernel has no descale branch, and its tl.dot
     # cannot take an fp8 KV cache, so a 1-byte-element KV cache (fp8
     # e4m3/e5m2, which the backend always pairs with descale tensors)
     # must fall back to the generic 3D kernel. Descale tensors on a
@@ -1730,7 +1783,7 @@ def unified_attention(
     # them when the loaded cache is fp8; the GGUF backend passes unit
     # scales unconditionally), so slim still takes those shapes.
     use_slim_3d = (
-        use_prefill_3d
+        _prefill_3d_shape
         and ENABLE_GFX906_ATTN_PREFILL_SLIM
         and k.element_size() > 1
         and v.element_size() > 1
@@ -1862,13 +1915,16 @@ def unified_attention(
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
+    # Spec-decode batches (few query tokens per sequence, see
+    # _spec_decode_batch) are excluded from (2) so they fall through to the
+    # split-KV path below.
     if (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or (max_seqlen_q > 1 and not _spec_decode_batch)
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     ):
@@ -1949,11 +2005,27 @@ def unified_attention(
                 ),
                 softmax_segm_output.shape[2],
             )
+        if _spec_decode_batch:
+            # Fixed segment count: graph capture runs with seq_lens=1, so a
+            # context-derived count would freeze at the capture-time context
+            # while replay scans the real one. The spec batch reuses the
+            # swept prefill tile/warp configuration (BLOCK_M 32 / TILE 32 /
+            # 4 warps), which its q blocks share with tuned prefill.
+            num_segments = min(
+                GFX906_SPEC_ATTN_SEGMENTS, softmax_segm_output.shape[2]
+            )
+            splitkv_tile_size = TILE_SIZE_PREFILL
+            splitkv_num_warps = 4
+        else:
+            splitkv_tile_size = TILE_SIZE_DECODE
+            splitkv_num_warps = (
+                _decode_num_warps(head_size, max_seqlen_k) if gfx906_sched else None
+            )
         _launch_split_kv(
             softmax_segm_output,
             softmax_segm_max,
             softmax_segm_expsum,
             num_segments,
-            TILE_SIZE_DECODE,
-            _decode_num_warps(head_size, max_seqlen_k) if gfx906_sched else None,
+            splitkv_tile_size,
+            splitkv_num_warps,
         )
