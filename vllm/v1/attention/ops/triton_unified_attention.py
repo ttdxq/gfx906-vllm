@@ -82,6 +82,18 @@ ENABLE_GFX906_ATTN_PREFILL_HIP = os.getenv(
     "VLLM_GFX906_ATTN_PREFILL_HIP", "1"
 ).lower() in {"1", "true", "yes", "on"}
 
+# Route the spec-decode split-KV launch through a handwritten HIP kernel on
+# gfx906 (csrc/attention/gfx906_prefill_attn.cu, gfx906_spec_attn_scan).
+# Same segment-workspace contract and online-softmax semantics as the
+# Triton scanner (fp32 accumulation, inactive segments masked by reduce,
+# per-token causal bounds), for the single-sequence fp16
+# head-256/GQA6 spec shape only; the cache block size is a runtime
+# parameter. Set 0 to restore the Triton scanner.
+ENABLE_GFX906_ATTN_SPEC_HIP = os.getenv(
+    "VLLM_GFX906_ATTN_SPEC_HIP", "1"
+).lower() in {"1", "true", "yes", "on"}
+_hip_spec_dbg_buf: torch.Tensor | None = None
+
 # Debug readout for the handwritten scanner's address guards: the kernel
 # clamps stale block-table/seq-lens inputs instead of faulting and counts
 # the events; with this env set the dispatch syncs and logs the counters.
@@ -222,6 +234,22 @@ def _log_hip_prefill_miss_once(num_seqs: int, q_dtype: str, k_dtype: str,
 def gfx906_decode_segments_capacity() -> int:
     """Segment-buffer capacity the backend should allocate on this platform."""
     return GFX906_MAX_DECODE_SEGMENTS if _gfx906_sched_tuning_enabled() else 0
+
+
+@lru_cache(maxsize=4)
+def _log_hip_spec_miss_once(spec: bool, slim: bool, op_present: bool,
+                            num_seqs: int, q_dtype: str, k_dtype: str,
+                            head_size: int, num_query_heads: int,
+                            num_kv_heads: int, block_size: int,
+                            q_contig: bool, k_strides: tuple, v_strides: tuple,
+                            bt_dtype: str, bt_stride1: int) -> bool:
+    logger.info(
+        "gfx906 HIP spec scan skipped: spec=%s slim=%s op=%s num_seqs=%d "
+        "q=%s k=%s hs=%d qh=%d kvh=%d bs=%d qcont=%s kstrides=%s "
+        "vstrides=%s bt=%s btstride1=%d", spec, slim, op_present, num_seqs,
+        q_dtype, k_dtype, head_size, num_query_heads, num_kv_heads,
+        block_size, q_contig, k_strides, v_strides, bt_dtype, bt_stride1)
+    return True
 
 
 def _decode_num_warps(
@@ -1646,6 +1674,65 @@ def unified_attention(
         tile_size,
         num_warps,
     ):
+        if use_hip_spec_scan:
+            global _hip_spec_dbg_buf
+            if _hip_spec_dbg_buf is None or _hip_spec_dbg_buf.device != q.device:
+                _hip_spec_dbg_buf = torch.zeros(
+                    2, dtype=torch.int32, device=q.device)
+            torch.ops._C.gfx906_spec_attn_scan(
+                q,
+                k,
+                v,
+                block_table,
+                seqused_k,
+                segm_output,
+                segm_max,
+                segm_expsum,
+                softmax_scale,
+                q.shape[0],
+                num_segments,
+                block_size,
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                _hip_spec_dbg_buf,
+            )
+            if (
+                ENABLE_GFX906_HIP_ATTN_GUARD
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                hits = int(_hip_spec_dbg_buf[0].item()) + int(
+                    _hip_spec_dbg_buf[1].item())
+                if hits:
+                    logger.warning(
+                        "gfx906 spec hip scan clamped %d stale page/tin and "
+                        "%d stale pbi inputs", int(_hip_spec_dbg_buf[0].item()),
+                        int(_hip_spec_dbg_buf[1].item()))
+                    _hip_spec_dbg_buf.zero_()
+            reduce_segments[(q.shape[0], num_query_heads)](
+                output_ptr=out,
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_seqs=1,
+                num_query_heads=num_query_heads,
+                out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                block_table_stride=block_table.stride(0),
+                TILE_SIZE=tile_size,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                query_start_len_ptr=cu_seqlens_q,
+                BLOCK_Q=1,
+                NUM_SEGMENTS_PER_SEQ=num_segments,
+                USE_FP8=output_scale is not None,
+            )
+            return
         if use_slim_3d:
             kernel_unified_attention_3d_slim[
                 (total_num_q_blocks, num_kv_heads, num_segments)
@@ -1844,6 +1931,55 @@ def unified_attention(
         and block_table.dtype == torch.int32
         and block_table.stride(1) == 1
     )
+
+    # Handwritten gfx906 HIP scanner for the spec-decode shape: replaces the
+    # Triton split-KV scanner 1:1 on the same single-sequence fp16
+    # head-256/GQA6 shape (runtime cache block size), gated to the spec
+    # branch so real prefill
+    # calls (which use the 2-segment/32-tile layout through the path above)
+    # keep their own scanner.
+    use_hip_spec_scan = (
+        _spec_decode_batch
+        and use_slim_3d
+        and ENABLE_GFX906_ATTN_SPEC_HIP
+        and hasattr(torch.ops._C, "gfx906_spec_attn_scan")
+        and num_seqs == 1
+        and q.dtype == torch.float16
+        and k.dtype == torch.float16
+        and head_size == 256
+        and num_query_heads == 24
+        and num_kv_heads == 4
+        and q.is_contiguous()
+        and k.stride(3) == 1
+        and v.stride(3) == 1
+        and k.stride(0) % 8 == 0
+        and k.stride(1) % 8 == 0
+        and k.stride(2) % 8 == 0
+        and v.stride(0) % 8 == 0
+        and v.stride(1) % 8 == 0
+        and v.stride(2) % 8 == 0
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1
+    )
+
+    if _spec_decode_batch and not use_hip_spec_scan:
+        _log_hip_spec_miss_once(
+            True,
+            use_slim_3d,
+            hasattr(torch.ops._C, "gfx906_spec_attn_scan"),
+            num_seqs,
+            str(q.dtype),
+            str(k.dtype),
+            head_size,
+            num_query_heads,
+            num_kv_heads,
+            block_size,
+            q.is_contiguous(),
+            tuple(k.stride()),
+            tuple(v.stride()),
+            str(block_table.dtype),
+            block_table.stride(1),
+        )
 
     if use_prefill_3d:
         num_segments = GFX906_PREFILL_SEGMENTS

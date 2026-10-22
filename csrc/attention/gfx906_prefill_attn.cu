@@ -612,6 +612,282 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Handwritten gfx906 speculative-decode attention scan kernel.
+//
+// Serves the spec-decode shape (verify + draft catch-up forwards): one query
+// token per 6-row GQA block, q_len tokens in flight, single sequence, fp16
+// KV on the head-256/GQA6/800-page shape. Writes the same fp32 split-KV
+// segment workspace the Triton path produces, in exactly the layout
+// reduce_segments recomputes (tiles_per_segment = cdiv(seq_len,
+// nseg * 16); inactive segments early-return without touching the rows
+// that reduce masks out, tokens whose causal bound ends inside the segment
+// store the untouched M=-inf/L=1/acc=0 state so stale rows never merge).
+//
+// The Triton scanner for this shape is launch-config-bound at ~35-90 GB/s
+// of KV scan: the block-table gather defeats its software pipelining and
+// every stage counts an extra LDS round trip. Here the block is 2 warps;
+// each lane owns 8 dims of the token's 6 query rows, streams K/V rows as
+// one 16B load each with a one-token K prefetch, folds the QK partials
+// with a 5-step butterfly, and keeps a private online-softmax state over
+// its half of the segment's tokens. The two warp states merge through 6KB
+// of LDS in the epilogue. No LDS staging of KV: at 6 rows the arithmetic
+// intensity cannot pay for it, and per-lane uint4 slices keep enough loads
+// in flight through occupancy (4+ resident 64-thread blocks per CU).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int SPEC_TILE = 16;  // layout tile; must equal reduce_segments' TILE_SIZE
+
+// runtime-block-size variant of kv_row for the spec scanner: the engine's
+// paged cache is not fixed to 800-token pages (e.g. 832 in production),
+// and the spec kernel's per-token row loads have no page-size constraint
+__device__ __forceinline__ const __half* kv_row_bs(
+    const __half* base, int s0, int s1, int s2, const int* __restrict__ bt,
+    int kvh, int tbase, int bs, int nb_tbl, int nb_cache, int* dbg) {
+  int page = tbase / bs;
+  if ((unsigned)page >= (unsigned)nb_tbl) {
+    if (dbg) atomicAdd(dbg, 1);
+    page = 0;
+  }
+  int pbi = bt[page];
+  if ((unsigned)pbi >= (unsigned)nb_cache) {
+    if (dbg) atomicAdd(dbg + 1, 1);
+    pbi = 0;
+  }
+  int tin = tbase - page * bs;
+  if (tin >= bs) {
+    if (dbg) atomicAdd(dbg, 1);
+    tin = 0;
+  }
+  return base + (size_t)pbi * s0 + (size_t)tin * s1 + (size_t)kvh * s2;
+}
+
+__global__ void __launch_bounds__(64)
+gfx906_spec_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
+                        const __half* __restrict__ kc,
+                        const __half* __restrict__ vc,
+                        const int* __restrict__ block_table,
+                        const int* __restrict__ seq_lens,  // [1]
+                        float* __restrict__ segm_out,   // [q_len, 24, nseg, 256]
+                        float* __restrict__ segm_max,   // [q_len, 24, nseg]
+                        float* __restrict__ segm_expsum,
+                        const float scale, const int q_len, const int nseg,
+                        const int bs, const int nb_tbl, const int nb_cache,
+                        const int k_s0, const int k_s1, const int k_s2,
+                        const int v_s0, const int v_s1, const int v_s2,
+                        int* dbg) {
+  constexpr int NWARP = 2;
+  const int tok = blockIdx.x;
+  const int kvh = blockIdx.y;
+  const int segm = blockIdx.z;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+
+  const int seq_len = seq_lens[0];
+  // segment partition must match reduce_segments exactly
+  const int tps = (seq_len + nseg * SPEC_TILE - 1) / (nseg * SPEC_TILE);
+  const int seg_lo = segm * tps * SPEC_TILE;
+  if (seg_lo >= seq_len) return;  // inactive; reduce masks the segment out
+  const int seg_hi = min((segm + 1) * tps * SPEC_TILE, seq_len);
+  // this token's causal bound; negative during seq_lens=1 graph capture,
+  // which just empties every range (the launch is what gets recorded)
+  const int context = seq_len - q_len;
+  const int hi = min(min(context + tok + 1, seq_len), seg_hi);
+
+  // 6 query rows of this token for kv head kvh, 8 dims per lane
+  __half2 qr[GQA][4];
+#pragma unroll
+  for (int r = 0; r < GQA; ++r) {
+    const uint4 v4 = *reinterpret_cast<const uint4*>(
+        q + ((size_t)tok * QHEADS + kvh * GQA + r) * HEAD + lane * 8);
+    qr[r][0] = reinterpret_cast<const __half2&>(v4.x);
+    qr[r][1] = reinterpret_cast<const __half2&>(v4.y);
+    qr[r][2] = reinterpret_cast<const __half2&>(v4.z);
+    qr[r][3] = reinterpret_cast<const __half2&>(v4.w);
+  }
+
+  float M[GQA], L[GQA], acc[GQA][8];
+#pragma unroll
+  for (int r = 0; r < GQA; ++r) {
+    M[r] = -INFINITY;
+    L[r] = 1.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[r][j] = 0.f;
+  }
+
+  // warp-private scan: the NWARP warps take complementary tokens of
+  // [seg_lo, hi). Both K and V of the next warp-local token stay in flight
+  // in registers across a full QK/softmax/PV cycle, so each lane keeps
+  // four 16B loads outstanding and the DRAM latency hides behind compute.
+  int t = seg_lo + warp;
+  uint4 k16, v16;
+  bool have = t < hi;
+  if (have) {
+    const __half* krow =
+        kv_row_bs(kc, k_s0, k_s1, k_s2, block_table, kvh, t, bs, nb_tbl, nb_cache, dbg);
+    k16 = *reinterpret_cast<const uint4*>(krow + lane * 8);
+    const __half* vrow =
+        kv_row_bs(vc, v_s0, v_s1, v_s2, block_table, kvh, t, bs, nb_tbl, nb_cache, dbg);
+    v16 = *reinterpret_cast<const uint4*>(vrow + lane * 8);
+  }
+  while (have) {
+    const int tn = t + NWARP;
+    const bool have_next = tn < hi;
+    uint4 kn16, vn16;
+    if (have_next) {
+      const __half* knrow =
+          kv_row_bs(kc, k_s0, k_s1, k_s2, block_table, kvh, tn, bs, nb_tbl, nb_cache, dbg);
+      kn16 = *reinterpret_cast<const uint4*>(knrow + lane * 8);
+      const __half* vnrow =
+          kv_row_bs(vc, v_s0, v_s1, v_s2, block_table, kvh, tn, bs, nb_tbl, nb_cache, dbg);
+      vn16 = *reinterpret_cast<const uint4*>(vnrow + lane * 8);
+    }
+
+    {
+      const __half2* kh2 = reinterpret_cast<const __half2*>(&k16);
+      float s[GQA];
+#pragma unroll
+      for (int r = 0; r < GQA; ++r) {
+        s[r] = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          s[r] = dot2_f32_f16(qr[r][j], kh2[j], s[r]);
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+#pragma unroll
+        for (int r = 0; r < GQA; ++r) s[r] += __shfl_xor(s[r], off);
+
+      // softmax update: identical on every lane of the warp
+      const __half2* vh2 = reinterpret_cast<const __half2*>(&v16);
+#pragma unroll
+      for (int r = 0; r < GQA; ++r) {
+        const float score = scale * s[r];
+        float m_new = fmaxf(M[r], score);
+        if (m_new == -INFINITY) m_new = 0.f;  // Triton's guard
+        const float alpha = __expf(M[r] - m_new);
+        const float p = __expf(score - m_new);
+        L[r] = L[r] * alpha + p;
+        M[r] = m_new;
+        const float2 f0 = __half22float2(vh2[0]);
+        const float2 f1 = __half22float2(vh2[1]);
+        const float2 f2 = __half22float2(vh2[2]);
+        const float2 f3 = __half22float2(vh2[3]);
+        acc[r][0] = acc[r][0] * alpha + p * f0.x;
+        acc[r][1] = acc[r][1] * alpha + p * f0.y;
+        acc[r][2] = acc[r][2] * alpha + p * f1.x;
+        acc[r][3] = acc[r][3] * alpha + p * f1.y;
+        acc[r][4] = acc[r][4] * alpha + p * f2.x;
+        acc[r][5] = acc[r][5] * alpha + p * f2.y;
+        acc[r][6] = acc[r][6] * alpha + p * f3.x;
+        acc[r][7] = acc[r][7] * alpha + p * f3.y;
+      }
+    }
+
+    k16 = kn16;
+    v16 = vn16;
+    t = tn;
+    have = have_next;
+  }
+
+  // merge the two warp states through LDS: warp 1 posts its partial state,
+  // warp 0 folds it into its own and writes the segment row
+  __shared__ float sm_M[GQA], sm_L[GQA];
+  __shared__ float sm_acc[GQA][HEAD];
+  if (warp == 1) {
+    if (lane == 0) {
+#pragma unroll
+      for (int r = 0; r < GQA; ++r) {
+        sm_M[r] = M[r];
+        sm_L[r] = L[r];
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < GQA; ++r) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) sm_acc[r][lane * 8 + j] = acc[r][j];
+    }
+  }
+  __syncthreads();
+  if (warp != 0) return;
+
+#pragma unroll
+  for (int r = 0; r < GQA; ++r) {
+    const int head = kvh * GQA + r;
+    const size_t base = ((size_t)tok * QHEADS + head) * nseg + segm;
+    float* dst = segm_out + base * HEAD;
+    const float mm = fmaxf(M[r], sm_M[r]);
+    if (mm == -INFINITY) {
+      // nothing scanned inside this token's causal range: post the
+      // untouched state exactly as the Triton scanner stores it
+      segm_max[base] = -INFINITY;
+      segm_expsum[base] = 1.0f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) dst[lane * 8 + j] = 0.f;
+      continue;
+    }
+    const float a1 = __expf(sm_M[r] - mm);
+    const float a0 = __expf(M[r] - mm);
+    segm_max[base] = mm;
+    segm_expsum[base] = L[r] * a0 + sm_L[r] * a1;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      dst[lane * 8 + j] = acc[r][j] * a0 + sm_acc[r][lane * 8 + j] * a1;
+  }
+}
+
+}  // namespace
+
+void gfx906_spec_attn_scan(torch::Tensor q, torch::Tensor key_cache,
+                           torch::Tensor value_cache, torch::Tensor block_table,
+                           torch::Tensor seq_lens, torch::Tensor segm_output,
+                           torch::Tensor segm_max, torch::Tensor segm_expsum,
+                           double scale, int64_t q_len, int64_t nseg,
+                           int64_t bs, int64_t k_s0, int64_t k_s1,
+                           int64_t k_s2, int64_t v_s0, int64_t v_s1,
+                           int64_t v_s2, torch::Tensor dbg) {
+  TORCH_CHECK(q.scalar_type() == at::kHalf, "q must be fp16");
+  TORCH_CHECK(key_cache.scalar_type() == at::kHalf, "kv cache must be fp16");
+  TORCH_CHECK(q.dim() == 3 && q.size(1) == QHEADS && q.size(2) == HEAD,
+              "bad q shape");
+  TORCH_CHECK(key_cache.dim() == 4 && key_cache.size(2) == KVHEADS &&
+                  key_cache.size(3) == HEAD,
+              "bad key cache layout");
+  TORCH_CHECK(value_cache.sizes() == key_cache.sizes(),
+              "bad value cache layout");
+  TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+  TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
+              "kv cache head dim must be dense");
+  // per-lane 16B row slices need 16B-multiple strides and bases
+  TORCH_CHECK((k_s0 % 8 == 0) && (k_s1 % 8 == 0) && (k_s2 % 8 == 0) &&
+                  (v_s0 % 8 == 0) && (v_s1 % 8 == 0) && (v_s2 % 8 == 0) &&
+                  (reinterpret_cast<uintptr_t>(key_cache.data_ptr()) % 16 == 0) &&
+                  (reinterpret_cast<uintptr_t>(value_cache.data_ptr()) % 16 == 0),
+              "kv cache strides must be 16B-stageable");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt && block_table.is_contiguous(),
+              "bad block table");
+  TORCH_CHECK(seq_lens.scalar_type() == at::kInt && seq_lens.numel() == 1,
+              "single-sequence only");
+  TORCH_CHECK(dbg.scalar_type() == at::kInt && dbg.numel() >= 2,
+              "dbg counter buffer");
+
+  const at::cuda::OptionalCUDAGuard guard(device_of(q));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+  dim3 grid((unsigned)q_len, KVHEADS, (unsigned)nseg);
+  gfx906_spec_attn_kernel<<<grid, dim3(64), 0, stream>>>(
+      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(key_cache.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(value_cache.data_ptr<at::Half>()),
+      block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
+      segm_output.data_ptr<float>(), segm_max.data_ptr<float>(),
+      segm_expsum.data_ptr<float>(), (float)scale, (int)q_len, (int)nseg,
+      (int)bs, (int)block_table.size(1), (int)key_cache.size(0), (int)k_s0, (int)k_s1,
+      (int)k_s2, (int)v_s0, (int)v_s1, (int)v_s2, dbg.data_ptr<int>());
+}
+
 void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
                               torch::Tensor value_cache,
                               torch::Tensor block_table,
