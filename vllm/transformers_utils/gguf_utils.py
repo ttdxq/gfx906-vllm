@@ -16,7 +16,10 @@ from transformers import (
     PreTrainedTokenizerFast,
     SiglipVisionConfig,
 )
-from transformers.integrations.ggml import convert_gguf_tokenizer
+try:  # transformers >= 5.20 moved the GGUF converters to a package
+    from transformers.integrations.gguf import convert_gguf_tokenizer
+except ImportError:
+    from transformers.integrations.ggml import convert_gguf_tokenizer
 from transformers.modeling_gguf_pytorch_utils import (
     GGUF_TO_TRANSFORMERS_MAPPING,
     _gguf_parse_value,
@@ -27,6 +30,28 @@ from vllm.logger import init_logger
 from .repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
+
+
+def _gguf_special_token_kwargs(
+    tokens: list[str], tokenizer_dict: dict, additional_kwargs: dict
+) -> dict:
+    """Special-token kwargs for PreTrainedTokenizerFast from the GGUF ids.
+
+    transformers >= 5.20 returns no additional kwargs from the GGUF
+    converter, so the bos/eos/pad/unk strings are taken from the ids the
+    file itself declares (setdefault: older converters may already have
+    provided them).
+    """
+    for id_key, token_key in (
+        ("bos_token_id", "bos_token"),
+        ("eos_token_id", "eos_token"),
+        ("pad_token_id", "pad_token"),
+        ("unk_token_id", "unk_token"),
+    ):
+        token_id = tokenizer_dict.get(id_key)
+        if token_id is not None:
+            additional_kwargs.setdefault(token_key, tokens[token_id])
+    return additional_kwargs
 
 
 def _gguf_model_family(path: Path) -> str:
@@ -643,7 +668,7 @@ def gemma4_gguf_tokenizer_path(model: str) -> str | None:
     if (
         (tokenizer_dir / "tokenizer.json").is_file()
         and marker.is_file()
-        and marker.read_text() == "gemma4-gguf-tokenizer-v5\n"
+        and marker.read_text() == "gemma4-gguf-tokenizer-v6\n"
     ):
         return str(tokenizer_dir)
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
@@ -671,7 +696,7 @@ def gemma4_gguf_tokenizer_path(model: str) -> str | None:
     (tokenizer_dir / "config.json").write_text(
         '{"architectures":["Gemma4ForCausalLM"],"model_type":"gemma4_text"}\n'
     )
-    marker.write_text("gemma4-gguf-tokenizer-v5\n")
+    marker.write_text("gemma4-gguf-tokenizer-v6\n")
     return str(tokenizer_dir)
 
 
@@ -746,6 +771,9 @@ def qwen35_gguf_tokenizer_path(model: str) -> str | None:
     tokenizer_object, additional_kwargs = convert_gguf_tokenizer(
         "qwen3",
         tokenizer_dict,
+    )
+    additional_kwargs = _gguf_special_token_kwargs(
+        tokenizer_dict["tokens"], tokenizer_dict, additional_kwargs
     )
     fast_tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer_object,
@@ -835,19 +863,37 @@ def maybe_patch_hf_config_from_gguf(
             "qwen3_5_moe_text",
         )
         if vision_config is not None and is_qwen35:
-            qwen_vision_config = hf_config.vision_config
-            qwen_vision_config.depth = vision_config.num_hidden_layers
-            qwen_vision_config.hidden_size = vision_config.hidden_size
-            qwen_vision_config.intermediate_size = vision_config.intermediate_size
-            qwen_vision_config.num_heads = vision_config.num_attention_heads
-            qwen_vision_config.patch_size = vision_config.patch_size
-            qwen_vision_config.num_position_embeddings = (
-                vision_config.image_size // vision_config.patch_size
-            ) ** 2
-            if hasattr(vision_config, "spatial_merge_size"):
-                qwen_vision_config.spatial_merge_size = vision_config.spatial_merge_size
-            if hasattr(vision_config, "projection_dim"):
-                qwen_vision_config.out_hidden_size = vision_config.projection_dim
+            # Rebuild the vision config as a fresh Qwen3_5VisionConfig:
+            # transformers >= 5.20's vision rotary reads fields (rope_
+            # parameters, head counts, ...) that strict-rebuilt configs
+            # from serialized dicts no longer default-fill, so the patched
+            # config must come from the class itself. Only kwargs the
+            # installed class declares are passed.
+            import inspect
+
+            from transformers.models.qwen3_5.configuration_qwen3_5 import (
+                Qwen3_5VisionConfig,
+            )
+
+            qwen_overrides = {
+                "depth": vision_config.num_hidden_layers,
+                "hidden_size": vision_config.hidden_size,
+                "intermediate_size": vision_config.intermediate_size,
+                "num_heads": vision_config.num_attention_heads,
+                "patch_size": vision_config.patch_size,
+                "num_position_embeddings": (
+                    vision_config.image_size // vision_config.patch_size
+                ) ** 2,
+                "spatial_merge_size": getattr(vision_config, "spatial_merge_size", 2),
+                "out_hidden_size": getattr(vision_config, "projection_dim", None),
+                # the mmproj declares no rope metadata; pin the axial
+                # defaults the vision rotary requires
+                "rope_parameters": {"rope_type": "axial", "rope_theta": 10000.0},
+            }
+            accepted = set(inspect.signature(Qwen3_5VisionConfig.__init__).parameters)
+            hf_config.vision_config = Qwen3_5VisionConfig(
+                **{k: v for k, v in qwen_overrides.items() if k in accepted}
+            )
             hf_config.architectures = [
                 "Qwen3_5MoeForConditionalGeneration"
                 if "moe" in hf_config.model_type
