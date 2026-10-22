@@ -1035,9 +1035,11 @@ static void ggml_mul_mat_vec_q8_dispatch(
     case 12: {
       if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
           gguf_planar_is_planar(W)) {
+        // q4_K: the software-pipelined single-row form wins or ties on every
+        // measured shape; the two-row tile measured 0.72-0.77x interleaved
         static const int min_rows = [] {
           const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR_MIN_ROWS");
-          return env == nullptr ? 6144 : std::max(1, std::atoi(env));
+          return env == nullptr ? INT_MAX : std::max(1, std::atoi(env));
         }();
         if (vecs == 1 && row >= min_rows) {
           mul_mat_vec_k45_q8_1_planar_row_tile2_cuda<scalar_t, false>(

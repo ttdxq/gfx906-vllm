@@ -1347,6 +1347,87 @@ static __device__ __forceinline__ void gguf_k45_scales(
     out[2] = (uint8_t)aux[1]; out[3] = (uint8_t)(aux[1] >> 8);
 }
 
+// software-pipelined form of the k45 planar kernels: the weight fragment is
+// double-buffered in registers (weights stream from the planes one superblock
+// ahead while the current one is being multiplied); activations stay L2-hot
+// and are loaded per iteration, mirroring the in-service fixed-cols pipe
+// kernels (double-buffering them too regresses short-row shapes on gfx906)
+struct gguf_k45_wt_frag {
+    int v0, v1;
+    int vh0, vh1;   // only dereferenced when HAS_QH
+    int sw0, sw1, sw2;
+    half2 dm;
+};
+
+template <bool HAS_QH>
+static __device__ __forceinline__ void gguf_k45_ld_wt(
+    gguf_k45_wt_frag & f,
+    const uint8_t * __restrict__ qlr, const uint8_t * __restrict__ qhr,
+    const uint8_t * __restrict__ scr, const half2 * __restrict__ dmr,
+    const int sb, const int bq8_offset, const int q4) {
+    f.v0 = *(const int *)(qlr + sb * 128 + 16 * bq8_offset + 4 * q4);
+    f.v1 = *(const int *)(qlr + sb * 128 + 16 * bq8_offset + 4 * q4 + 16);
+    if constexpr (HAS_QH) {
+        f.vh0 = *(const int *)(qhr + sb * 32 + 4 * q4);
+        f.vh1 = *(const int *)(qhr + sb * 32 + 4 * q4 + 16);
+    }
+    f.sw0 = *(const int *)(scr + sb * 12);
+    f.sw1 = *(const int *)(scr + sb * 12 + 4);
+    f.sw2 = *(const int *)(scr + sb * 12 + 8);
+    f.dm = dmr[sb];
+}
+
+template <bool HAS_QH>
+static __device__ __forceinline__ float gguf_k45_pipe_comp(
+    const gguf_k45_wt_frag & f, const int bq8_offset,
+    const block_q8_1 * __restrict__ ysb, const int q4) {
+    const block_q8_1 * b0 = ysb + bq8_offset + 0;
+    const block_q8_1 * b1 = ysb + bq8_offset + 1;
+    const float d80 = __low2float(b0->ds);
+    const float d81 = __low2float(b1->ds);
+    const int * q8a = (const int *)b0->qs + q4;
+    const int * q8b = (const int *)b1->qs + q4;
+    const int u0 = q8a[0];
+    const int u1 = q8a[4];
+    const int u2 = q8b[0];
+    const int u3 = q8b[4];
+    int sc0, sc1, m0, m1;
+    gfx906_kq_scales(f.sw0, f.sw1, f.sw2, bq8_offset, sc0, sc1, m0, m1);
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+    if constexpr (HAS_QH) {
+        const int vh0 = f.vh0 >> bq8_offset;
+        const int vh1 = f.vh1 >> bq8_offset;
+        const int v0_0 = ((f.v0 >> 0) & 0x0F0F0F0F) | (((vh0 >> 0) << 4) & 0x10101010);
+        const int v1_0 = ((f.v1 >> 0) & 0x0F0F0F0F) | (((vh1 >> 0) << 4) & 0x10101010);
+        const int v0_1 = ((f.v0 >> 4) & 0x0F0F0F0F) | (((vh0 >> 1) << 4) & 0x10101010);
+        const int v1_1 = ((f.v1 >> 4) & 0x0F0F0F0F) | (((vh1 >> 1) << 4) & 0x10101010);
+        const int d0 = __dp4a(v0_0, u0, __dp4a(v1_0, u1, 0));
+        const int e0 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
+        const int d1 = __dp4a(v0_1, u2, __dp4a(v1_1, u3, 0));
+        const int e1 = __dp4a(0x01010101, u2, __dp4a(0x01010101, u3, 0));
+        sumf_d += d80 * (d0 * sc0);
+        sumf_m += d80 * (e0 * m0);
+        sumf_d += d81 * (d1 * sc1);
+        sumf_m += d81 * (e1 * m1);
+    } else {
+        const int v0_0 = (f.v0 >> 0) & 0x0F0F0F0F;
+        const int v1_0 = (f.v1 >> 0) & 0x0F0F0F0F;
+        const int v0_1 = (f.v0 >> 4) & 0x0F0F0F0F;
+        const int v1_1 = (f.v1 >> 4) & 0x0F0F0F0F;
+        const int d0 = __dp4a(v1_0, u1, __dp4a(v0_0, u0, 0));
+        const int e0 = __dp4a(0x01010101, u1, __dp4a(0x01010101, u0, 0));
+        const int d1 = __dp4a(v1_1, u3, __dp4a(v0_1, u2, 0));
+        const int e1 = __dp4a(0x01010101, u3, __dp4a(0x01010101, u2, 0));
+        sumf_d += d80 * (d0 * sc0);
+        sumf_m += d80 * (e0 * m0);
+        sumf_d += d81 * (d1 * sc1);
+        sumf_m += d81 * (e1 * m1);
+    }
+    const float2 dmf = __half22float2(f.dm);
+    return dmf.x * sumf_d - dmf.y * sumf_m;
+}
+
 // core dot for one superblock; qh pointer is only dereferenced when HAS_QH
 template <bool HAS_QH>
 static __device__ __forceinline__ float gguf_k45_vec_dot(
@@ -1481,21 +1562,26 @@ mul_mat_vec_k45_q8_1_planar_v1(const uint8_t * __restrict__ vx, const void * __r
     const half2 * dmr = (const half2 *)(vx + gguf_planar_k45<HAS_QH>::dm_off(nrows, nb)) + base;
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int q4 = (iqs / 2) % 4;
+
     float tmp = 0.f;
-    for (int i = threadIdx.x / 16; i < nb; i += 4) {
-        const int bq8_offset = 2 * ((iqs / 2) / 4);
-        const int q4 = (iqs / 2) % 4;
-        const int v0 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4);
-        const int v1 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4 + 16);
-        int vh0 = 0, vh1 = 0;
-        if constexpr (HAS_QH) {
-            vh0 = (*(const int *)(qhr + i * 32 + 4 * q4)) >> bq8_offset;
-            vh1 = (*(const int *)(qhr + i * 32 + 4 * q4 + 16)) >> bq8_offset;
+    gguf_k45_wt_frag wa, wb;
+    int i = threadIdx.x / 16;
+    bool have_a = i < nb;
+    if (have_a) {
+        gguf_k45_ld_wt<HAS_QH>(wa, qlr, qhr, scr, dmr, i, bq8_offset, q4);
+    }
+    while (have_a) {
+        const int in = i + 4;
+        const bool have_b = in < nb;
+        if (have_b) {
+            gguf_k45_ld_wt<HAS_QH>(wb, qlr, qhr, scr, dmr, in, bq8_offset, q4);
         }
-        uint8_t sc[4];
-        gguf_k45_scales(scr + i * 12, bq8_offset, sc);
-        const block_q8_1 * yb = y + i * (QK_K / QK8_1);
-        tmp += gguf_k45_vec_dot<HAS_QH>(v0, v1, vh0, vh1, yb, sc, dmr[i], bq8_offset, q4);
+        tmp += gguf_k45_pipe_comp<HAS_QH>(wa, bq8_offset, y + i * (QK_K / QK8_1), q4);
+        i = in;
+        wa = wb;
+        have_a = have_b;
     }
 #pragma unroll
     for (int mask = 32; mask > 0; mask >>= 1)
@@ -1510,7 +1596,9 @@ static void mul_mat_vec_k45_q8_1_planar_v1_cuda(const void * vx, const void * vy
         <<<nrows, 64, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows);
 }
 
-// two rows per block for tall matrices
+// two rows per block for tall matrices; deliberately NOT software-pipelined:
+// the two-row form already has enough memory-level parallelism and the
+// double-buffered fragment measurably regressed it (register pressure)
 template <typename scalar_t, bool HAS_QH>
 static __global__ void __launch_bounds__(128)
 mul_mat_vec_k45_q8_1_planar_row_tile2(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
@@ -1527,10 +1615,11 @@ mul_mat_vec_k45_q8_1_planar_row_tile2(const uint8_t * __restrict__ vx, const voi
     const half2 * dmr = (const half2 *)(vx + gguf_planar_k45<HAS_QH>::dm_off(nrows, nb)) + base;
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int q4 = (iqs / 2) % 4;
+
     float tmp = 0.f;
     for (int i = threadIdx.x / 16; i < nb; i += 4) {
-        const int bq8_offset = 2 * ((iqs / 2) / 4);
-        const int q4 = (iqs / 2) % 4;
         const int v0 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4);
         const int v1 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4 + 16);
         int vh0 = 0, vh1 = 0;

@@ -166,11 +166,12 @@ def _gguf_planar_k_enabled() -> bool:
 
 
 # quant types eligible for the planar repack, mapped to their bytes per
-# 256-weight superblock. Only q6_K is packed by default: its planar kernels
-# beat the incumbent paths on the in-service shapes. The q4_K/q5_K planar
-# kernels are bit-exact but not yet faster than the fixed-cols pipe kernels
-# on every shape, so they are opt-in via VLLM_GGUF_KQUANT_PLANAR_TYPES
-# (comma-separated WeightType values, e.g. "12,13,14").
+# 256-weight superblock. q4_K and q6_K are packed by default: their planar
+# kernels win or tie against the incumbent paths on every measured shape
+# (q6_K MMVQ +10%; q4_K pipelined single-row +0-32%). q5_K is bit-exact and
+# wins most shapes (~+5%) but loses ~19% on the 5376x4096-class, so it is
+# opt-in via VLLM_GGUF_KQUANT_PLANAR_TYPES (comma-separated WeightType
+# values, e.g. "12,13,14").
 _GGUF_PLANAR_K_TYPE_SIZES = {
     int(WeightType.Q4_K): 144,
     int(WeightType.Q5_K): 176,
@@ -180,7 +181,7 @@ _GGUF_PLANAR_K_TYPE_SIZES = {
 
 @lru_cache(maxsize=1)
 def _gguf_planar_k_types() -> frozenset:
-    default = frozenset({int(WeightType.Q6_K)})
+    default = frozenset({int(WeightType.Q4_K), int(WeightType.Q6_K)})
     raw = os.getenv("VLLM_GGUF_KQUANT_PLANAR_TYPES")
     if not raw:
         return default
@@ -196,6 +197,15 @@ def _gguf_planar_k_types() -> frozenset:
         if t in _GGUF_PLANAR_K_TYPE_SIZES:
             chosen.add(t)
     return frozenset(chosen) if chosen else default
+
+
+def _qkv3_mmvq_planar_safe(qweight_types: list[int]) -> bool:
+    # the fused qkv3 MMVQ kernel only understands the original block layout,
+    # so it must not receive shards whose quant type is planar-packed
+    if not _gguf_planar_k_enabled():
+        return True
+    packed = _gguf_planar_k_types()
+    return qweight_types[0] not in packed and qweight_types[2] not in packed
 
 
 
@@ -1204,6 +1214,7 @@ def _fused_mul_mat_gguf_sharded_cached_mmvq(
         and qweight_types[0] == qweight_types[1]
         and qweight_types[0] in {WeightType.Q4_K, WeightType.Q5_K}
         and qweight_types[2] == WeightType.Q6_K
+        and _qkv3_mmvq_planar_safe(qweight_types)
         and hasattr(torch.ops._C, "ggml_mul_mat_vec_q8_qkv3")
     ):
         if ENABLE_GGUF_LINEAR_PROFILE:
