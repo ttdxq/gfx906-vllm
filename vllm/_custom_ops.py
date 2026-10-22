@@ -907,6 +907,22 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "gptq_gemm_rdna3
                 (row, (col // 256) * 210), dtype=torch.uint8, device=W.device
             )
 
+    if hasattr(torch.ops._C, "ggml_planar_pack"):
+
+        @register_fake("_C::ggml_planar_pack")
+        def _ggml_planar_pack_fake(
+            W: torch.Tensor,
+            type: int,
+            row: torch.SymInt,
+            col: torch.SymInt,
+        ) -> torch.Tensor:
+            bytes_per_block = 210 if type == 14 else (176 if type == 13 else 144)
+            return torch.empty(
+                (row, (col // 256) * bytes_per_block),
+                dtype=torch.uint8,
+                device=W.device,
+            )
+
     if hasattr(torch.ops._C, "ggml_repack_iq4_xs_to_q8_0"):
 
         @register_fake("_C::ggml_repack_iq4_xs_to_q8_0")

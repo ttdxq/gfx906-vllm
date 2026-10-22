@@ -1306,6 +1306,258 @@ static void mul_mat_vec_q6_K_q8_1_planar_v1_cuda(const void * vx, const void * v
         <<<nrows, 64, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows);
 }
 
+// ---- planar-repack q4_K/q5_K MMVQ variants (gfx906) ----
+// Same plane idea as q6_K, adapted to the K-quant scale structure
+// (6-bit packed scales + min/dmin pair). Plane layout, byte-conserving:
+//   q4_K (144B/sb): ql 128 | scales 12 | dm 4
+//   q5_K (176B/sb): ql 128 | qh 32 | scales 12 | dm 4
+// Per-thread math replicates vec_dot_q4_K_q8_1 / vec_dot_q5_K_q8_1
+// (VDR=2: iqs = 2*(tid%16), superblocks tid/16 strided by 4).
+template <bool HAS_QH>
+struct gguf_planar_k45 {
+    static constexpr int ql_stride = 128;
+    static constexpr int qh_stride = 32;  // q5_K only
+    static constexpr int sc_stride = 12;
+    static constexpr int dm_stride = 4;
+    static __host__ __device__ size_t ql_off(int, int) { return 0; }
+    static __host__ __device__ size_t qh_off(int rows, int nb) { return (size_t)rows * nb * ql_stride; }
+    static __host__ __device__ size_t sc_off(int rows, int nb) {
+        return qh_off(rows, nb) + (HAS_QH ? (size_t)rows * nb * qh_stride : 0);
+    }
+    static __host__ __device__ size_t dm_off(int rows, int nb) {
+        return sc_off(rows, nb) + (size_t)rows * nb * sc_stride;
+    }
+};
+
+// unpack the 6-bit scale/min pair used by both sub-block q8 blocks of this
+// thread (verbatim port of the uint16 aux dance in vec_dot_q4_K_q8_1)
+static __device__ __forceinline__ void gguf_k45_scales(
+    const uint8_t * __restrict__ scb, const int bq8_offset, uint8_t out[4]) {
+    const uint16_t * scales = (const uint16_t *)scb;
+    uint16_t aux[2];
+    const int j = bq8_offset / 2;
+    if (j < 2) {
+        aux[0] = scales[j + 0] & 0x3f3f;
+        aux[1] = scales[j + 2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+    }
+    out[0] = (uint8_t)aux[0]; out[1] = (uint8_t)(aux[0] >> 8);
+    out[2] = (uint8_t)aux[1]; out[3] = (uint8_t)(aux[1] >> 8);
+}
+
+// core dot for one superblock; qh pointer is only dereferenced when HAS_QH
+template <bool HAS_QH>
+static __device__ __forceinline__ float gguf_k45_vec_dot(
+    const int v0, const int v1, const int vh0, const int vh1,
+    const block_q8_1 * __restrict__ yb, const uint8_t * __restrict__ sc,
+    const half2 dm, const int bq8_offset, const int q4) {
+    int u[2 * QR4_K];
+    float d8[QR4_K];
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = yb + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int * q8 = (const int *)bq8i->qs + q4;
+        u[2 * i + 0] = q8[0];
+        u[2 * i + 1] = q8[4];
+    }
+    float sumf_d = 0.f;
+    float sumf_m = 0.f;
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        if constexpr (HAS_QH) {
+            const int vl0i = (v0 >> (4 * i)) & 0x0F0F0F0F;
+            const int vl1i = (v1 >> (4 * i)) & 0x0F0F0F0F;
+            const int vh0i = ((vh0 >> i) << 4) & 0x10101010;
+            const int vh1i = ((vh1 >> i) << 4) & 0x10101010;
+            const int dot1 = __dp4a(vl0i | vh0i, u[2 * i + 0], __dp4a(vl1i | vh1i, u[2 * i + 1], 0));
+            const int dot2 = __dp4a(0x01010101, u[2 * i + 0], __dp4a(0x01010101, u[2 * i + 1], 0));
+            sumf_d += d8[i] * (dot1 * sc[i]);
+            sumf_m += d8[i] * (dot2 * sc[2 + i]);
+        } else {
+            const int v0i = (v0 >> (4 * i)) & 0x0F0F0F0F;
+            const int v1i = (v1 >> (4 * i)) & 0x0F0F0F0F;
+            const int dot1 = __dp4a(v1i, u[2 * i + 1], __dp4a(v0i, u[2 * i + 0], 0));
+            const int dot2 = __dp4a(0x01010101, u[2 * i + 1], __dp4a(0x01010101, u[2 * i + 0], 0));
+            sumf_d += d8[i] * (dot1 * sc[i]);
+            sumf_m += d8[i] * (dot2 * sc[2 + i]);
+        }
+    }
+    const float2 dmf = __half22float2(dm);
+    return dmf.x * sumf_d - dmf.y * sumf_m;
+}
+
+// multi-vector combine form (vecs 2-4)
+template <typename scalar_t, int VECS, bool HAS_QH>
+static __global__ void __launch_bounds__(64)
+mul_mat_vec_k45_q8_1_planar(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
+                            scalar_t * __restrict__ dst, const int ncols, const int nrows,
+                            const int dst_stride) {
+    const int row = blockIdx.x;
+    const int nb = ncols / QK_K;
+    const int iqs = 2 * (threadIdx.x % 16);
+    const size_t base = (size_t)row * nb;
+    const uint8_t * qlr = vx + gguf_planar_k45<HAS_QH>::ql_off(nrows, nb) + base * 128;
+    const uint8_t * qhr = vx + gguf_planar_k45<HAS_QH>::qh_off(nrows, nb) + base * 32;
+    const uint8_t * scr = vx + gguf_planar_k45<HAS_QH>::sc_off(nrows, nb) + base * 12;
+    const half2 * dmr = (const half2 *)(vx + gguf_planar_k45<HAS_QH>::dm_off(nrows, nb)) + base;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+
+    float tmp[VECS];
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) tmp[vo] = 0.f;
+    for (int i = threadIdx.x / 16; i < nb; i += 4) {
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+        const int q4 = (iqs / 2) % 4;
+        const int v0 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4);
+        const int v1 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4 + 16);
+        int vh0 = 0, vh1 = 0;
+        if constexpr (HAS_QH) {
+            vh0 = (*(const int *)(qhr + i * 32 + 4 * q4)) >> bq8_offset;
+            vh1 = (*(const int *)(qhr + i * 32 + 4 * q4 + 16)) >> bq8_offset;
+        }
+        uint8_t sc[4];
+        gguf_k45_scales(scr + i * 12, bq8_offset, sc);
+        const half2 dm = dmr[i];
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            const block_q8_1 * yb = y + vo * (nrows_y / QK8_1) + i * (QK_K / QK8_1);
+            tmp[vo] += gguf_k45_vec_dot<HAS_QH>(v0, v1, vh0, vh1, yb, sc, dm, bq8_offset, q4);
+        }
+    }
+#pragma unroll
+    for (int mask = 32; mask > 0; mask >>= 1) {
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            tmp[vo] += VLLM_SHFL_XOR_SYNC(tmp[vo], mask);
+        }
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            dst[vo * dst_stride + row] = tmp[vo];
+        }
+    }
+}
+
+template <typename scalar_t, bool HAS_QH>
+static void mul_mat_vec_k45_q8_1_planar_cuda(const void * vx, const void * vy, scalar_t * dst,
+        const int ncols, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    const dim3 block_nums(nrows, 1, 1);
+    const dim3 block_dims(64, 1, 1);
+    const int stride = dst_stride < 0 ? nrows : dst_stride;
+    switch (nvecs) {
+      case 2:
+        mul_mat_vec_k45_q8_1_planar<scalar_t, 2, HAS_QH>
+            <<<block_nums, block_dims, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows, stride);
+        break;
+      case 3:
+        mul_mat_vec_k45_q8_1_planar<scalar_t, 3, HAS_QH>
+            <<<block_nums, block_dims, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows, stride);
+        break;
+      default:
+        mul_mat_vec_k45_q8_1_planar<scalar_t, 4, HAS_QH>
+            <<<block_nums, block_dims, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows, stride);
+        break;
+    }
+}
+
+// single-vector form, one row per block
+template <typename scalar_t, bool HAS_QH>
+static __global__ void __launch_bounds__(64)
+mul_mat_vec_k45_q8_1_planar_v1(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
+                               scalar_t * __restrict__ dst, const int ncols, const int nrows) {
+    const int row = blockIdx.x;
+    if (row >= nrows) return;
+    const int nb = ncols / QK_K;
+    const int iqs = 2 * (threadIdx.x % 16);
+    const size_t base = (size_t)row * nb;
+    const uint8_t * qlr = vx + gguf_planar_k45<HAS_QH>::ql_off(nrows, nb) + base * 128;
+    const uint8_t * qhr = vx + gguf_planar_k45<HAS_QH>::qh_off(nrows, nb) + base * 32;
+    const uint8_t * scr = vx + gguf_planar_k45<HAS_QH>::sc_off(nrows, nb) + base * 12;
+    const half2 * dmr = (const half2 *)(vx + gguf_planar_k45<HAS_QH>::dm_off(nrows, nb)) + base;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float tmp = 0.f;
+    for (int i = threadIdx.x / 16; i < nb; i += 4) {
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+        const int q4 = (iqs / 2) % 4;
+        const int v0 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4);
+        const int v1 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4 + 16);
+        int vh0 = 0, vh1 = 0;
+        if constexpr (HAS_QH) {
+            vh0 = (*(const int *)(qhr + i * 32 + 4 * q4)) >> bq8_offset;
+            vh1 = (*(const int *)(qhr + i * 32 + 4 * q4 + 16)) >> bq8_offset;
+        }
+        uint8_t sc[4];
+        gguf_k45_scales(scr + i * 12, bq8_offset, sc);
+        const block_q8_1 * yb = y + i * (QK_K / QK8_1);
+        tmp += gguf_k45_vec_dot<HAS_QH>(v0, v1, vh0, vh1, yb, sc, dmr[i], bq8_offset, q4);
+    }
+#pragma unroll
+    for (int mask = 32; mask > 0; mask >>= 1)
+        tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+    if (threadIdx.x == 0) dst[row] = tmp;
+}
+
+template <typename scalar_t, bool HAS_QH>
+static void mul_mat_vec_k45_q8_1_planar_v1_cuda(const void * vx, const void * vy, scalar_t * dst,
+        const int ncols, const int nrows, cudaStream_t stream) {
+    mul_mat_vec_k45_q8_1_planar_v1<scalar_t, HAS_QH>
+        <<<nrows, 64, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows);
+}
+
+// two rows per block for tall matrices
+template <typename scalar_t, bool HAS_QH>
+static __global__ void __launch_bounds__(128)
+mul_mat_vec_k45_q8_1_planar_row_tile2(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
+                                      scalar_t * __restrict__ dst, const int ncols, const int nrows,
+                                      const int dst_stride) {
+    const int row = blockIdx.x * 2 + threadIdx.y;
+    if (row >= nrows) return;
+    const int nb = ncols / QK_K;
+    const int iqs = 2 * (threadIdx.x % 16);
+    const size_t base = (size_t)row * nb;
+    const uint8_t * qlr = vx + gguf_planar_k45<HAS_QH>::ql_off(nrows, nb) + base * 128;
+    const uint8_t * qhr = vx + gguf_planar_k45<HAS_QH>::qh_off(nrows, nb) + base * 32;
+    const uint8_t * scr = vx + gguf_planar_k45<HAS_QH>::sc_off(nrows, nb) + base * 12;
+    const half2 * dmr = (const half2 *)(vx + gguf_planar_k45<HAS_QH>::dm_off(nrows, nb)) + base;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float tmp = 0.f;
+    for (int i = threadIdx.x / 16; i < nb; i += 4) {
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+        const int q4 = (iqs / 2) % 4;
+        const int v0 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4);
+        const int v1 = *(const int *)(qlr + i * 128 + 16 * bq8_offset + 4 * q4 + 16);
+        int vh0 = 0, vh1 = 0;
+        if constexpr (HAS_QH) {
+            vh0 = (*(const int *)(qhr + i * 32 + 4 * q4)) >> bq8_offset;
+            vh1 = (*(const int *)(qhr + i * 32 + 4 * q4 + 16)) >> bq8_offset;
+        }
+        uint8_t sc[4];
+        gguf_k45_scales(scr + i * 12, bq8_offset, sc);
+        const block_q8_1 * yb = y + i * (QK_K / QK8_1);
+        tmp += gguf_k45_vec_dot<HAS_QH>(v0, v1, vh0, vh1, yb, sc, dmr[i], bq8_offset, q4);
+    }
+#pragma unroll
+    for (int mask = 32; mask > 0; mask >>= 1)
+        tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+    if (threadIdx.x == 0) dst[row] = tmp;
+}
+
+template <typename scalar_t, bool HAS_QH>
+static void mul_mat_vec_k45_q8_1_planar_row_tile2_cuda(const void * vx, const void * vy, scalar_t * dst,
+        const int ncols, const int nrows, cudaStream_t stream) {
+    const dim3 block_nums((nrows + 1) / 2, 1, 1);
+    const dim3 block_dims(64, 2, 1);
+    mul_mat_vec_k45_q8_1_planar_row_tile2<scalar_t, HAS_QH>
+        <<<block_nums, block_dims, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows, nrows);
+}
+
 #endif  // USE_ROCM
 
 template<typename scalar_t>

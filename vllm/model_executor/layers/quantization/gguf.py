@@ -144,8 +144,14 @@ def _gguf_gfx906_q6_mmvq_max_batch() -> int:
 
 
 @lru_cache(maxsize=1)
-def _gguf_planar_q6_k_enabled() -> bool:
-    if not _env_flag("VLLM_GGUF_Q6_K_PLANAR", True):
+def _gguf_planar_k_enabled() -> bool:
+    # family switch for the plane-repacked K-quants (q4_K/q5_K/q6_K);
+    # VLLM_GGUF_Q6_K_PLANAR is kept as a legacy alias
+    legacy = os.getenv("VLLM_GGUF_Q6_K_PLANAR")
+    if legacy is not None:
+        if not _env_flag("VLLM_GGUF_Q6_K_PLANAR", True):
+            return False
+    elif not _env_flag("VLLM_GGUF_KQUANT_PLANAR", True):
         return False
     if ENABLE_GGUF_FORCE_DEQUANT_MATMUL:
         return False
@@ -157,6 +163,40 @@ def _gguf_planar_q6_k_enabled() -> bool:
         return on_gfx906()
     except Exception:
         return False
+
+
+# quant types eligible for the planar repack, mapped to their bytes per
+# 256-weight superblock. Only q6_K is packed by default: its planar kernels
+# beat the incumbent paths on the in-service shapes. The q4_K/q5_K planar
+# kernels are bit-exact but not yet faster than the fixed-cols pipe kernels
+# on every shape, so they are opt-in via VLLM_GGUF_KQUANT_PLANAR_TYPES
+# (comma-separated WeightType values, e.g. "12,13,14").
+_GGUF_PLANAR_K_TYPE_SIZES = {
+    int(WeightType.Q4_K): 144,
+    int(WeightType.Q5_K): 176,
+    int(WeightType.Q6_K): 210,
+}
+
+
+@lru_cache(maxsize=1)
+def _gguf_planar_k_types() -> frozenset:
+    default = frozenset({int(WeightType.Q6_K)})
+    raw = os.getenv("VLLM_GGUF_KQUANT_PLANAR_TYPES")
+    if not raw:
+        return default
+    chosen = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            t = int(part)
+        except ValueError:
+            continue
+        if t in _GGUF_PLANAR_K_TYPE_SIZES:
+            chosen.add(t)
+    return frozenset(chosen) if chosen else default
+
 
 
 @lru_cache(maxsize=1)
@@ -2229,19 +2269,19 @@ class GGUFLinearMethod(LinearMethodBase):
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
-        self._maybe_planar_pack_q6_k(layer)
+        self._maybe_planar_pack_kquants(layer)
         self._maybe_repack_iq4_xs_to_q8_0(layer)
         self._cache_gguf_shards(layer)
         self._cache_gguf_shard_metadata(layer)
 
-    def _maybe_planar_pack_q6_k(self, layer: torch.nn.Module) -> None:
-        """Rewrite plain (non-sharded) q6_K weights into the four-plane planar
-        layout. Byte count, tensor shape and the recorded quant type are all
-        unchanged; planar-aware MMVQ/MMQ kernels pick the buffer up through
-        the pointer registry in the C++ dispatch."""
-        if not _gguf_planar_q6_k_enabled():
+    def _maybe_planar_pack_kquants(self, layer: torch.nn.Module) -> None:
+        """Rewrite plain (non-sharded) q4_K/q5_K/q6_K weights into the plane
+        planar layout. Byte count, tensor shape and the recorded quant type
+        are all unchanged; planar-aware MMVQ/MMQ kernels pick the buffer up
+        through the pointer registry in the C++ dispatch."""
+        if not _gguf_planar_k_enabled():
             return
-        if not hasattr(torch.ops._C, "ggml_planar_pack_q6_k"):
+        if not hasattr(torch.ops._C, "ggml_planar_pack"):
             return
         if isinstance(layer, VocabParallelEmbedding):
             # Embedding rows are gathered and dequantized per row in the
@@ -2260,17 +2300,18 @@ class GGUFLinearMethod(LinearMethodBase):
             return  # repacked per shard in _cache_gguf_shards
         if not qweight.is_cuda or not qweight.is_contiguous():
             return
-        q6_k_type = int(WeightType.Q6_K)
-        if int(qweight_type.weight_type) != q6_k_type:
+        q_type = int(qweight_type.weight_type)
+        if q_type not in _gguf_planar_k_types():
             return
-        block_size, type_size = gguf.GGML_QUANT_SIZES[q6_k_type]
+        block_size = 256
+        type_size = _GGUF_PLANAR_K_TYPE_SIZES[q_type]
         row = qweight.shape[0]
         col = qweight.shape[1] // type_size * block_size
         if col % block_size or col == 0 or row == 0:
             return
-        packed = torch.ops._C.ggml_planar_pack_q6_k(qweight, row, col)
+        packed = torch.ops._C.ggml_planar_pack(qweight, q_type, row, col)
         qweight.data = packed
-        logger.info_once("Packed GGUF q6_K weights into the planar layout.")
+        logger.info_once("Packed GGUF K-quant weights into the planar layout.")
 
     def _maybe_repack_iq4_xs_to_q8_0(self, layer: torch.nn.Module) -> None:
         if not _gguf_repack_iq4_xs_to_q8_0_enabled():
@@ -2424,25 +2465,25 @@ class GGUFLinearMethod(LinearMethodBase):
         cache = {}
         layer_qweight_type = getattr(layer, "qweight_type", None)
         pack_shard = (
-            _gguf_planar_q6_k_enabled()
-            and hasattr(torch.ops._C, "ggml_planar_pack_q6_k")
+            _gguf_planar_k_enabled()
+            and hasattr(torch.ops._C, "ggml_planar_pack")
             and layer_qweight_type is not None
         )
-        q6_k_type = int(WeightType.Q6_K)
         shard_weight_type = getattr(layer_qweight_type, "shard_weight_type", {})
         for idx, (start, end, offset) in shard_offset_map.items():
             shard = qweight[start:end, :offset]
             if not shard.is_contiguous():
                 shard = shard.contiguous()
-            if pack_shard and int(shard_weight_type.get(idx, -1)) == q6_k_type:
+            shard_type = int(shard_weight_type.get(idx, -1))
+            if pack_shard and shard_type in _gguf_planar_k_types():
                 # repack each shard as its own planar tensor: the sharded
                 # MMVQ/MMQ dispatch receives shard base pointers, so the
-                # four-plane layout must be self-contained per shard
-                block_size, type_size = gguf.GGML_QUANT_SIZES[q6_k_type]
-                col = shard.shape[1] // type_size * block_size
-                if col % block_size == 0 and col > 0 and shard.shape[0] > 0:
-                    shard = torch.ops._C.ggml_planar_pack_q6_k(
-                        shard, shard.shape[0], col)
+                # plane layout must be self-contained per shard
+                type_size = _GGUF_PLANAR_K_TYPE_SIZES[shard_type]
+                col = shard.shape[1] // type_size * 256
+                if col % 256 == 0 and col > 0 and shard.shape[0] > 0:
+                    shard = torch.ops._C.ggml_planar_pack(
+                        shard, shard_type, shard.shape[0], col)
             cache[idx] = shard
         layer._gguf_shard_cache = cache
 

@@ -475,29 +475,35 @@ torch::Tensor ggml_repack_iq4_xs_to_q8_0(torch::Tensor W, int64_t row,
 }
 
 
-// ---- planar q6_K repack (load-time, byte-conserving, bit-exact) ----
-// Rewrites each 210-byte superblock into four per-tensor planes
-// (ql | qh | scales | d). Buffers produced here are registered and the
-// MMVQ dispatch routes registered pointers to the planar kernels.
-static std::unordered_set<const void*>& gguf_planar_q6_k_buffers() {
+// ---- planar K-quant repack (load-time, byte-conserving, bit-exact) ----
+// Rewrites each superblock into per-tensor planes. Buffers produced here are
+// registered and the MMVQ/MMQ dispatch routes registered pointers to the
+// planar kernels. Layouts (bytes per 256-weight superblock):
+//   q6_K 210: ql 128 | qh 64 | scales 16 | d 2
+//   q5_K 176: ql 128 | qh 32 | scales 12 | dm 4
+//   q4_K 144: ql 128 |        scales 12 | dm 4
+static std::unordered_set<const void*>& gguf_planar_buffers() {
   static std::unordered_set<const void*> buffers;
   return buffers;
 }
 
-static std::mutex& gguf_planar_q6_k_mutex() {
+static std::mutex& gguf_planar_mutex() {
   static std::mutex m;
   return m;
 }
 
-bool gguf_planar_q6_k_is_planar(const void* w) {
-  std::lock_guard<std::mutex> lock(gguf_planar_q6_k_mutex());
-  return gguf_planar_q6_k_buffers().count(w) > 0;
+bool gguf_planar_is_planar(const void* w) {
+  std::lock_guard<std::mutex> lock(gguf_planar_mutex());
+  return gguf_planar_buffers().count(w) > 0;
 }
 
-static bool q6_k_planar_enabled() {
+static bool planar_k_enabled() {
   static const bool enabled = [] {
-    const char* env = std::getenv("VLLM_GGUF_Q6_K_PLANAR");
-    return env == nullptr || env[0] != '0';
+    const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR");
+    if (env != nullptr) return env[0] != '0';
+    // legacy name kept as an alias so existing deployments keep working
+    const char* legacy = std::getenv("VLLM_GGUF_Q6_K_PLANAR");
+    return legacy == nullptr || legacy[0] != '0';
   }();
   return enabled;
 }
@@ -527,25 +533,89 @@ __global__ void planar_pack_q6_k_kernel(const block_q6_K* __restrict__ src,
   }
 }
 
-torch::Tensor ggml_planar_pack_q6_k(torch::Tensor W, int64_t row, int64_t col) {
-  TORCH_CHECK(W.is_cuda(), "planar q6_K pack input must be a CUDA tensor");
-  TORCH_CHECK(W.is_contiguous(), "planar q6_K pack input must be contiguous");
-  TORCH_CHECK(col % QK_K == 0, "planar q6_K pack col must be divisible by QK_K");
+__global__ void planar_pack_q4_k_kernel(const block_q4_K* __restrict__ src,
+                                        uint8_t* __restrict__ dst,
+                                        int64_t rows, int64_t nb,
+                                        int64_t total_blocks) {
+  const int64_t sb = blockIdx.x;
+  if (sb >= total_blocks) return;
+  const int64_t row = sb / nb;
+  const int64_t in_row = sb % nb;
+  const size_t sc_base = (size_t)rows * nb * 128;
+  const size_t dm_base = sc_base + (size_t)rows * nb * 12;
+  const block_q4_K& b = src[sb];
+  const int t = threadIdx.x;
+  if (t < 128) {
+    dst[(size_t)row * nb * 128 + in_row * 128 + t] = b.qs[t];
+  } else if (t < 140) {
+    dst[sc_base + (size_t)row * nb * 12 + in_row * 12 + (t - 128)] = b.scales[t - 128];
+  } else if (t == 140) {
+    ((half2*)(dst + dm_base))[row * nb + in_row] = b.dm;
+  }
+}
+
+__global__ void planar_pack_q5_k_kernel(const block_q5_K* __restrict__ src,
+                                        uint8_t* __restrict__ dst,
+                                        int64_t rows, int64_t nb,
+                                        int64_t total_blocks) {
+  const int64_t sb = blockIdx.x;
+  if (sb >= total_blocks) return;
+  const int64_t row = sb / nb;
+  const int64_t in_row = sb % nb;
+  const size_t qh_base = (size_t)rows * nb * 128;
+  const size_t sc_base = qh_base + (size_t)rows * nb * 32;
+  const size_t dm_base = sc_base + (size_t)rows * nb * 12;
+  const block_q5_K& b = src[sb];
+  const int t = threadIdx.x;
+  if (t < 128) {
+    dst[(size_t)row * nb * 128 + in_row * 128 + t] = b.qs[t];
+  } else if (t < 160) {
+    dst[qh_base + (size_t)row * nb * 32 + in_row * 32 + (t - 128)] = b.qh[t - 128];
+  } else if (t < 172) {
+    dst[sc_base + (size_t)row * nb * 12 + in_row * 12 + (t - 160)] = b.scales[t - 160];
+  } else if (t == 172) {
+    ((half2*)(dst + dm_base))[row * nb + in_row] = b.dm;
+  }
+}
+
+static void planar_pack_register(torch::Tensor& out) {
+  std::lock_guard<std::mutex> lock(gguf_planar_mutex());
+  gguf_planar_buffers().insert(out.data_ptr());
+}
+
+torch::Tensor ggml_planar_pack(torch::Tensor W, int64_t type, int64_t row, int64_t col) {
+  TORCH_CHECK(W.is_cuda(), "planar K-quant pack input must be a CUDA tensor");
+  TORCH_CHECK(W.is_contiguous(), "planar K-quant pack input must be contiguous");
+  TORCH_CHECK(col % QK_K == 0, "planar K-quant pack col must be divisible by QK_K");
   const int64_t nb = col / QK_K;
-  TORCH_CHECK(W.numel() == row * nb * 210, "planar q6_K pack size mismatch");
+  const int64_t bytes_per_block = type == 14 ? 210 : (type == 13 ? 176 : 144);
+  TORCH_CHECK(type >= 12 && type <= 14, "planar K-quant pack supports q4_K/q5_K/q6_K");
+  TORCH_CHECK(W.numel() == row * nb * bytes_per_block,
+              "planar K-quant pack size mismatch");
   auto options = torch::TensorOptions().dtype(torch::kUInt8).device(W.device());
-  at::Tensor out = torch::empty({row, nb * 210}, options);
+  at::Tensor out = torch::empty({row, nb * bytes_per_block}, options);
   const int64_t total_blocks = row * nb;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  planar_pack_q6_k_kernel<<<total_blocks, 256, 0, stream>>>(
-      static_cast<const block_q6_K*>(W.data_ptr()), out.data_ptr<uint8_t>(),
-      row, nb, total_blocks);
-  {
-    std::lock_guard<std::mutex> lock(gguf_planar_q6_k_mutex());
-    gguf_planar_q6_k_buffers().insert(out.data_ptr());
+  if (type == 14) {
+    planar_pack_q6_k_kernel<<<total_blocks, 256, 0, stream>>>(
+        static_cast<const block_q6_K*>(W.data_ptr()), out.data_ptr<uint8_t>(),
+        row, nb, total_blocks);
+  } else if (type == 13) {
+    planar_pack_q5_k_kernel<<<total_blocks, 256, 0, stream>>>(
+        static_cast<const block_q5_K*>(W.data_ptr()), out.data_ptr<uint8_t>(),
+        row, nb, total_blocks);
+  } else {
+    planar_pack_q4_k_kernel<<<total_blocks, 256, 0, stream>>>(
+        static_cast<const block_q4_K*>(W.data_ptr()), out.data_ptr<uint8_t>(),
+        row, nb, total_blocks);
   }
+  planar_pack_register(out);
   return out;
+}
+
+torch::Tensor ggml_planar_pack_q6_k(torch::Tensor W, int64_t row, int64_t col) {
+  return ggml_planar_pack(std::move(W), 14, row, col);
 }
 
 torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W,  // quant weight
@@ -963,6 +1033,24 @@ static void ggml_mul_mat_vec_q8_dispatch(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
       break;
     case 12: {
+      if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          gguf_planar_is_planar(W)) {
+        static const int min_rows = [] {
+          const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR_MIN_ROWS");
+          return env == nullptr ? 6144 : std::max(1, std::atoi(env));
+        }();
+        if (vecs == 1 && row >= min_rows) {
+          mul_mat_vec_k45_q8_1_planar_row_tile2_cuda<scalar_t, false>(
+              W, quant_X, dst, col, row, stream);
+        } else if (vecs == 1) {
+          mul_mat_vec_k45_q8_1_planar_v1_cuda<scalar_t, false>(
+              W, quant_X, dst, col, row, stream);
+        } else {
+          mul_mat_vec_k45_q8_1_planar_cuda<scalar_t, false>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+        }
+        break;
+      }
       const bool q4_k_fixed_cols_fast = q4_k_fixed_cols_fast_enabled();
       static const bool q4_k_col2560_fast = [] {
         const char* env = std::getenv("VLLM_GGUF_Q4_K_COL2560_FAST");
@@ -1075,6 +1163,24 @@ static void ggml_mul_mat_vec_q8_dispatch(
       break;
     }
     case 13: {
+      if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          gguf_planar_is_planar(W)) {
+        static const int min_rows = [] {
+          const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR_MIN_ROWS");
+          return env == nullptr ? 1024 : std::max(1, std::atoi(env));
+        }();
+        if (vecs == 1 && row >= min_rows) {
+          mul_mat_vec_k45_q8_1_planar_row_tile2_cuda<scalar_t, true>(
+              W, quant_X, dst, col, row, stream);
+        } else if (vecs == 1) {
+          mul_mat_vec_k45_q8_1_planar_v1_cuda<scalar_t, true>(
+              W, quant_X, dst, col, row, stream);
+        } else {
+          mul_mat_vec_k45_q8_1_planar_cuda<scalar_t, true>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+        }
+        break;
+      }
       const bool q5_k_fixed_cols_fast = q5_k_fixed_cols_fast_enabled();
       static const bool q5_k_5120_6144_fast = [] {
         const char* env = std::getenv("VLLM_GGUF_Q5_K_5120_6144_FAST");
@@ -1178,8 +1284,8 @@ static void ggml_mul_mat_vec_q8_dispatch(
       // planar routing is single-vector only; multi-vector batches (MTP
       // verify) fall through to the original kernels below, whose combine
       // variant measured ~10% faster than the planar one
-      if (q6_k_planar_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
-          gguf_planar_q6_k_is_planar(W)) {
+      if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          gguf_planar_is_planar(W)) {
         static const int min_rows = [] {
           const char* env = std::getenv("VLLM_GGUF_Q6_K_PLANAR_MIN_ROWS");
           return env == nullptr ? 6144 : std::max(1, std::atoi(env));
@@ -1753,13 +1859,13 @@ static void ggml_mul_mat_vec_q8_grouped_dispatch(
     int64_t type, cudaStream_t stream, const int* rows,
     const int dst_stride = -1) {
   // the grouped same-type kernel only understands the original block layout;
-  // planar q6_K shards are dispatched per shard instead (the plain dispatch
+  // planar K-quant shards are dispatched per shard instead (the plain dispatch
   // routes registered planar pointers to the planar kernels)
-  if (type == 14 && q6_k_planar_enabled()) {
+  if (type >= 12 && type <= 14 && planar_k_enabled()) {
     const void* ptrs[8] = {vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7};
     bool any_planar = false;
     for (int i = 0; i < 8 && !any_planar; ++i) {
-      any_planar = ptrs[i] != nullptr && gguf_planar_q6_k_is_planar(ptrs[i]);
+      any_planar = ptrs[i] != nullptr && gguf_planar_is_planar(ptrs[i]);
     }
     if (any_planar) {
       int row_offset = 0;

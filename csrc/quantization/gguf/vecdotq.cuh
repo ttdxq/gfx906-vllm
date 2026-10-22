@@ -1909,6 +1909,164 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
+// Plane-split q4_K MMQ loader (companion of load_tiles_q4_K_split): identical
+// tile contents, addresses rebased onto the (ql | scales | dm) planes.
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q4_K_split_planar(
+    const void * __restrict__ vx, const int & nrows_x, const int & row_x_0, const int & ib0,
+    int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    const int kbx  = k / QI4_K; // == 0 if QK_K == 256
+    const int kqsx = k % QI4_K;
+
+    const uint8_t * qlb = (const uint8_t *) vx;
+    const uint8_t * scb = qlb + (size_t)nrows_x * blocks_per_row * 128;
+    const half2  * dmb = (const half2 *)(scb + (size_t)nrows_x * blocks_per_row * 12);
+
+    const size_t sb0 = (size_t)(row_x_0 + i_offset)*blocks_per_row + ib0 + kbx;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        const int i = i0 + i_offset;
+        const size_t sb = need_check
+            ? (size_t)(row_x_0 + min(i, i_max))*blocks_per_row + ib0 + kbx
+            : sb0 + (size_t)(i0/nwarps)*nwarps*blocks_per_row;
+        const int ky = QR4_K*kqsx;
+
+        const int ql = *(const int *)(qlb + sb*128 + 4*kqsx);
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int kq0 = ky - ky % (QI4_K/2) + k % (QI4_K/4) + 0;
+        const int kq1 = ky - ky % (QI4_K/2) + k % (QI4_K/4) + (QI4_K/4);
+
+        const int ii = need_check ? min(i, i_max) : i;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq0] = ql0;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq1] = ql1;
+    }
+
+    const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI4_K; // == 1 if QK_K == 256
+    const int kbxd = k % blocks_per_tile_x_row;          // == 0 if QK_K == 256
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI4_K) {
+        int i = (i0 + i_offset * QI4_K + k / blocks_per_tile_x_row) % mmq_y;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + kbxd;
+
+        x_dm[i * (WARP_SIZE_GGUF/QI4_K) + i / QI4_K + kbxd] = dmb[sb];
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+        int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF/8)) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + (k % (WARP_SIZE_GGUF/8)) / (QI4_K/8);
+
+        const int * scales = (const int *)(scb + sb*12);
+        // the ksc=6,7 lanes of the unpack below read a 4th int past the
+        // 12-byte scale array; in the original layout those bytes are the
+        // block's qs[0..3], so fetch them from the ql plane to stay identical
+        const int s4[4] = {scales[0], scales[1], scales[2],
+                           *(const int *)(qlb + sb*128)};
+
+        const int ksc = k % (WARP_SIZE_GGUF/8);
+        // scale arrangement after the following two lines: sc0,...,sc3, sc4,...,sc7, m0,...,m3, m4,...,m8
+        int scales8 = (s4[(ksc%2) + (ksc!=0)] >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F; // lower 4 bits
+        scales8    |= (s4[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030; // upper 2 bits
+
+        x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + ksc] = scales8;
+    }
+    (void)x_qh;
+}
+
+// q5_K MMQ loader onto the (ql | qh | scales | dm) planes; tile contents are
+// identical to load_tiles_q5_K.
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q5_K_planar(
+    const void * __restrict__ vx, const int & nrows_x, const int & row_x_0, const int & ib0,
+    int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    const int kbx  = k / QI5_K; // == 0 if QK_K == 256
+    const int kqsx = k % QI5_K;
+
+    const uint8_t * qlb = (const uint8_t *) vx;
+    const uint8_t * qhb = qlb + (size_t)nrows_x * blocks_per_row * 128;
+    const uint8_t * scb = qhb + (size_t)nrows_x * blocks_per_row * 32;
+    const half2  * dmb = (const half2 *)(scb + (size_t)nrows_x * blocks_per_row * 12);
+
+    const size_t sb0 = (size_t)(row_x_0 + i_offset)*blocks_per_row + ib0 + kbx;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        const int i = i0 + i_offset;
+        const size_t sb = need_check
+            ? (size_t)(row_x_0 + min(i, i_max))*blocks_per_row + ib0 + kbx
+            : sb0 + (size_t)(i0/nwarps)*nwarps*blocks_per_row;
+        const int ky = QR5_K*kqsx;
+
+        const int ql = *(const int *)(qlb + sb*128 + 4*kqsx);
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int qh = *(const int *)(qhb + sb*32 + 4*(kqsx % (QI5_K/4)));
+        const int qh0 = ((qh >> (2 * (kqsx / (QI5_K/4)) + 0)) << 4) & 0x10101010;
+        const int qh1 = ((qh >> (2 * (kqsx / (QI5_K/4)) + 1)) << 4) & 0x10101010;
+
+        const int kq0 = ky - ky % (QI5_K/2) + k % (QI5_K/4) + 0;
+        const int kq1 = ky - ky % (QI5_K/2) + k % (QI5_K/4) + (QI5_K/4);
+
+        const int ii = need_check ? min(i, i_max) : i;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq0] = ql0 | qh0;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq1] = ql1 | qh1;
+    }
+
+    const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI5_K; // == 1 if QK_K == 256
+    const int kbxd = k % blocks_per_tile_x_row;          // == 0 if QK_K == 256
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI5_K) {
+        int i = (i0 + i_offset * QI5_K + k / blocks_per_tile_x_row) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + kbxd;
+
+        x_dm[i * (WARP_SIZE_GGUF/QI5_K) + i / QI5_K + kbxd] = dmb[sb];
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+        int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF/8)) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + (k % (WARP_SIZE_GGUF/8)) / (QI5_K/8);
+
+        const int * scales = (const int *)(scb + sb*12);
+        // the ksc=6,7 lanes of the unpack below read a 4th int past the
+        // 12-byte scale array; in the original layout those bytes are the
+        // block's qh[0..3], so fetch them from the qh plane to stay identical
+        const int s4[4] = {scales[0], scales[1], scales[2],
+                           *(const int *)(qhb + sb*32)};
+
+        const int ksc = k % (WARP_SIZE_GGUF/8);
+        // scale arrangement after the following two lines: sc0,...,sc3, sc4,...,sc7, m0,...,m3, m4,...,m8
+        int scales8 = (s4[(ksc%2) + (ksc!=0)] >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F; // lower 4 bits
+        scales8    |= (s4[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030; // upper 2 bits
+
+        x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + ksc] = scales8;
+    }
+    (void)x_qh;
+}
+
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_mul_mat(
     const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
