@@ -82,7 +82,7 @@ This is a modified version of [vLLM](https://github.com/vllm-project/vllm) for A
 - **Hardware**: AMD gfx906 GPU (Radeon VII, Radeon Pro VII, Instinct MI50, or Instinct MI60)
 - **ROCm**: One of the following community-supported combinations; both require the kernel-mode driver:
   - ROCm 6.3 + PyTorch 2.9 + triton-gfx906 v3.5.0+gfx906 (original compatibility stack)
-  - ROCm 7.2 + PyTorch 2.11 + triton-rocm 3.6.0 (current repository dependency stack)
+  - ROCm 7.2 + PyTorch 2.11 + Triton 3.8.0 (currently validated stack, using the native PyPI `triton` package)
 - **Python**: 3.10+
 - **Operating system**: Linux (tested on Ubuntu)
 

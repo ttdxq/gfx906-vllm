@@ -80,7 +80,7 @@
 - **硬件**: AMD gfx906 GPU（Radeon VII、Radeon Pro VII、Instinct MI50、Instinct MI60）
 - **ROCm**: 支持以下社区兼容组合（均需要内核模式驱动）
   - ROCm 6.3 + PyTorch 2.9 + triton-gfx906 v3.5.0+gfx906（原有兼容组合）
-  - ROCm 7.2 + PyTorch 2.11 + triton-rocm 3.6.0（当前仓库依赖组合）
+  - ROCm 7.2 + PyTorch 2.11 + Triton 3.8.0（当前验证组合，使用 PyPI 原生 `triton` 包）
 - **Python**: 3.10+
 - **操作系统**: Linux（在 Ubuntu 上测试）
 
