@@ -146,12 +146,15 @@ def _gguf_gfx906_q6_mmvq_max_batch() -> int:
 @lru_cache(maxsize=1)
 def _gguf_planar_k_enabled() -> bool:
     # family switch for the plane-repacked K-quants (q4_K/q5_K/q6_K);
-    # VLLM_GGUF_Q6_K_PLANAR is kept as a legacy alias
+    # VLLM_GGUF_Q6_K_PLANAR is kept as a legacy alias. Off by default: the
+    # repack buys a few percent of decode GEMV bandwidth at the cost of a
+    # longer load path and extra care around routing windows; opt in via
+    # VLLM_GGUF_KQUANT_PLANAR=1 (or VLLM_GGUF_Q6_K_PLANAR=1).
     legacy = os.getenv("VLLM_GGUF_Q6_K_PLANAR")
     if legacy is not None:
         if not _env_flag("VLLM_GGUF_Q6_K_PLANAR", True):
             return False
-    elif not _env_flag("VLLM_GGUF_KQUANT_PLANAR", True):
+    elif not _env_flag("VLLM_GGUF_KQUANT_PLANAR", False):
         return False
     if ENABLE_GGUF_FORCE_DEQUANT_MATMUL:
         return False
@@ -166,12 +169,12 @@ def _gguf_planar_k_enabled() -> bool:
 
 
 # quant types eligible for the planar repack, mapped to their bytes per
-# 256-weight superblock. q4_K and q6_K are packed by default: their planar
-# kernels win or tie against the incumbent paths on every measured shape
-# (q6_K MMVQ +10%; q4_K pipelined single-row +0-32%). q5_K is bit-exact and
-# wins most shapes (~+5%) but loses ~19% on the 5376x4096-class, so it is
-# opt-in via VLLM_GGUF_KQUANT_PLANAR_TYPES (comma-separated WeightType
-# values, e.g. "12,13,14").
+# 256-weight superblock. When the repack is enabled (VLLM_GGUF_KQUANT_PLANAR=1),
+# q4_K and q6_K are packed: their planar kernels win or tie against the
+# incumbent paths on every measured shape (q6_K MMVQ +10%; q4_K pipelined
+# single-row +0-32%). q5_K is bit-exact and wins most shapes (~+5%) but loses
+# ~19% on the 5376x4096-class, so it additionally requires listing in
+# VLLM_GGUF_KQUANT_PLANAR_TYPES (comma-separated WeightType values).
 _GGUF_PLANAR_K_TYPE_SIZES = {
     int(WeightType.Q4_K): 144,
     int(WeightType.Q5_K): 176,
@@ -1018,20 +1021,30 @@ except AttributeError as error:
 
 
 def _mmvq_safe_batch(qweight: torch.Tensor, qweight_type: int) -> int:
+    # the planar MMVQ kernels only accept up to 4 activation rows; larger
+    # batches must fall through to the MMQ path, otherwise a packed weight
+    # would be read by an original-layout kernel and silently corrupt outputs
+    planar_cap = (
+        _gguf_planar_k_enabled() and int(qweight_type) in _gguf_planar_k_types()
+    )
     if qweight_type in IMATRIX_QUANT_TYPES:
-        return 8 if qweight.shape[0] > 5120 else 16
-    if qweight.shape[0] > 5120:
+        cap = 8 if qweight.shape[0] > 5120 else 16
+    elif qweight.shape[0] > 5120:
         if (
             qweight_type in MMQ_QUANT_TYPES
             and _gguf_gfx906_small_batch_mmvq_enabled()
         ):
             if qweight_type in {WeightType.Q4_0, WeightType.Q4_1, WeightType.Q4_K}:
-                return _gguf_gfx906_q4_mmvq_max_batch()
-            if qweight_type == WeightType.Q6_K:
-                return _gguf_gfx906_q6_mmvq_max_batch()
-            return _gguf_gfx906_mmvq_max_batch()
-        return 2
-    return 6
+                cap = _gguf_gfx906_q4_mmvq_max_batch()
+            elif qweight_type == WeightType.Q6_K:
+                cap = _gguf_gfx906_q6_mmvq_max_batch()
+            else:
+                cap = _gguf_gfx906_mmvq_max_batch()
+        else:
+            cap = 2
+    else:
+        cap = 6
+    return 4 if planar_cap and cap > 4 else cap
 
 
 def _can_share_mmvq_activation(
@@ -2284,6 +2297,12 @@ class GGUFLinearMethod(LinearMethodBase):
         self._maybe_repack_iq4_xs_to_q8_0(layer)
         self._cache_gguf_shards(layer)
         self._cache_gguf_shard_metadata(layer)
+        # The planar packing replaces weight storages one tensor at a time;
+        # the freed originals linger as cached blocks in the CUDA allocator,
+        # which the later KV-cache sizing counts as consumed GPU memory.
+        # Hand them back to the driver so the KV budget is measured cleanly.
+        if _gguf_planar_k_enabled():
+            torch.cuda.empty_cache()
 
     def _maybe_planar_pack_kquants(self, layer: torch.nn.Module) -> None:
         """Rewrite plain (non-sharded) q4_K/q5_K/q6_K weights into the plane
@@ -2481,11 +2500,13 @@ class GGUFLinearMethod(LinearMethodBase):
             and layer_qweight_type is not None
         )
         shard_weight_type = getattr(layer_qweight_type, "shard_weight_type", {})
+        all_packed = True
         for idx, (start, end, offset) in shard_offset_map.items():
             shard = qweight[start:end, :offset]
             if not shard.is_contiguous():
                 shard = shard.contiguous()
             shard_type = int(shard_weight_type.get(idx, -1))
+            packed_shard = False
             if pack_shard and shard_type in _gguf_planar_k_types():
                 # repack each shard as its own planar tensor: the sharded
                 # MMVQ/MMQ dispatch receives shard base pointers, so the
@@ -2495,8 +2516,22 @@ class GGUFLinearMethod(LinearMethodBase):
                 if col % 256 == 0 and col > 0 and shard.shape[0] > 0:
                     shard = torch.ops._C.ggml_planar_pack(
                         shard, shard_type, shard.shape[0], col)
+                    packed_shard = True
+            all_packed = all_packed and packed_shard
             cache[idx] = shard
         layer._gguf_shard_cache = cache
+        if all_packed and cache:
+            # every shard now lives as its own packed tensor in the cache;
+            # the padded concat buffer is dead weight, so replace it with a
+            # zero-element placeholder that keeps the shard metadata attrs
+            # (same pattern as the mixed-width branch above)
+            sh0 = next(iter(cache.values()))
+            placeholder = Parameter(
+                torch.empty(0, 0, dtype=sh0.dtype, device=sh0.device),
+                requires_grad=False,
+            )
+            set_weight_attrs(placeholder, vars(qweight))
+            layer.register_parameter("qweight", placeholder)
 
     def _cache_gguf_shard_metadata(self, layer: torch.nn.Module):
         if not getattr(layer.qweight, "shard_id", []):
