@@ -2173,11 +2173,12 @@ torch::Tensor ggml_mul_mat_vec_q8(torch::Tensor W, torch::Tensor quant_X,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
   int64_t vecs = quant_X.sizes()[0];
   auto options = torch::TensorOptions().dtype(dtype).device(W.device());
-  // The MMVQ kernels fully overwrite every dst[row, vec] element (plain
-  // assignment, no accumulation), so the freshly allocated output does not
-  // need to be zeroed first; skipping the fill removes one kernel launch per
-  // op on the decode path.
+  // Zero the output before the launch: under CUDA graph capture the output
+  // allocation comes from the graph pool, where one address can back several
+  // tensors' static buffers between replays, so any kernel-unwritten slot
+  // would leak values from an unrelated buffer.
   at::Tensor Y = torch::empty({vecs, row}, options);
+  Y.zero_();
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   VLLM_DISPATCH_FLOATING_TYPES(dtype, "ggml_mul_mat_vec_q8", [&] {
