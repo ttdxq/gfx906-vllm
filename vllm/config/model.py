@@ -2091,13 +2091,20 @@ class ModelConfig:
             "qwen3_5_text",
             "qwen35",
         ):
-            # Only inject the Qwen-recommended penalty under the "auto"
-            # (model defaults) semantics. With --generation-config vllm the
-            # neutral defaults must stay clean: the injected penalty makes
-            # every default request hit the spec-decode penalty guard on
-            # MTP deployments.
+            # Only inject sampling defaults under the "auto" (model defaults)
+            # semantics; with --generation-config vllm the neutral defaults
+            # must stay clean.
             if self.generation_config == "auto":
-                diff_sampling_param.setdefault("repetition_penalty", 1.2)
+                # GGUF checkpoints ship no generation_config.json, so without
+                # these the serving layer samples at temperature=1.0 with no
+                # top-k/top-p truncation; with the default seed of 0 the
+                # counter-based Gumbel sampler then deterministically picks
+                # far-tail (~0.1% probability) tokens on fresh servers and
+                # the output reads as garbled text. Fall back to the
+                # Qwen3-family thinking-mode recommendation.
+                diff_sampling_param.setdefault("temperature", 0.6)
+                diff_sampling_param.setdefault("top_p", 0.95)
+                diff_sampling_param.setdefault("top_k", 20)
             eos_ids: list[int] = []
             generation_eos = config.get("eos_token_id")
             if isinstance(generation_eos, int):
