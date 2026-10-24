@@ -2533,6 +2533,14 @@ class GGUFLinearMethod(LinearMethodBase):
             and layer_qweight_type is not None
         )
         shard_weight_type = getattr(layer_qweight_type, "shard_weight_type", {})
+        # Same-type contiguous shard groups are served whole-tensor from the
+        # original block-layout qweight (_get_full_mmvq_shard_weight takes
+        # priority over the shard cache), so planar copies of their shards
+        # would never be read and would only double the resident memory.
+        if pack_shard and _get_full_mmvq_shard_weight(
+            layer, list(shard_weight_type.values())
+        ) is not None:
+            pack_shard = False
         all_packed = True
         for idx, (start, end, offset) in shard_offset_map.items():
             shard = qweight[start:end, :offset]
