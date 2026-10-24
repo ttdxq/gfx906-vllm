@@ -217,9 +217,9 @@ void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
                               torch::Tensor segm_output,
                               torch::Tensor segm_max,
                               torch::Tensor segm_expsum, double scale,
-                              int64_t q_len, int64_t k_s0, int64_t k_s1,
-                              int64_t k_s2, int64_t v_s0, int64_t v_s1,
-                              int64_t v_s2, torch::Tensor dbg);
+                              int64_t q_len, int64_t bs, int64_t k_s0,
+                              int64_t k_s1, int64_t k_s2, int64_t v_s0,
+                              int64_t v_s1, int64_t v_s2, torch::Tensor dbg);
 
 // gfx906 handwritten speculative-decode attention scan (see
 // csrc/attention/gfx906_prefill_attn.cu): same segment-workspace contract

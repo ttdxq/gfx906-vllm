@@ -210,7 +210,7 @@ def _gfx906_sched_tuning_enabled() -> bool:
 def _log_hip_prefill_scan_once() -> bool:
     logger.info(
         "gfx906 handwritten HIP prefill attention scan enabled "
-        "(single-sequence fp16 head-256/GQA6/page-800 shape)"
+        "(single-sequence fp16 head-256/GQA6 shape, runtime page size)"
     )
     return True
 
@@ -1915,7 +1915,9 @@ def unified_attention(
         and head_size == 256
         and num_query_heads == 24
         and num_kv_heads == 4
-        and block_size == 800
+        # the scanner takes the page size as a runtime parameter; a
+        # 32-token KV tile must never straddle a page (800/832 both qualify)
+        and block_size % 32 == 0
         and q.is_contiguous()
         and k.stride(3) == 1
         and v.stride(3) == 1
@@ -2008,6 +2010,7 @@ def unified_attention(
                 segm_expsum,
                 softmax_scale,
                 q.shape[0],
+                block_size,
                 k.stride(0),
                 k.stride(1),
                 k.stride(2),

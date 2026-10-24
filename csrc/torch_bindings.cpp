@@ -310,7 +310,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor q, Tensor key_cache, Tensor value_cache,"
       "    Tensor block_table, Tensor seq_lens,"
       "    Tensor! segm_output, Tensor! segm_max, Tensor! segm_expsum,"
-      "    float scale, int q_len, int k_s0, int k_s1, int k_s2, "
+      "    float scale, int q_len, int bs, int k_s0, int k_s1, int k_s2, "
       "    int v_s0, int v_s1, int v_s2, Tensor! dbg)"
       " -> ()");
   ops.impl("gfx906_prefill_attn_scan", torch::kCUDA, &gfx906_prefill_attn_scan);

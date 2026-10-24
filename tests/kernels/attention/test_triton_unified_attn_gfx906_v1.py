@@ -168,7 +168,10 @@ def test_v1_unified_attention_gqa6_decode_matches_reference(kv_len: int, num_seq
 
 @pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
 @torch.inference_mode()
-def test_v1_unified_attention_prefill_split_kv_matches_reference(monkeypatch):
+@pytest.mark.parametrize("block_size", [800, 832])
+def test_v1_unified_attention_prefill_split_kv_matches_reference(
+    monkeypatch, block_size
+):
     """Opt-in prefill split-KV (3D) path vs the eager reference."""
     monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_PREFILL_3D", True)
     torch.manual_seed(0)
@@ -176,7 +179,6 @@ def test_v1_unified_attention_prefill_split_kv_matches_reference(monkeypatch):
     dtype = torch.float16
     num_kv_heads, num_queries_per_kv, head_size = 4, 6, 256
     num_q_heads = num_kv_heads * num_queries_per_kv
-    block_size = 800
     # q_len spans multiple 32-row query blocks and several KV tiles so the
     # segment partition is exercised on both sides of a tile boundary
     q_len, kv_len = 1023, 2048

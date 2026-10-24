@@ -1,8 +1,8 @@
 // Handwritten gfx906 prefill attention scan kernel.
 //
 // Replaces the Triton slim scanner on the single-sequence plain-causal
-// fp16-KV head-256/GQA6/800-page shape, writing the same fp32 split-KV
-// segment workspace that reduce_segments combines. fp32 accumulation over
+// fp16-KV head-256/GQA6 shape (runtime page size), writing the same
+// fp32 split-KV segment workspace that reduce_segments combines. fp32 accumulation over
 // fp16 inputs throughout (v_dot2_f32_f16: exact fp16 products, fp32
 // accumulate), identical online-softmax semantics including the
 // m_new == -inf guard.
@@ -43,7 +43,6 @@ constexpr int QHEADS = 24;
 constexpr int KVHEADS = 4;
 constexpr int GQA = 6;
 constexpr int HEAD = 256;
-constexpr int PAGE = 800;
 constexpr int NSEG = 2;
 
 // 16B staging granularity: a TILE x HEAD half tile is TILE * 32 uint4
@@ -120,7 +119,7 @@ __device__ __forceinline__ void kv_stage_vt(const uint4* pre, __half* lds,
 __device__ __forceinline__ const __half* kv_row(
     const __half* base, int s0, int s1, int s2,
     const int* __restrict__ bt, int kvh, int tbase, int nb_tbl, int nb_cache,
-    int* dbg) {
+    int page_sz, int* dbg) {
   // all KV load addresses must stay inside the cache tensor by
   // construction: a stale/torn block-table or seq_lens entry (upstream
   // write racing this kernel) must degrade to wrong data, never to a wild
@@ -131,7 +130,7 @@ __device__ __forceinline__ const __half* kv_row(
   // block table is sized by the longest sequence while page ids index the
   // whole pool, so a table column may legitimately hold an id past the
   // table width
-  int page = tbase / PAGE;
+  int page = tbase / page_sz;
   if ((unsigned)page >= (unsigned)nb_tbl) {
     if (dbg) atomicAdd(dbg, 1);
     page = 0;
@@ -141,8 +140,8 @@ __device__ __forceinline__ const __half* kv_row(
     if (dbg) atomicAdd(dbg + 1, 1);
     pbi = 0;
   }
-  int tin = tbase - page * PAGE;
-  if (tin >= PAGE) {
+  int tin = tbase - page * page_sz;
+  if (tin >= page_sz) {
     if (dbg) atomicAdd(dbg, 1);
     tin = 0;
   }
@@ -182,7 +181,7 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
                            float* __restrict__ segm_out,   // [rows, 24, NSEG, 256]
                            float* __restrict__ segm_max,   // [rows, 24, NSEG]
                            float* __restrict__ segm_expsum,  // [.., NSEG]
-                           const float scale, const int q_len,
+                           const float scale, const int q_len, const int bs,
                            const int nb_tbl, const int nb_cache, const int k_s0,
                            const int k_s1, const int k_s2, const int v_s0,
                            const int v_s1, const int v_s2, int* dbg) {
@@ -302,11 +301,11 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
   // phase A prologue: K(seg_lo) into LDS, V(seg_lo) in flight
   if (a_end > seg_lo) {
     const int t0 = seg_lo * TILE;
-    kv_load<TILE, THREADS>(pre_k, kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, t0, nb_tbl, nb_cache, dbg),
+    kv_load<TILE, THREADS>(pre_k, kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, t0, nb_tbl, nb_cache, bs, dbg),
                            k_s1, tid, t0, INT_MAX);
     kv_stage<TILE, THREADS, KSTRIDE>(pre_k, KV_lds, tid);
     __syncthreads();
-    kv_load<TILE, THREADS>(pre_v, kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, t0, nb_tbl, nb_cache, dbg),
+    kv_load<TILE, THREADS>(pre_v, kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, t0, nb_tbl, nb_cache, bs, dbg),
                            v_s1, tid, t0, INT_MAX);
   }
 
@@ -318,7 +317,7 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     // K(j+1) in flight across the whole QK/softmax/PV cycle
     if (more)
       kv_load<TILE, THREADS>(pre_k,
-                             kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
+                             kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, tnext, nb_tbl, nb_cache, bs, dbg),
                              k_s1, tid, tnext, INT_MAX);
 
     // QK dot (fp32 acc over fp16 inputs): 4x4 (row, col) block on the
@@ -414,7 +413,7 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     // V(j+1) in flight across PV plus the next tile's QK/softmax
     if (more)
       kv_load<TILE, THREADS>(pre_v,
-                             kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
+                             kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, tnext, nb_tbl, nb_cache, bs, dbg),
                              v_s1, tid, tnext, INT_MAX);
     __syncthreads();
 
@@ -450,11 +449,11 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
   // phase B prologue: K(b_beg) into LDS, V(b_beg) in flight
   if (b_beg < seg_hi) {
     const int t0 = b_beg * TILE;
-    kv_load<TILE, THREADS>(pre_k, kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, t0, nb_tbl, nb_cache, dbg),
+    kv_load<TILE, THREADS>(pre_k, kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, t0, nb_tbl, nb_cache, bs, dbg),
                            k_s1, tid, t0, max_prefix);
     kv_stage<TILE, THREADS, KSTRIDE>(pre_k, KV_lds, tid);
     __syncthreads();
-    kv_load<TILE, THREADS>(pre_v, kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, t0, nb_tbl, nb_cache, dbg),
+    kv_load<TILE, THREADS>(pre_v, kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, t0, nb_tbl, nb_cache, bs, dbg),
                            v_s1, tid, t0, max_prefix);
   }
 
@@ -465,7 +464,7 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
 
     if (more)
       kv_load<TILE, THREADS>(pre_k,
-                             kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
+                             kv_row(kc, k_s0, k_s1, k_s2, block_table, kvh, tnext, nb_tbl, nb_cache, bs, dbg),
                              k_s1, tid, tnext, max_prefix);
     // QK dot + causal/query masks (same 4x4 block / d-quarter mapping)
     float s[QK_R][QK_C];
@@ -560,7 +559,7 @@ gfx906_prefill_attn_kernel(const __half* __restrict__ q,  // [q_len, 24, 256]
     kv_stage_vt<TILE, THREADS>(pre_v, KV_lds, tid);
     if (more)
       kv_load<TILE, THREADS>(pre_v,
-                             kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, tnext, nb_tbl, nb_cache, dbg),
+                             kv_row(vc, v_s0, v_s1, v_s2, block_table, kvh, tnext, nb_tbl, nb_cache, bs, dbg),
                              v_s1, tid, tnext, max_prefix);
     __syncthreads();
 
@@ -895,16 +894,22 @@ void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
                               torch::Tensor segm_output,
                               torch::Tensor segm_max,
                               torch::Tensor segm_expsum, double scale,
-                              int64_t q_len, int64_t k_s0, int64_t k_s1,
-                              int64_t k_s2, int64_t v_s0, int64_t v_s1,
-                              int64_t v_s2, torch::Tensor dbg) {
+                              int64_t q_len, int64_t bs, int64_t k_s0,
+                              int64_t k_s1, int64_t k_s2, int64_t v_s0,
+                              int64_t v_s1, int64_t v_s2, torch::Tensor dbg) {
+  constexpr int BM = 64, TILE = 32, TH = 512;
   TORCH_CHECK(q.scalar_type() == at::kHalf, "q must be fp16");
   TORCH_CHECK(key_cache.scalar_type() == at::kHalf, "kv cache must be fp16");
   TORCH_CHECK(q.dim() == 3 && q.size(1) == QHEADS && q.size(2) == HEAD,
               "bad q shape");
-  TORCH_CHECK(key_cache.dim() == 4 && key_cache.size(1) == PAGE &&
+  // the paged cache block size is a runtime parameter (800- and 832-token
+  // pages are both in service); a 32-token KV tile must never straddle a page
+  TORCH_CHECK(key_cache.dim() == 4 && key_cache.size(1) == bs &&
                   key_cache.size(2) == KVHEADS && key_cache.size(3) == HEAD,
               "bad key cache layout");
+  TORCH_CHECK(bs > 0 && bs % TILE == 0,
+              "cache block size must be a positive multiple of the 32-token "
+              "KV tile");
   TORCH_CHECK(value_cache.sizes() == key_cache.sizes(),
               "bad value cache layout");
   // K/V arrive as strided views of the paged cache (e.g. the interleaved
@@ -930,8 +935,6 @@ void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
   const at::cuda::OptionalCUDAGuard guard(device_of(q));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-
-  constexpr int BM = 64, TILE = 32, TH = 512;
   constexpr int BLOCK_Q = BM / GQA;
   dim3 grid((q_len + BLOCK_Q - 1) / BLOCK_Q, KVHEADS, NSEG);
   gfx906_prefill_attn_kernel<BM, TILE, TH>
@@ -941,7 +944,7 @@ void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
           reinterpret_cast<const __half*>(value_cache.data_ptr<at::Half>()),
           block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
           segm_output.data_ptr<float>(), segm_max.data_ptr<float>(),
-          segm_expsum.data_ptr<float>(), (float)scale, (int)q_len,
+          segm_expsum.data_ptr<float>(), (float)scale, (int)q_len, (int)bs,
           (int)block_table.size(1), (int)key_cache.size(0), (int)k_s0, (int)k_s1, (int)k_s2, (int)v_s0, (int)v_s1, (int)v_s2,
           dbg.data_ptr<int>());
 }
