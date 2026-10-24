@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
@@ -2313,10 +2314,13 @@ class GGUFLinearMethod(LinearMethodBase):
             return
         if not hasattr(torch.ops._C, "ggml_planar_pack"):
             return
-        if isinstance(layer, VocabParallelEmbedding):
+        if isinstance(layer, VocabParallelEmbedding) and not isinstance(
+            layer, ParallelLMHead
+        ):
             # Embedding rows are gathered and dequantized per row in the
             # original block layout (_apply_gguf_embedding); only the matmul
-            # kernels can consume the planar layout.
+            # kernels can consume the planar layout. LM heads subclass the
+            # embedding module but only ever run as matmuls, so they pack.
             return
         qweight = layer.qweight
         qweight_type = layer.qweight_type
@@ -2490,6 +2494,35 @@ class GGUFLinearMethod(LinearMethodBase):
         qweight = layer.qweight
         shard_offset_map = getattr(qweight, "shard_offset_map", None)
         if not shard_offset_map:
+            # Mixed-width merged layers keep standalone shard tensors in the
+            # cache from _create_padded_weight_param (no padded concat exists);
+            # repack those in place so the sharded dispatch can route them to
+            # the planar kernels
+            cache = getattr(layer, "_gguf_shard_cache", None)
+            if (
+                cache
+                and _gguf_planar_k_enabled()
+                and hasattr(torch.ops._C, "ggml_planar_pack")
+            ):
+                shard_weight_type = getattr(
+                    getattr(layer, "qweight_type", None), "shard_weight_type", {}
+                )
+                for idx, shard in list(cache.items()):
+                    shard_type = int(shard_weight_type.get(idx, -1))
+                    if (
+                        shard_type in _gguf_planar_k_types()
+                        and shard.is_cuda
+                        and shard.is_contiguous()
+                    ):
+                        type_size = _GGUF_PLANAR_K_TYPE_SIZES[shard_type]
+                        col = shard.shape[1] // type_size * 256
+                        if (
+                            col % 256 == 0
+                            and col > 0
+                            and shard.shape[0] > 0
+                        ):
+                            cache[idx] = torch.ops._C.ggml_planar_pack(
+                                shard, shard_type, shard.shape[0], col)
             return
 
         cache = {}
