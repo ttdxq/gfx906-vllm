@@ -2055,6 +2055,8 @@ class ModelConfig:
 
         available_params = [
             "repetition_penalty",
+            "presence_penalty",
+            "frequency_penalty",
             "temperature",
             "top_k",
             "top_p",
@@ -2084,8 +2086,12 @@ class ModelConfig:
                 scope="local",
             )
 
-        if check_gguf_file(self.model) and getattr(
-            self.hf_config, "model_type", ""
+        # The method is also called unbound on lightweight stand-ins (see
+        # tests/config/test_config_generation.py) that carry only the
+        # generation-config attributes, so these model/config reads must
+        # stay optional.
+        if check_gguf_file(getattr(self, "model", "")) and getattr(
+            getattr(self, "hf_config", None), "model_type", ""
         ) in (
             "qwen3_5",
             "qwen3_5_text",
