@@ -1703,6 +1703,129 @@ static void mul_mat_vec_k45_q8_1_planar_v1_cuda(const void * vx, const void * vy
         <<<nrows, 64, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows);
 }
 
+// Wide-load form: each lane covers a group of 4 consecutive p (p = iqs/2,
+// i.e. 64 weights per lane per superblock). For a group start p0 = 4*g the
+// payload words {p0%4..+3} and {+4..+7} form two 16B-aligned int4 windows in
+// the ql plane, the qh words likewise, and the q8 block pair, the packed
+// scale index and the qh shift (= bq8_offset = 2*g) are group-uniform. The
+// per-p arithmetic mirrors gguf_k45_vec_dot with the q8 d8 scales and u words
+// hoisted out of the t loop (the helper form reloaded them per word).
+template <typename scalar_t, int VECS, bool HAS_QH>
+static __global__ void __launch_bounds__(64)
+mul_mat_vec_k45_q8_1_planar_wide(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
+                                 scalar_t * __restrict__ dst, const int ncols, const int nrows,
+                                 const int dst_stride) {
+    const int row = blockIdx.x;
+    if (row >= nrows) return;
+    const int nb = ncols / QK_K;
+    const int lane = threadIdx.x;
+    constexpr int NG = 4;              // p-groups per superblock (16 p / 4)
+    constexpr int STEP = 16;           // superblocks in flight per block (64/4)
+    const int g = lane % NG;
+    const int bofs = 2 * g;            // bq8_offset = 2*(p0/4)
+    const int qsb = 16 * bofs;         // payload region base byte in the ql plane
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+    float tmp[VECS];
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) tmp[vo] = 0.f;
+    for (int i = lane / NG; i < nb; i += STEP) {
+        // activation: both q8 blocks of the pair, u words 0..7 each
+        float d8[2][VECS];
+        int ua[8][VECS], ub[8][VECS];
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            const block_q8_1 * ya = y + vo * (nrows_y / QK8_1) + i * (QK_K / QK8_1) + bofs;
+            const block_q8_1 * yb = ya + 1;
+            d8[0][vo] = __low2float(ya->ds);
+            d8[1][vo] = __low2float(yb->ds);
+            const int * qa = (const int *)ya->qs;
+            const int * qb = (const int *)yb->qs;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) ua[w][vo] = qa[w];
+#pragma unroll
+            for (int w = 0; w < 8; ++w) ub[w][vo] = qb[w];
+        }
+        {
+            const size_t base = (size_t)row * nb + i;
+            const uint8_t * qlr = vx + gguf_planar_k45<HAS_QH>::ql_off(nrows, nb) + base * 128;
+            const int4 qs0 = *(const int4 *)(qlr + qsb);
+            const int4 qs1 = *(const int4 *)(qlr + qsb + 16);
+            int4 qh0, qh1;
+            if constexpr (HAS_QH) {
+                const uint8_t * qhr = vx + gguf_planar_k45<HAS_QH>::qh_off(nrows, nb) + base * 32;
+                qh0 = *(const int4 *)(qhr);
+                qh1 = *(const int4 *)(qhr + 16);
+            }
+            uint8_t sc4[4];
+            gguf_k45_scales(vx + gguf_planar_k45<HAS_QH>::sc_off(nrows, nb) + base * 12, bofs, sc4);
+            const float2 dmf = __half22float2(
+                *(const half2 *)(vx + gguf_planar_k45<HAS_QH>::dm_off(nrows, nb) + base * 4));
+#pragma unroll
+            for (int vo = 0; vo < VECS; ++vo) {
+                float sumf_d = 0.f;
+                float sumf_m = 0.f;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const int v0 = ((const int *)&qs0)[t];
+                    const int v1 = ((const int *)&qs1)[t];
+                    int vh0 = 0, vh1 = 0;
+                    if constexpr (HAS_QH) {
+                        vh0 = ((const int *)&qh0)[t] >> bofs;
+                        vh1 = ((const int *)&qh1)[t] >> bofs;
+                    }
+#pragma unroll
+                    for (int ii = 0; ii < 2; ++ii) {
+                        const int u0 = ii ? ub[t][vo] : ua[t][vo];
+                        const int u1 = ii ? ub[t + 4][vo] : ua[t + 4][vo];
+                        int v0i, v1i;
+                        if constexpr (HAS_QH) {
+                            v0i = ((v0 >> (4 * ii)) & 0x0F0F0F0F) | (((vh0 >> ii) << 4) & 0x10101010);
+                            v1i = ((v1 >> (4 * ii)) & 0x0F0F0F0F) | (((vh1 >> ii) << 4) & 0x10101010);
+                        } else {
+                            v0i = (v0 >> (4 * ii)) & 0x0F0F0F0F;
+                            v1i = (v1 >> (4 * ii)) & 0x0F0F0F0F;
+                        }
+                        const int dot1 = __dp4a(v0i, u0, __dp4a(v1i, u1, 0));
+                        const int dot2 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
+                        sumf_d += d8[ii][vo] * (dot1 * (ii ? sc4[1] : sc4[0]));
+                        sumf_m += d8[ii][vo] * (dot2 * (ii ? sc4[3] : sc4[2]));
+                    }
+                }
+                tmp[vo] += dmf.x * sumf_d - dmf.y * sumf_m;
+            }
+        }
+    }
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) {
+        float t = tmp[vo];
+#pragma unroll
+        for (int mask = 32; mask > 0; mask >>= 1)
+            t += VLLM_SHFL_XOR_SYNC(t, mask);
+        if (threadIdx.x == 0) dst[vo * dst_stride + row] = t;
+    }
+}
+
+template <typename scalar_t, bool HAS_QH>
+static void mul_mat_vec_k45_q8_1_planar_wide_cuda(const void * vx, const void * vy, scalar_t * dst,
+        const int ncols, const int nrows, const int nvecs, cudaStream_t stream,
+        const int dst_stride = -1) {
+    const int stride = dst_stride < 0 ? nrows : dst_stride;
+    const uint8_t * wx = (const uint8_t *)vx;
+#define K45W_LAUNCH(VECS_)                                                 \
+    do {                                                                   \
+        mul_mat_vec_k45_q8_1_planar_wide<scalar_t, VECS_, HAS_QH>          \
+            <<<nrows, 64, 0, stream>>>(wx, vy, dst, ncols, nrows, stride); \
+    } while (0)
+    switch (nvecs) {
+      case 1:  K45W_LAUNCH(1); break;
+      case 2:  K45W_LAUNCH(2); break;
+      case 3:  K45W_LAUNCH(3); break;
+      default: K45W_LAUNCH(4); break;
+    }
+#undef K45W_LAUNCH
+}
+
 // two rows per block for tall matrices; deliberately NOT software-pipelined:
 // the two-row form already has enough memory-level parallelism and the
 // double-buffered fragment measurably regressed it (register pressure)

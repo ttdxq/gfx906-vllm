@@ -173,12 +173,13 @@ def _gguf_planar_k_enabled() -> bool:
 
 
 # quant types eligible for the planar repack, mapped to their bytes per
-# 256-weight superblock. When the repack is enabled (VLLM_GGUF_KQUANT_PLANAR=1),
-# q4_K and q6_K are packed: their planar kernels win or tie against the
-# incumbent paths on every measured shape (q6_K MMVQ +10%; q4_K pipelined
-# single-row +0-32%). q5_K is bit-exact and wins most shapes (~+5%) but loses
-# ~19% on the 5376x4096-class, so it additionally requires listing in
-# VLLM_GGUF_KQUANT_PLANAR_TYPES (comma-separated WeightType values).
+# 256-weight superblock. When the repack is enabled (VLLM_GGUF_KQUANT_PLANAR=1
+# by default on gfx906), q4_K/q5_K/q6_K are packed and served by the
+# wide-load planar kernels (~460-560 GB/s vs 410-500 for the block-layout
+# paths on decode shapes). q5_K used to stay out of the default set because
+# its old planar kernel lost ~19% on the 5376x4096-class shapes; the wide
+# kernel no longer has that weakness. Override with VLLM_GGUF_KQUANT_PLANAR_TYPES
+# (comma-separated WeightType values).
 _GGUF_PLANAR_K_TYPE_SIZES = {
     int(WeightType.Q4_K): 144,
     int(WeightType.Q5_K): 176,
@@ -188,7 +189,11 @@ _GGUF_PLANAR_K_TYPE_SIZES = {
 
 @lru_cache(maxsize=1)
 def _gguf_planar_k_types() -> frozenset:
-    default = frozenset({int(WeightType.Q4_K), int(WeightType.Q6_K)})
+    default = frozenset({
+        int(WeightType.Q4_K),
+        int(WeightType.Q5_K),
+        int(WeightType.Q6_K),
+    })
     raw = os.getenv("VLLM_GGUF_KQUANT_PLANAR_TYPES")
     if not raw:
         return default

@@ -1037,6 +1037,15 @@ static void ggml_mul_mat_vec_q8_dispatch(
           gguf_planar_is_planar(W)) {
         // q4_K: the software-pipelined single-row form wins or ties on every
         // measured shape; the two-row tile measured 0.72-0.77x interleaved
+        // Wide-load variant first (read per call for in-process A/B): the
+        // 4-consecutive-p group loads reach ~460-540 GB/s on decode shapes.
+        const char* k45_wide_env = std::getenv("VLLM_GGUF_K45_WIDE");
+        const bool k45_wide = k45_wide_env == nullptr || k45_wide_env[0] != '0';
+        if (k45_wide) {
+          mul_mat_vec_k45_q8_1_planar_wide_cuda<scalar_t, false>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        }
         static const int min_rows = [] {
           const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR_MIN_ROWS");
           return env == nullptr ? INT_MAX : std::max(1, std::atoi(env));
@@ -1167,6 +1176,15 @@ static void ggml_mul_mat_vec_q8_dispatch(
     case 13: {
       if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
           gguf_planar_is_planar(W)) {
+        // Wide-load variant first (read per call for in-process A/B): the
+        // 4-consecutive-p group loads reach ~435-560 GB/s on decode shapes.
+        const char* k45_wide_env = std::getenv("VLLM_GGUF_K45_WIDE");
+        const bool k45_wide = k45_wide_env == nullptr || k45_wide_env[0] != '0';
+        if (k45_wide) {
+          mul_mat_vec_k45_q8_1_planar_wide_cuda<scalar_t, true>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        }
         static const int min_rows = [] {
           const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR_MIN_ROWS");
           return env == nullptr ? 1024 : std::max(1, std::atoi(env));
