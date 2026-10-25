@@ -1288,6 +1288,16 @@ static void ggml_mul_mat_vec_q8_dispatch(
       // variant measured ~10% faster than the planar one
       if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
           gguf_planar_is_planar(W)) {
+        // Wide-load planar variant: read per call so an in-process A/B can
+        // flip it without a restart; default on for gfx906 (measured
+        // 610-636 GB/s standalone vs 570-620 for row-tile planar).
+        const char* wide_env = std::getenv("VLLM_GGUF_Q6_K_WIDE");
+        const bool wide = wide_env == nullptr || wide_env[0] != '0';
+        if (wide) {
+          mul_mat_vec_q6_K_q8_1_planar_wide_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        }
         static const int min_rows = [] {
           const char* env = std::getenv("VLLM_GGUF_Q6_K_PLANAR_MIN_ROWS");
           return env == nullptr ? 6144 : std::max(1, std::atoi(env));

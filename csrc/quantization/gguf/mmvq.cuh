@@ -1252,6 +1252,113 @@ static void mul_mat_vec_q6_K_q8_1_planar_row_tile2_cuda(const void * vx, const v
         <<<block_nums, block_dims, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows, nrows);
 }
 
+// Wide-load form: one row per 64-lane block, each lane covers a 4-word group
+// (32 weights). For a group start iqs0 = 4*g the ql window (16B), the qh
+// window (16B), the scale byte pair, the qh shift and the q8 block pair are
+// all group-uniform, so the lane's weights arrive as two fully-consumed int4
+// loads per superblock instead of eight 4B loads (the diagnosis that mattered
+// on gfx906: in-flight bytes per request, not sector efficiency). The word
+// select stays compile-time inside the unrolled t loop -- a runtime index
+// into an int4 makes the compiler split it back into scalar loads. Measured
+// standalone on gfx906: 610-636 GB/s on the main shapes vs 470-510 for the
+// generic kernel and 570-620 for the row-tile planar form; row tiles, a
+// software pipeline, 8-word groups and a q8_1 y-plane all measured slower.
+template <typename scalar_t, int VECS>
+static __global__ void __launch_bounds__(64)
+mul_mat_vec_q6_K_q8_1_planar_wide(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
+                                  scalar_t * __restrict__ dst, const int ncols, const int nrows,
+                                  const int dst_stride) {
+    const int row = blockIdx.x;
+    if (row >= nrows) return;
+    const int nb = ncols / QK_K;
+    const int lane = threadIdx.x;
+    constexpr int NG = 8;              // word groups per superblock (32/4)
+    constexpr int STEP = 8;            // superblocks in flight per block (64/8)
+    const int g = lane % NG;
+    const int iqs0 = 4 * g;
+    const int bofs = 4 * (iqs0 / 16) + (iqs0 % 16) / 8;    // q8 block pair base
+    const int scbase = 8 * (iqs0 / 16) + (iqs0 % 16) / 4;  // scale byte base
+    const int sh = 2 * ((iqs0 % 16) / 8);                  // qh shift
+    const int qlb = 4 * iqs0;                             // 16B-aligned ql window
+    const int qhb = 4 * (8 * (iqs0 / 16) + iqs0 % 8);     // 16B-aligned qh window
+    const int uw0 = iqs0 % 8;                             // first u word (0 or 4)
+    const size_t base = (size_t)row * nb;
+    const uint8_t * qlr = vx + gguf_planar_q6_k::ql_off(nrows, nb) + base * 128;
+    const uint8_t * qhr = vx + gguf_planar_q6_k::qh_off(nrows, nb) + base * 64;
+    const uint8_t * scr = vx + gguf_planar_q6_k::sc_off(nrows, nb) + base * 16;
+    const __half * dr = (const __half *)(vx + gguf_planar_q6_k::d_off(nrows, nb)) + base;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+    float tmp[VECS];
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) tmp[vo] = 0.f;
+    for (int i = lane / NG; i < nb; i += STEP) {
+        const int4 qlg = *(const int4 *)(qlr + i * 128 + qlb);
+        const int4 qhg = *(const int4 *)(qhr + i * 64 + qhb);
+        const int8_t * sc = (const int8_t *)scr + i * 16 + scbase;
+        const float d = __half2float(dr[i]);
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            const block_q8_1 * ya = y + vo * (nrows_y / QK8_1) + i * (QK_K / QK8_1) + bofs;
+            const block_q8_1 * yb = ya + 2;
+            const float d8a = __half2float(__low2half(ya->ds));
+            const float d8b = __half2float(__low2half(yb->ds));
+            float blk = 0.f;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int u0 = get_int_from_int8_aligned(ya->qs, uw0 + t);
+                const int u1 = get_int_from_int8_aligned(yb->qs, uw0 + t);
+                const int vl = ((const int *)&qlg)[t];
+                const int vhk = ((const int *)&qhg)[t] >> sh;
+                const float sumf =
+                    d8a * (__dp4a(gguf_q6_psub32((vl & 0x0F0F0F0F) | ((vhk << 4) & 0x30303030)), u0, 0) * sc[0]) +
+                    d8b * (__dp4a(gguf_q6_psub32(((vl >> 4) & 0x0F0F0F0F) | (((vhk >> 4) << 4) & 0x30303030)), u1, 0) * sc[4]);
+                blk += sumf;
+            }
+            tmp[vo] += d * blk;
+        }
+    }
+#pragma unroll
+    for (int mask = 32; mask > 0; mask >>= 1) {
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            tmp[vo] += VLLM_SHFL_XOR_SYNC(tmp[vo], mask);
+        }
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            dst[vo * dst_stride + row] = tmp[vo];
+        }
+    }
+}
+
+template <typename scalar_t>
+static void mul_mat_vec_q6_K_q8_1_planar_wide_cuda(const void * vx, const void * vy, scalar_t * dst,
+        const int ncols, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
+    const dim3 block_nums(nrows, 1, 1);
+    const dim3 block_dims(64, 1, 1);
+    const int stride = dst_stride < 0 ? nrows : dst_stride;
+    switch (nvecs) {
+      case 1:
+        mul_mat_vec_q6_K_q8_1_planar_wide<scalar_t, 1>
+            <<<block_nums, block_dims, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows, stride);
+        break;
+      case 2:
+        mul_mat_vec_q6_K_q8_1_planar_wide<scalar_t, 2>
+            <<<block_nums, block_dims, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows, stride);
+        break;
+      case 3:
+        mul_mat_vec_q6_K_q8_1_planar_wide<scalar_t, 3>
+            <<<block_nums, block_dims, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows, stride);
+        break;
+      default:
+        mul_mat_vec_q6_K_q8_1_planar_wide<scalar_t, 4>
+            <<<block_nums, block_dims, 0, stream>>>((const uint8_t *)vx, vy, dst, ncols, nrows, stride);
+        break;
+    }
+}
+
 
 template <typename scalar_t>
 static __global__ void __launch_bounds__(64)
