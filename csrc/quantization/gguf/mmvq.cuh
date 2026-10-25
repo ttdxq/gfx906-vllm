@@ -2086,6 +2086,100 @@ static void mul_mat_vec_iq4_xs_q8_1_cuda(const void * vx, const void * vy, scala
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
+// Wide-load form on the ORIGINAL block layout (no planar repack needed): the
+// 136-byte block stride keeps every payload window 8-byte aligned, so each
+// lane covers one whole 32-weight group (16B payload = 2x u64, one q8_1
+// block, one 6-bit scale). Lanes j = lane%8 tile the superblock's 128B
+// payload contiguously; the gfx906 v_perm lattice lookup keeps the per-weight
+// cost at the dp4a level. Same dp4a chain order as vec_dot_iq4_xs_q8_1, so
+// only the final float reduction order differs.
+template <typename scalar_t, int VECS>
+static __global__ void __launch_bounds__(64)
+mul_mat_vec_iq4xs_q8_1_wide(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
+                            scalar_t * __restrict__ dst, const int ncols, const int nrows,
+                            const int dst_stride) {
+    const int row = blockIdx.x;
+    if (row >= nrows) return;
+    const int nb = ncols / QK_K;
+    const int lane = threadIdx.x;
+    const int j = lane & 7;              // 32-weight group inside the superblock
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+    float tmp[VECS];
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) tmp[vo] = 0.f;
+    for (int i = lane >> 3; i < nb; i += 8) {
+        float d8[VECS];
+        int q8w[8][VECS];
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            const block_q8_1 * y8 = y + (size_t)vo * (nrows_y / QK8_1) + i * (QK_K / QK8_1) + j;
+            d8[vo] = __low2float(y8->ds);
+            const int * qa = (const int *)y8->qs;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) q8w[w][vo] = qa[w];
+        }
+        {
+            const uint8_t * wrow = vx + (size_t)row * nb * sizeof(block_iq4_xs);
+            // 8B header: d | scales_h | scales_l[4], 8-byte aligned (136 % 8 == 0)
+            const unsigned long long hd =
+                *(const unsigned long long *)(wrow + (size_t)i * sizeof(block_iq4_xs));
+            const uint32_t lo = (uint32_t)hd;
+            const uint32_t hi = (uint32_t)(hd >> 32);
+            const int ls = (int)(((hi >> (8 * (j >> 1) + 4 * (j & 1))) & 0x0F)
+                                 | ((((lo >> 16) >> (2 * j)) & 0x03) << 4));
+            const float d = __half2float(__ushort_as_half((unsigned short)lo)) * (ls - 32);
+            // payload window: 16B at block+8+16*j, 8-byte aligned
+            const uint8_t * pw = wrow + (size_t)i * sizeof(block_iq4_xs) + 8 + 16 * j;
+            const unsigned long long q0 = *(const unsigned long long *)pw;
+            const unsigned long long q1 = *(const unsigned long long *)(pw + 8);
+#pragma unroll
+            for (int vo = 0; vo < VECS; ++vo) {
+                int sumi = 0;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const uint32_t aux = (uint32_t)(t == 0 ? q0 : t == 1 ? (q0 >> 32)
+                                                        : t == 2 ? q1 : (q1 >> 32));
+                    const int v1 = lookup_iq4nl_values_gfx906(aux & 0x0F0F0F0F);
+                    const int v2 = lookup_iq4nl_values_gfx906((aux >> 4) & 0x0F0F0F0F);
+                    sumi = __dp4a(v1, q8w[t][vo], sumi);
+                    sumi = __dp4a(v2, q8w[t + 4][vo], sumi);
+                }
+                tmp[vo] += d * (d8[vo] * (float)sumi);
+            }
+        }
+    }
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) {
+        float t = tmp[vo];
+#pragma unroll
+        for (int mask = 32; mask > 0; mask >>= 1)
+            t += VLLM_SHFL_XOR_SYNC(t, mask);
+        if (threadIdx.x == 0) dst[vo * dst_stride + row] = t;
+    }
+}
+
+template <typename scalar_t>
+static void mul_mat_vec_iq4xs_q8_1_wide_cuda(const void * vx, const void * vy, scalar_t * dst,
+        const int ncols, const int nrows, const int nvecs, cudaStream_t stream,
+        const int dst_stride = -1) {
+    const int stride = dst_stride < 0 ? nrows : dst_stride;
+    const uint8_t * wx = (const uint8_t *)vx;
+#define IQ4W_LAUNCH(VECS_)                                                  \
+    do {                                                                    \
+        mul_mat_vec_iq4xs_q8_1_wide<scalar_t, VECS_>                        \
+            <<<nrows, 64, 0, stream>>>(wx, vy, dst, ncols, nrows, stride);  \
+    } while (0)
+    switch (nvecs) {
+      case 1:  IQ4W_LAUNCH(1); break;
+      case 2:  IQ4W_LAUNCH(2); break;
+      case 3:  IQ4W_LAUNCH(3); break;
+      default: IQ4W_LAUNCH(4); break;
+    }
+#undef IQ4W_LAUNCH
+}
+
+
 template<typename scalar_t>
 static void mul_mat_vec_iq3_s_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, const int dst_stride = -1) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;

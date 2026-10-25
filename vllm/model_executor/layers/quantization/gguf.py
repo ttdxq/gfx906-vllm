@@ -104,8 +104,12 @@ ENABLE_GGUF_LINEAR_PROFILE = _env_flag("VLLM_GGUF_LINEAR_PROFILE", False)
 ENABLE_GGUF_FORCE_DEQUANT_MATMUL = _env_flag(
     "VLLM_GGUF_FORCE_DEQUANT_MATMUL", False
 )
+# The repack doubles iq4_xs weight bytes (x2.09 VRAM) and its q8_0 decode
+# speed only reaches ~300-360 GB/s of effective (original-byte) bandwidth on
+# gfx906, below the native iq4_xs paths (~440-600 GB/s). Off by default; set
+# VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0=1 to restore the repacked layout.
 ENABLE_GGUF_REPACK_IQ4_XS_TO_Q8_0 = _env_flag(
-    "VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0", True
+    "VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0", False
 )
 
 _GGUF_Q8_1_BUFFER_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}

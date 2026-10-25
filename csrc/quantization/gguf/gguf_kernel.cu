@@ -1446,10 +1446,23 @@ static void ggml_mul_mat_vec_q8_dispatch(
       mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
       break;
-    case 23:
+    case 23: {
+      // Wide-load variant (read per call for in-process A/B): reads the
+      // original 136-byte blocks with 8B-aligned u64 pairs. It wins 22-26% on
+      // narrow-column shapes whose q8 activation vector stays L1-resident
+      // (~1.125 B/col-element, threshold at 8192) and loses ~14% on wide
+      // columns where the scattered q8 loads fall out to L2, so route by
+      // shape. VLLM_GGUF_IQ4XS_WIDE=0 restores the generic template everywhere.
+      const char* iq4w_env = std::getenv("VLLM_GGUF_IQ4XS_WIDE");
+      if (col <= 8192 && (iq4w_env == nullptr || iq4w_env[0] != '0')) {
+        mul_mat_vec_iq4xs_q8_1_wide_cuda<scalar_t>(
+            W, quant_X, dst, col, row, vecs, stream, dst_stride);
+        break;
+      }
       mul_mat_vec_iq4_xs_q8_1_cuda<scalar_t>(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
       break;
+    }
     case 29:
       mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
