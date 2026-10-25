@@ -147,15 +147,18 @@ def _gguf_gfx906_q6_mmvq_max_batch() -> int:
 @lru_cache(maxsize=1)
 def _gguf_planar_k_enabled() -> bool:
     # family switch for the plane-repacked K-quants (q4_K/q5_K/q6_K);
-    # VLLM_GGUF_Q6_K_PLANAR is kept as a legacy alias. Off by default: the
-    # repack buys a few percent of decode GEMV bandwidth at the cost of a
-    # longer load path and extra care around routing windows; opt in via
-    # VLLM_GGUF_KQUANT_PLANAR=1 (or VLLM_GGUF_Q6_K_PLANAR=1).
+    # VLLM_GGUF_Q6_K_PLANAR is kept as a legacy alias. On by default on
+    # gfx906: the wide-load q6_K MMVQ kernel on the planar layout raises the
+    # q6_K decode GEMV family from ~410-500 to ~500-670 GB/s and end-to-end
+    # decode by 5-7% on Q6_K models, and the per-tensor pack plus the
+    # post-layer empty_cache measurably enlarge the KV budget (61,352 vs
+    # 38,345 tokens on a 27B Q6_K model at the same utilization). Opt out
+    # via VLLM_GGUF_KQUANT_PLANAR=0 (or VLLM_GGUF_Q6_K_PLANAR=0).
     legacy = os.getenv("VLLM_GGUF_Q6_K_PLANAR")
     if legacy is not None:
         if not _env_flag("VLLM_GGUF_Q6_K_PLANAR", True):
             return False
-    elif not _env_flag("VLLM_GGUF_KQUANT_PLANAR", False):
+    elif not _env_flag("VLLM_GGUF_KQUANT_PLANAR", True):
         return False
     if ENABLE_GGUF_FORCE_DEQUANT_MATMUL:
         return False
