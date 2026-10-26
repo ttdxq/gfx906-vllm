@@ -867,3 +867,56 @@ static void ggml_mul_mat_q6_K_q8_1_cuda(
         }
     }
 }
+
+
+#if defined(USE_ROCM)
+// mmq_y=128 like the K-quants; the 64 value-word rows make the weight tile
+// ~33KB so one block is resident per CU either way, but the 2-block launch
+// bound is kept: its 128-register cap is what keeps the vec_dot from
+// spilling to scratch (measured 26x slower without it on gfx906).
+#define  MMQ_X_IQ4_XS 64
+#define  MMQ_Y_IQ4_XS 128
+#define NWARPS_IQ4_XS 8
+#else
+#define  MMQ_X_IQ4_XS 4
+#define  MMQ_Y_IQ4_XS 32
+#define NWARPS_IQ4_XS 4
+#endif
+
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*NWARPS_IQ4_XS, 2)
+#endif
+mul_mat_iq4_xs(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  =  MMQ_X_IQ4_XS;
+    const int mmq_y  =  MMQ_Y_IQ4_XS;
+    const int nwarps = NWARPS_IQ4_XS;
+
+    mul_mat_q<scalar_t, QK_K, QR4_XS, QI4_XS, false, block_iq4_xs, mmq_x, mmq_y, nwarps, allocate_tiles_iq4_xs<mmq_y>,
+        load_tiles_iq4_xs<mmq_y, nwarps, need_check>, VDR_IQ4_XS_Q8_1_MMQ, vec_dot_iq4_xs_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+template<typename scalar_t>
+static void ggml_mul_mat_iq4_xs_q8_1_cuda(
+    const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    const int mmq_x  =  MMQ_X_IQ4_XS;
+    const int mmq_y  =  MMQ_Y_IQ4_XS;
+    const int nwarps = NWARPS_IQ4_XS;
+
+    const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+    const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+    if (nrows_x % mmq_y == 0) {
+        mul_mat_iq4_xs<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+            (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+    } else {
+        mul_mat_iq4_xs<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+            (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+    }
+}

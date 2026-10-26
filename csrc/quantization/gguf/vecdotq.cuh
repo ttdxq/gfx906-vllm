@@ -2371,6 +2371,117 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
 }
 
 
+#define VDR_IQ4_XS_Q8_1_MMQ 8
+
+// value-word lookup for the iq4_xs/iq4_nl lattice: nibbles hold indices into
+// kvalues_iq4nl; on gfx906 the 3-perm trick resolves them register-only,
+// elsewhere a byte LUT is used
+static __device__ __forceinline__ int iq4xs_lookup_word(const uint32_t nibbles) {
+#if defined(USE_ROCM) && defined(__gfx906__)
+    return lookup_iq4nl_values_gfx906(nibbles);
+#else
+    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
+    int out;
+    uint8_t * ob = (uint8_t *)&out;
+    const uint8_t * nb = (const uint8_t *)&nibbles;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) ob[t] = values[nb[t]];
+    return out;
+#endif
+}
+
+// MMQ tiles for iq4_xs. The payload word k (bytes 4k..4k+3 of the 128-byte
+// block payload) dequantizes to TWO consecutive 4-weight words: the lo
+// nibbles are weights 32*(k/4) + 4*(k%4) .. +3 and the hi nibbles the same
+// +16 (see dequantize_block_iq4_xs), so after the lattice lookup both words
+// are directly dp4a-able against consecutive q8_1 words. Tile layout per row:
+//   x_ql[i*(2W+1) + m]       = lo-nibble value word of payload word m
+//   x_ql[i*(2W+1) + W + m]   = hi-nibble value word of payload word m
+//   x_sc (as float*)[i*8+g]  = d * (ls_g - 32) per 32-weight group
+template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_iq4_xs(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+    __shared__ int   tile_x_ql[mmq_y * (2*WARP_SIZE_GGUF) + mmq_y];
+    __shared__ int   tile_x_sc[mmq_y * 8];
+    __shared__ half2 tile_x_dm[1];   // unused, satisfies the pointer contract
+
+    *x_ql = tile_x_ql;
+    *x_dm = tile_x_dm;
+    *x_qh = nullptr;
+    *x_sc = tile_x_sc;
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq4_xs(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm;
+    (void)x_qh;
+
+    const block_iq4_xs * bx0 = (const block_iq4_xs *) vx;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_iq4_xs * bxi = bx0 + i*blocks_per_row;   // kbx == 0: QI4_XS == WARP_SIZE
+        const int pw = get_int_from_uint8(bxi->qs, k);
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + k]                     = iq4xs_lookup_word(pw & 0x0F0F0F0F);
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + WARP_SIZE_GGUF + k]   = iq4xs_lookup_word((pw >> 4) & 0x0F0F0F0F);
+    }
+
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        if (k < 8) {
+            const block_iq4_xs * bxi = bx0 + i*blocks_per_row;
+            const int ls = ((bxi->scales_l[k >> 1] >> (4*(k & 1))) & 0x0F)
+                         | (((bxi->scales_h >> (2*k)) & 0x03) << 4);
+            x_scf[i*8 + k] = __half2float(bxi->d) * (ls - 32);
+        }
+    }
+}
+
+static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+    (void)x_dm;
+    (void)x_qh;
+
+    const float * scf  = (const float *) x_sc;
+    const float * y_df = (const float *) y_ds;   // need_sum == false: pre-cast ds.x
+
+    const int * ql = &x_ql[i * (2*WARP_SIZE_GGUF + 1)];
+    const int * yq = &y_qs[j * WARP_SIZE_GGUF];
+
+    // payload words k..k+7; the slab-local offset (k & 15) is either 0 or 8
+    int sumi[2] = {0, 0};
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int m  = k + l;                 // global payload word index in the block
+        // quad (4 weights) covered by payload word m inside the 128-weight slab
+        const int qa = ((k & 15) << 1) + l + 4*(l >> 2);
+        const int s  = __dp4a(ql[WARP_SIZE_GGUF + m], yq[qa + 4],
+                              __dp4a(ql[m], yq[qa], 0));
+        sumi[l >> 2] += s;
+    }
+
+    const int ir = k >> 4;          // slab (0 or 1) within the 256-weight block
+    const int g0 = 4*ir + ((k & 15) >> 2);
+    const int d8 = ((k & 15) >> 2); // q8_1 block index within the 4-block slab
+
+    return y_df[j*(WARP_SIZE_GGUF/QI8_1) + d8 + 0] * (scf[i*8 + g0 + 0] * (float)sumi[0])
+         + y_df[j*(WARP_SIZE_GGUF/QI8_1) + d8 + 1] * (scf[i*8 + g0 + 1] * (float)sumi[1]);
+}
+
 #define VDR_IQ4_XS_Q8_1_MMVQ 4
 
 static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
