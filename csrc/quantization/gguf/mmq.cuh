@@ -920,3 +920,61 @@ static void ggml_mul_mat_iq4_xs_q8_1_cuda(
             (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
     }
 }
+
+
+// gfx906 i-quant family MMQ: same tile geometry as iq4_xs (mmq_x=64,
+// mmq_y=128, 8 warps, 2-block launch bound for the 128-register cap). The
+// x_ql/x_sc strides differ per type (value words vs packed iq1_m words,
+// 4/8/16/64 scale slots) and are baked into each allocator instantiation.
+
+#define  MMQ_X_IQ 64
+#define  MMQ_Y_IQ 128
+#define NWARPS_IQ 8
+
+#define DEFINE_MUL_MAT_IQ(NAME, BLOCK_T, LOADER, VECDOT, QLSTR, SCSTR, NEED_SUM)        \
+template<typename scalar_t, bool need_check> static __global__ void                     \
+__launch_bounds__(WARP_SIZE_GGUF*NWARPS_IQ, 2)                                          \
+NAME(                                                                                    \
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst, \
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) { \
+    mul_mat_q<scalar_t, QK_K, QR4_XS, QI4_XS, NEED_SUM, BLOCK_T, MMQ_X_IQ, MMQ_Y_IQ, NWARPS_IQ, \
+        allocate_tiles_iq<MMQ_Y_IQ, QLSTR, SCSTR>,                                       \
+        LOADER<MMQ_Y_IQ, NWARPS_IQ, need_check>, VDR_IQ_Q8_1_MMQ, VECDOT>                \
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);                    \
+}
+
+DEFINE_MUL_MAT_IQ(mul_mat_iq4_nl,  block_iq4_nl_x8, load_tiles_iq4_nl,  vec_dot_iq_v4_mul_mat,  2*WARP_SIZE_GGUF + 1, 8, false)
+DEFINE_MUL_MAT_IQ(mul_mat_iq2_xxs, block_iq2_xxs,   load_tiles_iq2_xxs, vec_dot_iq_v4_mul_mat,  2*WARP_SIZE_GGUF + 1, 8, false)
+DEFINE_MUL_MAT_IQ(mul_mat_iq2_xs,  block_iq2_xs,    load_tiles_iq2_xs,  vec_dot_iq_v8_mul_mat,  2*WARP_SIZE_GGUF + 1, 16, false)
+DEFINE_MUL_MAT_IQ(mul_mat_iq2_s,   block_iq2_s,     load_tiles_iq2_s,   vec_dot_iq_v8_mul_mat,  2*WARP_SIZE_GGUF + 1, 16, false)
+DEFINE_MUL_MAT_IQ(mul_mat_iq3_xxs, block_iq3_xxs,   load_tiles_iq3_xxs, vec_dot_iq_v4_mul_mat,  2*WARP_SIZE_GGUF + 1, 8, false)
+DEFINE_MUL_MAT_IQ(mul_mat_iq3_s,   block_iq3_s,     load_tiles_iq3_s,   vec_dot_iq_v4_mul_mat,  2*WARP_SIZE_GGUF + 1, 8, false)
+DEFINE_MUL_MAT_IQ(mul_mat_iq1_s,   block_iq1_s,     load_tiles_iq1_s,   vec_dot_iq1_s_mul_mat,  2*WARP_SIZE_GGUF + 1, 16, true)
+DEFINE_MUL_MAT_IQ(mul_mat_iq1_m,   block_iq1_m,     load_tiles_iq1_m,   vec_dot_iq1_m_mul_mat,  WARP_SIZE_GGUF + 1,   64, false)
+
+#define DEFINE_GGML_MUL_MAT_IQ_CUDA(NAME, KERNEL)                                       \
+template<typename scalar_t>                                                             \
+static void NAME(                                                                       \
+    const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x, \
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {   \
+    const int block_num_x = (nrows_x + MMQ_Y_IQ - 1) / MMQ_Y_IQ;                        \
+    const int block_num_y = (ncols_y + MMQ_X_IQ - 1) / MMQ_X_IQ;                        \
+    const dim3 block_nums(block_num_x, block_num_y, 1);                                 \
+    const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);                                \
+    if (nrows_x % MMQ_Y_IQ == 0) {                                                      \
+        KERNEL<scalar_t, false><<<block_nums, block_dims, 0, stream>>>                  \
+            (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);               \
+    } else {                                                                            \
+        KERNEL<scalar_t, true><<<block_nums, block_dims, 0, stream>>>                   \
+            (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);               \
+    }                                                                                   \
+}
+
+DEFINE_GGML_MUL_MAT_IQ_CUDA(ggml_mul_mat_iq4_nl_q8_1_cuda,  mul_mat_iq4_nl)
+DEFINE_GGML_MUL_MAT_IQ_CUDA(ggml_mul_mat_iq2_xxs_q8_1_cuda, mul_mat_iq2_xxs)
+DEFINE_GGML_MUL_MAT_IQ_CUDA(ggml_mul_mat_iq2_xs_q8_1_cuda,  mul_mat_iq2_xs)
+DEFINE_GGML_MUL_MAT_IQ_CUDA(ggml_mul_mat_iq2_s_q8_1_cuda,   mul_mat_iq2_s)
+DEFINE_GGML_MUL_MAT_IQ_CUDA(ggml_mul_mat_iq3_xxs_q8_1_cuda, mul_mat_iq3_xxs)
+DEFINE_GGML_MUL_MAT_IQ_CUDA(ggml_mul_mat_iq3_s_q8_1_cuda,   mul_mat_iq3_s)
+DEFINE_GGML_MUL_MAT_IQ_CUDA(ggml_mul_mat_iq1_s_q8_1_cuda,   mul_mat_iq1_s)
+DEFINE_GGML_MUL_MAT_IQ_CUDA(ggml_mul_mat_iq1_m_q8_1_cuda,   mul_mat_iq1_m)

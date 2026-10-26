@@ -856,12 +856,45 @@ IMATRIX_QUANT_TYPES = {
     WeightType.IQ4_XS,
     WeightType.IQ4_NL,
 }
-# TODO(Isotr0py): Currently, we don't have MMQ kernel for I-Matrix quantization.
-# Consolidate DEQUANT_TYPES, MMVQ_QUANT_TYPES and MMQ_QUANT_TYPES after we add
-# MMQ kernel for I-Matrix quantization.
+# I-Matrix types with a native MMQ kernel. On gfx906 these kernels beat the
+# dequant+GEMM fallback only on k-heavy shapes (k > n), so their routing is
+# shape-gated in _fused_mul_mat_gguf.
+IQ_MMQ_QUANT_TYPES = {
+    WeightType.IQ1_M,
+    WeightType.IQ1_S,
+    WeightType.IQ2_XXS,
+    WeightType.IQ2_XS,
+    WeightType.IQ2_S,
+    WeightType.IQ3_XXS,
+    WeightType.IQ3_S,
+    WeightType.IQ4_NL,
+}
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS}
+# Q8_1 has no MMQ dispatch case (and never appears as a real weight type);
+# keep it out so a hypothetical routing mistake cannot hit a silent no-op.
+MMQ_QUANT_TYPES = (
+    (STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES)
+) - {WeightType.Q8_1}
+
+
+def _iq_mmq_beats_dequant(x: torch.Tensor, qweight: torch.Tensor,
+                          qweight_type: int) -> bool:
+    """Shape gate for the i-quant MMQ kernels.
+
+    gfx906 measurements at 256/2048-token batches: the dp4a MMQ kernels beat
+    the dequant+fp16-GEMM fallback on k-heavy tensors (k > n, e.g. down-proj
+    [5120, 17408]) at every batch size, but lose on tall tensors where the
+    matrix-core GEMM dominates (even at batch 256). iq4_nl additionally
+    needs k % 256 == 0 because its loader treats eight 32-weight blocks as
+    one 256-weight unit. iq1_m's per-word float dot loses on both
+    orientations, so it stays on the fallback until it is restructured.
+    """
+    if qweight_type == WeightType.IQ1_M:
+        return False
+    if qweight_type == WeightType.IQ4_NL and x.shape[1] % 256 != 0:
+        return False
+    return x.shape[1] > qweight.shape[0]
 
 
 def _fused_mul_mat_gguf(
@@ -903,12 +936,18 @@ def _fused_mul_mat_gguf(
             )
         else:
             y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Use MMQ Kernel if it's available (standard + k-quants)
-    elif qweight_type in MMQ_QUANT_TYPES:
+    # Use MMQ Kernel if it's available (standard + k-quants); the shape-gated
+    # i-quant kernels fall back to dequantize on shapes where the fp16 GEMM
+    # path is faster
+    elif qweight_type in MMQ_QUANT_TYPES and (
+        qweight_type not in IQ_MMQ_QUANT_TYPES
+        or _iq_mmq_beats_dequant(x, qweight, qweight_type)
+    ):
         if ENABLE_GGUF_LINEAR_PROFILE:
             _gguf_linear_profile_hit("single_mmq", x, [qweight], [qweight_type])
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
-    # If there is no available MMQ kernel, fallback to dequantize
+    # If there is no available MMQ kernel (or the shape gate sent an i-quant
+    # here), fallback to dequantize
     elif qweight_type in DEQUANT_TYPES:
         if ENABLE_GGUF_LINEAR_PROFILE:
             _gguf_linear_profile_hit("single_dequant", x, [qweight], [qweight_type])
