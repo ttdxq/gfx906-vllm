@@ -1419,33 +1419,97 @@ static void ggml_mul_mat_vec_q8_dispatch(
       break;
     }
     case 16:
-      mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 17:
-      mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 18:
-      mul_mat_vec_iq3_xxs_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 19:
-      mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 20:
-      mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 21:
-      mul_mat_vec_iq3_s_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 22:
-      mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+    case 29: {
+      // Wide-load i-quant GEMV (decode path): decodes one whole 32-weight
+      // group per lane instead of the generic per-vec_dot template, which
+      // runs these types at 70-155 GB/s on gfx906. VLLM_GGUF_IQ_WIDE=0
+      // restores the generic templates.
+      // wide wins consistently only for these four; iq2_xxs/iq1_s are
+      // latency-bound at ~2bpw and the generic template matches them,
+      // iq4_nl/iq1_m are shape-mixed (measured on gfx906)
+      const bool iq_wide_type =
+          type == 17 || type == 18 || type == 21 || type == 22;
+      const char* iq_wide_env = std::getenv("VLLM_GGUF_IQ_WIDE");
+      if (iq_wide_type && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          (iq_wide_env == nullptr || iq_wide_env[0] != '0')) {
+        switch (type) {
+          case 16:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq2_xxs>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 17:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq2_xs>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 18:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq3_xxs>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 19:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq1_s>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 20:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq4_nl>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 21:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq3_s>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 22:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq2_s>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 29:
+            mul_mat_vec_iq1m_wide_cuda<scalar_t>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+        }
+        break;
+      }
+      switch (type) {
+        case 16:
+          mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 17:
+          mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 18:
+          mul_mat_vec_iq3_xxs_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 19:
+          mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 20:
+          mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 21:
+          mul_mat_vec_iq3_s_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 22:
+          mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 29:
+          mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+      }
       break;
+    }
     case 23: {
       // Wide-load variant (read per call for in-process A/B): reads the
       // original 136-byte blocks with 8B-aligned u64 pairs. It wins 22-26% on
@@ -1463,10 +1527,6 @@ static void ggml_mul_mat_vec_q8_dispatch(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
       break;
     }
-    case 29:
-      mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
   }
 }
 

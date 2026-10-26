@@ -2188,3 +2188,326 @@ static void mul_mat_vec_iq3_s_q8_1_cuda(const void * vx, const void * vy, scalar
     mul_mat_vec_q<scalar_t, QK_K, QI3_XS, block_iq3_s, 1, vec_dot_iq3_s_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
+
+// ---------------------------------------------------------------------------
+// gfx906 wide-load MMVQ for the i-quant family (iq2_xxs/xs/s, iq3_xxs/s,
+// iq4_nl, iq1_s). Same skeleton as mul_mat_vec_iq4xs_q8_1_wide: 64 lanes,
+// lane j = 32-weight group inside the superblock, superblocks warp-strided,
+// activation staged into registers, butterfly shuffle reduce. The per-group
+// weight decode is plugged in through a decoder type; the decode math is the
+// one validated by the MMQ loaders (grid lookups + SIMD sign negation).
+//
+// MODE 0 (SINGLE): one scale per 32 weights -> one integer accumulator
+// MODE 1 (DUAL):   16-weight scale granularity (iq2_xs / iq2_s)
+// MODE 2 (IQ1S):   d1q scale pair; the delta term consumes the q8_1 block
+//                  sum (ds.y) like the MMVQ reference
+
+template <typename scalar_t, int VECS, typename DEC>
+static __global__ void __launch_bounds__(64)
+mul_mat_vec_iq_wide(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
+                    scalar_t * __restrict__ dst, const int ncols, const int nrows,
+                    const int dst_stride) {
+    const int row = blockIdx.x;
+    if (row >= nrows) return;
+    const int nb = ncols / QK_K;
+    const int lane = threadIdx.x;
+    const int j = lane & 7;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+    const uint8_t * wrow = vx + (size_t)row * nb * DEC::BLOCK_BYTES;
+    float tmp[VECS];
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) tmp[vo] = 0.f;
+    for (int i = lane >> 3; i < nb; i += 8) {
+        float d8[VECS], d8y[VECS];
+        int q8w[8][VECS];
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            const block_q8_1 * y8 = y + (size_t)vo * (nrows_y / QK8_1) + i * (QK_K / QK8_1) + j;
+            const half2 ds = y8->ds;
+            d8[vo]  = __low2float(ds);
+            d8y[vo] = __high2float(ds);
+            const int * qa = (const int *)y8->qs;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) q8w[w][vo] = qa[w];
+        }
+        int vw[8];
+        float s0, s1;
+        DEC::group(wrow, i, j, vw, s0, s1);
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            if (DEC::MODE == 0) {
+                int sumi = 0;
+#pragma unroll
+                for (int w = 0; w < 8; ++w) sumi = __dp4a(vw[w], q8w[w][vo], sumi);
+                tmp[vo] += d8[vo] * (s0 * (float)sumi);
+            } else if (DEC::MODE == 1) {
+                int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+                for (int w = 0; w < 4; ++w)
+                    sumi0 = __dp4a(vw[w], q8w[w][vo], sumi0);
+#pragma unroll
+                for (int w = 4; w < 8; ++w)
+                    sumi1 = __dp4a(vw[w], q8w[w][vo], sumi1);
+                tmp[vo] += d8[vo] * (s0 * (float)sumi0 + s1 * (float)sumi1);
+            } else {
+                int sumi = 0;
+#pragma unroll
+                for (int w = 0; w < 8; ++w) sumi = __dp4a(vw[w], q8w[w][vo], sumi);
+                tmp[vo] += d8[vo] * (s0 * (float)sumi) + d8y[vo] * s1;
+            }
+        }
+    }
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) {
+        float t = tmp[vo];
+#pragma unroll
+        for (int mask = 32; mask > 0; mask >>= 1)
+            t += VLLM_SHFL_XOR_SYNC(t, mask);
+        if (threadIdx.x == 0) dst[vo * dst_stride + row] = t;
+    }
+}
+
+// iq1_m wide: the packed iq1s grid word stays packed (nibble planes unpacked
+// here) and the scale/delta pairs are per 8-weight word, so the dot mixes
+// ints and floats word by word, exactly like the MMQ kernel
+template <typename scalar_t, int VECS>
+static __global__ void __launch_bounds__(64)
+mul_mat_vec_iq1m_wide(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
+                      scalar_t * __restrict__ dst, const int ncols, const int nrows,
+                      const int dst_stride) {
+    const int row = blockIdx.x;
+    if (row >= nrows) return;
+    const int nb = ncols / QK_K;
+    const int lane = threadIdx.x;
+    const int j = lane & 7;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+    const uint8_t * wrow = vx + (size_t)row * nb * sizeof(block_iq1_m);
+    float tmp[VECS];
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) tmp[vo] = 0.f;
+    for (int i = lane >> 3; i < nb; i += 8) {
+        float d8[VECS];
+        int q8w[8][VECS];
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            const block_q8_1 * y8 = y + (size_t)vo * (nrows_y / QK8_1) + i * (QK_K / QK8_1) + j;
+            d8[vo] = __low2float(y8->ds);
+            const int * qa = (const int *)y8->qs;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) q8w[w][vo] = qa[w];
+        }
+        const block_iq1_m * blk = (const block_iq1_m *)(wrow + (size_t)i * sizeof(block_iq1_m));
+        const uint16_t * sc = (const uint16_t *) blk->scales;
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        const float d = __half2float(scale.f16);
+        const int tmps = sc[j >> 1] >> (6*(j & 1));
+        const float sc0 = d * (2*((tmps >> 0) & 0x07) + 1);
+        const float sc1 = d * (2*((tmps >> 3) & 0x07) + 1);
+#pragma unroll
+        for (int vo = 0; vo < VECS; ++vo) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int qhl = blk->qh[2*j + (l >> 1)] >> (4 * (l & 1));
+                const int grid = (int)iq1s_grid_gpu[blk->qs[4*j + l] | ((qhl & 0x07) << 8)];
+                const float scl = (l >> 1) ? sc1 : sc0;
+                const float delta = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f*IQ1M_DELTA/0x08);
+                const int s  = __dp4a((grid >> 4) & 0x0F0F0F0F, q8w[2*l+1][vo],
+                                      __dp4a(grid & 0x0F0F0F0F, q8w[2*l][vo], 0));
+                const int sy = __dp4a(0x01010101, q8w[2*l+1][vo],
+                                      __dp4a(0x01010101, q8w[2*l][vo], 0));
+                acc += scl * ((float)s + delta * (float)sy);
+            }
+            tmp[vo] += d8[vo] * acc;
+        }
+    }
+#pragma unroll
+    for (int vo = 0; vo < VECS; ++vo) {
+        float t = tmp[vo];
+#pragma unroll
+        for (int mask = 32; mask > 0; mask >>= 1)
+            t += VLLM_SHFL_XOR_SYNC(t, mask);
+        if (threadIdx.x == 0) dst[vo * dst_stride + row] = t;
+    }
+}
+
+// ---- per-type group decoders (addressing + decode validated in mmq.cuh) ----
+
+struct dec_iq2_xxs {
+    static constexpr int MODE = 0;
+    static constexpr int BLOCK_BYTES = (int)sizeof(block_iq2_xxs);
+    static __device__ __forceinline__ void group(const uint8_t * wrow, int i, int j,
+                                                 int (&vw)[8], float & s0, float & s1) {
+        const block_iq2_xxs * blk = (const block_iq2_xxs *)(wrow + (size_t)i * BLOCK_BYTES);
+        const uint16_t * q2 = blk->qs + 4*j;
+        // the four grid indices are the BYTES of q2[0..1], one per lookup
+        const uint32_t idxw = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux32 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        const float d = __half2float(blk->d) * (0.5f + (aux32 >> 28)) * 0.25f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g_lo = ((const uint32_t *)(iq2xxs_grid + ((idxw >> (8*l)) & 0xFF)))[0];
+            const uint32_t g_hi = ((const uint32_t *)(iq2xxs_grid + ((idxw >> (8*l)) & 0xFF)))[1];
+            iq_sign_words(g_lo, g_hi, ksigns_iq2xs[(aux32 >> (7*l)) & 127], vw[2*l], vw[2*l+1]);
+        }
+        s0 = s1 = d;
+    }
+};
+
+struct dec_iq2_xs {
+    static constexpr int MODE = 1;
+    static constexpr int BLOCK_BYTES = (int)sizeof(block_iq2_xs);
+    static __device__ __forceinline__ void group(const uint8_t * wrow, int i, int j,
+                                                 int (&vw)[8], float & s0, float & s1) {
+        const block_iq2_xs * blk = (const block_iq2_xs *)(wrow + (size_t)i * BLOCK_BYTES);
+        const uint16_t * q2 = blk->qs + 4*j;
+        const float d = __half2float(blk->d) * 0.25f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g_lo = ((const uint32_t *)(iq2xs_grid + (q2[l] & 511)))[0];
+            const uint32_t g_hi = ((const uint32_t *)(iq2xs_grid + (q2[l] & 511)))[1];
+            iq_sign_words(g_lo, g_hi, ksigns_iq2xs[q2[l] >> 9], vw[2*l], vw[2*l+1]);
+        }
+        s0 = d * (0.5f + (blk->scales[j] & 0xf));
+        s1 = d * (0.5f + (blk->scales[j] >>  4));
+    }
+};
+
+struct dec_iq2_s {
+    static constexpr int MODE = 1;
+    static constexpr int BLOCK_BYTES = (int)sizeof(block_iq2_s);
+    static __device__ __forceinline__ void group(const uint8_t * wrow, int i, int j,
+                                                 int (&vw)[8], float & s0, float & s1) {
+        const block_iq2_s * blk = (const block_iq2_s *)(wrow + (size_t)i * BLOCK_BYTES);
+        const float d = __half2float(blk->d) * 0.25f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int idx = blk->qs[4*j + l] | ((blk->qh[j] << (8 - 2*l)) & 0x300);
+            const uint32_t g_lo = ((const uint32_t *)(iq2s_grid + idx))[0];
+            const uint32_t g_hi = ((const uint32_t *)(iq2s_grid + idx))[1];
+            iq_sign_words(g_lo, g_hi, blk->qs[QK_K/8 + 4*j + l], vw[2*l], vw[2*l+1]);
+        }
+        s0 = d * (0.5f + (blk->scales[j] & 0xf));
+        s1 = d * (0.5f + (blk->scales[j] >>  4));
+    }
+};
+
+struct dec_iq3_xxs {
+    static constexpr int MODE = 0;
+    static constexpr int BLOCK_BYTES = (int)sizeof(block_iq3_xxs);
+    static __device__ __forceinline__ void group(const uint8_t * wrow, int i, int j,
+                                                 int (&vw)[8], float & s0, float & s1) {
+        const block_iq3_xxs * blk = (const block_iq3_xxs *)(wrow + (size_t)i * BLOCK_BYTES);
+        const uint8_t * q3 = blk->qs + 8*j;
+        const uint16_t * gas = (const uint16_t *)(blk->qs + QK_K/4) + 2*j;
+        const uint32_t aux32 = (uint32_t)gas[0] | ((uint32_t)gas[1] << 16);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t grid1 = iq3xxs_grid[q3[2*l + 0]];
+            const uint32_t grid2 = iq3xxs_grid[q3[2*l + 1]];
+            const uint32_t * sgn = (const uint32_t *)(ksigns64 + ((aux32 >> (7*l)) & 127));
+            vw[2*l + 0] = (int)__vsub4(grid1 ^ sgn[0], sgn[0]);
+            vw[2*l + 1] = (int)__vsub4(grid2 ^ sgn[1], sgn[1]);
+        }
+        s0 = s1 = __half2float(blk->d) * (0.5f + (aux32 >> 28)) * 0.5f;
+    }
+};
+
+struct dec_iq3_s {
+    static constexpr int MODE = 0;
+    static constexpr int BLOCK_BYTES = (int)sizeof(block_iq3_s);
+    static __device__ __forceinline__ void group(const uint8_t * wrow, int i, int j,
+                                                 int (&vw)[8], float & s0, float & s1) {
+        const block_iq3_s * blk = (const block_iq3_s *)(wrow + (size_t)i * BLOCK_BYTES);
+        const uint8_t * qs = blk->qs + 8*j;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t grid1 = iq3xs_grid[qs[2*l + 0] | ((blk->qh[j] << (8 - 2*l)) & 256)];
+            const uint32_t grid2 = iq3xs_grid[qs[2*l + 1] | ((blk->qh[j] << (7 - 2*l)) & 256)];
+            iq_sign_words(grid1, grid2, blk->signs[4*j + l], vw[2*l], vw[2*l+1]);
+        }
+        const float s = 0.5f + ((blk->scales[j >> 1] >> 4*(j & 1)) & 0xf);
+        s0 = s1 = __half2float(blk->d) * s * 0.5f;
+    }
+};
+
+struct dec_iq4_nl {
+    static constexpr int MODE = 0;
+    static constexpr int BLOCK_BYTES = 8 * (int)sizeof(block_iq4_nl);   // 8 sub-blocks = 256 weights
+    static __device__ __forceinline__ void group(const uint8_t * wrow, int i, int j,
+                                                 int (&vw)[8], float & s0, float & s1) {
+        // 16B payload of sub-block j: word m -> lo quads m, hi quads m+4
+        const uint8_t * sb = wrow + (size_t)i * BLOCK_BYTES + (size_t)j * sizeof(block_iq4_nl);
+        const half d = *(const half *)sb;
+        const uint32_t * pw = (const uint32_t *)(sb + 2);
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            vw[m]     = iq4xs_lookup_word(pw[m] & 0x0F0F0F0F);
+            vw[m + 4] = iq4xs_lookup_word((pw[m] >> 4) & 0x0F0F0F0F);
+        }
+        s0 = s1 = __half2float(d);
+    }
+};
+
+struct dec_iq1_s {
+    static constexpr int MODE = 2;
+    static constexpr int BLOCK_BYTES = (int)sizeof(block_iq1_s);
+    static __device__ __forceinline__ void group(const uint8_t * wrow, int i, int j,
+                                                 int (&vw)[8], float & s0, float & s1) {
+        const block_iq1_s * blk = (const block_iq1_s *)(wrow + (size_t)i * BLOCK_BYTES);
+        const int qh = blk->qh[j];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int grid = (int)iq1s_grid_gpu[blk->qs[4*j + l] | (((qh >> 3*l) & 0x07) << 8)];
+            vw[2*l + 0] = grid & 0x0F0F0F0F;
+            vw[2*l + 1] = (grid >> 4) & 0x0F0F0F0F;
+        }
+        const float d1 = __half2float(blk->d) * (((qh >> 11) & 0x0E) + 1);
+        const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+        s0 = d1;
+        s1 = d1 * delta;
+    }
+};
+
+template <typename scalar_t, typename DEC>
+static void mul_mat_vec_iq_wide_cuda(const void * vx, const void * vy, scalar_t * dst,
+        const int ncols, const int nrows, const int nvecs, cudaStream_t stream,
+        const int dst_stride = -1) {
+    const int stride = dst_stride < 0 ? nrows : dst_stride;
+    const uint8_t * wx = (const uint8_t *)vx;
+#define IQW_LAUNCH(VECS_)                                                        \
+    do {                                                                         \
+        mul_mat_vec_iq_wide<scalar_t, VECS_, DEC>                                \
+            <<<nrows, 64, 0, stream>>>(wx, vy, dst, ncols, nrows, stride);       \
+    } while (0)
+    switch (nvecs) {
+      case 1:  IQW_LAUNCH(1); break;
+      case 2:  IQW_LAUNCH(2); break;
+      case 3:  IQW_LAUNCH(3); break;
+      default: IQW_LAUNCH(4); break;
+    }
+#undef IQW_LAUNCH
+}
+
+template <typename scalar_t>
+static void mul_mat_vec_iq1m_wide_cuda(const void * vx, const void * vy, scalar_t * dst,
+        const int ncols, const int nrows, const int nvecs, cudaStream_t stream,
+        const int dst_stride = -1) {
+    const int stride = dst_stride < 0 ? nrows : dst_stride;
+    const uint8_t * wx = (const uint8_t *)vx;
+#define IQ1MW_LAUNCH(VECS_)                                                      \
+    do {                                                                         \
+        mul_mat_vec_iq1m_wide<scalar_t, VECS_>                                   \
+            <<<nrows, 64, 0, stream>>>(wx, vy, dst, ncols, nrows, stride);       \
+    } while (0)
+    switch (nvecs) {
+      case 1:  IQ1MW_LAUNCH(1); break;
+      case 2:  IQ1MW_LAUNCH(2); break;
+      case 3:  IQ1MW_LAUNCH(3); break;
+      default: IQ1MW_LAUNCH(4); break;
+    }
+#undef IQ1MW_LAUNCH
+}
