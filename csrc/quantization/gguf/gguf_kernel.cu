@@ -1179,6 +1179,9 @@ static void ggml_mul_mat_vec_q8_dispatch(
         // Wide-load variant first (read per call for in-process A/B): the
         // 4-consecutive-p group loads reach ~435-560 GB/s on decode shapes.
         const char* k45_wide_env = std::getenv("VLLM_GGUF_K45_WIDE");
+        // Shape-gating q5_K back to row_tile2/v1 looked 6-18% faster in a
+        // standalone loop (L2-warm weights) but measured ~0.75ms/step slower
+        // end-to-end on cold streaming weights; keep wide everywhere.
         const bool k45_wide = k45_wide_env == nullptr || k45_wide_env[0] != '0';
         if (k45_wide) {
           mul_mat_vec_k45_q8_1_planar_wide_cuda<scalar_t, true>(
@@ -1309,6 +1312,9 @@ static void ggml_mul_mat_vec_q8_dispatch(
         // Wide-load planar variant: read per call so an in-process A/B can
         // flip it without a restart; default on for gfx906 (measured
         // 610-636 GB/s standalone vs 570-620 for row-tile planar).
+        // Restricting it to embedding-class shapes (row >= 65536) also
+        // measured slower end-to-end despite faster L2-warm standalone
+        // numbers for row_tile2 on MLP shapes.
         const char* wide_env = std::getenv("VLLM_GGUF_Q6_K_WIDE");
         const bool wide = wide_env == nullptr || wide_env[0] != '0';
         if (wide) {
