@@ -112,6 +112,7 @@ class QuarkW4A16Int4(QuarkScheme):
             act_type=params_dtype,
             group_size=group_size,
             zero_points=not self.is_symmetric,
+            has_g_idx=False,
         )
         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
 

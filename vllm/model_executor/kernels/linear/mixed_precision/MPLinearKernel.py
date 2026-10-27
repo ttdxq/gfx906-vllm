@@ -19,6 +19,7 @@ class MPLinearLayerConfig:
     act_type: torch.dtype
     group_size: int
     zero_points: bool
+    has_g_idx: bool = False
     out_type: torch.dtype | None = None
 
 

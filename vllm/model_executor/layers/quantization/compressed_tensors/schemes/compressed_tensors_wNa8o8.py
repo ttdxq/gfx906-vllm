@@ -110,6 +110,7 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
             act_type=params_dtype,  # activation quant applied externally (SRQ)
             group_size=self.group_size,
             zero_points=False,
+            has_g_idx=False,
         )
         self.kernel = choose_mp_linear_kernel(mp_config)(
             mp_config,
