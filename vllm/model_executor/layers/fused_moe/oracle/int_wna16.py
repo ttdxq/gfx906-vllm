@@ -938,13 +938,12 @@ def _process_weights_rdna3(
     w13 = w13.transpose(1, 2).contiguous()
     w2 = w2.transpose(1, 2).contiguous()
 
-    empty_perm = torch.empty(0, dtype=torch.int32, device=w13.device)
     for e in range(num_experts):
         w13_e = w13[e].contiguous()
-        ops.gptq_shuffle(w13_e, empty_perm, 4)
+        ops.gptq_shuffle(w13_e, 4)
         w13[e] = w13_e
         w2_e = w2[e].contiguous()
-        ops.gptq_shuffle(w2_e, empty_perm, 4)
+        ops.gptq_shuffle(w2_e, 4)
         w2[e] = w2_e
 
     def _qzeros(w: torch.Tensor) -> torch.Tensor:

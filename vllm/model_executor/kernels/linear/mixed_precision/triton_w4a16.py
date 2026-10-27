@@ -211,9 +211,6 @@ class TritonW4A16LinearKernel(MPLinearKernel):
             return False, "Only float16/bfloat16 activations are supported"
         if c.partition_weight_shape[1] % 8 != 0:
             return False, "Output features must be divisible by 8"
-        if c.has_g_idx:
-            return False, "Activation reordering is not supported"
-
         group_size = c.group_size
         if (
             group_size not in TRITON_W4A16_SUPPORTED_GROUP_SIZES
@@ -275,7 +272,7 @@ class TritonW4A16LinearKernel(MPLinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         config = self.config
-        w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        w_q, w_s, w_zp = self._get_weight_params(layer)
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
         out_shape = x.shape[:-1] + (config.partition_weight_shape[1],)
 

@@ -158,7 +158,6 @@ class CompressedTensorsWNA4Int(CompressedTensorsScheme):
             act_type=params_dtype,
             group_size=self.group_size,
             zero_points=not self.symmetric,
-            has_g_idx=False,
         )
 
         kernel_type = choose_mp_linear_kernel(mp_config)
@@ -174,7 +173,7 @@ class CompressedTensorsWNA4Int(CompressedTensorsScheme):
         group_size = self.group_size if self.group_size != -1 else input_size
         row_parallel = input_size != input_size_per_partition
         partition_scales = not marlin_repeat_scales_on_all_ranks(
-            False, self.group_size, row_parallel
+            self.group_size, row_parallel
         )
         scales_and_zp_size = input_size // group_size
         if partition_scales:

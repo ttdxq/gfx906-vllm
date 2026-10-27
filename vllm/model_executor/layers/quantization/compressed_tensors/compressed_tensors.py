@@ -870,7 +870,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                 strategy=weight_quant.strategy,
                 symmetric=weight_quant.symmetric,
                 group_size=weight_quant.group_size,
-                actorder=weight_quant.actorder,
                 layer_name=layer_name,
             )
 

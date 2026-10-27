@@ -127,7 +127,7 @@ class ConchLinearKernel(MPLinearKernel):
     ) -> torch.Tensor:
         from conch.ops.quantization.gemm import mixed_precision_gemm
 
-        w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        w_q, w_s, w_zp = self._get_weight_params(layer)
 
         output = mixed_precision_gemm(
             x=x,

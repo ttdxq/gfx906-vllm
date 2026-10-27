@@ -344,7 +344,6 @@ class AutoGPTQLinearMethod(LinearMethodBase):
             act_type=params_dtype if input_dtype is None else input_dtype,
             group_size=self.quant_config.group_size,
             zero_points=False,
-            has_g_idx=self.quant_config.desc_act,
         )
 
         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
@@ -361,7 +360,7 @@ class AutoGPTQLinearMethod(LinearMethodBase):
 
         # Determine sharding
         if marlin_repeat_scales_on_all_ranks(
-            self.quant_config.desc_act, self.quant_config.group_size, is_row_parallel
+            self.quant_config.group_size, is_row_parallel
         ):
             # By setting scale_dim == None, weight_loader will
             # repeat the scales on each GPU in TP>1 case.
@@ -434,7 +433,6 @@ class AutoGPTQLinearMethod(LinearMethodBase):
             w_q_param_name="qweight",
             w_s_param_name="scales",
             w_zp_param_name="qzeros",
-            w_gidx_param_name="g_idx",
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

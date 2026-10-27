@@ -98,7 +98,6 @@ class CompressedTensorsW4A8Int(CompressedTensorsScheme):
             act_type=params_dtype,
             group_size=effective_group_size,
             zero_points=False,
-            has_g_idx=False,
         )
 
         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)

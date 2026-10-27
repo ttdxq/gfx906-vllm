@@ -699,13 +699,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // to prevent the meta function registry.
   ops.def(
       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, "
-      "Tensor b_gptq_scales, Tensor b_g_idx, bool use_exllama, bool "
+      "Tensor b_gptq_scales, bool use_exllama, bool "
       "use_v2_format, int bit) "
       "-> Tensor");
 
   // Post processing for GPTQ.
-  ops.def(
-      "gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
+  ops.def("gptq_shuffle(Tensor! q_weight, int bit) -> ()");
 
   // Mamba selective scan kernel
   ops.def(

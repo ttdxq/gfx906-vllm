@@ -62,7 +62,11 @@ class MoeWNA16Config(QuantizationConfig):
         from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 
         if self.linear_quant_method == "gptq":
-            pass
+            normalize_and_validate_gptq_desc_act(
+                full_config.get("desc_act", False),
+                group_size,
+                full_config.get("dynamic") or {},
+            )
         elif self.linear_quant_method in ("awq", "awq_marlin"):
             capability_tuple = current_platform.get_device_capability()
             device_capability = (
@@ -109,11 +113,6 @@ class MoeWNA16Config(QuantizationConfig):
         if linear_quant_method == "gptq":
             has_zp = not cls.get_from_keys(config, ["sym"])
             modules_to_not_convert = []
-            normalize_and_validate_gptq_desc_act(
-                cls.get_from_keys(config, ["desc_act"]),
-                group_size,
-                config.get("dynamic", {}),
-            )
         elif linear_quant_method in ("awq", "awq_marlin"):
             has_zp = cls.get_from_keys(config, ["zero_point"])
             modules_to_not_convert = cls.get_from_keys_or(
@@ -146,11 +145,16 @@ class MoeWNA16Config(QuantizationConfig):
         # Extract data from quant config.
         quant_method = quant_config.get("quant_method", "").lower()
         num_bits = quant_config.get("bits")
-        desc_act = normalize_and_validate_gptq_desc_act(
-            quant_config.get("desc_act"),
-            quant_config.get("group_size"),
-            quant_config.get("dynamic", {}),
-        )
+        desc_act = quant_config.get("desc_act", False)
+        try:
+            normalize_and_validate_gptq_desc_act(
+                desc_act,
+                quant_config.get("group_size"),
+                quant_config.get("dynamic") or {},
+            )
+            supported_act_order = True
+        except ValueError:
+            supported_act_order = False
 
         capability_tuple = current_platform.get_device_capability()
         device_capability = (
@@ -161,7 +165,9 @@ class MoeWNA16Config(QuantizationConfig):
 
         awq_min_capability = AutoAWQConfig.get_min_capability()
 
-        gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [4, 8]
+        gptq_compatible = (
+            quant_method == "gptq" and supported_act_order and num_bits in [4, 8]
+        )
         awq_compatible = (
             quant_method == "awq"
             and num_bits == 4
