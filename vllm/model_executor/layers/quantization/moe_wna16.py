@@ -19,12 +19,16 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
+    UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+    normalize_and_validate_gptq_desc_act,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -105,7 +109,12 @@ class MoeWNA16Config(QuantizationConfig):
         if linear_quant_method == "gptq":
             has_zp = not cls.get_from_keys(config, ["sym"])
             modules_to_not_convert = []
-        elif linear_quant_method == "awq":
+            normalize_and_validate_gptq_desc_act(
+                cls.get_from_keys(config, ["desc_act"]),
+                group_size,
+                config.get("dynamic", {}),
+            )
+        elif linear_quant_method in ("awq", "awq_marlin"):
             has_zp = cls.get_from_keys(config, ["zero_point"])
             modules_to_not_convert = cls.get_from_keys_or(
                 config, ["modules_to_not_convert"], None
@@ -137,7 +146,11 @@ class MoeWNA16Config(QuantizationConfig):
         # Extract data from quant config.
         quant_method = quant_config.get("quant_method", "").lower()
         num_bits = quant_config.get("bits")
-        desc_act = quant_config.get("desc_act")
+        desc_act = normalize_and_validate_gptq_desc_act(
+            quant_config.get("desc_act"),
+            quant_config.get("group_size"),
+            quant_config.get("dynamic", {}),
+        )
 
         capability_tuple = current_platform.get_device_capability()
         device_capability = (
@@ -161,6 +174,8 @@ class MoeWNA16Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
+            if isinstance(layer, RoutedExperts):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
             return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
             # Avoid circular import
@@ -170,15 +185,14 @@ class MoeWNA16Config(QuantizationConfig):
             )
 
             if self.linear_quant_method == "gptq":
-                return AutoGPTQConfig.from_config(self.full_config).get_quant_method(
-                    layer, prefix
-                )
+                delegate = AutoGPTQConfig.from_config(self.full_config)
             elif self.linear_quant_method in ("awq", "awq_marlin"):
-                return AutoAWQConfig.from_config(self.full_config).get_quant_method(
-                    layer, prefix
-                )
+                delegate = AutoAWQConfig.from_config(self.full_config)
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
+            if self.packed_modules_mapping:
+                delegate.packed_modules_mapping = self.packed_modules_mapping
+            return delegate.get_quant_method(layer, prefix)
         elif isinstance(layer, RoutedExperts):
             return MoeWNA16Method(self, layer.moe_config)
         return None
