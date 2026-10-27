@@ -689,11 +689,6 @@ def awq_gemm(
     return torch.ops._C.awq_gemm(input, qweight, qzeros, scales, split_k_iters)
 
 
-# gptq
-def gptq_shuffle_awq_qweight(q_weight: torch.Tensor, bit: int) -> None:
-    torch.ops._C.gptq_shuffle_awq_qweight(q_weight, bit)
-
-
 # marlin_24
 def gptq_marlin_24_gemm(
     a: torch.Tensor,
