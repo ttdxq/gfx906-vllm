@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -178,7 +178,7 @@ class MoeWNA16Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> "QuantizeMethodBase | None":
         if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
             if isinstance(layer, RoutedExperts):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
@@ -190,15 +190,21 @@ class MoeWNA16Config(QuantizationConfig):
                 AutoGPTQConfig,
             )
 
+            linear_config: QuantizationConfig
             if self.linear_quant_method == "gptq":
-                delegate = AutoGPTQConfig.from_config(self.full_config)
+                linear_config = AutoGPTQConfig.from_config(self.full_config)
             elif self.linear_quant_method in ("awq", "awq_marlin"):
-                delegate = AutoAWQConfig.from_config(self.full_config)
+                linear_config = AutoAWQConfig.from_config(self.full_config)
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
-            if self.packed_modules_mapping:
-                delegate.packed_modules_mapping = self.packed_modules_mapping
-            return delegate.get_quant_method(layer, prefix)
+
+            # The delegate is rebuilt from the raw HF quantization dict, which
+            # lists shard names and never fused ones. Without the mapping it
+            # resolves fused layers (qkv_proj, gate_up_proj) to
+            # UnquantizedLinearMethod and the checkpoint's qweight has nowhere
+            # to load.
+            linear_config.packed_modules_mapping = self.packed_modules_mapping
+            return linear_config.get_quant_method(layer, prefix)
         elif isinstance(layer, RoutedExperts):
             return MoeWNA16Method(self, layer.moe_config)
         return None
