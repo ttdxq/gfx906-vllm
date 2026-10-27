@@ -106,7 +106,7 @@ class AWQConfig(QuantizationConfig):
                 prefix,
                 self.modules_to_not_convert,
                 self.packed_modules_mapping,
-                skip_with_substr=True,
+                match_mode="substring",
             ):
                 return UnquantizedLinearMethod()
             if _use_gfx906_awq_triton():
