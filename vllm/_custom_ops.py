@@ -675,20 +675,6 @@ def awq_dequantize(
     return torch.ops._C.awq_dequantize(qweight, scales, zeros, split_k_iters, thx, thy)
 
 
-def awq_gemm(
-    input: torch.Tensor,
-    qweight: torch.Tensor,
-    qzeros: torch.Tensor,
-    scales: torch.Tensor,
-    split_k_iters: int,
-) -> torch.Tensor:
-    if envs.VLLM_USE_TRITON_AWQ:
-        from vllm.model_executor.layers.quantization.awq_triton import awq_gemm_triton
-
-        return awq_gemm_triton(input, qweight, scales, qzeros, split_k_iters)
-    return torch.ops._C.awq_gemm(input, qweight, qzeros, scales, split_k_iters)
-
-
 # marlin_24
 def gptq_marlin_24_gemm(
     a: torch.Tensor,
@@ -804,6 +790,7 @@ def gptq_gemm(
     b_q_weight: torch.Tensor,
     b_gptq_qzeros: torch.Tensor,
     b_gptq_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
     use_exllama: bool,
     use_v2_format: bool,
     bit: int,
@@ -813,6 +800,7 @@ def gptq_gemm(
         b_q_weight,
         b_gptq_qzeros,
         b_gptq_scales,
+        b_g_idx,
         use_exllama,
         use_v2_format,
         bit,
@@ -827,6 +815,7 @@ if hasattr(torch.ops._C, "gptq_gemm"):
         b_q_weight: torch.Tensor,
         b_gptq_qzeros: torch.Tensor,
         b_gptq_scales: torch.Tensor,
+        b_g_idx: torch.Tensor,
         use_exllama: bool,
         use_v2_format: bool,
         bit: int,
@@ -836,8 +825,10 @@ if hasattr(torch.ops._C, "gptq_gemm"):
         )
 
 
-def gptq_shuffle(q_weight: torch.Tensor, bit: int) -> None:
-    torch.ops._C.gptq_shuffle(q_weight, bit)
+def gptq_shuffle(
+    q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int
+) -> None:
+    torch.ops._C.gptq_shuffle(q_weight, q_perm, bit)
 
 
 def gptq_gemm_rdna3(

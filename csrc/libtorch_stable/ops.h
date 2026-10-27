@@ -628,10 +628,12 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
                                 torch::stable::Tensor b_q_weight,
                                 torch::stable::Tensor b_gptq_qzeros,
                                 torch::stable::Tensor b_gptq_scales,
+                                torch::stable::Tensor b_g_idx,
                                 bool use_exllama, bool use_v2_format,
                                 int64_t bit);
 
-void gptq_shuffle(torch::stable::Tensor q_weight, int64_t bit);
+void gptq_shuffle(torch::stable::Tensor q_weight, torch::stable::Tensor q_perm,
+                  int64_t bit);
 
 // Cache ops (shared CUDA/ROCm)
 void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,

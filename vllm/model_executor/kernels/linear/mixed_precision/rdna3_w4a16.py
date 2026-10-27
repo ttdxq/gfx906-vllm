@@ -127,7 +127,10 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
             # Same 4-bit shuffle as exllama. The RDNA3 kernel reads weights in
             # the same shuffled int32 layout and uses the (qa & 0x000F000F)
             # bit-trick on top.
-            ops.gptq_shuffle(x_cont, c.weight_type.size_bits)
+            empty_perm = torch.empty(
+                0, dtype=torch.int32, device=x_cont.device
+            )
+            ops.gptq_shuffle(x_cont, empty_perm, c.weight_type.size_bits)
             return x_cont
 
         def transform_w_s(x):

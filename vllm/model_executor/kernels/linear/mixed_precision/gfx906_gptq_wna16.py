@@ -52,10 +52,15 @@ class Gfx906GPTQWNA16LinearKernel(MPLinearKernel):
 
         def transform_w_q(x: BasevLLMParameter) -> BasevLLMParameter:
             # CompressedTensors stores [N, K/pack] with K packed. gptq_gemm
-            # expects [K/pack, N], then an exllama/GPTQ shuffle.
+            # expects [K/pack, N], then an exllama/GPTQ shuffle. Activation
+            # reordering is rejected in can_implement, so the shuffle always
+            # runs without a permutation.
             permute_param_layout_(x, input_dim=1, output_dim=0, packed_dim=1)
             x.data = x.data.t().contiguous()
-            ops.gptq_shuffle(x.data, c.weight_type.size_bits)
+            empty_perm = torch.empty(
+                0, dtype=torch.int32, device=x.data.device
+            )
+            ops.gptq_shuffle(x.data, empty_perm, c.weight_type.size_bits)
             return x
 
         def transform_w_s(x: BasevLLMParameter) -> BasevLLMParameter:
@@ -97,16 +102,6 @@ class Gfx906GPTQWNA16LinearKernel(MPLinearKernel):
                 torch.nn.Parameter(packed_zeros.contiguous(), requires_grad=False),
             )
 
-        self.w_gidx_name = "g_idx"
-        setattr(
-            layer,
-            self.w_gidx_name,
-            torch.nn.Parameter(
-                torch.empty(0, dtype=torch.int32, device=getattr(layer, self.w_q_name).device),
-                requires_grad=False,
-            ),
-        )
-
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -118,18 +113,21 @@ class Gfx906GPTQWNA16LinearKernel(MPLinearKernel):
         x_2d = x.reshape(-1, x.shape[-1])
         out_shape = x.shape[:-1] + (c.partition_weight_shape[1],)
 
-        w_q, w_s, w_zp = self._get_weight_params(layer)
+        w_q, w_s, w_zp, w_g_idx = self._get_weight_params(layer)
         if x_2d.dtype != torch.float16:
             x_2d = x_2d.to(torch.float16)
         if w_s.dtype != torch.float16:
             w_s = w_s.to(torch.float16)
 
         assert w_zp is not None
+        if w_g_idx is None:
+            w_g_idx = torch.empty(0, dtype=torch.int32, device=x_2d.device)
         output = ops.gptq_gemm(
             x_2d.contiguous(),
             w_q,
             w_zp,
             w_s,
+            w_g_idx,
             True,
             True,
             c.weight_type.size_bits,

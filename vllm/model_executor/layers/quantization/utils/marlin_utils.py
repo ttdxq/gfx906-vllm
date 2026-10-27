@@ -500,9 +500,13 @@ def _marlin_gemm_fake(
 direct_register_custom_op("marlin_gemm", _marlin_gemm, fake_impl=_marlin_gemm_fake)
 
 
-def marlin_repeat_scales_on_all_ranks(group_size: int, is_row_parallel: bool) -> bool:
+def marlin_repeat_scales_on_all_ranks(
+    act_order: bool, group_size: int, is_row_parallel: bool
+) -> bool:
+    # Need to repeat scales on every rank if act_ordering or
+    # channelwise and RowParallelLinear
     is_channelwise = group_size == -1
-    return is_channelwise and is_row_parallel
+    return act_order or (is_channelwise and is_row_parallel)
 
 
 def marlin_make_empty(device: torch.device) -> torch.Tensor:
