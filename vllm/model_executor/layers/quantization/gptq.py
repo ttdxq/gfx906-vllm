@@ -373,7 +373,7 @@ class GPTQLinearMethod(LinearMethodBase):
                     (0,), dtype=torch.int, device=layer.g_idx.device
                 )
             layer.exllama_state = ExllamaState.READY
-            ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+            ops.gptq_shuffle(layer.qweight, self.quant_config.weight_bits)
 
     def apply(
         self,
@@ -399,7 +399,6 @@ class GPTQLinearMethod(LinearMethodBase):
             layer.qweight,
             layer.qzeros,
             scales,
-            layer.g_idx,
             layer.exllama_state == ExllamaState.READY,
             self.use_v2_format,
             self.quant_config.weight_bits,

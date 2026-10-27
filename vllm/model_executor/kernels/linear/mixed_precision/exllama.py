@@ -125,12 +125,9 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
-            assert self.w_gidx_name is not None
-            g_idx = getattr(layer, self.w_gidx_name)
-
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
             x_cont = x.data.contiguous()
-            ops.gptq_shuffle(x_cont, g_idx, c.weight_type.size_bits)
+            ops.gptq_shuffle(x_cont, c.weight_type.size_bits)
             return x_cont
 
         def transform_w_s(x):
@@ -164,7 +161,7 @@ class ExllamaLinearKernel(MPLinearKernel):
         assert w_zp is not None, "Zero points are required by Exllama"
         assert w_g_idx is not None, "Group index is required by Exllama"
         output = ops.gptq_gemm(
-            x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format, c.weight_type.size_bits
+            x_2d, w_q, w_zp, w_s, True, use_v2_format, c.weight_type.size_bits
         )
 
         if bias is not None:

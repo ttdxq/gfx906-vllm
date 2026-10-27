@@ -307,7 +307,6 @@ class AWQLinearMethod(LinearMethodBase):
             layer.qweight,
             layer.qzeros,
             scales,
-            torch.empty(0, device=layer.qweight.device),
             True,
             True,
             self.quant_config.weight_bits,
