@@ -161,7 +161,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
-    VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ: bool = False
     VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE: bool = False
 
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1419,13 +1418,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
-    ),
-    # Opt-in override for gfx906 AWQ to use the mobydick-style
-    # GPTQ-compatible AWQ path instead of the default Triton AWQ path.
-    # Disabled by default to preserve current gfx906 behavior.
-    "VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ": lambda: (
-        os.getenv("VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ", "False").lower()
-        in ("true", "1")
     ),
     # Opt into the Triton causal_conv1d_update kernel on gfx906. The default
     # keeps the conservative torch fallback for compatibility.

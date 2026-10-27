@@ -261,13 +261,7 @@ print(response.choices[0].message.content)
 - ⚠️ **MoE 量化模型** - 速度显著较慢，不推荐
 - ⚠️ **非量化模型** - 略慢，但可用
 
-gfx906 上 AWQ 默认继续使用当前较保守的 Triton 路径。如需试验 `vllm-gfx906-mobydick` 风格的 GPTQ-compatible AWQ 路径，可显式设置：
-
-```bash
-export VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ=1
-```
-
-该开关默认关闭，仅建议在排查 Triton AWQ 兼容性或对比两条 AWQ 路径行为时使用。
+gfx906 上 AWQ 使用 Triton 路径。
 
 详细信息请参阅 [Issue #29](https://github.com/nlzy/vllm-gfx906/issues/29)。
 

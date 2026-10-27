@@ -272,15 +272,7 @@ Based on testing from the original project:
 - ⚠️ **Quantized MoE models** - Significantly slower and not recommended.
 - ⚠️ **Unquantized models** - Slightly slower, but usable.
 
-AWQ uses the current conservative Triton path by default on gfx906. To test the
-GPTQ-compatible AWQ path based on `vllm-gfx906-mobydick`, set:
-
-```bash
-export VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ=1
-```
-
-This option is disabled by default. Use it only to investigate Triton AWQ
-compatibility or to compare the two AWQ paths.
+AWQ uses the Triton path on gfx906.
 
 See [Issue #29](https://github.com/nlzy/vllm-gfx906/issues/29) for more information.
 

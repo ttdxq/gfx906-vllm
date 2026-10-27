@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, Union
 import torch
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 
-from vllm import envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
@@ -34,19 +33,7 @@ logger = init_logger(__name__)
 
 
 def _use_gfx906_awq_triton() -> bool:
-    return (
-        current_platform.is_rocm()
-        and on_gfx906()
-        and not envs.VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ
-    )
-
-
-def _use_gfx906_mobydick_awq() -> bool:
-    return (
-        current_platform.is_rocm()
-        and on_gfx906()
-        and envs.VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ
-    )
+    return current_platform.is_rocm() and on_gfx906()
 
 
 class AWQConfig(QuantizationConfig):
@@ -124,14 +111,7 @@ class AWQConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             if _use_gfx906_awq_triton():
                 logger.warning_once(
-                    "[gfx906] Falling back to Triton AWQ kernels instead of "
-                    "exllama/GPTQ-compatible AWQ path."
-                )
-                return AWQLinearMethod(self)
-            if _use_gfx906_mobydick_awq():
-                logger.warning_once(
-                    "[gfx906] Using opt-in mobydick AWQ path via GPTQ-compatible "
-                    "kernel flow instead of the default Triton AWQ path."
+                    "[gfx906] Using Triton AWQ kernels on gfx906."
                 )
                 return AWQLinearMethod(self)
             logger.warning_once(
@@ -141,44 +121,6 @@ class AWQConfig(QuantizationConfig):
             return AWQLinearMethod(self)
         elif isinstance(layer, RoutedExperts):
             # Lazy import to avoid circular import.
-            if _use_gfx906_mobydick_awq():
-                from .awq_marlin import AWQMarlinConfig
-                from .moe_wna16 import MoeWNA16Config
-                from .utils.marlin_utils import check_moe_marlin_supports_layer
-
-                if on_gfx906() or not check_moe_marlin_supports_layer(
-                    layer, self.group_size
-                ):
-                    logger.warning_once(
-                        f"Layer '{prefix}' is not supported by AWQMoeMarlin or "
-                        "GFX906 mobydick AWQ path is selected. Falling back to "
-                        "Moe WNA16 kernels."
-                    )
-                    config = {
-                        "quant_method": "awq",
-                        "bits": self.weight_bits,
-                        "group_size": self.group_size,
-                        "zero_point": self.zero_point,
-                        "lm_head": False,
-                        "modules_to_not_convert": self.modules_to_not_convert,
-                    }
-                    return MoeWNA16Config.from_config(config).get_quant_method(
-                        layer, prefix
-                    )
-
-                marlin_compatible_config_dict = {
-                    "quant_method": "awq",
-                    "bits": self.weight_bits,
-                    "group_size": self.group_size,
-                    "zero_point": self.zero_point,
-                    "lm_head": False,
-                    "modules_to_not_convert": self.modules_to_not_convert,
-                }
-                awq_marlin_config = AWQMarlinConfig.from_config(
-                    marlin_compatible_config_dict
-                )
-                return awq_marlin_config.get_quant_method(layer, prefix)
-
             from .moe_wna16 import MoeWNA16Config
 
             config = {
