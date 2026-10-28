@@ -267,12 +267,12 @@ print(response.choices[0].message.content)
 Based on testing from the original project:
 
 - ⚠️ **GPTQ** - Some models work, but kernel, tensor-shape, and MoE combinations may still have compatibility or performance problems.
-- ⚠️ **AWQ** - Some dense models work. The Triton path is used by default, but some models may still produce invalid output or fail during startup.
+- ⚠️ **AWQ** - Some dense models work. Dense linear layers on gfx906 use the W4A16 HIP kernel selected by the mixed-precision backend, but some models may still produce invalid output or fail during startup.
 - ⚠️ **W4A16 INT** - Some models do not work (via llm-compressor).
 - ⚠️ **Quantized MoE models** - Significantly slower and not recommended.
 - ⚠️ **Unquantized models** - Slightly slower, but usable.
 
-AWQ uses the Triton path on gfx906.
+Dense AWQ layers on gfx906 convert checkpoint weights to the shared packed format and use the gfx906 W4A16 HIP kernel selected by the mixed-precision backend; Marlin hardware support is not required.
 
 See [Issue #29](https://github.com/nlzy/vllm-gfx906/issues/29) for more information.
 

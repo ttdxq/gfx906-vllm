@@ -256,12 +256,12 @@ print(response.choices[0].message.content)
 
 基于原项目测试结果：
 - ⚠️ **GPTQ** - 部分模型可用，但 kernel、张量形状和 MoE 组合仍可能存在兼容性或性能问题
-- ⚠️ **AWQ** - 部分 dense 模型可用；默认使用 Triton 路径，部分模型仍可能输出异常或启动失败
+- ⚠️ **AWQ** - 部分 dense 模型可用；gfx906 稠密线性层通过混合精度内核选择使用 W4A16 HIP 内核，部分模型仍可能输出异常或启动失败
 - ⚠️ **W4A16 INT** - 部分模型不可用（通过 llm-compressor）
 - ⚠️ **MoE 量化模型** - 速度显著较慢，不推荐
 - ⚠️ **非量化模型** - 略慢，但可用
 
-gfx906 上 AWQ 使用 Triton 路径。
+gfx906 上的 AWQ 稠密线性层先转换为共享的打包权重格式，再由混合精度内核选择使用 gfx906 W4A16 HIP 内核；该路径不要求 Marlin 硬件支持。
 
 详细信息请参阅 [Issue #29](https://github.com/nlzy/vllm-gfx906/issues/29)。
 
