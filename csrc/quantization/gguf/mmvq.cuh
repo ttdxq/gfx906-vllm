@@ -1710,7 +1710,9 @@ static void mul_mat_vec_k45_q8_1_planar_v1_cuda(const void * vx, const void * vy
 // scale index and the qh shift (= bq8_offset = 2*g) are group-uniform. The
 // per-p arithmetic mirrors gguf_k45_vec_dot with the q8 d8 scales and u words
 // hoisted out of the t loop (the helper form reloaded them per word).
-template <typename scalar_t, int VECS, bool HAS_QH>
+// Integer accumulation applies the shared scales once per q8 block; even
+// q5_K's scaled integer sum fits exactly in float32.
+template <typename scalar_t, int VECS, bool HAS_QH, bool INT_ACC = false>
 static __global__ void __launch_bounds__(64)
 mul_mat_vec_k45_q8_1_planar_wide(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
                                  scalar_t * __restrict__ dst, const int ncols, const int nrows,
@@ -1765,6 +1767,8 @@ mul_mat_vec_k45_q8_1_planar_wide(const uint8_t * __restrict__ vx, const void * _
             for (int vo = 0; vo < VECS; ++vo) {
                 float sumf_d = 0.f;
                 float sumf_m = 0.f;
+                int sumi_d[2] = {0, 0};
+                int sumi_m[2] = {0, 0};
 #pragma unroll
                 for (int t = 0; t < 4; ++t) {
                     const int v0 = ((const int *)&qs0)[t];
@@ -1786,11 +1790,25 @@ mul_mat_vec_k45_q8_1_planar_wide(const uint8_t * __restrict__ vx, const void * _
                             v0i = (v0 >> (4 * ii)) & 0x0F0F0F0F;
                             v1i = (v1 >> (4 * ii)) & 0x0F0F0F0F;
                         }
-                        const int dot1 = __dp4a(v0i, u0, __dp4a(v1i, u1, 0));
-                        const int dot2 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
-                        sumf_d += d8[ii][vo] * (dot1 * (ii ? sc4[1] : sc4[0]));
-                        sumf_m += d8[ii][vo] * (dot2 * (ii ? sc4[3] : sc4[2]));
+                        if constexpr (INT_ACC) {
+                            sumi_d[ii] = __dp4a(
+                                v0i, u0, __dp4a(v1i, u1, sumi_d[ii]));
+                            sumi_m[ii] = __dp4a(
+                                0x01010101, u0,
+                                __dp4a(0x01010101, u1, sumi_m[ii]));
+                        } else {
+                            const int dot1 = __dp4a(v0i, u0, __dp4a(v1i, u1, 0));
+                            const int dot2 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
+                            sumf_d += d8[ii][vo] * (dot1 * (ii ? sc4[1] : sc4[0]));
+                            sumf_m += d8[ii][vo] * (dot2 * (ii ? sc4[3] : sc4[2]));
+                        }
                     }
+                }
+                if constexpr (INT_ACC) {
+                    sumf_d = d8[0][vo] * (sumi_d[0] * sc4[0]) +
+                             d8[1][vo] * (sumi_d[1] * sc4[1]);
+                    sumf_m = d8[0][vo] * (sumi_m[0] * sc4[2]) +
+                             d8[1][vo] * (sumi_m[1] * sc4[3]);
                 }
                 tmp[vo] += dmf.x * sumf_d - dmf.y * sumf_m;
             }
@@ -1812,10 +1830,17 @@ static void mul_mat_vec_k45_q8_1_planar_wide_cuda(const void * vx, const void * 
         const int dst_stride = -1) {
     const int stride = dst_stride < 0 ? nrows : dst_stride;
     const uint8_t * wx = (const uint8_t *)vx;
+    const char * int_acc_env = std::getenv("VLLM_GGUF_K45_INT_ACC");
+    const bool int_acc = int_acc_env == nullptr || int_acc_env[0] != '0';
 #define K45W_LAUNCH(VECS_)                                                 \
     do {                                                                   \
-        mul_mat_vec_k45_q8_1_planar_wide<scalar_t, VECS_, HAS_QH>          \
-            <<<nrows, 64, 0, stream>>>(wx, vy, dst, ncols, nrows, stride); \
+        if (int_acc) {                                                     \
+            mul_mat_vec_k45_q8_1_planar_wide<scalar_t, VECS_, HAS_QH, true>   \
+                <<<nrows, 64, 0, stream>>>(wx, vy, dst, ncols, nrows, stride); \
+        } else {                                                           \
+            mul_mat_vec_k45_q8_1_planar_wide<scalar_t, VECS_, HAS_QH>          \
+                <<<nrows, 64, 0, stream>>>(wx, vy, dst, ncols, nrows, stride); \
+        }                                                                  \
     } while (0)
     switch (nvecs) {
       case 1:  K45W_LAUNCH(1); break;

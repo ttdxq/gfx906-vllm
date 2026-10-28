@@ -4,10 +4,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import gguf
+import numpy as np
 import pytest
 import torch
 from huggingface_hub import snapshot_download
 
+import vllm._custom_ops as ops
 from vllm.model_executor.layers.quantization import gguf as gguf_layer
 from vllm.model_executor.layers.quantization.gguf import (
     GGUFLinearMethod,
@@ -152,3 +154,51 @@ def test_planar_merged_weights_have_no_original_layout_shard_views():
             actual = method.apply(layer, x)
             expected = gguf_layer.fused_mul_mat_gguf(x, raw, int(qtype))
             torch.testing.assert_close(actual, expected, atol=0.125, rtol=0.002)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@torch.inference_mode()
+def test_planar_k45_matches_explicit_quantized_dot_product(monkeypatch):
+    """Late scaling must preserve the dot product, including cancellation."""
+    if "gfx906" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""):
+        pytest.skip("gfx906 planar routing")
+    monkeypatch.setenv("VLLM_GGUF_K45_WIDE", "1")
+    sample_dir = Path(snapshot_download("Isotr0py/test-gguf-sample"))
+    keepalive = []
+    torch.manual_seed(27)
+    for qtype in (gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.Q5_K):
+        sample = gguf.GGUFReader(sample_dir / f"Quant_{qtype.name}_1024.gguf")
+        block, size = gguf.GGML_QUANT_SIZES[qtype]
+        source = sample.tensors[0].data[:64]
+        for cols in (768, 5120, 17408):
+            width = cols // block * size
+            repeats = (width + source.shape[1] - 1) // source.shape[1]
+            data = np.tile(source, (1, repeats))[:, :width].copy()
+            raw = torch.tensor(data, device="cuda")
+            packed = torch.ops._C.ggml_planar_pack(raw, int(qtype), len(data), cols)
+            keepalive.extend((raw, packed))
+            weight = torch.from_numpy(gguf.dequantize(data, qtype)).double()
+            x = torch.randn((4, cols), device="cuda", dtype=torch.float32)
+            x[1].fill_(1)
+            x[2].fill_(1)
+            x[2, 1::2] = -1
+            x[3].zero_()
+            for batch in (1, 4):
+                quant_x = ops.ggml_quantize_row_q8_1(x[:batch])
+                blocks = quant_x.cpu().view(torch.uint8).reshape(batch, -1, 36)
+                scale = blocks[..., :2].contiguous().view(torch.float16).double()
+                values = blocks[..., 4:].contiguous().view(torch.int8).double()
+                dequant_x = (scale * values).reshape(batch, -1)[:, :cols]
+                expected = dequant_x @ weight.T
+                for variant in ("0", "1"):
+                    monkeypatch.setenv("VLLM_GGUF_K45_INT_ACC", variant)
+                    actual = (
+                        ops.ggml_mul_mat_vec_q8(
+                            packed, quant_x, int(qtype), len(data), cols, torch.float32
+                        )
+                        .cpu()
+                        .double()
+                    )
+                    torch.testing.assert_close(actual, expected, atol=0.001, rtol=2e-5)
+                    if batch == 4:
+                        assert torch.count_nonzero(actual[3]).item() == 0
