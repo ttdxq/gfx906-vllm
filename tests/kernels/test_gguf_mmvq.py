@@ -997,3 +997,57 @@ def test_planar_k45_overwrites_poisoned_output_on_graph_replay(
                         atol=0,
                         rtol=0,
                     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_q8_m1_preserves_math_graph_and_multivec_fallback(monkeypatch, dtype):
+    """M=1 specialization must preserve raw layout math and other batches."""
+    if "gfx906" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""):
+        pytest.skip("gfx906 Q8 row-tile dispatch")
+    qtype = gguf.GGMLQuantizationType.Q8_0
+    torch.manual_seed(2814)
+    monkeypatch.setenv("VLLM_GGUF_MMVQ_SCHEDULE", "0")
+    for cols in (768, 5120, 17408):
+        for rows in (5, 2049):
+            data = _quantized_test_rows(qtype, rows, cols)
+            data = np.tile(data, ((rows + len(data) - 1) // len(data), 1))[:rows]
+            weight = torch.tensor(data, device="cuda")
+            _TEST_WEIGHT_STORAGE.append(weight)
+            x = torch.randn((8, cols), device="cuda", dtype=dtype) * 0.1
+            for batch in (1, 2, 4, 8):
+                monkeypatch.setenv("VLLM_GGUF_Q8_0_M1_SPECIALIZE", "0")
+                expected = ops.ggml_mul_mat_vec_a8(weight, x[:batch], qtype, rows)
+                monkeypatch.setenv("VLLM_GGUF_Q8_0_M1_SPECIALIZE", "1")
+                actual = ops.ggml_mul_mat_vec_a8(weight, x[:batch], qtype, rows)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            q = ops.ggml_quantize_row_q8_1(x[:1])
+            expected = ops.ggml_mul_mat_vec_a8(weight, x[:1], qtype, rows)
+            observed = torch.empty_like(expected)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                observed.fill_(float("nan"))
+                ops.ggml_mul_mat_vec_q8_out(weight, q, observed, qtype, rows, cols)
+            graph.replay()
+            torch.testing.assert_close(observed, expected, atol=0, rtol=0)
+            x.zero_()
+            q.copy_(ops.ggml_quantize_row_q8_1(x[:1]))
+            graph.replay()
+            torch.testing.assert_close(
+                observed, torch.zeros_like(observed), atol=0, rtol=0
+            )
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        ops.ggml_mul_mat_vec_a8(weight, x[:1], qtype, rows)
+        torch.cuda.synchronize()
+    names = [
+        e.name
+        for e in profile.events()
+        if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert any("q8_0_q8_1_row_tile<" in n and ", true>" in n for n in names), names

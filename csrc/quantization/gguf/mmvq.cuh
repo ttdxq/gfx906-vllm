@@ -164,15 +164,16 @@ static void mul_mat_vec_q8_0_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs, dst_stride < 0 ? nrows : dst_stride);
 }
 
-template <typename scalar_t, int rows_per_wave>
+template <typename scalar_t, int rows_per_wave, bool SINGLE_VEC = false>
 static __global__ void mul_mat_vec_q8_0_q8_1_row_tile(
     const void * __restrict__ vx, const void * __restrict__ vy,
     scalar_t * __restrict__ dst, const int ncols, const int nrows,
     const int nvecs, const int dst_stride) {
     const int first_row = blockIdx.x * rows_per_wave;
-    const bool combine_vecs = gguf_mmvq_combine_vecs(nvecs);
+    constexpr int max_vecs = SINGLE_VEC ? 1 : 4;
+    const bool combine_vecs = !SINGLE_VEC && gguf_mmvq_combine_vecs(nvecs);
     const int first_vec = combine_vecs ? 0 : blockIdx.y;
-    const int vec_count = combine_vecs ? nvecs : 1;
+    const int vec_count = SINGLE_VEC ? 1 : (combine_vecs ? nvecs : 1);
     if (first_row >= nrows || first_vec >= nvecs) {
         return;
     }
@@ -184,16 +185,16 @@ static __global__ void mul_mat_vec_q8_0_q8_1_row_tile(
         ((ncols + 512 - 1) / 512 * 512) / QK8_1;
     const block_q8_0 * x = static_cast<const block_q8_0 *>(vx);
     const block_q8_1 * y = static_cast<const block_q8_1 *>(vy);
-    float tmp[4][rows_per_wave] = {};
+    float tmp[max_vecs][rows_per_wave] = {};
 
     for (int i = threadIdx.x / (QI8_0 / VDR_Q8_0_Q8_1_MMVQ);
          i < blocks_per_row; i += blocks_per_wave) {
         const int iqs = VDR_Q8_0_Q8_1_MMVQ *
             (threadIdx.x % (QI8_0 / VDR_Q8_0_Q8_1_MMVQ));
-        int activation[4][VDR_Q8_0_Q8_1_MMVQ];
-        float activation_scale[4];
+        int activation[max_vecs][VDR_Q8_0_Q8_1_MMVQ];
+        float activation_scale[max_vecs];
 #pragma unroll
-        for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+        for (int vec_offset = 0; vec_offset < max_vecs; ++vec_offset) {
             if (vec_offset >= vec_count) {
                 break;
             }
@@ -217,7 +218,7 @@ static __global__ void mul_mat_vec_q8_0_q8_1_row_tile(
                 &x[row * blocks_per_row + i];
             const float weight_scale = __half2float(weight_block->d);
 #pragma unroll
-            for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+            for (int vec_offset = 0; vec_offset < max_vecs; ++vec_offset) {
                 if (vec_offset >= vec_count) {
                     break;
                 }
@@ -239,7 +240,7 @@ static __global__ void mul_mat_vec_q8_0_q8_1_row_tile(
 #pragma unroll
         for (int row_offset = 0; row_offset < rows_per_wave; ++row_offset) {
 #pragma unroll
-            for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+            for (int vec_offset = 0; vec_offset < max_vecs; ++vec_offset) {
                 if (vec_offset >= vec_count) {
                     break;
                 }
@@ -255,7 +256,7 @@ static __global__ void mul_mat_vec_q8_0_q8_1_row_tile(
             const int row = first_row + row_offset;
             if (row < nrows) {
 #pragma unroll
-                for (int vec_offset = 0; vec_offset < 4; ++vec_offset) {
+                for (int vec_offset = 0; vec_offset < max_vecs; ++vec_offset) {
                     if (vec_offset >= vec_count) {
                         break;
                     }
@@ -276,6 +277,16 @@ static void mul_mat_vec_q8_0_q8_1_row_tile_cuda(
         (nrows + rows_per_wave - 1) / rows_per_wave,
         gguf_mmvq_grid_vecs(nvecs), 1);
     const dim3 block_dims(WARP_SIZE, 1, 1);
+#if defined(USE_ROCM)
+    const char* specialize = std::getenv("VLLM_GGUF_Q8_0_M1_SPECIALIZE");
+    if (nvecs == 1 && specialize != nullptr && std::string(specialize) == "1") {
+        mul_mat_vec_q8_0_q8_1_row_tile<scalar_t, rows_per_wave, true>
+            <<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, dst, ncols, nrows, nvecs,
+                dst_stride < 0 ? nrows : dst_stride);
+        return;
+    }
+#endif
     mul_mat_vec_q8_0_q8_1_row_tile<scalar_t, rows_per_wave>
         <<<block_nums, block_dims, 0, stream>>>(
             vx, vy, dst, ncols, nrows, nvecs,
