@@ -18,6 +18,7 @@
 #include "dequantize.cuh"
 #include "mmvq.cuh"
 #include "mmvq_prepared.cuh"
+#include "mmvq_schedule.cuh"
 #include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
@@ -1096,6 +1097,76 @@ static bool gguf_mmvq_type_selected(const char* selected, int64_t type) {
 }
 
 template <typename scalar_t>
+static bool try_mul_mat_vec_schedule(
+    const void* W, const void* quant_X, scalar_t* dst, int col, int row,
+    int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
+#if defined(USE_ROCM)
+  const char* mode = std::getenv("VLLM_GGUF_MMVQ_SCHEDULE");
+  bool automatic_shared = false;
+  if (mode != nullptr && mode[0] == 'a') {
+    if (vecs != 1 || row < 2048) return false;
+    if ((type == 2 || type == 3 || type == 6) && col >= 4096 && col <= 17408) {
+      mode = "8";
+      automatic_shared = true;
+    } else if ((type == 7 || type == 8) && col > 8192 && col <= 17408) {
+      mode = "8";
+      automatic_shared = true;
+    } else if (type == 10 || (type == 14 && col > 8192)) {
+      mode = "4";
+    } else {
+      return false;
+    }
+  }
+  if (mode == nullptr || (mode[0] != '4' && mode[0] != '8') ||
+      vecs < 1 || vecs > 4 || col <= 0 || col % QK_K != 0 ||
+      (type >= 12 && type <= 13 && gguf_planar_is_planar(W)) ||
+      std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+              .find("gfx906") != 0) return false;
+  const char* selected = std::getenv("VLLM_GGUF_MMVQ_SCHEDULE_TYPE");
+  if (!gguf_mmvq_type_selected(selected, type)) return false;
+  const char* shared_env = std::getenv("VLLM_GGUF_MMVQ_SHARED_X");
+  const bool shared = (automatic_shared || (shared_env != nullptr && shared_env[0] == '1')) &&
+                      vecs == 1 && ((col + 511) / 512 * 512) / 32 * 36 <= 32768;
+  if (type == 14 && gguf_planar_is_planar(W)) {
+    if (vecs != 1) return false;
+    const int bytes = ((col + 511) / 512 * 512) / 32 * 36;
+#define Q6_SCHEDULE(ROWS_, SHARED_) \
+    mul_mat_vec_q6_K_q8_1_planar_wide<scalar_t, 1, ROWS_, SHARED_> \
+      <<<(row + ROWS_ - 1) / ROWS_, ROWS_ * 64, SHARED_ ? bytes : 0, stream>>>( \
+          (const uint8_t*)W, quant_X, dst, col, row, dst_stride)
+    if (mode[0] == '8') {
+      if (shared) { Q6_SCHEDULE(8, true); }
+      else { Q6_SCHEDULE(8, false); }
+    } else {
+      if (shared) { Q6_SCHEDULE(4, true); }
+      else { Q6_SCHEDULE(4, false); }
+    }
+#undef Q6_SCHEDULE
+    return true;
+  }
+#define SCHEDULE_CASE(TYPE_, QK_, QI_, BLOCK_, VDR_, DOT_) \
+  case TYPE_: \
+    launch_mmvq_schedule<scalar_t, QK_, QI_, BLOCK_, VDR_, DOT_>( \
+        W, quant_X, dst, col, row, vecs, dst_stride, stream, mode[0] - '0', shared); \
+    return true
+  switch (type) {
+    SCHEDULE_CASE(2, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1);
+    SCHEDULE_CASE(3, QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1);
+    SCHEDULE_CASE(6, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1);
+    SCHEDULE_CASE(7, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1);
+    SCHEDULE_CASE(8, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1);
+    SCHEDULE_CASE(10, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1);
+    SCHEDULE_CASE(11, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1);
+    SCHEDULE_CASE(12, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1);
+    SCHEDULE_CASE(13, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1);
+    SCHEDULE_CASE(14, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1);
+  }
+#undef SCHEDULE_CASE
+#endif
+  return false;
+}
+
+template <typename scalar_t>
 static bool try_mul_mat_vec_iq_lut(
     const void* W, const void* quant_X, scalar_t* dst, int col, int row,
     int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
@@ -1157,6 +1228,10 @@ static void ggml_mul_mat_vec_q8_dispatch(
     return;
   }
   if (try_mul_mat_vec_iq_lut(
+          W, quant_X, dst, col, row, vecs, type, stream, dst_stride)) {
+    return;
+  }
+  if (try_mul_mat_vec_schedule(
           W, quant_X, dst, col, row, vecs, type, stream, dst_stride)) {
     return;
   }

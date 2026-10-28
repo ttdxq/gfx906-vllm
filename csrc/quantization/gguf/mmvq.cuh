@@ -1263,15 +1263,24 @@ static void mul_mat_vec_q6_K_q8_1_planar_row_tile2_cuda(const void * vx, const v
 // standalone on gfx906: 610-636 GB/s on the main shapes vs 470-510 for the
 // generic kernel and 570-620 for the row-tile planar form; row tiles, a
 // software pipeline, 8-word groups and a q8_1 y-plane all measured slower.
-template <typename scalar_t, int VECS>
-static __global__ void __launch_bounds__(64)
+template <typename scalar_t, int VECS, int ROWS = 1, bool SHARED_X = false>
+static __global__ void __launch_bounds__(64 * ROWS)
 mul_mat_vec_q6_K_q8_1_planar_wide(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
                                   scalar_t * __restrict__ dst, const int ncols, const int nrows,
                                   const int dst_stride) {
-    const int row = blockIdx.x;
+    extern __shared__ int staged_x[];
+    const int nrows_y = (ncols + 511) / 512 * 512;
+    const block_q8_1 * y = (const block_q8_1 *)vy;
+    if constexpr (SHARED_X) {
+        for (int k = threadIdx.x; k < nrows_y / 32 * 9; k += blockDim.x)
+            staged_x[k] = ((const int *)vy)[k];
+        __syncthreads();
+        y = (const block_q8_1 *)staged_x;
+    }
+    const int row = blockIdx.x * ROWS + threadIdx.x / 64;
     if (row >= nrows) return;
     const int nb = ncols / QK_K;
-    const int lane = threadIdx.x;
+    const int lane = threadIdx.x & 63;
     constexpr int NG = 8;              // word groups per superblock (32/4)
     constexpr int STEP = 8;            // superblocks in flight per block (64/8)
     const int g = lane % NG;
@@ -1287,8 +1296,6 @@ mul_mat_vec_q6_K_q8_1_planar_wide(const uint8_t * __restrict__ vx, const void * 
     const uint8_t * qhr = vx + gguf_planar_q6_k::qh_off(nrows, nb) + base * 64;
     const uint8_t * scr = vx + gguf_planar_q6_k::sc_off(nrows, nb) + base * 16;
     const __half * dr = (const __half *)(vx + gguf_planar_q6_k::d_off(nrows, nb)) + base;
-    const block_q8_1 * y = (const block_q8_1 *) vy;
-    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
     float tmp[VECS];
 #pragma unroll
     for (int vo = 0; vo < VECS; ++vo) tmp[vo] = 0.f;
@@ -1325,7 +1332,7 @@ mul_mat_vec_q6_K_q8_1_planar_wide(const uint8_t * __restrict__ vx, const void * 
             tmp[vo] += VLLM_SHFL_XOR_SYNC(tmp[vo], mask);
         }
     }
-    if (threadIdx.x == 0) {
+    if (lane == 0) {
 #pragma unroll
         for (int vo = 0; vo < VECS; ++vo) {
             dst[vo * dst_stride + row] = tmp[vo];
