@@ -2357,7 +2357,7 @@ class GGUFLinearMethod(LinearMethodBase):
             torch.cuda.empty_cache()
 
     def _maybe_planar_pack_kquants(self, layer: torch.nn.Module) -> None:
-        """Rewrite plain (non-sharded) q4_K/q5_K/q6_K weights into the plane
+        """Rewrite q4_K/q5_K/q6_K weights into the plane
         planar layout. Byte count, tensor shape and the recorded quant type
         are all unchanged; planar-aware MMVQ/MMQ kernels pick the buffer up
         through the pointer registry in the C++ dispatch."""
@@ -2381,11 +2381,18 @@ class GGUFLinearMethod(LinearMethodBase):
             return
         if qweight.numel() == 0:
             return
-        if getattr(qweight, "shard_offset_map", None):
-            return  # repacked per shard in _cache_gguf_shards
         if not qweight.is_cuda or not qweight.is_contiguous():
             return
-        q_type = int(qweight_type.weight_type)
+        merged = bool(getattr(qweight, "shard_offset_map", None))
+        if merged:
+            full = _get_full_mmvq_shard_weight(
+                layer, list(qweight_type.shard_weight_type.values())
+            )
+            if full is None:
+                return  # Mixed types are packed per shard in _cache_gguf_shards.
+            _, q_type = full
+        else:
+            q_type = int(qweight_type.weight_type)
         if q_type not in _gguf_planar_k_types():
             return
         block_size = 256
@@ -2396,6 +2403,14 @@ class GGUFLinearMethod(LinearMethodBase):
             return
         packed = torch.ops._C.ggml_planar_pack(qweight, q_type, row, col)
         qweight.data = packed
+        if merged:
+            # A planar tensor cannot be sliced at original block-row offsets.
+            # Canonicalize the complete same-type group before shard caching,
+            # so every MMVQ/MMQ consumer uses its registered base pointer.
+            qweight.shard_id = []
+            qweight.shard_offset_map = {}
+            qweight_type.weight_type = q_type
+            qweight_type.shard_weight_type = {}
         logger.info_once("Packed GGUF K-quant weights into the planar layout.")
 
     def _maybe_repack_iq4_xs_to_q8_0(self, layer: torch.nn.Module) -> None:
@@ -2675,6 +2690,18 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = getattr(layer.qweight, "shard_id", [])
 
         if shard_id:
+            full_mmvq = getattr(layer, "_gguf_full_shard_mmvq", None)
+            if full_mmvq is not None:
+                # Keep batch-dependent MMVQ/MMQ selection inside the custom
+                # op. Tracing the Python small-batch branch during prefill
+                # otherwise leaves separate shard calls in the decode graph.
+                qweight, qweight_type, _ = full_mmvq
+                out = _fused_mul_mat_gguf_cached_mmvq(
+                    x, qweight, qweight_type, layer, "_gguf_full_mmvq_quant_x"
+                )
+                if bias is not None:
+                    out.add_(bias)
+                return out
             collected = _collect_gguf_linear_shards(layer)
             assert collected is not None
             qweights, qweight_types = collected
@@ -2687,34 +2714,23 @@ class GGUFLinearMethod(LinearMethodBase):
             if mmvq_max_batch is None:
                 can_share_mmvq = _can_share_mmvq_activation(x, qweights, qweight_types)
             if can_share_mmvq:
-                full_mmvq = getattr(layer, "_gguf_full_shard_mmvq", None)
-                if full_mmvq is not None and x.shape[0] <= full_mmvq[2]:
-                    qweight, qweight_type, _ = full_mmvq
-                    if ENABLE_GGUF_LINEAR_PROFILE:
-                        _gguf_linear_profile_hit(
-                            "sharded_full_mmvq", x, [qweight], [qweight_type]
-                        )
-                    out = _fused_mul_mat_gguf_cached_mmvq(
-                        x, qweight, qweight_type, layer, "_gguf_full_mmvq_quant_x"
-                    )
+                coalesced = getattr(layer, "_gguf_coalesced_shards", None)
+                if coalesced is not None and x.shape[0] <= coalesced[2]:
+                    qweights, qweight_types = coalesced[0], coalesced[1]
+                    profile_path = "sharded_coalesced_mmvq"
                 else:
-                    coalesced = getattr(layer, "_gguf_coalesced_shards", None)
-                    if coalesced is not None and x.shape[0] <= coalesced[2]:
-                        qweights, qweight_types = coalesced[0], coalesced[1]
-                        profile_path = "sharded_coalesced_mmvq"
-                    else:
-                        profile_path = "sharded_mmvq"
-                    if ENABLE_GGUF_LINEAR_PROFILE:
-                        _gguf_linear_profile_hit(
-                            profile_path, x, qweights, qweight_types
-                        )
-                    out = _fused_mul_mat_gguf_sharded_cached_mmvq(
-                        x,
-                        qweights,
-                        qweight_types,
-                        layer,
-                        "_gguf_sharded_mmvq_quant_x",
+                    profile_path = "sharded_mmvq"
+                if ENABLE_GGUF_LINEAR_PROFILE:
+                    _gguf_linear_profile_hit(
+                        profile_path, x, qweights, qweight_types
                     )
+                out = _fused_mul_mat_gguf_sharded_cached_mmvq(
+                    x,
+                    qweights,
+                    qweight_types,
+                    layer,
+                    "_gguf_sharded_mmvq_quant_x",
+                )
             else:
                 if ENABLE_GGUF_LINEAR_PROFILE:
                     _gguf_linear_profile_hit(
