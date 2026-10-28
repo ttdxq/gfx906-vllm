@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,197 @@ from vllm.model_executor.layers.quantization.gguf import (
     _get_full_mmvq_shard_weight,
 )
 
+_NATIVE_WEIGHT_TYPES = [
+    gguf.GGMLQuantizationType[name]
+    for name in (
+        "Q4_0",
+        "Q4_1",
+        "Q5_0",
+        "Q5_1",
+        "Q8_0",
+        "Q2_K",
+        "Q3_K",
+        "Q4_K",
+        "Q5_K",
+        "Q6_K",
+        "IQ1_S",
+        "IQ1_M",
+        "IQ2_XXS",
+        "IQ2_XS",
+        "IQ2_S",
+        "IQ3_XXS",
+        "IQ3_S",
+        "IQ4_NL",
+        "IQ4_XS",
+    )
+]
+_TEST_WEIGHT_STORAGE = []
+
+
+@lru_cache(maxsize=1)
+def _quantized_sample_dir():
+    return Path(snapshot_download("Isotr0py/test-gguf-sample"))
+
+
+def _quantized_test_rows(qtype, rows, cols):
+    if qtype in (gguf.GGMLQuantizationType.Q4_1, gguf.GGMLQuantizationType.Q5_1):
+        rng = np.random.default_rng(2710 + int(qtype))
+        return gguf.quantize(
+            rng.standard_normal((rows, cols)).astype(np.float32), qtype
+        )
+    sample_dir = _quantized_sample_dir()
+    sample = gguf.GGUFReader(sample_dir / f"Quant_{qtype.name}_1024.gguf")
+    block, size = gguf.GGML_QUANT_SIZES[qtype]
+    width = cols // block * size
+    source = sample.tensors[0].data[:rows]
+    return np.tile(source, (1, (width + source.shape[1] - 1) // source.shape[1]))[
+        :, :width
+    ].copy()
+
+
+def _dequantized_reference(data, qtype):
+    decoded = gguf.dequantize(data, qtype)
+    if qtype not in (gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.Q5_K):
+        return torch.from_numpy(decoded).double()
+    # The dequantizer rounds coefficient products in FP16 even for FP32
+    # output. HIP contracts its final half multiply/subtract into an FMA.
+    _, size = gguf.GGML_QUANT_SIZES[qtype]
+    raw = data.reshape(-1, size)
+    d = raw[:, :2].copy().view(np.float16).astype(np.float32)
+    minimum = raw[:, 2:4].copy().view(np.float16).astype(np.float32)
+    sc, m = gguf.quants.Q4_K.get_scale_min(raw[:, 4:16].copy())
+    scale = (d * sc).reshape(-1, 8, 1)
+    offset = (minimum * m).reshape(-1, 8, 1)
+    values = decoded.reshape(-1, 8, 32)
+    integer = np.divide(
+        values + offset, scale, out=np.zeros_like(values), where=scale != 0
+    ).round()
+    product = scale.astype(np.float16).astype(np.float32) * integer
+    if not gguf_layer.current_platform.is_rocm():
+        product = product.astype(np.float16).astype(np.float32)
+    rounded = (product - offset.astype(np.float16).astype(np.float32)).astype(
+        np.float16
+    )
+    return torch.from_numpy(rounded.reshape(decoded.shape)).double()
+
+
+def _quantized_dot_reference(data, qtype, quant_x, cols, *, mmq=False):
+    """CPU decoded weights plus each format's documented Q8 correction."""
+    batch = quant_x.shape[0]
+    blocks = quant_x.cpu().view(torch.uint8).reshape(batch, -1, 36)
+    ds = blocks[..., :4].contiguous().view(torch.float16).double()
+    qs = blocks[..., 4:].contiguous().view(torch.int8).double()
+    dq_x = (ds[..., :1] * qs).reshape(batch, -1)[:, :cols]
+    weight = torch.from_numpy(gguf.dequantize(data, qtype)).double()
+    result = dq_x @ weight.T
+    if mmq and qtype == gguf.GGMLQuantizationType.Q5_0:
+        # MMQ centers the 5-bit values in its tile; MMVQ uses the original sum.
+        return result
+    count = cols // 32
+    scale_x = ds[:, :count, 0]
+    sums_x = ds[:, :count, 1]
+    sum_quant = scale_x * qs[:, :count].sum(dim=-1)
+    if qtype in (gguf.GGMLQuantizationType.Q4_1, gguf.GGMLQuantizationType.Q5_1):
+        _, size = gguf.GGML_QUANT_SIZES[qtype]
+        metadata = torch.from_numpy(data.reshape(len(data), -1, size)[..., :4].copy())
+        metadata = metadata.view(torch.float16).double()
+        dw, minimum = metadata[..., 0], metadata[..., 1]
+        unsigned = torch.where(
+            dw[..., None] != 0,
+            (weight.reshape(len(data), count, 32) - minimum[..., None]) / dw[..., None],
+            0,
+        ).round()
+        dots = torch.einsum("nbi,mbi->mnb", unsigned, qs[:, :count])
+        # These two existing kernels multiply the half2 metadata in FP16.
+        coefficient = (dw[None] * scale_x[:, None]).half().double()
+        offset = (minimum[None] * sums_x[:, None]).half().double()
+        return (coefficient * dots + offset).sum(dim=-1)
+    if mmq and qtype in (
+        gguf.GGMLQuantizationType.Q4_K,
+        gguf.GGMLQuantizationType.Q5_K,
+    ):
+        _, size = gguf.GGML_QUANT_SIZES[qtype]
+        raw = data.reshape(-1, size)
+        minimum = raw[:, 2:4].copy().view(np.float16).astype(np.float64)
+        _, minima = gguf.quants.Q4_K.get_scale_min(raw[:, 4:16].copy())
+        offset = torch.from_numpy(-(minimum * minima).reshape(len(data), count))
+    elif qtype in (gguf.GGMLQuantizationType.Q4_0, gguf.GGMLQuantizationType.Q5_0):
+        _, size = gguf.GGML_QUANT_SIZES[qtype]
+        scales = torch.from_numpy(data.reshape(len(data), -1, size)[..., :2].copy())
+        offset = scales.view(torch.float16).double().squeeze(-1)
+        offset *= -8 if qtype == gguf.GGMLQuantizationType.Q4_0 else -16
+    elif qtype == gguf.GGMLQuantizationType.IQ1_S:
+        raw = data.reshape(len(data), -1, 50)
+        d = raw[..., :2].copy().view(np.float16).astype(np.float64)
+        high = raw[..., 34:].copy().view(np.uint16)
+        multiplier = 2 * ((high >> 12) & 7).astype(np.float64) + 1
+        delta = np.where((high & 0x8000) == 0, 0.125, -0.125) - 1
+        offset = torch.from_numpy((d * multiplier * delta).reshape(len(data), count))
+    else:
+        return result
+    return result + torch.einsum("nb,mb->mn", offset, sums_x - sum_quant)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("qtype", _NATIVE_WEIGHT_TYPES, ids=lambda t: t.name)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_all_gguf_weight_formats_match_cpu_reference_and_graph(qtype, dtype):
+    """Format coverage must include affine sums, odd rows and Q8 padding."""
+    torch.manual_seed(2710 + int(qtype))
+    for cols in (768, 1024):
+        data = _quantized_test_rows(qtype, 3, cols)
+        raw = torch.tensor(data, device="cuda")
+        _TEST_WEIGHT_STORAGE.append(raw)
+        dequant = ops.ggml_dequantize(raw, int(qtype), 3, cols, torch.float32).cpu()
+        torch.testing.assert_close(
+            dequant.double(),
+            _dequantized_reference(data, qtype),
+            atol=0.001,
+            rtol=0.001,
+        )
+        empty = gguf_layer.fused_mul_mat_gguf(
+            torch.empty((0, cols), device="cuda", dtype=dtype), raw, int(qtype)
+        )
+        assert empty.shape == (0, 3)
+        for batch in (1, 4, 5, 8):
+            x = torch.randn((batch, cols), device="cuda", dtype=dtype) * 0.2
+            quant_x = ops.ggml_quantize_row_q8_1(x)
+            expected = _quantized_dot_reference(data, qtype, quant_x, cols)
+            actual = ops.ggml_mul_mat_vec_q8(raw, quant_x, int(qtype), 3, cols, dtype)
+            atol, rtol = (0.001, 2e-4) if dtype == torch.float32 else (0.02, 0.01)
+            torch.testing.assert_close(
+                actual.cpu().double(), expected, atol=atol, rtol=rtol
+            )
+            if batch == 1:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = ops.ggml_mul_mat_vec_q8(
+                        raw, quant_x, int(qtype), 3, cols, dtype
+                    )
+                    observed = output.clone()
+                    output.fill_(float("nan"))
+                for _ in range(2):
+                    graph.replay()
+                    torch.testing.assert_close(observed, actual, atol=0, rtol=0)
+                quant_x.copy_(ops.ggml_quantize_row_q8_1(torch.zeros_like(x)))
+                for _ in range(2):
+                    graph.replay()
+                    torch.testing.assert_close(
+                        observed, torch.zeros_like(actual), atol=0, rtol=0
+                    )
+        if cols == 1024:
+            for batch in (17, 65):
+                x = torch.randn((batch, cols), device="cuda", dtype=dtype) * 0.2
+                quant_x = ops.ggml_quantize_row_q8_1(x)
+                expected = _quantized_dot_reference(
+                    data, qtype, quant_x, cols, mmq=True
+                )
+                actual = ops.ggml_mul_mat_a8(raw, x, int(qtype), 3)
+                torch.testing.assert_close(
+                    actual.cpu().double(), expected, atol=atol, rtol=rtol
+                )
+
 
 def _make_layer(
     shard_offset_map: dict[int, tuple[int, int, int]],
@@ -26,6 +218,127 @@ def _make_layer(
     qweight.shard_offset_map = shard_offset_map
     qweight_type = SimpleNamespace(shard_weight_type=shard_weight_type)
     return SimpleNamespace(qweight=qweight, qweight_type=qweight_type)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize(
+    "qtype", [gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.Q5_K]
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_prepared_k45_preserves_math_graph_replay_and_fallback(
+    monkeypatch, qtype, dtype
+):
+    """The private producer/consumer must match standard Q8 and fully write tails."""
+    if "gfx906" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""):
+        pytest.skip("gfx906 prepared routing")
+    torch.manual_seed(2710)
+    monkeypatch.setenv("VLLM_GGUF_K45_WIDE", "1")
+    monkeypatch.setenv("VLLM_GGUF_K45_INT_ACC", "1")
+    for rows, cols in (
+        (65, 768),
+        (64, 5120),
+        (65, 6144),
+        (65, 17408),
+        (63, 1024),
+        (65, 29440),
+    ):
+        data = _quantized_test_rows(qtype, rows, cols)
+        raw = torch.tensor(data, device="cuda")
+        packed = torch.ops._C.ggml_planar_pack(raw, int(qtype), rows, cols)
+        _TEST_WEIGHT_STORAGE.extend((raw, packed))
+        x = torch.randn((4, cols), device="cuda", dtype=dtype) * 0.2
+        original_x = x.clone()
+        for batch in (1, 2, 4):
+            monkeypatch.setenv("VLLM_GGUF_K45_PREPARED", "0")
+            quant_x = ops.ggml_quantize_row_q8_1(x[:batch])
+            expected = ops.ggml_mul_mat_vec_a8(packed, x[:batch], int(qtype), rows)
+            monkeypatch.setenv("VLLM_GGUF_K45_PREPARED", "1")
+            actual = ops.ggml_mul_mat_vec_a8(packed, x[:batch], int(qtype), rows)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            torch.testing.assert_close(
+                ops.ggml_quantize_row_q8_1(x[:batch]), quant_x, atol=0, rtol=0
+            )
+            if batch != 1:
+                continue
+            reference = _quantized_dot_reference(data, qtype, quant_x, cols)
+            atol, rtol = (0.003, 3e-4) if dtype == torch.float32 else (0.03, 0.01)
+            torch.testing.assert_close(
+                actual.cpu().double(), reference, atol=atol, rtol=rtol
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = ops.ggml_mul_mat_vec_a8(packed, x[:1], int(qtype), rows)
+                observed = output.clone()
+                output.fill_(float("nan"))
+            for zero_input in (False, True):
+                if zero_input:
+                    x.zero_()
+                for _ in range(2):
+                    graph.replay()
+                    torch.testing.assert_close(
+                        observed,
+                        torch.zeros_like(expected) if zero_input else expected,
+                        atol=0,
+                        rtol=0,
+                    )
+            x.copy_(original_x)
+        if cols == 768:
+            for alternating in (False, True):
+                probe = torch.ones_like(x[:1])
+                if alternating:
+                    probe[:, 1::2] = -1
+                monkeypatch.setenv("VLLM_GGUF_K45_PREPARED", "0")
+                expected = ops.ggml_mul_mat_vec_a8(packed, probe, int(qtype), rows)
+                monkeypatch.setenv("VLLM_GGUF_K45_PREPARED", "1")
+                actual = ops.ggml_mul_mat_vec_a8(packed, probe, int(qtype), rows)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        for gate in ("VLLM_GGUF_K45_INT_ACC", "VLLM_GGUF_K45_WIDE"):
+            monkeypatch.setenv(gate, "0")
+            monkeypatch.setenv("VLLM_GGUF_K45_PREPARED", "0")
+            expected = ops.ggml_mul_mat_vec_a8(packed, x[:1], int(qtype), rows)
+            monkeypatch.setenv("VLLM_GGUF_K45_PREPARED", "1")
+            actual = ops.ggml_mul_mat_vec_a8(packed, x[:1], int(qtype), rows)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            monkeypatch.setenv(gate, "1")
+        expected = ops.ggml_mul_mat_vec_a8(packed, x[:1], int(qtype), rows)
+        monkeypatch.setenv("VLLM_GGUF_MMVQ_ZERO_OUTPUT", "1")
+        torch.testing.assert_close(
+            ops.ggml_mul_mat_vec_a8(packed, x[:1], int(qtype), rows),
+            expected,
+            atol=0,
+            rtol=0,
+        )
+        monkeypatch.delenv("VLLM_GGUF_MMVQ_ZERO_OUTPUT")
+
+
+def test_q8_1_weight_type_is_rejected():
+    """Q8_1 activation records do not implement the GGUF weight format."""
+    qtype = gguf.GGMLQuantizationType.Q8_1
+    assert set(_NATIVE_WEIGHT_TYPES) == gguf_layer.MMVQ_QUANT_TYPES
+    assert set(_NATIVE_WEIGHT_TYPES) == gguf_layer.MMQ_QUANT_TYPES
+    assert set(_NATIVE_WEIGHT_TYPES) == gguf_layer.DEQUANT_TYPES
+    assert qtype not in gguf_layer.MMVQ_QUANT_TYPES
+    assert qtype not in gguf_layer.MMQ_QUANT_TYPES
+    assert qtype not in gguf_layer.DEQUANT_TYPES
+    with pytest.raises(NotImplementedError, match="Unsupported GGUF"):
+        gguf_layer._fused_mul_mat_gguf(
+            torch.ones((1, 32)), torch.zeros((3, 40), dtype=torch.uint8), qtype
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@torch.inference_mode()
+def test_native_q8_1_weights_fail_explicitly():
+    raw = torch.zeros((3, 40), device="cuda", dtype=torch.uint8)
+    x = torch.ones((1, 32), device="cuda")
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    with pytest.raises(RuntimeError, match="Unsupported GGUF MMVQ"):
+        ops.ggml_mul_mat_vec_q8(raw, quant_x, 9, 3, 32, x.dtype)
+    with pytest.raises(RuntimeError, match="Unsupported GGUF MMQ"):
+        ops.ggml_mul_mat_a8(raw, x, 9, 3)
+    with pytest.raises(RuntimeError, match="Unsupported GGUF dequantization"):
+        ops.ggml_dequantize(raw, 9, 3, 32, x.dtype)
 
 
 def test_full_mmvq_shard_weight_accepts_contiguous_same_type_shards():

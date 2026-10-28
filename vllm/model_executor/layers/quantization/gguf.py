@@ -836,7 +836,6 @@ STANDARD_QUANT_TYPES = {
     WeightType.Q5_0,
     WeightType.Q5_1,
     WeightType.Q8_0,
-    WeightType.Q8_1,
 }
 KQUANT_TYPES = {
     WeightType.Q2_K,
@@ -871,11 +870,10 @@ IQ_MMQ_QUANT_TYPES = {
 }
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-# Q8_1 has no MMQ dispatch case (and never appears as a real weight type);
-# keep it out so a hypothetical routing mistake cannot hit a silent no-op.
+# Q8_1 is an activation format here; native weight kernels do not support it.
 MMQ_QUANT_TYPES = (
-    (STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES)
-) - {WeightType.Q8_1}
+    STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES
+)
 
 
 def _iq_mmq_beats_dequant(x: torch.Tensor, qweight: torch.Tensor,
