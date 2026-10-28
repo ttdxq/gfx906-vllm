@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     VLLM_RAY_DP_PLACEMENT_NODE_IPS: str = ""
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
+    VLLM_GGUF_SHARED_ACTIVATION: bool = False
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
@@ -1580,6 +1581,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # meta-llama/Llama-3.2-1B   /tmp/Llama-3.2-1B
     "VLLM_MODEL_REDIRECT_PATH": lambda: os.environ.get(
         "VLLM_MODEL_REDIRECT_PATH", None
+    ),
+    # Share GGUF activation quantization across projections of the same input.
+    "VLLM_GGUF_SHARED_ACTIVATION": lambda: (
+        os.environ.get("VLLM_GGUF_SHARED_ACTIVATION", "0") == "1"
     ),
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (

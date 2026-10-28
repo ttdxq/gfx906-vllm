@@ -503,6 +503,68 @@ def test_mixed_format_candidates_preserve_sharded_stride_and_graph(monkeypatch, 
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_shared_activation_preserves_all_formats_and_graph(monkeypatch, dtype):
+    """Sharing must retain single-kernel math, strides and replay overwrite."""
+    if "gfx906" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""):
+        pytest.skip("gfx906 shared activation")
+    monkeypatch.setenv("VLLM_GGUF_SHARED_ACTIVATION", "1")
+    torch.manual_seed(2810)
+    for cols in (768, 5120, 17408):
+        weights = []
+        for qtype in _NATIVE_WEIGHT_TYPES:
+            rows = 2049 if qtype == 8 else (65 if qtype in (12, 13, 14) else 5)
+            data = _quantized_test_rows(qtype, rows, cols)
+            if len(data) < rows:
+                data = np.tile(data, ((rows + len(data) - 1) // len(data), 1))[:rows]
+            raw = torch.tensor(data, device="cuda")
+            _TEST_WEIGHT_STORAGE.append(raw)
+            weight = raw
+            if qtype in (12, 13, 14):
+                weight = torch.ops._C.ggml_planar_pack(raw, int(qtype), rows, cols)
+                _TEST_WEIGHT_STORAGE.append(weight)
+            weights.append(weight)
+        x = torch.randn((4, cols), device="cuda", dtype=dtype) * 0.1
+        for batch in (1, 2, 4):
+            expected = torch.cat(
+                [
+                    ops.ggml_mul_mat_vec_a8(w, x[:batch], int(t), w.shape[0])
+                    for w, t in zip(weights, _NATIVE_WEIGHT_TYPES)
+                ],
+                dim=1,
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = ops.ggml_mul_mat_vec_a8_sharded(
+                    weights, x[:batch], _NATIVE_WEIGHT_TYPES
+                )
+                observed = output.clone()
+                output.fill_(float("nan"))
+            for _ in range(2):
+                graph.replay()
+                torch.testing.assert_close(observed, expected, atol=0, rtol=0)
+        # Exercise both single-representation producers as well as the dual one.
+        for indices in ([7, 8], [0, 4, 18]):
+            selected = [weights[i] for i in indices]
+            types = [_NATIVE_WEIGHT_TYPES[i] for i in indices]
+            for prepared in ("0", "1"):
+                monkeypatch.setenv("VLLM_GGUF_K45_PREPARED", prepared)
+                expected = torch.cat(
+                    [
+                        ops.ggml_mul_mat_vec_a8(w, x[:1], int(t), w.shape[0])
+                        for w, t in zip(selected, types)
+                    ],
+                    dim=1,
+                )
+                actual = ops.ggml_mul_mat_vec_a8_sharded(selected, x[:1], types)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        x.zero_()
+        graph.replay()
+        torch.testing.assert_close(observed, torch.zeros_like(observed), atol=0, rtol=0)
+
+
 def _make_layer(
     shard_offset_map: dict[int, tuple[int, int, int]],
     shard_weight_type: dict[int, int],
@@ -715,6 +777,73 @@ def test_compiled_full_shards_keep_one_runtime_dispatch(monkeypatch, qtype):
             expected = x.sum(dim=1, keepdim=True) + layer.qweight[:, 0].to(x) + bias
             torch.testing.assert_close(actual, expected)
             assert calls == ([(batch, 5)] if batch else [])
+    finally:
+        torch._dynamo.reset()
+        lib._destroy()
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_compiled_shared_activation_keeps_runtime_batch_selection(monkeypatch, grouped):
+    """Prefill tracing must keep sharing available for mixed decode shards."""
+    monkeypatch.setattr(gguf_layer, "ENABLE_GGUF_SHARED_ACTIVATION", True)
+    types = [gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.Q6_K]
+    layer = _make_layer({0: (0, 2, 4), 1: (2, 5, 4)}, dict(enumerate(types)))
+    layer.qweight.copy_(torch.arange(20, dtype=torch.uint8).reshape(5, 4))
+    method = GGUFLinearMethod(SimpleNamespace())
+    method._cache_gguf_shard_metadata(layer)
+    weights = [layer.qweight[:2], layer.qweight[2:]]
+    calls = []
+
+    def matmul(weight, x, weight_type, rows):
+        calls.append(("single", x.shape[0], rows))
+        return x.sum(dim=1, keepdim=True) + weight[:, 0].to(x)
+
+    def sharded(qweights, x, qtypes):
+        calls.append(("shared", x.shape[0], sum(w.shape[0] for w in qweights)))
+        return x.sum(dim=1, keepdim=True) + torch.cat(qweights)[:, 0].to(x)
+
+    monkeypatch.setattr(gguf_layer.ops, "ggml_mul_mat_vec_a8", matmul)
+    monkeypatch.setattr(gguf_layer.ops, "ggml_mul_mat_a8", matmul)
+    monkeypatch.setattr(gguf_layer.ops, "ggml_mul_mat_vec_a8_sharded", sharded)
+    if grouped:
+        layers = []
+        for w, t in zip(weights, types):
+            sublayer = torch.nn.Module()
+            sublayer.qweight = torch.nn.Parameter(w, requires_grad=False)
+            sublayer.qweight_type = SimpleNamespace(weight_type=t)
+            layers.append(sublayer)
+
+        def apply(x):
+            result = gguf_layer.try_grouped_gguf_linear_mmvq(x, layers)
+            return torch.cat(result, dim=1)
+    else:
+
+        def apply(x):
+            return method.apply(layer, x)
+
+    lib = torch.library.Library("vllm", "IMPL", "CPU")
+    try:
+        lib.impl(
+            "_fused_mul_mat_gguf_sharded_mmvq",
+            gguf_layer._fused_mul_mat_gguf_sharded_mmvq,
+        )
+        compiled = torch.compile(apply, backend="eager", dynamic=True, fullgraph=True)
+        for batch in (32, 8, 5, 4, 1, 0):
+            calls.clear()
+            x = torch.ones((batch, 4))
+            actual = compiled(x)
+            expected = x.sum(dim=1, keepdim=True) + layer.qweight[:, 0].to(x)
+            torch.testing.assert_close(actual, expected)
+            if 0 < batch <= 4:
+                assert calls == [("shared", batch, 5)]
+            else:
+                assert calls == (
+                    [("single", batch, 2), ("single", batch, 3)] if batch else []
+                )
+        monkeypatch.setattr(gguf_layer, "ENABLE_GGUF_Q8_0_FAST_MMVQ", True)
+        calls.clear()
+        compiled(torch.ones((1, 4)))
+        assert calls == [("single", 1, 2), ("single", 1, 3)]
     finally:
         torch._dynamo.reset()
         lib._destroy()

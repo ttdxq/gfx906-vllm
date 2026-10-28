@@ -24,10 +24,11 @@
 #include "moe_vec.cuh"
 
 // Q8 gemv
-template <typename scalar_t, bool PREPARED = false>
+template <typename scalar_t, bool PREPARED = false, bool DUAL = false>
 static __global__ void quantize_q8_1(const scalar_t* __restrict__ x,
                                      void* __restrict__ vy, const int kx,
-                                     const int kx_padded) {
+                                     const int kx_padded,
+                                     void* __restrict__ vprepared) {
   const auto ix = blockDim.x * blockIdx.x + threadIdx.x;
   if (ix >= kx_padded) {
     return;
@@ -55,13 +56,13 @@ static __global__ void quantize_q8_1(const scalar_t* __restrict__ x,
   const float d = amax / 127;
   const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
-  if constexpr (PREPARED) {
+  if constexpr (PREPARED || DUAL) {
     int sum_q = q;
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
       sum_q += VLLM_SHFL_XOR_SYNC_WIDTH(sum_q, mask, 32);
     }
-    uint8_t* record = static_cast<uint8_t*>(vy) +
+    uint8_t* record = static_cast<uint8_t*>(DUAL ? vprepared : vy) +
                       (iy * (kx_padded / 64) + ix / 64) * 72;
     reinterpret_cast<int8_t*>(record)[ix % 64] = q;
     if (iqs == 0) {
@@ -69,7 +70,8 @@ static __global__ void quantize_q8_1(const scalar_t* __restrict__ x,
                             (uint32_t(uint16_t(int16_t(sum_q))) << 16);
       reinterpret_cast<uint32_t*>(record + 64)[(ix % 64) / 32] = bits;
     }
-  } else {
+  }
+  if constexpr (!PREPARED) {
     y[ib].qs[iqs] = q;
     if (iqs == 0) {
       y[ib].ds.x = __float2half(d);
@@ -278,9 +280,10 @@ static __global__ void rms_norm_gated_quantize_q8_1(
   }
 }
 
-template <typename scalar_t, bool PREPARED = false>
+template <typename scalar_t, bool PREPARED = false, bool DUAL = false>
 static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx,
-                                   const int ky, cudaStream_t stream) {
+                                   const int ky, cudaStream_t stream,
+                                   void* vprepared = nullptr) {
   const int64_t kx_padded = (kx + 512 - 1) / 512 * 512;
   const int block_num_x =
       (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
@@ -289,8 +292,11 @@ static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx,
     const int num_blocks_y = std::min(ky, off + MAX_BLOCK_SIZE) - off;
     const dim3 num_blocks(block_num_x, num_blocks_y, 1);
     const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
-    quantize_q8_1<scalar_t, PREPARED><<<num_blocks, block_size, 0, stream>>>(
-        &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
+    quantize_q8_1<scalar_t, PREPARED, DUAL>
+        <<<num_blocks, block_size, 0, stream>>>(
+            &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9),
+            kx, kx_padded,
+            DUAL ? (int32_t*)vprepared + off * (kx_padded / 32 * 9) : nullptr);
   }
 }
 
@@ -1038,9 +1044,9 @@ static bool try_mul_mat_vec_k45_planar_wide(
   return true;
 }
 
-static bool try_mul_mat_vec_k45_prepared(
+static bool can_mul_mat_vec_k45_prepared(
     const torch::Tensor& W, const torch::Tensor& X, int64_t type,
-    int64_t row, torch::Tensor& Y) {
+    int64_t row) {
 #if defined(USE_ROCM)
   if ((type != 12 && type != 13) || !planar_k_enabled() ||
       !X.is_cuda() || !W.is_cuda() || X.dim() != 2 ||
@@ -1064,6 +1070,19 @@ static bool try_mul_mat_vec_k45_prepared(
   }
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   if (std::string(properties->gcnArchName).find("gfx906") != 0) return false;
+  return true;
+#else
+  return false;
+#endif
+}
+
+static bool try_mul_mat_vec_k45_prepared(
+    const torch::Tensor& W, const torch::Tensor& X, int64_t type,
+    int64_t row, torch::Tensor& Y) {
+#if defined(USE_ROCM)
+  if (!can_mul_mat_vec_k45_prepared(W, X, type, row)) return false;
+  const int64_t col = X.size(1);
+  const int64_t padded = (col + 511) / 512 * 512;
   Y = torch::empty({1, row}, X.options());
   const char* force_zero = std::getenv("VLLM_GGUF_MMVQ_ZERO_OUTPUT");
   if (force_zero != nullptr && force_zero[0] == '1') Y.zero_();
@@ -2865,6 +2884,75 @@ torch::Tensor ggml_mul_mat_vec_a8_sharded(std::vector<torch::Tensor> W,
               "W and types must have the same number of elements");
   int col = X.sizes()[1];
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+#if defined(USE_ROCM)
+  const char* shared = std::getenv("VLLM_GGUF_SHARED_ACTIVATION");
+  if (shared != nullptr && shared[0] == '1') {
+    TORCH_CHECK(X.is_cuda() && X.dim() == 2 && X.is_contiguous(),
+                "Shared GGUF activation must be a contiguous CUDA matrix");
+    const int vecs = X.size(0);
+    int64_t total_rows = 0;
+    bool needs_standard = false;
+    bool needs_prepared = false;
+    std::vector<bool> prepared;
+    for (size_t i = 0; i < W.size(); ++i) {
+      const auto& shard = W[i];
+      TORCH_CHECK(shard.is_cuda() && shard.device() == X.device() &&
+                      shard.dim() == 2 && shard.is_contiguous() &&
+                      shard.scalar_type() == torch::kUInt8,
+                  "Shared GGUF weights must be contiguous CUDA byte matrices");
+      total_rows += shard.size(0);
+      const bool use_prepared =
+          can_mul_mat_vec_k45_prepared(shard, X, types[i], shard.size(0));
+      prepared.push_back(use_prepared);
+      needs_prepared |= use_prepared;
+      needs_standard |= !use_prepared;
+    }
+    TORCH_CHECK(total_rows <= std::numeric_limits<int>::max(),
+                "Shared GGUF output stride exceeds kernel indexing range");
+    auto Y = torch::empty({vecs, total_rows}, X.options());
+    if (Y.numel() == 0) return Y;
+    // Retain one clear until every shared consumer has passed replay tests.
+    Y.zero_();
+    const int64_t padded = (int64_t(col) + 511) / 512 * 512;
+    auto quant_options = X.options().dtype(torch::kInt32);
+    torch::Tensor quant_X, prepared_X;
+    if (needs_standard) {
+      quant_X = torch::empty({vecs, padded / 32 * 9}, quant_options);
+    }
+    if (needs_prepared) {
+      prepared_X = torch::empty({vecs, padded / 32 * 9}, quant_options);
+    }
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_shared_activation", [&] {
+      const auto* x = static_cast<const scalar_t*>(X.data_ptr());
+      if (needs_standard && needs_prepared) {
+        quantize_row_q8_1_cuda<scalar_t, false, true>(
+            x, quant_X.data_ptr(), col, vecs, stream, prepared_X.data_ptr());
+      } else if (needs_prepared) {
+        quantize_row_q8_1_cuda<scalar_t, true>(
+            x, prepared_X.data_ptr(), col, vecs, stream);
+      } else {
+        quantize_row_q8_1_cuda<scalar_t>(
+            x, quant_X.data_ptr(), col, vecs, stream);
+      }
+      int64_t offset = 0;
+      for (size_t i = 0; i < W.size(); ++i) {
+        const int rows = W[i].size(0);
+        auto* dst = static_cast<scalar_t*>(Y.data_ptr()) + offset;
+        if (prepared[i]) {
+          gguf_k45_prepared::launch(W[i].data_ptr(), prepared_X.data_ptr(),
+                                   dst, col, rows, types[i], stream);
+        } else {
+          ggml_mul_mat_vec_q8_dispatch<scalar_t>(
+              W[i].data_ptr(), quant_X.data_ptr(), dst, col, rows, vecs,
+              types[i], stream, total_rows);
+        }
+        offset += rows;
+      }
+    });
+    return Y;
+  }
+#endif
   at::Tensor quant_X = ggml_quantize_row_q8_1(X);
   return ggml_mul_mat_vec_q8_sharded(W, quant_X, types, col, X.scalar_type());
 }

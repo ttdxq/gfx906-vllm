@@ -71,6 +71,7 @@ ENABLE_GGUF_SIGMOID_GATED_OUT_PROJ_MMVQ = _env_flag(
     "VLLM_GGUF_SIGMOID_GATED_OUT_PROJ_MMVQ", True
 )
 ENABLE_GGUF_Q8_0_FAST_MMVQ = _env_flag("VLLM_GGUF_Q8_0_FAST_MMVQ", False)
+ENABLE_GGUF_SHARED_ACTIVATION = os.getenv("VLLM_GGUF_SHARED_ACTIVATION", "0") == "1"
 ENABLE_GGUF_Q8_1_BUFFER_CACHE = _env_flag("VLLM_GGUF_Q8_1_BUFFER_CACHE", True)
 ENABLE_GGUF_SINGLE_MMVQ_Q8_CACHE = _env_flag(
     "VLLM_GGUF_SINGLE_MMVQ_Q8_CACHE", False
@@ -1243,6 +1244,18 @@ def _fused_mul_mat_gguf_sharded_mmvq(
     qweights: list[torch.Tensor],
     qweight_types: list[int],
 ) -> torch.Tensor:
+    if ENABLE_GGUF_SHARED_ACTIVATION and (
+        ENABLE_GGUF_FORCE_DEQUANT_MATMUL
+        or ENABLE_GGUF_Q8_0_FAST_MMVQ
+        or not _can_share_mmvq_activation(x, qweights, qweight_types)
+    ):
+        return torch.cat(
+            [
+                _fused_mul_mat_gguf(x, weight, weight_type)
+                for weight, weight_type in zip(qweights, qweight_types)
+            ],
+            dim=1,
+        )
     return ops.ggml_mul_mat_vec_a8_sharded(qweights, x, qweight_types)
 
 
@@ -1491,7 +1504,7 @@ def try_grouped_gguf_linear_mmvq(
     x: torch.Tensor,
     layers: list[torch.nn.Module],
 ) -> list[torch.Tensor] | None:
-    if x.shape[0] == 0:
+    if not ENABLE_GGUF_SHARED_ACTIVATION and x.shape[0] == 0:
         return None
 
     plan = _get_grouped_gguf_mmvq_plan(layers)
@@ -1505,6 +1518,9 @@ def try_grouped_gguf_linear_mmvq(
         mmvq_max_batch,
         use_same_type_kernel,
     ) = plan
+    if ENABLE_GGUF_SHARED_ACTIVATION:
+        out = fused_mul_mat_gguf_sharded_mmvq(x, qweights, qweight_types)
+        return list(out.split(split_sizes, dim=1))
     if x.shape[0] > mmvq_max_batch:
         return None
 
@@ -2703,6 +2719,11 @@ class GGUFLinearMethod(LinearMethodBase):
             collected = _collect_gguf_linear_shards(layer)
             assert collected is not None
             qweights, qweight_types = collected
+            if ENABLE_GGUF_SHARED_ACTIVATION:
+                out = fused_mul_mat_gguf_sharded_mmvq(x, qweights, qweight_types)
+                if bias is not None:
+                    out.add_(bias)
+                return out
             mmvq_max_batch = getattr(layer, "_gguf_sharded_mmvq_max_batch", None)
             can_share_mmvq = (
                 x.shape[0] > 0
