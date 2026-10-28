@@ -675,25 +675,6 @@ def awq_dequantize(
     return torch.ops._C.awq_dequantize(qweight, scales, zeros, split_k_iters, thx, thy)
 
 
-def awq_gemm(
-    input: torch.Tensor,
-    qweight: torch.Tensor,
-    qzeros: torch.Tensor,
-    scales: torch.Tensor,
-    split_k_iters: int,
-) -> torch.Tensor:
-    if envs.VLLM_USE_TRITON_AWQ:
-        from vllm.model_executor.layers.quantization.awq_triton import awq_gemm_triton
-
-        return awq_gemm_triton(input, qweight, scales, qzeros, split_k_iters)
-    return torch.ops._C.awq_gemm(input, qweight, qzeros, scales, split_k_iters)
-
-
-# gptq
-def gptq_shuffle_awq_qweight(q_weight: torch.Tensor, bit: int) -> None:
-    torch.ops._C.gptq_shuffle_awq_qweight(q_weight, bit)
-
-
 # marlin_24
 def gptq_marlin_24_gemm(
     a: torch.Tensor,
@@ -894,6 +875,34 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "gptq_gemm_rdna3
         row: torch.SymInt,
     ) -> torch.Tensor:
         return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
+
+    if hasattr(torch.ops._C, "ggml_planar_pack_q6_k"):
+
+        @register_fake("_C::ggml_planar_pack_q6_k")
+        def _ggml_planar_pack_q6_k_fake(
+            W: torch.Tensor,
+            row: torch.SymInt,
+            col: torch.SymInt,
+        ) -> torch.Tensor:
+            return torch.empty(
+                (row, (col // 256) * 210), dtype=torch.uint8, device=W.device
+            )
+
+    if hasattr(torch.ops._C, "ggml_planar_pack"):
+
+        @register_fake("_C::ggml_planar_pack")
+        def _ggml_planar_pack_fake(
+            W: torch.Tensor,
+            type: int,
+            row: torch.SymInt,
+            col: torch.SymInt,
+        ) -> torch.Tensor:
+            bytes_per_block = 210 if type == 14 else (176 if type == 13 else 144)
+            return torch.empty(
+                (row, (col // 256) * bytes_per_block),
+                dtype=torch.uint8,
+                device=W.device,
+            )
 
     if hasattr(torch.ops._C, "ggml_repack_iq4_xs_to_q8_0"):
 

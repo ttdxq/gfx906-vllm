@@ -247,9 +247,16 @@ class Qwen3_5GatedDeltaNet(GatedDeltaNetAttention):
         config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig,
         vllm_config: VllmConfig,
         split_projections: bool = False,
+        v_heads_tiled: bool = True,
         prefix: str = "",
     ) -> None:
         self.split_projections = split_projections
+        # V-head order inside the value dim: GGUF checkpoints store the V
+        # heads tiled (llama.cpp broadcast order), HF-layout checkpoints
+        # (compressed-tensors etc.) store them grouped by K head. The two
+        # orders are a 48-head permutation; mixing them silently scrambles
+        # every GDN layer.
+        self.v_heads_tiled = v_heads_tiled
         super().__init__(
             config=config,
             vllm_config=vllm_config,
@@ -306,7 +313,7 @@ class Qwen3_5GatedDeltaNet(GatedDeltaNetAttention):
             and _env_bool("VLLM_QWEN35_EMPTY_CORE_ATTN_SINGLE_TOKEN", True)
         )
         self.use_tiled_qk_expand = _env_bool(
-            "VLLM_QWEN35_TILED_QK_EXPAND", self.split_projections
+            "VLLM_QWEN35_TILED_QK_EXPAND", self.v_heads_tiled
         )
         self.call_b_first = os.getenv("VLLM_QWEN35_CALL_ORDER", "ba").lower() != "ab"
         # Default to the specialized Qwen3NextGatedDeltaNet core: it is
@@ -410,7 +417,7 @@ class Qwen3_5GatedDeltaNet(GatedDeltaNetAttention):
     def _use_tiled_qk_head_mapping_for_packed_decode(self) -> bool:
         raw = os.getenv(
             "VLLM_QWEN35_PACKED_DECODE_TILED_QK",
-            "1" if self.split_projections else "0",
+            "1" if self.v_heads_tiled else "0",
         )
         return raw.lower() in {"1", "true", "yes", "on"}
 
@@ -751,10 +758,16 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 "gguf",
                 "compressed-tensors",
             }:
+                # Both formats provide split projections, but their V-head
+                # order differs: GGUF is tiled (llama.cpp), compressed-tensors
+                # keeps the HF grouped order.
                 self.linear_attn = Qwen3_5GatedDeltaNet(
                     config,
                     vllm_config=vllm_config,
                     split_projections=True,
+                    v_heads_tiled=(
+                        vllm_config.model_config.quantization == "gguf"
+                    ),
                     prefix=f"{prefix}.linear_attn",
                 )
             else:

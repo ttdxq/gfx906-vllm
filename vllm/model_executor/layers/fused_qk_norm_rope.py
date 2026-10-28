@@ -11,6 +11,7 @@ single Triton launch. See :func:`fused_qk_rmsnorm_rope_gate`.
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @triton.jit
@@ -199,3 +200,40 @@ def fused_qk_rmsnorm_rope_gate(
         num_stages=2,
     )
     return q_out, k_out, gate_out
+
+
+def _fused_qk_rmsnorm_rope_gate_fake(
+    q_gate: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_tokens = q_gate.shape[0]
+    q_out = torch.empty(
+        (n_tokens, num_q_heads * head_dim), dtype=q_gate.dtype, device=q_gate.device
+    )
+    k_out = torch.empty(
+        (n_tokens, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
+    )
+    return q_out, k_out, torch.empty_like(q_out)
+
+
+# Register as a custom op so dynamo treats the launch as opaque. A bare Triton
+# launch traced through torch's triton_kernel_wrap fails identify_mutated_tensors
+# on this kernel's mixed positional-scalar signature (triton 3.8), which makes
+# the wrapper assume every input is mutated and corrupts the compiled graph.
+direct_register_custom_op(
+    op_name="fused_qk_rmsnorm_rope_gate",
+    op_func=fused_qk_rmsnorm_rope_gate,
+    mutates_args=[],
+    fake_impl=_fused_qk_rmsnorm_rope_gate_fake,
+)
+
+fused_qk_rmsnorm_rope_gate = torch.ops.vllm.fused_qk_rmsnorm_rope_gate

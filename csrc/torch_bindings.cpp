@@ -154,6 +154,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "ggml_repack_iq4_xs_to_q8_0(Tensor W, SymInt row, SymInt col) -> Tensor");
   ops.impl("ggml_repack_iq4_xs_to_q8_0", torch::kCUDA,
            &ggml_repack_iq4_xs_to_q8_0);
+  ops.def("ggml_planar_pack_q6_k(Tensor W, SymInt row, SymInt col) -> Tensor");
+  ops.impl("ggml_planar_pack_q6_k", torch::kCUDA, &ggml_planar_pack_q6_k);
+  ops.def("ggml_planar_pack(Tensor W, int type, SymInt row, SymInt col) -> Tensor");
+  ops.impl("ggml_planar_pack", torch::kCUDA, &ggml_planar_pack);
 
   // mmvq kernel for GGML.
   ops.def(
@@ -306,10 +310,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor q, Tensor key_cache, Tensor value_cache,"
       "    Tensor block_table, Tensor seq_lens,"
       "    Tensor! segm_output, Tensor! segm_max, Tensor! segm_expsum,"
-      "    float scale, int q_len, int k_s0, int k_s1, int k_s2, "
+      "    float scale, int q_len, int bs, int k_s0, int k_s1, int k_s2, "
       "    int v_s0, int v_s1, int v_s2, Tensor! dbg)"
       " -> ()");
   ops.impl("gfx906_prefill_attn_scan", torch::kCUDA, &gfx906_prefill_attn_scan);
+
+  ops.def(
+      "gfx906_spec_attn_scan("
+      "    Tensor q, Tensor key_cache, Tensor value_cache,"
+      "    Tensor block_table, Tensor seq_lens,"
+      "    Tensor! segm_output, Tensor! segm_max, Tensor! segm_expsum,"
+      "    float scale, int q_len, int nseg, int bs, int k_s0, int k_s1, int k_s2, "
+      "    int v_s0, int v_s1, int v_s2, Tensor! dbg)"
+      " -> ()");
+  ops.impl("gfx906_spec_attn_scan", torch::kCUDA, &gfx906_spec_attn_scan);
 
   ops.def(
       "causal_conv1d_gfx906_decode_update("
@@ -456,12 +470,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // SM100 CUTLASS MLA decode
 #endif
-
-  // Quantized GEMM for GPTQ.
-  // Note: even though the C++ inferred schema is correct for this op, it seems
-  // to prevent the meta function registry.
-  ops.def("gptq_shuffle_awq_qweight(Tensor! q_weight, int bit) -> ()");
-  ops.impl("gptq_shuffle_awq_qweight", torch::kCUDA, &gptq_shuffle_awq_qweight);
 
   // Compute FP8 quantized tensor for given scaling factor.
 #ifndef USE_ROCM

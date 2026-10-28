@@ -32,6 +32,16 @@ def test_decode_num_warps_scales_with_head_and_context():
     assert unified_attn._decode_num_warps(128, 16384) == 2
 
 
+def test_decode_num_warps_two_on_one_token_per_block_shape():
+    # The 8-row GQA6-256 decode blocks cannot feed 4 warps; 2 warps
+    # measure ~1.7x faster there at every context length.
+    assert unified_attn._decode_num_warps(256, 4096, 6) == 2
+    assert unified_attn._decode_num_warps(256, 65536, 6) == 2
+    assert unified_attn._decode_num_warps(256, 1535, 6) == 2
+    # Other wide-head shapes keep the 4-warp choice
+    assert unified_attn._decode_num_warps(256, 4096, 8) == 4
+
+
 def test_decode_block_m_uses_eight_for_wide_head_gqa6():
     assert unified_attn._decode_block_m(256, 6) == 8
     assert unified_attn._decode_block_m(256, 8) is None
@@ -158,7 +168,10 @@ def test_v1_unified_attention_gqa6_decode_matches_reference(kv_len: int, num_seq
 
 @pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
 @torch.inference_mode()
-def test_v1_unified_attention_prefill_split_kv_matches_reference(monkeypatch):
+@pytest.mark.parametrize("block_size", [800, 832])
+def test_v1_unified_attention_prefill_split_kv_matches_reference(
+    monkeypatch, block_size
+):
     """Opt-in prefill split-KV (3D) path vs the eager reference."""
     monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_PREFILL_3D", True)
     torch.manual_seed(0)
@@ -166,7 +179,6 @@ def test_v1_unified_attention_prefill_split_kv_matches_reference(monkeypatch):
     dtype = torch.float16
     num_kv_heads, num_queries_per_kv, head_size = 4, 6, 256
     num_q_heads = num_kv_heads * num_queries_per_kv
-    block_size = 800
     # q_len spans multiple 32-row query blocks and several KV tiles so the
     # segment partition is exercised on both sides of a tile boundary
     q_len, kv_len = 1023, 2048
@@ -279,6 +291,306 @@ def test_v1_unified_attention_prefill_matches_reference():
     keys = k.reshape(-1, num_kv_heads, head_size)[:kv_len]
     values = v.reshape(-1, num_kv_heads, head_size)[:kv_len]
     # reference: q[t, h*G+g] attends causally over keys[: context + t + 1]
+    ref = torch.empty_like(q)
+    for t in range(q_len):
+        end = context + t + 1
+        q_t = q[t].reshape(num_kv_heads, num_queries_per_kv, head_size)
+        s = torch.einsum("hgd,thd->hgt", q_t.float(), keys[:end].float()) * scale
+        p = torch.softmax(s, dim=-1)
+        o = torch.einsum("hgt,thd->hgd", p.float(), values[:end].float())
+        ref[t] = o.reshape(num_q_heads, head_size)
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
+@pytest.mark.parametrize("kv_len", [1024, 16384])
+@pytest.mark.parametrize("q_len", [2, 3])
+@torch.inference_mode()
+def test_v1_unified_attention_spec_decode_split_kv_matches_reference(
+    monkeypatch, q_len: int, kv_len: int
+):
+    """Spec-decode forwards (few query tokens over the full decode context)
+    take the split-KV decode path with backend-provided buffers, not the
+    tuned-prefill 2-segment route."""
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_SPEC_SPLIT_KV", True)
+    # earlier prefill tests may have provisioned the lazy workspace; reset so
+    # the route assertions below observe only this call's behavior
+    monkeypatch.setattr(unified_attn, "_prefill_segm_state", None)
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.float16
+    num_kv_heads, num_queries_per_kv, head_size = 4, 6, 256
+    num_q_heads = num_kv_heads * num_queries_per_kv
+    block_size = 800
+    scale = head_size**-0.5
+
+    num_blocks = (kv_len + block_size - 1) // block_size
+    q = torch.randn(q_len, num_q_heads, head_size, device=device, dtype=dtype)
+    k = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, device=device, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    )
+    num_par_softmax_segments = unified_attn.gfx906_decode_segments_capacity()
+    headdim_padded = 256
+    # backend-sized workspace: one row per decode batch-threshold sequence
+    workspace_rows = 4
+    softmax_segm_output = torch.empty(
+        workspace_rows,
+        num_q_heads,
+        num_par_softmax_segments,
+        headdim_padded,
+        dtype=torch.float32,
+        device=device,
+    )
+    softmax_segm_max = torch.empty(
+        workspace_rows, num_q_heads, num_par_softmax_segments,
+        dtype=torch.float32, device=device,
+    )
+    softmax_segm_expsum = torch.empty_like(softmax_segm_max)
+
+    unified_attn.unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_len,
+        seqused_k=seqused_k,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=32,
+        num_par_softmax_segments=num_par_softmax_segments,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
+    )
+    # the spec route must not have provisioned the prefill lazy workspace
+    assert unified_attn._prefill_segm_state is None
+
+    context = kv_len - q_len
+    keys = k.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    values = v.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    ref = torch.empty_like(q)
+    for t in range(q_len):
+        end = context + t + 1
+        q_t = q[t].reshape(num_kv_heads, num_queries_per_kv, head_size)
+        s = torch.einsum("hgd,thd->hgt", q_t.float(), keys[:end].float()) * scale
+        p = torch.softmax(s, dim=-1)
+        o = torch.einsum("hgt,thd->hgd", p.float(), values[:end].float())
+        ref[t] = o.reshape(num_q_heads, head_size)
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
+@torch.inference_mode()
+def test_v1_unified_attention_spec_decode_falls_back_below_workspace_rows(
+    monkeypatch,
+):
+    """When the batch's spec tokens exceed the workspace rows, the dispatch
+    falls back to the 2D kernel and stays numerically correct."""
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_SPEC_SPLIT_KV", True)
+    # earlier prefill tests may have provisioned the lazy workspace; reset so
+    # the route assertions below observe only this call's behavior
+    monkeypatch.setattr(unified_attn, "_prefill_segm_state", None)
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.float16
+    num_kv_heads, num_queries_per_kv, head_size = 4, 6, 256
+    num_q_heads = num_kv_heads * num_queries_per_kv
+    block_size = 800
+    q_len, kv_len = 3, 2048
+    scale = head_size**-0.5
+
+    num_blocks = (kv_len + block_size - 1) // block_size
+    q = torch.randn(q_len, num_q_heads, head_size, device=device, dtype=dtype)
+    k = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, device=device, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    )
+    # two rows cannot hold a three-token spec batch
+    workspace_rows = 2
+    num_par_softmax_segments = unified_attn.gfx906_decode_segments_capacity()
+    softmax_segm_output = torch.empty(
+        workspace_rows, num_q_heads, num_par_softmax_segments, 256,
+        dtype=torch.float32, device=device,
+    )
+    softmax_segm_max = torch.empty(
+        workspace_rows, num_q_heads, num_par_softmax_segments,
+        dtype=torch.float32, device=device,
+    )
+    softmax_segm_expsum = torch.empty_like(softmax_segm_max)
+
+    unified_attn.unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_len,
+        seqused_k=seqused_k,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=32,
+        num_par_softmax_segments=num_par_softmax_segments,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
+    )
+    # the workspace guard sent the batch down the pre-change tuned-prefill
+    # split-KV route (its own lazily provisioned 2-segment workspace)
+    assert unified_attn._prefill_segm_state is not None
+    assert (
+        unified_attn._prefill_segm_state["segs"]
+        == unified_attn.GFX906_PREFILL_SEGMENTS
+    )
+
+    context = kv_len - q_len
+    keys = k.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    values = v.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    ref = torch.empty_like(q)
+    for t in range(q_len):
+        end = context + t + 1
+        q_t = q[t].reshape(num_kv_heads, num_queries_per_kv, head_size)
+        s = torch.einsum("hgd,thd->hgt", q_t.float(), keys[:end].float()) * scale
+        p = torch.softmax(s, dim=-1)
+        o = torch.einsum("hgt,thd->hgd", p.float(), values[:end].float())
+        ref[t] = o.reshape(num_q_heads, head_size)
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+class _ExplodingKernel:
+    """Stand-in that fails the test if the Triton scanner gets launched."""
+
+    def __getitem__(self, grid):
+        raise AssertionError("Triton scanner launched; HIP route not taken")
+
+
+@pytest.mark.skipif(not _is_gfx906(), reason="gfx906-specific Triton path")
+@pytest.mark.parametrize("kv_len", [1024, 16384])
+@pytest.mark.parametrize("q_len", [2, 3, 4])
+@pytest.mark.parametrize("block_size", [800, 832])
+@torch.inference_mode()
+def test_v1_unified_attention_spec_hip_scan_matches_reference(
+    monkeypatch, q_len: int, kv_len: int, block_size: int
+):
+    """The handwritten HIP spec scanner produces the same attention as the
+    eager reference on the spec-decode shape, replacing the Triton scanner
+    launch 1:1 (same segment workspace, reduce_segments unchanged). Covers
+    the contiguous 800-token layout and the engine's 832-token fused
+    K/V-interleaved cache layout."""
+    import torch as _torch
+
+    if not hasattr(_torch.ops._C, "gfx906_spec_attn_scan"):
+        pytest.skip("gfx906_spec_attn_scan op not built")
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_SPEC_SPLIT_KV", True)
+    monkeypatch.setattr(unified_attn, "ENABLE_GFX906_ATTN_SPEC_HIP", True)
+    monkeypatch.setattr(unified_attn, "_prefill_segm_state", None)
+    # if the HIP route is active the Triton scanners must never launch
+    monkeypatch.setattr(
+        unified_attn, "kernel_unified_attention_3d_slim", _ExplodingKernel()
+    )
+    monkeypatch.setattr(
+        unified_attn, "kernel_unified_attention_3d", _ExplodingKernel()
+    )
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.float16
+    num_kv_heads, num_queries_per_kv, head_size = 4, 6, 256
+    num_q_heads = num_kv_heads * num_queries_per_kv
+    scale = head_size**-0.5
+
+    num_blocks = (kv_len + block_size - 1) // block_size
+    q = torch.randn(q_len, num_q_heads, head_size, device=device, dtype=dtype)
+    if block_size == 832:
+        # engine layout: fused cache with K/V interleaved per head
+        fused = torch.randn(
+            num_blocks, block_size, num_kv_heads, 2, head_size,
+            device=device, dtype=dtype,
+        )
+        k = fused[:, :, :, 0, :]
+        v = fused[:, :, :, 1, :]
+    else:
+        k = torch.randn(
+            num_blocks, block_size, num_kv_heads, head_size,
+            device=device, dtype=dtype,
+        )
+        v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+    seqused_k = torch.tensor([kv_len], device=device, dtype=torch.int32)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    )
+    num_par_softmax_segments = unified_attn.gfx906_decode_segments_capacity()
+    workspace_rows = 8
+    softmax_segm_output = torch.empty(
+        workspace_rows,
+        num_q_heads,
+        num_par_softmax_segments,
+        256,
+        dtype=torch.float32,
+        device=device,
+    )
+    softmax_segm_max = torch.empty(
+        workspace_rows, num_q_heads, num_par_softmax_segments,
+        dtype=torch.float32, device=device,
+    )
+    softmax_segm_expsum = torch.empty_like(softmax_segm_max)
+
+    unified_attn.unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_len,
+        seqused_k=seqused_k,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=32,
+        num_par_softmax_segments=num_par_softmax_segments,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
+    )
+    assert unified_attn._prefill_segm_state is None
+
+    context = kv_len - q_len
+    keys = k.reshape(-1, num_kv_heads, head_size)[:kv_len]
+    values = v.reshape(-1, num_kv_heads, head_size)[:kv_len]
     ref = torch.empty_like(q)
     for t in range(q_len):
         end = context + t + 1

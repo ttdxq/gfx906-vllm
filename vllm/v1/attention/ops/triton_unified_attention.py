@@ -82,6 +82,18 @@ ENABLE_GFX906_ATTN_PREFILL_HIP = os.getenv(
     "VLLM_GFX906_ATTN_PREFILL_HIP", "1"
 ).lower() in {"1", "true", "yes", "on"}
 
+# Route the spec-decode split-KV launch through a handwritten HIP kernel on
+# gfx906 (csrc/attention/gfx906_prefill_attn.cu, gfx906_spec_attn_scan).
+# Same segment-workspace contract and online-softmax semantics as the
+# Triton scanner (fp32 accumulation, inactive segments masked by reduce,
+# per-token causal bounds), for the single-sequence fp16
+# head-256/GQA6 spec shape only; the cache block size is a runtime
+# parameter. Set 0 to restore the Triton scanner.
+ENABLE_GFX906_ATTN_SPEC_HIP = os.getenv(
+    "VLLM_GFX906_ATTN_SPEC_HIP", "1"
+).lower() in {"1", "true", "yes", "on"}
+_hip_spec_dbg_buf: torch.Tensor | None = None
+
 # Debug readout for the handwritten scanner's address guards: the kernel
 # clamps stale block-table/seq-lens inputs instead of faulting and counts
 # the events; with this env set the dispatch syncs and logs the counters.
@@ -100,6 +112,31 @@ GFX906_MAX_DECODE_SEGMENTS = 128
 # each other (8+ regress); 2 halves the fp32 segment workspace, which keeps
 # gpu_memory_utilization=0.95 runs within budget at the default chunk size.
 GFX906_PREFILL_SEGMENTS = 2
+
+# Route speculative-decode forwards (target verify + draft steps) through
+# the split-KV path on gfx906. Those forwards carry only a handful of query
+# tokens per sequence but scan the full decode context; they arrive with
+# max_seqlen_q > 1, which used to push them into the tuned-prefill 3D route
+# (fixed 2 segments) or, under CUDA-graph capture, the no-split 2D fallback.
+# Either way the grid is ~q_blocks x kv_heads x <=2 CTAs and a 60-CU gfx906
+# streams the context KV at a few percent of achievable bandwidth, which is
+# what makes MTP decode collapse at long contexts (27B Q6 MTP=2: 20.8 tok/s
+# at 4k falling to 2.9 at 64k while draft acceptance stays ~93%; profiled
+# as kernel_unified_attention_3d_slim at ~14-43 GB/s per call). The spec
+# path reuses the backend-provided decode segment buffers with a fixed
+# segment count so warmup, capture and replay share one launch
+# configuration (graph capture runs with seq_lens=1, freezing any
+# context-derived count at the capture-time context). Set to 0 to restore
+# the prefill-3D / 2D routing.
+ENABLE_GFX906_ATTN_SPEC_SPLIT_KV = os.getenv(
+    "VLLM_GFX906_TRITON_ATTN_SPEC_SPLIT_KV", "1"
+).lower() in {"1", "true", "yes", "on"}
+# Query-tokens-per-sequence ceiling for treating a max_seqlen_q > 1 batch
+# as decode-like; spec-decode steps schedule num_spec_tokens + 1 or fewer.
+GFX906_SPEC_MAX_QUERY_LEN = 8
+# Fixed split-KV segments for the spec path, bounded by the decode segment
+# buffer capacity the backend allocates (GFX906_MAX_DECODE_SEGMENTS).
+GFX906_SPEC_ATTN_SEGMENTS = 128
 
 # Lazily grown workspace for the prefill split-KV path. Unlike the decode
 # segment buffers (sized for the decode batch threshold and provided by the
@@ -173,7 +210,7 @@ def _gfx906_sched_tuning_enabled() -> bool:
 def _log_hip_prefill_scan_once() -> bool:
     logger.info(
         "gfx906 handwritten HIP prefill attention scan enabled "
-        "(single-sequence fp16 head-256/GQA6/page-800 shape)"
+        "(single-sequence fp16 head-256/GQA6 shape, runtime page size)"
     )
     return True
 
@@ -199,10 +236,37 @@ def gfx906_decode_segments_capacity() -> int:
     return GFX906_MAX_DECODE_SEGMENTS if _gfx906_sched_tuning_enabled() else 0
 
 
-def _decode_num_warps(head_size: int, max_seqlen_k: int) -> int:
-    # Wide-head decodes keep 4 warps busy once the KV scan is long enough;
-    # short contexts run faster with 2 warps on gfx906.
-    if head_size > 128 and max_seqlen_k >= 1536:
+@lru_cache(maxsize=4)
+def _log_hip_spec_miss_once(spec: bool, slim: bool, op_present: bool,
+                            num_seqs: int, q_dtype: str, k_dtype: str,
+                            head_size: int, num_query_heads: int,
+                            num_kv_heads: int, block_size: int,
+                            q_contig: bool, k_strides: tuple, v_strides: tuple,
+                            bt_dtype: str, bt_stride1: int) -> bool:
+    logger.info(
+        "gfx906 HIP spec scan skipped: spec=%s slim=%s op=%s num_seqs=%d "
+        "q=%s k=%s hs=%d qh=%d kvh=%d bs=%d qcont=%s kstrides=%s "
+        "vstrides=%s bt=%s btstride1=%d", spec, slim, op_present, num_seqs,
+        q_dtype, k_dtype, head_size, num_query_heads, num_kv_heads,
+        block_size, q_contig, k_strides, v_strides, bt_dtype, bt_stride1)
+    return True
+
+
+def _decode_num_warps(
+    head_size: int, max_seqlen_k: int, num_queries_per_kv: int = 0
+) -> int:
+    # Wide-head decodes used to run 4 warps once the KV scan was long
+    # enough, but on the one-token-per-block shape (the 8-row GQA6-256
+    # blocks from _decode_block_m) the 8x16 tiles cannot feed 4 warps and
+    # the extra warps only add scheduling overhead: 2 warps measure ~1.7x
+    # faster at every context length (116 vs 206us at 4k, 313 vs 530us at
+    # 16k, 1140 vs 2009us at 64k per call through the decode dispatch).
+    # Other wide-head shapes keep the previous 4-warp choice.
+    if (
+        head_size > 128
+        and max_seqlen_k >= 1536
+        and _decode_block_m(head_size, num_queries_per_kv) is None
+    ):
         return 4
     return 2
 
@@ -1532,9 +1596,34 @@ def unified_attention(
 
     gfx906_sched = _gfx906_sched_tuning_enabled()
 
+    # Spec-decode forwards (verify + draft) look like tiny prefills to the
+    # max_seqlen_q > 1 dispatch below but scan the whole decode context;
+    # flag them so they take the split-KV decode path instead (see
+    # ENABLE_GFX906_ATTN_SPEC_SPLIT_KV). The segment workspace is indexed
+    # by absolute token position (one row per scheduled token) and the
+    # backend sizes it to the decode batch threshold, so batches whose
+    # total spec tokens exceed that (multi-sequence speculative decoding)
+    # keep the previous routing through this bound (tuned-prefill split-KV
+    # when eager, the 2D kernel under CUDA-graph capture).
+    _spec_decode_batch = (
+        ENABLE_GFX906_ATTN_SPEC_SPLIT_KV
+        and gfx906_sched
+        and 1 < max_seqlen_q <= GFX906_SPEC_MAX_QUERY_LEN
+        and softmax_segm_output is not None
+        and softmax_segm_max is not None
+        and softmax_segm_expsum is not None
+        and q.shape[0] <= softmax_segm_output.shape[0]
+    )
+
+    # Spec batches share the decode row packing (one query token per block,
+    # reusing the KV-scan shape the decode path is tuned for) rather than
+    # the prefill BLOCK_M: on gfx906 GQA6/head-256, sweeping the spec shape
+    # (q=3) shows the 8-row/16-token/2-warp split-KV configuration
+    # 1.7-1.9x faster than the prefill 32/32/4 one at 4k-64k contexts
+    # (475->260us at 4k, 1563->788us at 16k, ~5.0->2.9ms at 64k per call).
     decode_block_m = (
         _decode_block_m(head_size, num_queries_per_kv)
-        if gfx906_sched and max_seqlen_q == 1
+        if gfx906_sched and (max_seqlen_q == 1 or _spec_decode_batch)
         else None
     )
     prefill_block_m = (
@@ -1585,6 +1674,65 @@ def unified_attention(
         tile_size,
         num_warps,
     ):
+        if use_hip_spec_scan:
+            global _hip_spec_dbg_buf
+            if _hip_spec_dbg_buf is None or _hip_spec_dbg_buf.device != q.device:
+                _hip_spec_dbg_buf = torch.zeros(
+                    2, dtype=torch.int32, device=q.device)
+            torch.ops._C.gfx906_spec_attn_scan(
+                q,
+                k,
+                v,
+                block_table,
+                seqused_k,
+                segm_output,
+                segm_max,
+                segm_expsum,
+                softmax_scale,
+                q.shape[0],
+                num_segments,
+                block_size,
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                _hip_spec_dbg_buf,
+            )
+            if (
+                ENABLE_GFX906_HIP_ATTN_GUARD
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                hits = int(_hip_spec_dbg_buf[0].item()) + int(
+                    _hip_spec_dbg_buf[1].item())
+                if hits:
+                    logger.warning(
+                        "gfx906 spec hip scan clamped %d stale page/tin and "
+                        "%d stale pbi inputs", int(_hip_spec_dbg_buf[0].item()),
+                        int(_hip_spec_dbg_buf[1].item()))
+                    _hip_spec_dbg_buf.zero_()
+            reduce_segments[(q.shape[0], num_query_heads)](
+                output_ptr=out,
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_seqs=1,
+                num_query_heads=num_query_heads,
+                out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                block_table_stride=block_table.stride(0),
+                TILE_SIZE=tile_size,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                query_start_len_ptr=cu_seqlens_q,
+                BLOCK_Q=1,
+                NUM_SEGMENTS_PER_SEQ=num_segments,
+                USE_FP8=output_scale is not None,
+            )
+            return
         if use_slim_3d:
             kernel_unified_attention_3d_slim[
                 (total_num_q_blocks, num_kv_heads, num_segments)
@@ -1703,8 +1851,10 @@ def unified_attention(
     # path is restricted to plain causal attention so the swept configuration
     # (BLOCK_M 32 / TILE 32 / 4 warps / 1 stage / 2 segments) is the only one
     # exercised, and is disabled under CUDA-graph capture because the segment
-    # workspace cannot be allocated inside a capture.
-    use_prefill_3d = (
+    # workspace cannot be allocated inside a capture. Spec-decode batches are
+    # excluded: they take the split-KV decode path with backend-provided
+    # buffers instead (see _spec_decode_batch above).
+    _prefill_3d_shape = (
         ENABLE_GFX906_ATTN_PREFILL_3D
         and gfx906_sched
         and prefill_block_m is not None
@@ -1716,13 +1866,20 @@ def unified_attention(
         and softcap == 0
         and output_scale is None
         and not is_batch_invariant
+    )
+    use_prefill_3d = (
+        _prefill_3d_shape
+        and not _spec_decode_batch
         and not torch.cuda.is_current_stream_capturing()
     )
 
     # Slim plain-causal prefill kernel: same math as the gated 3D path,
     # specialized for exact-GQA packing with power-of-two heads (see the
     # ENABLE_GFX906_ATTN_PREFILL_SLIM comment for the structural
-    # changes). The slim kernel has no descale branch, and its tl.dot
+    # changes). Gated on the plain-causal shape family rather than on
+    # use_prefill_3d itself so the spec-decode split-KV launch (which runs
+    # under CUDA-graph capture with backend-provided buffers) can also use
+    # it. The slim kernel has no descale branch, and its tl.dot
     # cannot take an fp8 KV cache, so a 1-byte-element KV cache (fp8
     # e4m3/e5m2, which the backend always pairs with descale tensors)
     # must fall back to the generic 3D kernel. Descale tensors on a
@@ -1730,7 +1887,7 @@ def unified_attention(
     # them when the loaded cache is fp8; the GGUF backend passes unit
     # scales unconditionally), so slim still takes those shapes.
     use_slim_3d = (
-        use_prefill_3d
+        _prefill_3d_shape
         and ENABLE_GFX906_ATTN_PREFILL_SLIM
         and k.element_size() > 1
         and v.element_size() > 1
@@ -1758,7 +1915,9 @@ def unified_attention(
         and head_size == 256
         and num_query_heads == 24
         and num_kv_heads == 4
-        and block_size == 800
+        # the scanner takes the page size as a runtime parameter; a
+        # 32-token KV tile must never straddle a page (800/832 both qualify)
+        and block_size % 32 == 0
         and q.is_contiguous()
         and k.stride(3) == 1
         and v.stride(3) == 1
@@ -1774,6 +1933,55 @@ def unified_attention(
         and block_table.dtype == torch.int32
         and block_table.stride(1) == 1
     )
+
+    # Handwritten gfx906 HIP scanner for the spec-decode shape: replaces the
+    # Triton split-KV scanner 1:1 on the same single-sequence fp16
+    # head-256/GQA6 shape (runtime cache block size), gated to the spec
+    # branch so real prefill
+    # calls (which use the 2-segment/32-tile layout through the path above)
+    # keep their own scanner.
+    use_hip_spec_scan = (
+        _spec_decode_batch
+        and use_slim_3d
+        and ENABLE_GFX906_ATTN_SPEC_HIP
+        and hasattr(torch.ops._C, "gfx906_spec_attn_scan")
+        and num_seqs == 1
+        and q.dtype == torch.float16
+        and k.dtype == torch.float16
+        and head_size == 256
+        and num_query_heads == 24
+        and num_kv_heads == 4
+        and q.is_contiguous()
+        and k.stride(3) == 1
+        and v.stride(3) == 1
+        and k.stride(0) % 8 == 0
+        and k.stride(1) % 8 == 0
+        and k.stride(2) % 8 == 0
+        and v.stride(0) % 8 == 0
+        and v.stride(1) % 8 == 0
+        and v.stride(2) % 8 == 0
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1
+    )
+
+    if _spec_decode_batch and not use_hip_spec_scan:
+        _log_hip_spec_miss_once(
+            True,
+            use_slim_3d,
+            hasattr(torch.ops._C, "gfx906_spec_attn_scan"),
+            num_seqs,
+            str(q.dtype),
+            str(k.dtype),
+            head_size,
+            num_query_heads,
+            num_kv_heads,
+            block_size,
+            q.is_contiguous(),
+            tuple(k.stride()),
+            tuple(v.stride()),
+            str(block_table.dtype),
+            block_table.stride(1),
+        )
 
     if use_prefill_3d:
         num_segments = GFX906_PREFILL_SEGMENTS
@@ -1802,6 +2010,7 @@ def unified_attention(
                 segm_expsum,
                 softmax_scale,
                 q.shape[0],
+                block_size,
                 k.stride(0),
                 k.stride(1),
                 k.stride(2),
@@ -1862,13 +2071,16 @@ def unified_attention(
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
+    # Spec-decode batches (few query tokens per sequence, see
+    # _spec_decode_batch) are excluded from (2) so they fall through to the
+    # split-KV path below.
     if (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or (max_seqlen_q > 1 and not _spec_decode_batch)
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     ):
@@ -1949,11 +2161,34 @@ def unified_attention(
                 ),
                 softmax_segm_output.shape[2],
             )
+        if _spec_decode_batch:
+            # Fixed segment count: graph capture runs with seq_lens=1, so a
+            # context-derived count would freeze at the capture-time context
+            # while replay scans the real one. On the decode-tuned shape the
+            # batch shares the decode tile/warp configuration (see
+            # decode_block_m above); other shapes keep the swept prefill
+            # configuration their q blocks were sized against.
+            num_segments = min(
+                GFX906_SPEC_ATTN_SEGMENTS, softmax_segm_output.shape[2]
+            )
+            if decode_block_m is not None:
+                splitkv_tile_size = TILE_SIZE_DECODE
+                splitkv_num_warps = 2
+            else:
+                splitkv_tile_size = TILE_SIZE_PREFILL
+                splitkv_num_warps = 4
+        else:
+            splitkv_tile_size = TILE_SIZE_DECODE
+            splitkv_num_warps = (
+                _decode_num_warps(head_size, max_seqlen_k, num_queries_per_kv)
+                if gfx906_sched
+                else None
+            )
         _launch_split_kv(
             softmax_segm_output,
             softmax_segm_max,
             softmax_segm_expsum,
             num_segments,
-            TILE_SIZE_DECODE,
-            _decode_num_warps(head_size, max_seqlen_k) if gfx906_sched else None,
+            splitkv_tile_size,
+            splitkv_num_warps,
         )

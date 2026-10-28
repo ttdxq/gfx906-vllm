@@ -80,7 +80,7 @@
 - **硬件**: AMD gfx906 GPU（Radeon VII、Radeon Pro VII、Instinct MI50、Instinct MI60）
 - **ROCm**: 支持以下社区兼容组合（均需要内核模式驱动）
   - ROCm 6.3 + PyTorch 2.9 + triton-gfx906 v3.5.0+gfx906（原有兼容组合）
-  - ROCm 7.2 + PyTorch 2.11 + triton-rocm 3.6.0（当前仓库依赖组合）
+  - ROCm 7.2 + PyTorch 2.11 + Triton 3.8.0（当前验证组合，使用 PyPI 原生 `triton` 包）
 - **Python**: 3.10+
 - **操作系统**: Linux（在 Ubuntu 上测试）
 
@@ -256,18 +256,12 @@ print(response.choices[0].message.content)
 
 基于原项目测试结果：
 - ⚠️ **GPTQ** - 部分模型可用，但 kernel、张量形状和 MoE 组合仍可能存在兼容性或性能问题
-- ⚠️ **AWQ** - 部分 dense 模型可用；默认使用 Triton 路径，部分模型仍可能输出异常或启动失败
+- ⚠️ **AWQ** - 部分 dense 模型可用；gfx906 稠密线性层通过混合精度内核选择使用 W4A16 HIP 内核，部分模型仍可能输出异常或启动失败
 - ⚠️ **W4A16 INT** - 部分模型不可用（通过 llm-compressor）
 - ⚠️ **MoE 量化模型** - 速度显著较慢，不推荐
 - ⚠️ **非量化模型** - 略慢，但可用
 
-gfx906 上 AWQ 默认继续使用当前较保守的 Triton 路径。如需试验 `vllm-gfx906-mobydick` 风格的 GPTQ-compatible AWQ 路径，可显式设置：
-
-```bash
-export VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ=1
-```
-
-该开关默认关闭，仅建议在排查 Triton AWQ 兼容性或对比两条 AWQ 路径行为时使用。
+gfx906 上的 AWQ 稠密线性层先转换为共享的打包权重格式，再由混合精度内核选择使用 gfx906 W4A16 HIP 内核；该路径不要求 Marlin 硬件支持。
 
 详细信息请参阅 [Issue #29](https://github.com/nlzy/vllm-gfx906/issues/29)。
 

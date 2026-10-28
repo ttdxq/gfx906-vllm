@@ -178,15 +178,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             layer=layer,
         )
         # `moe_kernel` is initialized to None in FusedMoEMethodBase.__init__;
-        # On the first call we replace the parameter normally. On subsequent
-        # calls (e.g. RL weight updates that re-trigger
-        # process_weights_after_loading) the moe kernel has already been set
-        # up and CUDA graphs may have captured the parameter addresses, so
-        # we copy the shuffled data into the existing storage instead of
-        # re-registering a new Parameter.
+        # replace_parameter keeps the parameter object and copies into the
+        # existing storage when shapes match, so captured CUDA graph addresses
+        # survive RL weight updates that re-trigger this method.
         is_weight_update = self.moe_kernel is not None  # type: ignore[has-type]
-        replace_parameter(layer, "w13_weight", w13_new, prefer_copy=is_weight_update)
-        replace_parameter(layer, "w2_weight", w2_new, prefer_copy=is_weight_update)
+        replace_parameter(layer, "w13_weight", w13_new)
+        replace_parameter(layer, "w2_weight", w2_new)
 
         if not is_weight_update:
             # Setup moe kernel only on the first call. For the unquantized

@@ -2,7 +2,10 @@
 #include <cuda_runtime.h>
 
 #include <cstdlib>
+#include <limits>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -14,15 +17,18 @@
 #include "vecdotq.cuh"
 #include "dequantize.cuh"
 #include "mmvq.cuh"
+#include "mmvq_prepared.cuh"
+#include "mmvq_schedule.cuh"
 #include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
 
 // Q8 gemv
-template <typename scalar_t>
+template <typename scalar_t, bool PREPARED = false, bool DUAL = false>
 static __global__ void quantize_q8_1(const scalar_t* __restrict__ x,
                                      void* __restrict__ vy, const int kx,
-                                     const int kx_padded) {
+                                     const int kx_padded,
+                                     void* __restrict__ vprepared) {
   const auto ix = blockDim.x * blockIdx.x + threadIdx.x;
   if (ix >= kx_padded) {
     return;
@@ -42,20 +48,36 @@ static __global__ void quantize_q8_1(const scalar_t* __restrict__ x,
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1) {
     amax = fmaxf(amax, VLLM_SHFL_XOR_SYNC_WIDTH(amax, mask, 32));
-    sum += VLLM_SHFL_XOR_SYNC_WIDTH(sum, mask, 32);
+    if constexpr (!PREPARED) {
+      sum += VLLM_SHFL_XOR_SYNC_WIDTH(sum, mask, 32);
+    }
   }
 
   const float d = amax / 127;
   const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
-  y[ib].qs[iqs] = q;
-
-  if (iqs > 0) {
-    return;
+  if constexpr (PREPARED || DUAL) {
+    int sum_q = q;
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      sum_q += VLLM_SHFL_XOR_SYNC_WIDTH(sum_q, mask, 32);
+    }
+    uint8_t* record = static_cast<uint8_t*>(DUAL ? vprepared : vy) +
+                      (iy * (kx_padded / 64) + ix / 64) * 72;
+    reinterpret_cast<int8_t*>(record)[ix % 64] = q;
+    if (iqs == 0) {
+      const uint32_t bits = uint32_t(__half_as_ushort(__float2half(d))) |
+                            (uint32_t(uint16_t(int16_t(sum_q))) << 16);
+      reinterpret_cast<uint32_t*>(record + 64)[(ix % 64) / 32] = bits;
+    }
   }
-
-  y[ib].ds.x = __float2half(d);
-  y[ib].ds.y = __float2half(sum);
+  if constexpr (!PREPARED) {
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) {
+      y[ib].ds.x = __float2half(d);
+      y[ib].ds.y = __float2half(sum);
+    }
+  }
 }
 
 template <typename scalar_t>
@@ -258,9 +280,10 @@ static __global__ void rms_norm_gated_quantize_q8_1(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool PREPARED = false, bool DUAL = false>
 static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx,
-                                   const int ky, cudaStream_t stream) {
+                                   const int ky, cudaStream_t stream,
+                                   void* vprepared = nullptr) {
   const int64_t kx_padded = (kx + 512 - 1) / 512 * 512;
   const int block_num_x =
       (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
@@ -269,8 +292,11 @@ static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx,
     const int num_blocks_y = std::min(ky, off + MAX_BLOCK_SIZE) - off;
     const dim3 num_blocks(block_num_x, num_blocks_y, 1);
     const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
-    quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(
-        &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
+    quantize_q8_1<scalar_t, PREPARED, DUAL>
+        <<<num_blocks, block_size, 0, stream>>>(
+            &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9),
+            kx, kx_padded,
+            DUAL ? (int32_t*)vprepared + off * (kx_padded / 32 * 9) : nullptr);
   }
 }
 
@@ -413,6 +439,7 @@ torch::Tensor ggml_dequantize(torch::Tensor W,  // quant weight
 
   VLLM_DISPATCH_FLOATING_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
     auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
+    TORCH_CHECK(to_cuda != nullptr, "Unsupported GGUF dequantization type: ", type);
     to_cuda((void*)W.data_ptr(), (scalar_t*)DW.data_ptr(), m * n, stream);
   });
 
@@ -472,11 +499,163 @@ torch::Tensor ggml_repack_iq4_xs_to_q8_0(torch::Tensor W, int64_t row,
   return out;
 }
 
+
+// ---- planar K-quant repack (load-time, byte-conserving, bit-exact) ----
+// Rewrites each superblock into per-tensor planes. Buffers produced here are
+// registered and the MMVQ/MMQ dispatch routes registered pointers to the
+// planar kernels. Layouts (bytes per 256-weight superblock):
+//   q6_K 210: ql 128 | qh 64 | scales 16 | d 2
+//   q5_K 176: ql 128 | qh 32 | scales 12 | dm 4
+//   q4_K 144: ql 128 |        scales 12 | dm 4
+static std::unordered_set<const void*>& gguf_planar_buffers() {
+  static std::unordered_set<const void*> buffers;
+  return buffers;
+}
+
+static std::mutex& gguf_planar_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+bool gguf_planar_is_planar(const void* w) {
+  std::lock_guard<std::mutex> lock(gguf_planar_mutex());
+  return gguf_planar_buffers().count(w) > 0;
+}
+
+static bool planar_k_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR");
+    if (env != nullptr) return env[0] != '0';
+    // legacy name kept as an alias so existing deployments keep working
+    const char* legacy = std::getenv("VLLM_GGUF_Q6_K_PLANAR");
+    return legacy == nullptr || legacy[0] != '0';
+  }();
+  return enabled;
+}
+
+
+__global__ void planar_pack_q6_k_kernel(const block_q6_K* __restrict__ src,
+                                        uint8_t* __restrict__ dst,
+                                        int64_t rows, int64_t nb,
+                                        int64_t total_blocks) {
+  const int64_t sb = blockIdx.x;  // global superblock index
+  if (sb >= total_blocks) return;
+  const int64_t row = sb / nb;
+  const int64_t in_row = sb % nb;
+  const size_t qh_base = (size_t)rows * nb * 128;
+  const size_t sc_base = qh_base + (size_t)rows * nb * 64;
+  const size_t d_base = sc_base + (size_t)rows * nb * 16;
+  const block_q6_K& b = src[sb];
+  const int t = threadIdx.x;
+  if (t < 128) {
+    dst[(size_t)row * nb * 128 + in_row * 128 + t] = b.ql[t];
+  } else if (t < 192) {
+    dst[qh_base + (size_t)row * nb * 64 + in_row * 64 + (t - 128)] = b.qh[t - 128];
+  } else if (t < 208) {
+    dst[sc_base + (size_t)row * nb * 16 + in_row * 16 + (t - 192)] = b.scales[t - 192];
+  } else if (t == 208) {
+    ((half*)(dst + d_base))[row * nb + in_row] = b.d;
+  }
+}
+
+__global__ void planar_pack_q4_k_kernel(const block_q4_K* __restrict__ src,
+                                        uint8_t* __restrict__ dst,
+                                        int64_t rows, int64_t nb,
+                                        int64_t total_blocks) {
+  const int64_t sb = blockIdx.x;
+  if (sb >= total_blocks) return;
+  const int64_t row = sb / nb;
+  const int64_t in_row = sb % nb;
+  const size_t sc_base = (size_t)rows * nb * 128;
+  const size_t dm_base = sc_base + (size_t)rows * nb * 12;
+  const block_q4_K& b = src[sb];
+  const int t = threadIdx.x;
+  if (t < 128) {
+    dst[(size_t)row * nb * 128 + in_row * 128 + t] = b.qs[t];
+  } else if (t < 140) {
+    dst[sc_base + (size_t)row * nb * 12 + in_row * 12 + (t - 128)] = b.scales[t - 128];
+  } else if (t == 140) {
+    ((half2*)(dst + dm_base))[row * nb + in_row] = b.dm;
+  }
+}
+
+__global__ void planar_pack_q5_k_kernel(const block_q5_K* __restrict__ src,
+                                        uint8_t* __restrict__ dst,
+                                        int64_t rows, int64_t nb,
+                                        int64_t total_blocks) {
+  const int64_t sb = blockIdx.x;
+  if (sb >= total_blocks) return;
+  const int64_t row = sb / nb;
+  const int64_t in_row = sb % nb;
+  const size_t qh_base = (size_t)rows * nb * 128;
+  const size_t sc_base = qh_base + (size_t)rows * nb * 32;
+  const size_t dm_base = sc_base + (size_t)rows * nb * 12;
+  const block_q5_K& b = src[sb];
+  const int t = threadIdx.x;
+  if (t < 128) {
+    dst[(size_t)row * nb * 128 + in_row * 128 + t] = b.qs[t];
+  } else if (t < 160) {
+    dst[qh_base + (size_t)row * nb * 32 + in_row * 32 + (t - 128)] = b.qh[t - 128];
+  } else if (t < 172) {
+    dst[sc_base + (size_t)row * nb * 12 + in_row * 12 + (t - 160)] = b.scales[t - 160];
+  } else if (t == 172) {
+    ((half2*)(dst + dm_base))[row * nb + in_row] = b.dm;
+  }
+}
+
+static void planar_pack_register(torch::Tensor& out) {
+  std::lock_guard<std::mutex> lock(gguf_planar_mutex());
+  gguf_planar_buffers().insert(out.data_ptr());
+}
+
+torch::Tensor ggml_planar_pack(torch::Tensor W, int64_t type, int64_t row, int64_t col) {
+  TORCH_CHECK(W.is_cuda(), "planar K-quant pack input must be a CUDA tensor");
+  TORCH_CHECK(W.is_contiguous(), "planar K-quant pack input must be contiguous");
+  TORCH_CHECK(col % QK_K == 0, "planar K-quant pack col must be divisible by QK_K");
+  const int64_t nb = col / QK_K;
+  const int64_t bytes_per_block = type == 14 ? 210 : (type == 13 ? 176 : 144);
+  TORCH_CHECK(type >= 12 && type <= 14, "planar K-quant pack supports q4_K/q5_K/q6_K");
+  TORCH_CHECK(W.numel() == row * nb * bytes_per_block,
+              "planar K-quant pack size mismatch");
+  auto options = torch::TensorOptions().dtype(torch::kUInt8).device(W.device());
+  at::Tensor out = torch::empty({row, nb * bytes_per_block}, options);
+  const int64_t total_blocks = row * nb;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  if (type == 14) {
+    planar_pack_q6_k_kernel<<<total_blocks, 256, 0, stream>>>(
+        static_cast<const block_q6_K*>(W.data_ptr()), out.data_ptr<uint8_t>(),
+        row, nb, total_blocks);
+  } else if (type == 13) {
+    planar_pack_q5_k_kernel<<<total_blocks, 256, 0, stream>>>(
+        static_cast<const block_q5_K*>(W.data_ptr()), out.data_ptr<uint8_t>(),
+        row, nb, total_blocks);
+  } else {
+    planar_pack_q4_k_kernel<<<total_blocks, 256, 0, stream>>>(
+        static_cast<const block_q4_K*>(W.data_ptr()), out.data_ptr<uint8_t>(),
+        row, nb, total_blocks);
+  }
+  planar_pack_register(out);
+  return out;
+}
+
+torch::Tensor ggml_planar_pack_q6_k(torch::Tensor W, int64_t row, int64_t col) {
+  return ggml_planar_pack(std::move(W), 14, row, col);
+}
+
+static bool try_mul_mat_vec_k45_prepared(
+    const torch::Tensor& W, const torch::Tensor& X, int64_t type,
+    int64_t row, torch::Tensor& Y);
+
 torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W,  // quant weight
                                   torch::Tensor X,  // input
                                   int64_t type, int64_t row) {
   int64_t col = X.sizes()[1];
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  torch::Tensor Y;
+  if (try_mul_mat_vec_k45_prepared(W, X, type, row, Y)) {
+    return Y;
+  }
   at::Tensor quant_X = ggml_quantize_row_q8_1(X);
   return ggml_mul_mat_vec_q8(W, quant_X, type, row, col, X.scalar_type());
 }
@@ -844,9 +1023,237 @@ static int q8_0_row_tile_min_rows() {
 }
 
 template <typename scalar_t>
+static bool try_mul_mat_vec_k45_planar_wide(
+    const void* W, const void* quant_X, scalar_t* dst, int col, int row,
+    int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
+  if ((type != 12 && type != 13) || !planar_k_enabled() || vecs < 1 ||
+      vecs > 4 || col % QK_K != 0 || !gguf_planar_is_planar(W)) {
+    return false;
+  }
+  const char* wide_env = std::getenv("VLLM_GGUF_K45_WIDE");
+  if (wide_env != nullptr && wide_env[0] == '0') {
+    return false;
+  }
+  if (type == 12) {
+    mul_mat_vec_k45_q8_1_planar_wide_cuda<scalar_t, false>(
+        W, quant_X, dst, col, row, vecs, stream, dst_stride);
+  } else {
+    mul_mat_vec_k45_q8_1_planar_wide_cuda<scalar_t, true>(
+        W, quant_X, dst, col, row, vecs, stream, dst_stride);
+  }
+  return true;
+}
+
+static bool can_mul_mat_vec_k45_prepared(
+    const torch::Tensor& W, const torch::Tensor& X, int64_t type,
+    int64_t row) {
+#if defined(USE_ROCM)
+  if ((type != 12 && type != 13) || !planar_k_enabled() ||
+      !X.is_cuda() || !W.is_cuda() || X.dim() != 2 ||
+      X.size(0) != 1 || !X.is_contiguous() ||
+      W.dim() != 2 || !W.is_contiguous() || W.scalar_type() != torch::kUInt8 ||
+      W.device() != X.device() || W.size(0) != row || row < 64) {
+    return false;
+  }
+  for (const char* name : {"VLLM_GGUF_K45_PREPARED", "VLLM_GGUF_K45_WIDE",
+                           "VLLM_GGUF_K45_INT_ACC"}) {
+    const char* value = std::getenv(name);
+    if (value != nullptr && value[0] == '0') return false;
+  }
+  const int64_t col = X.size(1);
+  const int64_t padded = (col + 511) / 512 * 512;
+  if (col <= 0 || col % QK_K != 0 || padded / 32 * 36 > 32768 ||
+      W.numel() != row * (col / QK_K) * (type == 12 ? 144 : 176) ||
+      W.numel() > std::numeric_limits<int>::max() ||
+      !gguf_planar_is_planar(W.data_ptr())) {
+    return false;
+  }
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  if (std::string(properties->gcnArchName).find("gfx906") != 0) return false;
+  return true;
+#else
+  return false;
+#endif
+}
+
+static bool try_mul_mat_vec_k45_prepared(
+    const torch::Tensor& W, const torch::Tensor& X, int64_t type,
+    int64_t row, torch::Tensor& Y) {
+#if defined(USE_ROCM)
+  if (!can_mul_mat_vec_k45_prepared(W, X, type, row)) return false;
+  const int64_t col = X.size(1);
+  const int64_t padded = (col + 511) / 512 * 512;
+  Y = torch::empty({1, row}, X.options());
+  const char* force_zero = std::getenv("VLLM_GGUF_MMVQ_ZERO_OUTPUT");
+  if (force_zero != nullptr && force_zero[0] == '1') Y.zero_();
+  auto quant_X = torch::empty({1, padded / 32 * 9}, X.options().dtype(torch::kInt32));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_k45_prepared", [&] {
+    quantize_row_q8_1_cuda<scalar_t, true>(
+        static_cast<const scalar_t*>(X.data_ptr()), quant_X.data_ptr(),
+        col, 1, stream);
+    gguf_k45_prepared::launch(W.data_ptr(), quant_X.data_ptr(),
+                             static_cast<scalar_t*>(Y.data_ptr()),
+                             col, row, type, stream);
+  });
+  return true;
+#else
+  return false;
+#endif
+}
+
+static bool gguf_mmvq_type_selected(const char* selected, int64_t type) {
+  if (selected == nullptr) return true;
+  while (*selected != '\0') {
+    char* end;
+    const long value = std::strtol(selected, &end, 10);
+    if (end == selected) return false;
+    if (value == type) return true;
+    if (*end != ',') return false;
+    selected = end + 1;
+  }
+  return false;
+}
+
+template <typename scalar_t>
+static bool try_mul_mat_vec_schedule(
+    const void* W, const void* quant_X, scalar_t* dst, int col, int row,
+    int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
+#if defined(USE_ROCM)
+  const char* mode = std::getenv("VLLM_GGUF_MMVQ_SCHEDULE");
+  bool automatic_shared = false;
+  if (mode != nullptr && mode[0] == 'a') {
+    if (vecs != 1 || row < 2048) return false;
+    if ((type == 2 || type == 3 || type == 6) && col >= 4096 && col <= 17408) {
+      mode = "8";
+      automatic_shared = true;
+    } else if ((type == 7 || type == 8) && col > 8192 && col <= 17408) {
+      mode = "8";
+      automatic_shared = true;
+    } else if (type == 10 || (type == 14 && col > 8192)) {
+      mode = "4";
+    } else {
+      return false;
+    }
+  }
+  if (mode == nullptr || (mode[0] != '4' && mode[0] != '8') ||
+      vecs < 1 || vecs > 4 || col <= 0 || col % QK_K != 0 ||
+      (type >= 12 && type <= 13 && gguf_planar_is_planar(W)) ||
+      std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+              .find("gfx906") != 0) return false;
+  const char* selected = std::getenv("VLLM_GGUF_MMVQ_SCHEDULE_TYPE");
+  if (!gguf_mmvq_type_selected(selected, type)) return false;
+  const char* shared_env = std::getenv("VLLM_GGUF_MMVQ_SHARED_X");
+  const bool shared = (automatic_shared || (shared_env != nullptr && shared_env[0] == '1')) &&
+                      vecs == 1 && ((col + 511) / 512 * 512) / 32 * 36 <= 32768;
+  if (type == 14 && gguf_planar_is_planar(W)) {
+    if (vecs != 1) return false;
+    const int bytes = ((col + 511) / 512 * 512) / 32 * 36;
+#define Q6_SCHEDULE(ROWS_, SHARED_) \
+    mul_mat_vec_q6_K_q8_1_planar_wide<scalar_t, 1, ROWS_, SHARED_> \
+      <<<(row + ROWS_ - 1) / ROWS_, ROWS_ * 64, SHARED_ ? bytes : 0, stream>>>( \
+          (const uint8_t*)W, quant_X, dst, col, row, dst_stride)
+    if (mode[0] == '8') {
+      if (shared) { Q6_SCHEDULE(8, true); }
+      else { Q6_SCHEDULE(8, false); }
+    } else {
+      if (shared) { Q6_SCHEDULE(4, true); }
+      else { Q6_SCHEDULE(4, false); }
+    }
+#undef Q6_SCHEDULE
+    return true;
+  }
+#define SCHEDULE_CASE(TYPE_, QK_, QI_, BLOCK_, VDR_, DOT_) \
+  case TYPE_: \
+    launch_mmvq_schedule<scalar_t, QK_, QI_, BLOCK_, VDR_, DOT_>( \
+        W, quant_X, dst, col, row, vecs, dst_stride, stream, mode[0] - '0', shared); \
+    return true
+  switch (type) {
+    SCHEDULE_CASE(2, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1);
+    SCHEDULE_CASE(3, QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1);
+    SCHEDULE_CASE(6, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1);
+    SCHEDULE_CASE(7, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1);
+    SCHEDULE_CASE(8, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1);
+    SCHEDULE_CASE(10, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1);
+    SCHEDULE_CASE(11, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1);
+    SCHEDULE_CASE(12, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1);
+    SCHEDULE_CASE(13, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1);
+    SCHEDULE_CASE(14, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1);
+  }
+#undef SCHEDULE_CASE
+#endif
+  return false;
+}
+
+template <typename scalar_t>
+static bool try_mul_mat_vec_iq_lut(
+    const void* W, const void* quant_X, scalar_t* dst, int col, int row,
+    int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
+#if defined(USE_ROCM)
+  const char* mode = std::getenv("VLLM_GGUF_IQ_LUT");
+  if (mode == nullptr) mode = "a";
+  if (mode != nullptr && mode[0] == 'a') {
+    if (type == 17 || type == 18 || type == 21 || type == 22 || type == 29) {
+      mode = "2";
+    } else if (type == 23 && col == 6144 && row >= 2048) {
+      mode = "3";
+    } else {
+      return false;
+    }
+  }
+  const char* selected = std::getenv("VLLM_GGUF_IQ_LUT_TYPE");
+  const char* master = std::getenv("VLLM_GGUF_IQ_WIDE");
+  const char* iq4_wide = std::getenv("VLLM_GGUF_IQ4XS_WIDE");
+  if (mode == nullptr || (mode[0] != '2' && mode[0] != '3') ||
+      !gguf_mmvq_type_selected(selected, type) ||
+      (master != nullptr && master[0] == '0') || vecs < 1 || vecs > 4 ||
+      (type == 23 && iq4_wide != nullptr && iq4_wide[0] == '0') ||
+      col <= 0 || col % QK_K != 0 ||
+      ((type == 20 || type == 23) && vecs == 1 && mode[0] == '2' &&
+       ((col + 511) / 512 * 512) / 32 * 36 > 32768) ||
+      std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+              .find("gfx906") != 0) return false;
+#define IQ_LUT_CASE(TYPE_, KIND_) \
+  case TYPE_: \
+    if (mode[0] == '2') \
+      mul_mat_vec_iq_lut_cuda<scalar_t, KIND_, true>( \
+          W, quant_X, dst, col, row, vecs, stream, dst_stride); \
+    else \
+      mul_mat_vec_iq_lut_cuda<scalar_t, KIND_, false>( \
+          W, quant_X, dst, col, row, vecs, stream, dst_stride); \
+    return true
+  switch (type) {
+    IQ_LUT_CASE(16, 0);
+    IQ_LUT_CASE(19, 1);
+    IQ_LUT_CASE(18, 2);
+    IQ_LUT_CASE(21, 3);
+    IQ_LUT_CASE(17, 4);
+    IQ_LUT_CASE(22, 5);
+    IQ_LUT_CASE(29, 6);
+    IQ_LUT_CASE(20, 7);
+    IQ_LUT_CASE(23, 8);
+  }
+#undef IQ_LUT_CASE
+#endif
+  return false;
+}
+
+template <typename scalar_t>
 static void ggml_mul_mat_vec_q8_dispatch(
     const void* W, const void* quant_X, scalar_t* dst, int col, int row,
     int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
+  if (try_mul_mat_vec_k45_planar_wide(
+          W, quant_X, dst, col, row, vecs, type, stream, dst_stride)) {
+    return;
+  }
+  if (try_mul_mat_vec_iq_lut(
+          W, quant_X, dst, col, row, vecs, type, stream, dst_stride)) {
+    return;
+  }
+  if (try_mul_mat_vec_schedule(
+          W, quant_X, dst, col, row, vecs, type, stream, dst_stride)) {
+    return;
+  }
   switch (type) {
     case 2:
       mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
@@ -887,6 +1294,24 @@ static void ggml_mul_mat_vec_q8_dispatch(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
       break;
     case 12: {
+      if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          gguf_planar_is_planar(W)) {
+        static const int min_rows = [] {
+          const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR_MIN_ROWS");
+          return env == nullptr ? INT_MAX : std::max(1, std::atoi(env));
+        }();
+        if (vecs == 1 && row >= min_rows) {
+          mul_mat_vec_k45_q8_1_planar_row_tile2_cuda<scalar_t, false>(
+              W, quant_X, dst, col, row, stream);
+        } else if (vecs == 1) {
+          mul_mat_vec_k45_q8_1_planar_v1_cuda<scalar_t, false>(
+              W, quant_X, dst, col, row, stream);
+        } else {
+          mul_mat_vec_k45_q8_1_planar_cuda<scalar_t, false>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+        }
+        break;
+      }
       const bool q4_k_fixed_cols_fast = q4_k_fixed_cols_fast_enabled();
       static const bool q4_k_col2560_fast = [] {
         const char* env = std::getenv("VLLM_GGUF_Q4_K_COL2560_FAST");
@@ -999,6 +1424,24 @@ static void ggml_mul_mat_vec_q8_dispatch(
       break;
     }
     case 13: {
+      if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          gguf_planar_is_planar(W)) {
+        static const int min_rows = [] {
+          const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR_MIN_ROWS");
+          return env == nullptr ? 1024 : std::max(1, std::atoi(env));
+        }();
+        if (vecs == 1 && row >= min_rows) {
+          mul_mat_vec_k45_q8_1_planar_row_tile2_cuda<scalar_t, true>(
+              W, quant_X, dst, col, row, stream);
+        } else if (vecs == 1) {
+          mul_mat_vec_k45_q8_1_planar_v1_cuda<scalar_t, true>(
+              W, quant_X, dst, col, row, stream);
+        } else {
+          mul_mat_vec_k45_q8_1_planar_cuda<scalar_t, true>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+        }
+        break;
+      }
       const bool q5_k_fixed_cols_fast = q5_k_fixed_cols_fast_enabled();
       static const bool q5_k_5120_6144_fast = [] {
         const char* env = std::getenv("VLLM_GGUF_Q5_K_5120_6144_FAST");
@@ -1099,6 +1542,40 @@ static void ggml_mul_mat_vec_q8_dispatch(
       break;
     }
     case 14: {
+      // planar routing is single-vector only; multi-vector batches (MTP
+      // verify) fall through to the original kernels below, whose combine
+      // variant measured ~10% faster than the planar one
+      if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          gguf_planar_is_planar(W)) {
+        // Wide-load planar variant: read per call so an in-process A/B can
+        // flip it without a restart; default on for gfx906 (measured
+        // 610-636 GB/s standalone vs 570-620 for row-tile planar).
+        // Restricting it to embedding-class shapes (row >= 65536) also
+        // measured slower end-to-end despite faster L2-warm standalone
+        // numbers for row_tile2 on MLP shapes.
+        const char* wide_env = std::getenv("VLLM_GGUF_Q6_K_WIDE");
+        const bool wide = wide_env == nullptr || wide_env[0] != '0';
+        if (wide) {
+          mul_mat_vec_q6_K_q8_1_planar_wide_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        }
+        static const int min_rows = [] {
+          const char* env = std::getenv("VLLM_GGUF_Q6_K_PLANAR_MIN_ROWS");
+          return env == nullptr ? 6144 : std::max(1, std::atoi(env));
+        }();
+        if (vecs == 1 && row >= min_rows) {
+          mul_mat_vec_q6_K_q8_1_planar_row_tile2_cuda<scalar_t>(
+              W, quant_X, dst, col, row, stream);
+        } else if (vecs == 1) {
+          mul_mat_vec_q6_K_q8_1_planar_v1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, stream);
+        } else {
+          mul_mat_vec_q6_K_q8_1_planar_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+        }
+        break;
+      }
       static const bool q6_k_col2560_fast = [] {
         const char* env = std::getenv("VLLM_GGUF_Q6_K_COL2560_FAST");
         return env == nullptr || env[0] != '0';
@@ -1186,41 +1663,150 @@ static void ggml_mul_mat_vec_q8_dispatch(
       break;
     }
     case 16:
-      mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 17:
-      mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 18:
-      mul_mat_vec_iq3_xxs_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 19:
-      mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 20:
-      mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 21:
-      mul_mat_vec_iq3_s_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
     case 22:
-      mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
+    case 29: {
+      // Wide-load i-quant GEMV (decode path): decodes one whole 32-weight
+      // group per lane instead of the generic per-vec_dot template.
+      // IQ2_XXS and IQ1_S default to the LDS path on gfx906.
+      const char* iq_wide_env = std::getenv("VLLM_GGUF_IQ_WIDE");
+      const char* iq2_xxs_wide_env =
+          std::getenv("VLLM_GGUF_IQ2_XXS_WIDE");
+      const char* iq1_s_wide_env = std::getenv("VLLM_GGUF_IQ1_S_WIDE");
+#if defined(USE_ROCM)
+      const char* iq_lut_env = type == 16 ? iq2_xxs_wide_env : iq1_s_wide_env;
+      if (iq_lut_env == nullptr) iq_lut_env = "2";
+      if ((type == 16 || type == 19) &&
+          (iq_lut_env[0] == '2' || iq_lut_env[0] == '3') &&
+          (iq_wide_env == nullptr || iq_wide_env[0] != '0') &&
+          vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+                  .find("gfx906") == 0) {
+        if (type == 16) {
+          if (iq_lut_env[0] == '2') {
+            mul_mat_vec_iq_lut_cuda<scalar_t, false, true>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          } else {
+            mul_mat_vec_iq_lut_cuda<scalar_t, false, false>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          }
+        } else {
+          if (iq_lut_env[0] == '2') {
+            mul_mat_vec_iq_lut_cuda<scalar_t, true, true>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          } else {
+            mul_mat_vec_iq_lut_cuda<scalar_t, true, false>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          }
+        }
+        break;
+      }
+#endif
+      const bool iq_wide_enabled =
+          (iq_wide_env == nullptr || iq_wide_env[0] != '0') &&
+          ((type == 17 || type == 18 || type == 21 || type == 22) ||
+           (type == 16 && iq2_xxs_wide_env != nullptr &&
+            iq2_xxs_wide_env[0] == '1') ||
+           (type == 19 && iq1_s_wide_env != nullptr &&
+            iq1_s_wide_env[0] == '1'));
+      if (iq_wide_enabled && vecs >= 1 && vecs <= 4 &&
+          col % QK_K == 0) {
+        switch (type) {
+          case 16:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq2_xxs>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 17:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq2_xs>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 18:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq3_xxs>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 19:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq1_s>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 20:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq4_nl>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 21:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq3_s>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 22:
+            mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq2_s>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+          case 29:
+            mul_mat_vec_iq1m_wide_cuda<scalar_t>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+            break;
+        }
+        break;
+      }
+      switch (type) {
+        case 16:
+          mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 17:
+          mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 18:
+          mul_mat_vec_iq3_xxs_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 19:
+          mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 20:
+          mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 21:
+          mul_mat_vec_iq3_s_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 22:
+          mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+        case 29:
+          mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
+              W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          break;
+      }
       break;
-    case 23:
+    }
+    case 23: {
+      // Wide-load variant (read per call for in-process A/B): reads the
+      // original 136-byte blocks with 8B-aligned u64 pairs. It wins 22-26% on
+      // narrow-column shapes whose q8 activation vector stays L1-resident
+      // (~1.125 B/col-element, threshold at 8192) and loses ~14% on wide
+      // columns where the scattered q8 loads fall out to L2, so route by
+      // shape. VLLM_GGUF_IQ4XS_WIDE=0 restores the generic template everywhere.
+      const char* iq4w_env = std::getenv("VLLM_GGUF_IQ4XS_WIDE");
+      if (vecs >= 1 && vecs <= 4 && col <= 8192 &&
+          (iq4w_env == nullptr || iq4w_env[0] != '0')) {
+        mul_mat_vec_iq4xs_q8_1_wide_cuda<scalar_t>(
+            W, quant_X, dst, col, row, vecs, stream, dst_stride);
+        break;
+      }
       mul_mat_vec_iq4_xs_q8_1_cuda<scalar_t>(
           W, quant_X, dst, col, row, vecs, stream, dst_stride);
       break;
-    case 29:
-      mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
-          W, quant_X, dst, col, row, vecs, stream, dst_stride);
-      break;
+    }
+    default:
+      TORCH_CHECK(false, "Unsupported GGUF MMVQ weight type: ", type);
   }
 }
 
@@ -1655,6 +2241,29 @@ static void ggml_mul_mat_vec_q8_grouped_dispatch(
     const void* quant_X, scalar_t* dst, int col, int total_rows, int vecs,
     int64_t type, cudaStream_t stream, const int* rows,
     const int dst_stride = -1) {
+  // the grouped same-type kernel only understands the original block layout;
+  // planar K-quant shards are dispatched per shard instead (the plain dispatch
+  // routes registered planar pointers to the planar kernels)
+  if (type >= 12 && type <= 14 && planar_k_enabled()) {
+    const void* ptrs[8] = {vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7};
+    bool any_planar = false;
+    for (int i = 0; i < 8 && !any_planar; ++i) {
+      any_planar = ptrs[i] != nullptr && gguf_planar_is_planar(ptrs[i]);
+    }
+    if (any_planar) {
+      int row_offset = 0;
+      for (int i = 0; i < 8; ++i) {
+        if (ptrs[i] == nullptr || rows[i] <= 0) {
+          continue;
+        }
+        ggml_mul_mat_vec_q8_dispatch<scalar_t>(
+            ptrs[i], quant_X, dst + row_offset, col, rows[i], vecs, type,
+            stream, total_rows);
+        row_offset += rows[i];
+      }
+      return;
+    }
+  }
   switch (type) {
     case 2:
       mul_mat_vec_q_grouped_same_type_cuda<
@@ -1946,10 +2555,22 @@ torch::Tensor ggml_mul_mat_vec_q8(torch::Tensor W, torch::Tensor quant_X,
   int64_t vecs = quant_X.sizes()[0];
   auto options = torch::TensorOptions().dtype(dtype).device(W.device());
   at::Tensor Y = torch::empty({vecs, row}, options);
-  Y.zero_();
+  if (Y.numel() == 0) {
+    return Y;
+  }
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   VLLM_DISPATCH_FLOATING_TYPES(dtype, "ggml_mul_mat_vec_q8", [&] {
+    const char* zero_env = std::getenv("VLLM_GGUF_MMVQ_ZERO_OUTPUT");
+    const bool force_zero = zero_env != nullptr && zero_env[0] == '1';
+    // Wide planar k45 writes every [vec, row] without reading dst. Other
+    // paths retain clearing for potentially unwritten graph-pool slots.
+    if (!force_zero && col > 0 && try_mul_mat_vec_k45_planar_wide(
+            W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+            col, row, vecs, type, stream, row)) {
+      return;
+    }
+    Y.zero_();
     ggml_mul_mat_vec_q8_dispatch<scalar_t>(
         (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
         col, row, vecs, type, stream, row);
@@ -2263,6 +2884,75 @@ torch::Tensor ggml_mul_mat_vec_a8_sharded(std::vector<torch::Tensor> W,
               "W and types must have the same number of elements");
   int col = X.sizes()[1];
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+#if defined(USE_ROCM)
+  const char* shared = std::getenv("VLLM_GGUF_SHARED_ACTIVATION");
+  if (shared != nullptr && shared[0] == '1') {
+    TORCH_CHECK(X.is_cuda() && X.dim() == 2 && X.is_contiguous(),
+                "Shared GGUF activation must be a contiguous CUDA matrix");
+    const int vecs = X.size(0);
+    int64_t total_rows = 0;
+    bool needs_standard = false;
+    bool needs_prepared = false;
+    std::vector<bool> prepared;
+    for (size_t i = 0; i < W.size(); ++i) {
+      const auto& shard = W[i];
+      TORCH_CHECK(shard.is_cuda() && shard.device() == X.device() &&
+                      shard.dim() == 2 && shard.is_contiguous() &&
+                      shard.scalar_type() == torch::kUInt8,
+                  "Shared GGUF weights must be contiguous CUDA byte matrices");
+      total_rows += shard.size(0);
+      const bool use_prepared =
+          can_mul_mat_vec_k45_prepared(shard, X, types[i], shard.size(0));
+      prepared.push_back(use_prepared);
+      needs_prepared |= use_prepared;
+      needs_standard |= !use_prepared;
+    }
+    TORCH_CHECK(total_rows <= std::numeric_limits<int>::max(),
+                "Shared GGUF output stride exceeds kernel indexing range");
+    auto Y = torch::empty({vecs, total_rows}, X.options());
+    if (Y.numel() == 0) return Y;
+    // Retain one clear until every shared consumer has passed replay tests.
+    Y.zero_();
+    const int64_t padded = (int64_t(col) + 511) / 512 * 512;
+    auto quant_options = X.options().dtype(torch::kInt32);
+    torch::Tensor quant_X, prepared_X;
+    if (needs_standard) {
+      quant_X = torch::empty({vecs, padded / 32 * 9}, quant_options);
+    }
+    if (needs_prepared) {
+      prepared_X = torch::empty({vecs, padded / 32 * 9}, quant_options);
+    }
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_shared_activation", [&] {
+      const auto* x = static_cast<const scalar_t*>(X.data_ptr());
+      if (needs_standard && needs_prepared) {
+        quantize_row_q8_1_cuda<scalar_t, false, true>(
+            x, quant_X.data_ptr(), col, vecs, stream, prepared_X.data_ptr());
+      } else if (needs_prepared) {
+        quantize_row_q8_1_cuda<scalar_t, true>(
+            x, prepared_X.data_ptr(), col, vecs, stream);
+      } else {
+        quantize_row_q8_1_cuda<scalar_t>(
+            x, quant_X.data_ptr(), col, vecs, stream);
+      }
+      int64_t offset = 0;
+      for (size_t i = 0; i < W.size(); ++i) {
+        const int rows = W[i].size(0);
+        auto* dst = static_cast<scalar_t*>(Y.data_ptr()) + offset;
+        if (prepared[i]) {
+          gguf_k45_prepared::launch(W[i].data_ptr(), prepared_X.data_ptr(),
+                                   dst, col, rows, types[i], stream);
+        } else {
+          ggml_mul_mat_vec_q8_dispatch<scalar_t>(
+              W[i].data_ptr(), quant_X.data_ptr(), dst, col, rows, vecs,
+              types[i], stream, total_rows);
+        }
+        offset += rows;
+      }
+    });
+    return Y;
+  }
+#endif
   at::Tensor quant_X = ggml_quantize_row_q8_1(X);
   return ggml_mul_mat_vec_q8_sharded(W, quant_X, types, col, X.scalar_type());
 }
@@ -2335,6 +3025,53 @@ torch::Tensor ggml_mul_mat_a8(torch::Tensor W,  // quant weight
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
             (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
         break;
+      case 23:
+        ggml_mul_mat_iq4_xs_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      case 16:
+        ggml_mul_mat_iq2_xxs_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      case 17:
+        ggml_mul_mat_iq2_xs_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      case 18:
+        ggml_mul_mat_iq3_xxs_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      case 19:
+        ggml_mul_mat_iq1_s_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      case 20:
+        ggml_mul_mat_iq4_nl_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      case 21:
+        ggml_mul_mat_iq3_s_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      case 22:
+        ggml_mul_mat_iq2_s_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      case 29:
+        ggml_mul_mat_iq1_m_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported GGUF MMQ weight type: ", type);
     }
   });
   return Y;

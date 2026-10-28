@@ -217,13 +217,30 @@ void gfx906_prefill_attn_scan(torch::Tensor q, torch::Tensor key_cache,
                               torch::Tensor segm_output,
                               torch::Tensor segm_max,
                               torch::Tensor segm_expsum, double scale,
-                              int64_t q_len, int64_t k_s0, int64_t k_s1,
-                              int64_t k_s2, int64_t v_s0, int64_t v_s1,
-                              int64_t v_s2, torch::Tensor dbg);
+                              int64_t q_len, int64_t bs, int64_t k_s0,
+                              int64_t k_s1, int64_t k_s2, int64_t v_s0,
+                              int64_t v_s1, int64_t v_s2, torch::Tensor dbg);
+
+// gfx906 handwritten speculative-decode attention scan (see
+// csrc/attention/gfx906_prefill_attn.cu): same segment-workspace contract
+// for the single-sequence one-token-per-block spec shape; the reduction
+// stays in the Triton reduce_segments kernel.
+void gfx906_spec_attn_scan(torch::Tensor q, torch::Tensor key_cache,
+                           torch::Tensor value_cache, torch::Tensor block_table,
+                           torch::Tensor seq_lens, torch::Tensor segm_output,
+                           torch::Tensor segm_max, torch::Tensor segm_expsum,
+                           double scale, int64_t q_len, int64_t nseg, int64_t bs,
+                           int64_t k_s0, int64_t k_s1, int64_t k_s2,
+                           int64_t v_s0, int64_t v_s1, int64_t v_s2,
+                           torch::Tensor dbg);
 
 torch::Tensor ggml_dequantize(torch::Tensor W, int64_t type, int64_t m,
                               int64_t n,
                               std::optional<at::ScalarType> const& dtype);
+torch::Tensor ggml_planar_pack_q6_k(torch::Tensor W, int64_t row, int64_t col);
+torch::Tensor ggml_planar_pack(torch::Tensor W, int64_t type, int64_t row,
+                               int64_t col);
+
 torch::Tensor ggml_repack_iq4_xs_to_q8_0(torch::Tensor W, int64_t row,
                                          int64_t col);
 
@@ -493,15 +510,6 @@ void static_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
 void dynamic_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
                                torch::Tensor& scales,
                                std::optional<torch::Tensor> const& azp);
-
-torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
-                        torch::Tensor b_gptq_qzeros,
-                        torch::Tensor b_gptq_scales, torch::Tensor b_g_idx,
-                        bool use_exllama, bool use_v2_format, int64_t bit);
-
-void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
-
-void gptq_shuffle_awq_qweight(torch::Tensor q_weight, int64_t bit);
 
 void static_scaled_fp8_quant(torch::Tensor& out, torch::Tensor const& input,
                              torch::Tensor const& scale);

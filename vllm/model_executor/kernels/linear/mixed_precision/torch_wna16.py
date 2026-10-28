@@ -31,13 +31,10 @@ class TorchWNA16LinearKernel(MPLinearKernel):
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
             return False, f"Unsupported quant type {c.weight_type}"
 
-        if c.has_g_idx:
-            return False, "Activation reordering is not supported"
-
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        for name in [self.w_q_name, self.w_s_name, self.w_zp_name, self.w_gidx_name]:
+        for name in [self.w_q_name, self.w_s_name, self.w_zp_name]:
             if name is None or getattr(layer, name, None) is None:
                 continue
             param = getattr(layer, name)
@@ -48,7 +45,7 @@ class TorchWNA16LinearKernel(MPLinearKernel):
             )
 
     def _dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
-        w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        w_q, w_s, w_zp = self._get_weight_params(layer)
         c = self.config
 
         unpacked = unpack_quantized_values_into_int32(

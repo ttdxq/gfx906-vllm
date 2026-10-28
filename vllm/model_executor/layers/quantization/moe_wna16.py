@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
+    UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -26,8 +27,8 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    check_marlin_supports_layer,
+from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+    normalize_and_validate_gptq_desc_act,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -57,34 +58,21 @@ class MoeWNA16Config(QuantizationConfig):
         self.lm_head_quantized = lm_head_quantized
         self.linear_quant_method = linear_quant_method
         self.full_config = full_config
-        self.use_marlin = False
         # Avoid circular import
-        from vllm.model_executor.layers.quantization.awq import AWQConfig
-
-        # The awq_marlin/gptq_marlin configs are optional: keep moe_wna16
-        # usable when those modules are not available on this build.
-        try:
-            from vllm.model_executor.layers.quantization.awq_marlin import (
-                AWQMarlinConfig,
-            )
-            from vllm.model_executor.layers.quantization.gptq_marlin import (
-                GPTQMarlinConfig,
-            )
-        except ImportError:
-            AWQMarlinConfig = None
-            GPTQMarlinConfig = None
+        from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 
         if self.linear_quant_method == "gptq":
-            if GPTQMarlinConfig is not None:
-                self.use_marlin = GPTQMarlinConfig.is_gptq_marlin_compatible(
-                    full_config
-                )
-        elif self.linear_quant_method == "awq":
+            normalize_and_validate_gptq_desc_act(
+                full_config.get("desc_act", False),
+                group_size,
+                full_config.get("dynamic") or {},
+            )
+        elif self.linear_quant_method in ("awq", "awq_marlin"):
             capability_tuple = current_platform.get_device_capability()
             device_capability = (
                 -1 if capability_tuple is None else capability_tuple.to_int()
             )
-            awq_min_capability = AWQConfig.get_min_capability()
+            awq_min_capability = AutoAWQConfig.get_min_capability()
             if device_capability < awq_min_capability:
                 raise ValueError(
                     "The quantization method moe_wna16 + awq is not supported "
@@ -92,8 +80,6 @@ class MoeWNA16Config(QuantizationConfig):
                     f"Minimum capability: {awq_min_capability}. "
                     f"Current capability: {device_capability}."
                 )
-            if AWQMarlinConfig is not None:
-                self.use_marlin = AWQMarlinConfig.is_awq_marlin_compatible(full_config)
         else:
             raise ValueError("moe_wna16 only support gptq and awq.")
 
@@ -127,7 +113,7 @@ class MoeWNA16Config(QuantizationConfig):
         if linear_quant_method == "gptq":
             has_zp = not cls.get_from_keys(config, ["sym"])
             modules_to_not_convert = []
-        elif linear_quant_method == "awq":
+        elif linear_quant_method in ("awq", "awq_marlin"):
             has_zp = cls.get_from_keys(config, ["zero_point"])
             modules_to_not_convert = cls.get_from_keys_or(
                 config, ["modules_to_not_convert"], None
@@ -159,18 +145,29 @@ class MoeWNA16Config(QuantizationConfig):
         # Extract data from quant config.
         quant_method = quant_config.get("quant_method", "").lower()
         num_bits = quant_config.get("bits")
-        desc_act = quant_config.get("desc_act")
+        desc_act = quant_config.get("desc_act", False)
+        try:
+            normalize_and_validate_gptq_desc_act(
+                desc_act,
+                quant_config.get("group_size"),
+                quant_config.get("dynamic") or {},
+            )
+            supported_act_order = True
+        except ValueError:
+            supported_act_order = False
 
         capability_tuple = current_platform.get_device_capability()
         device_capability = (
             -1 if capability_tuple is None else capability_tuple.to_int()
         )
         # Avoid circular import
-        from vllm.model_executor.layers.quantization.awq import AWQConfig
+        from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 
-        awq_min_capability = AWQConfig.get_min_capability()
+        awq_min_capability = AutoAWQConfig.get_min_capability()
 
-        gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [4, 8]
+        gptq_compatible = (
+            quant_method == "gptq" and supported_act_order and num_bits in [4, 8]
+        )
         awq_compatible = (
             quant_method == "awq"
             and num_bits == 4
@@ -181,42 +178,33 @@ class MoeWNA16Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> "QuantizeMethodBase | None":
         if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
+            if isinstance(layer, RoutedExperts):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
             return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
             # Avoid circular import
-            from vllm.model_executor.layers.quantization.awq import AWQConfig
-            from vllm.model_executor.layers.quantization.awq_marlin import (
-                AWQMarlinConfig,
-            )
-            from vllm.model_executor.layers.quantization.gptq import GPTQConfig
-            from vllm.model_executor.layers.quantization.gptq_marlin import (
-                GPTQMarlinConfig,
+            from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
+            from vllm.model_executor.layers.quantization.auto_gptq import (
+                AutoGPTQConfig,
             )
 
+            linear_config: QuantizationConfig
             if self.linear_quant_method == "gptq":
-                if self.use_marlin:
-                    return GPTQMarlinConfig.from_config(
-                        self.full_config
-                    ).get_quant_method(layer, prefix)
-                else:
-                    return GPTQConfig.from_config(self.full_config).get_quant_method(
-                        layer, prefix
-                    )
-            elif self.linear_quant_method == "awq":
-                if self.use_marlin and check_marlin_supports_layer(
-                    layer, self.group_size
-                ):
-                    return AWQMarlinConfig.from_config(
-                        self.full_config
-                    ).get_quant_method(layer, prefix)
-                else:
-                    return AWQConfig.from_config(self.full_config).get_quant_method(
-                        layer, prefix
-                    )
+                linear_config = AutoGPTQConfig.from_config(self.full_config)
+            elif self.linear_quant_method in ("awq", "awq_marlin"):
+                linear_config = AutoAWQConfig.from_config(self.full_config)
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
+
+            # The delegate is rebuilt from the raw HF quantization dict, which
+            # lists shard names and never fused ones. Without the mapping it
+            # resolves fused layers (qkv_proj, gate_up_proj) to
+            # UnquantizedLinearMethod and the checkpoint's qweight has nowhere
+            # to load.
+            linear_config.packed_modules_mapping = self.packed_modules_mapping
+            return linear_config.get_quant_method(layer, prefix)
         elif isinstance(layer, RoutedExperts):
             return MoeWNA16Method(self, layer.moe_config)
         return None

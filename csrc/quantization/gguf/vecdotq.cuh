@@ -1829,6 +1829,244 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
+// Planar-repack variant of load_tiles_q6_K: identical tile contents, but the
+// weight bytes come from the four-plane layout produced by
+// ggml_planar_pack_q6_k (ql | qh | scales | d). Extended signature so the
+// loader can derive the plane bases (it needs the tensor row count, which the
+// original pointer-per-tile calling convention does not carry).
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q6_K_planar(
+    const void * __restrict__ vx, const int & nrows_x, const int & row_x_0, const int & ib0,
+    int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    const int kbx  = k / QI6_K; // == 0 if QK_K == 256
+    const int kqsx = k % QI6_K; // == k if QK_K == 256
+
+    const uint8_t * qlb = (const uint8_t *) vx;
+    const uint8_t * qhb = qlb + (size_t)nrows_x * blocks_per_row * 128;
+    const uint8_t * scb = qhb + (size_t)nrows_x * blocks_per_row * 64;
+    const half   * db  = (const half *)(scb + (size_t)nrows_x * blocks_per_row * 16);
+
+    // strength-reduced form of the row loop: the superblock index advances
+    // linearly, so the plane pointers are carried as increments instead of
+    // being recomputed with 64-bit multiplies (the MMQ tile loader is
+    // arithmetic-bound enough for that to matter on gfx906)
+    const size_t sb0   = (size_t)(row_x_0 + i_offset)*blocks_per_row + ib0 + kbx;
+    const size_t sb_stp = (size_t)nwarps*blocks_per_row;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        const int i = i0 + i_offset;
+        const size_t sb = need_check
+            ? (size_t)(row_x_0 + min(i, i_max))*blocks_per_row + ib0 + kbx
+            : sb0 + (size_t)(i0/nwarps)*nwarps*blocks_per_row;
+        const int ky = QR6_K*kqsx;
+
+        const int ql = *(const int *)(qlb + sb*128 + 4*kqsx);
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int qh = *(const int *)(qhb + sb*64 + 4*((QI6_K/4) * (kqsx / (QI6_K/2)) + kqsx % (QI6_K/4)));
+        const int qh0 = ((qh >> (2 * ((kqsx % (QI6_K/2)) / (QI6_K/4)))) << 4) & 0x30303030;
+        const int qh1 =  (qh >> (2 * ((kqsx % (QI6_K/2)) / (QI6_K/4))))       & 0x30303030;
+
+        const int kq0 = ky - ky % QI6_K + k % (QI6_K/2) + 0;
+        const int kq1 = ky - ky % QI6_K + k % (QI6_K/2) + (QI6_K/2);
+
+        const int ii = need_check ? min(i, i_max) : i;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq0] = __vsubss4(ql0 | qh0, 0x20202020);
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+    }
+    (void)sb_stp;
+
+    const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI6_K; // == 1 if QK_K == 256
+    const int kbxd = k % blocks_per_tile_x_row;          // == 0 if QK_K == 256
+    float * x_dmf = (float *) x_dm;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI6_K) {
+        int i = (i0 + i_offset * QI6_K + k / blocks_per_tile_x_row) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + kbxd;
+
+        x_dmf[i * (WARP_SIZE_GGUF/QI6_K) + i / QI6_K + kbxd] = __half2float(db[sb]);
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+        int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF/8)) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + (k % (WARP_SIZE_GGUF/8)) / 4;
+
+        x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + k % (WARP_SIZE_GGUF/8)] =
+            *(const int *)(scb + sb*16 + 4*(k % (QI6_K/8)));
+    }
+}
+
+// Plane-split q4_K MMQ loader (companion of load_tiles_q4_K_split): identical
+// tile contents, addresses rebased onto the (ql | scales | dm) planes.
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q4_K_split_planar(
+    const void * __restrict__ vx, const int & nrows_x, const int & row_x_0, const int & ib0,
+    int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    const int kbx  = k / QI4_K; // == 0 if QK_K == 256
+    const int kqsx = k % QI4_K;
+
+    const uint8_t * qlb = (const uint8_t *) vx;
+    const uint8_t * scb = qlb + (size_t)nrows_x * blocks_per_row * 128;
+    const half2  * dmb = (const half2 *)(scb + (size_t)nrows_x * blocks_per_row * 12);
+
+    const size_t sb0 = (size_t)(row_x_0 + i_offset)*blocks_per_row + ib0 + kbx;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        const int i = i0 + i_offset;
+        const size_t sb = need_check
+            ? (size_t)(row_x_0 + min(i, i_max))*blocks_per_row + ib0 + kbx
+            : sb0 + (size_t)(i0/nwarps)*nwarps*blocks_per_row;
+        const int ky = QR4_K*kqsx;
+
+        const int ql = *(const int *)(qlb + sb*128 + 4*kqsx);
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int kq0 = ky - ky % (QI4_K/2) + k % (QI4_K/4) + 0;
+        const int kq1 = ky - ky % (QI4_K/2) + k % (QI4_K/4) + (QI4_K/4);
+
+        const int ii = need_check ? min(i, i_max) : i;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq0] = ql0;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq1] = ql1;
+    }
+
+    const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI4_K; // == 1 if QK_K == 256
+    const int kbxd = k % blocks_per_tile_x_row;          // == 0 if QK_K == 256
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI4_K) {
+        int i = (i0 + i_offset * QI4_K + k / blocks_per_tile_x_row) % mmq_y;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + kbxd;
+
+        x_dm[i * (WARP_SIZE_GGUF/QI4_K) + i / QI4_K + kbxd] = dmb[sb];
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+        int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF/8)) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + (k % (WARP_SIZE_GGUF/8)) / (QI4_K/8);
+
+        const int * scales = (const int *)(scb + sb*12);
+        // the ksc=6,7 lanes of the unpack below read a 4th int past the
+        // 12-byte scale array; in the original layout those bytes are the
+        // block's qs[0..3], so fetch them from the ql plane to stay identical
+        const int s4[4] = {scales[0], scales[1], scales[2],
+                           *(const int *)(qlb + sb*128)};
+
+        const int ksc = k % (WARP_SIZE_GGUF/8);
+        // scale arrangement after the following two lines: sc0,...,sc3, sc4,...,sc7, m0,...,m3, m4,...,m8
+        int scales8 = (s4[(ksc%2) + (ksc!=0)] >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F; // lower 4 bits
+        scales8    |= (s4[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030; // upper 2 bits
+
+        x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + ksc] = scales8;
+    }
+    (void)x_qh;
+}
+
+// q5_K MMQ loader onto the (ql | qh | scales | dm) planes; tile contents are
+// identical to load_tiles_q5_K.
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q5_K_planar(
+    const void * __restrict__ vx, const int & nrows_x, const int & row_x_0, const int & ib0,
+    int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    const int kbx  = k / QI5_K; // == 0 if QK_K == 256
+    const int kqsx = k % QI5_K;
+
+    const uint8_t * qlb = (const uint8_t *) vx;
+    const uint8_t * qhb = qlb + (size_t)nrows_x * blocks_per_row * 128;
+    const uint8_t * scb = qhb + (size_t)nrows_x * blocks_per_row * 32;
+    const half2  * dmb = (const half2 *)(scb + (size_t)nrows_x * blocks_per_row * 12);
+
+    const size_t sb0 = (size_t)(row_x_0 + i_offset)*blocks_per_row + ib0 + kbx;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        const int i = i0 + i_offset;
+        const size_t sb = need_check
+            ? (size_t)(row_x_0 + min(i, i_max))*blocks_per_row + ib0 + kbx
+            : sb0 + (size_t)(i0/nwarps)*nwarps*blocks_per_row;
+        const int ky = QR5_K*kqsx;
+
+        const int ql = *(const int *)(qlb + sb*128 + 4*kqsx);
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int qh = *(const int *)(qhb + sb*32 + 4*(kqsx % (QI5_K/4)));
+        const int qh0 = ((qh >> (2 * (kqsx / (QI5_K/4)) + 0)) << 4) & 0x10101010;
+        const int qh1 = ((qh >> (2 * (kqsx / (QI5_K/4)) + 1)) << 4) & 0x10101010;
+
+        const int kq0 = ky - ky % (QI5_K/2) + k % (QI5_K/4) + 0;
+        const int kq1 = ky - ky % (QI5_K/2) + k % (QI5_K/4) + (QI5_K/4);
+
+        const int ii = need_check ? min(i, i_max) : i;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq0] = ql0 | qh0;
+        x_ql[ii * (2*WARP_SIZE_GGUF + 1) + kq1] = ql1 | qh1;
+    }
+
+    const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI5_K; // == 1 if QK_K == 256
+    const int kbxd = k % blocks_per_tile_x_row;          // == 0 if QK_K == 256
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI5_K) {
+        int i = (i0 + i_offset * QI5_K + k / blocks_per_tile_x_row) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + kbxd;
+
+        x_dm[i * (WARP_SIZE_GGUF/QI5_K) + i / QI5_K + kbxd] = dmb[sb];
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+        int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF/8)) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const size_t sb = (size_t)(row_x_0 + i)*blocks_per_row + ib0 + (k % (WARP_SIZE_GGUF/8)) / (QI5_K/8);
+
+        const int * scales = (const int *)(scb + sb*12);
+        // the ksc=6,7 lanes of the unpack below read a 4th int past the
+        // 12-byte scale array; in the original layout those bytes are the
+        // block's qh[0..3], so fetch them from the qh plane to stay identical
+        const int s4[4] = {scales[0], scales[1], scales[2],
+                           *(const int *)(qhb + sb*32)};
+
+        const int ksc = k % (WARP_SIZE_GGUF/8);
+        // scale arrangement after the following two lines: sc0,...,sc3, sc4,...,sc7, m0,...,m3, m4,...,m8
+        int scales8 = (s4[(ksc%2) + (ksc!=0)] >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F; // lower 4 bits
+        scales8    |= (s4[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030; // upper 2 bits
+
+        x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + ksc] = scales8;
+    }
+    (void)x_qh;
+}
+
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_mul_mat(
     const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
@@ -2132,6 +2370,518 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
 #endif
 }
 
+
+#define VDR_IQ4_XS_Q8_1_MMQ 8
+
+// value-word lookup for the iq4_xs/iq4_nl lattice: nibbles hold indices into
+// kvalues_iq4nl; on gfx906 the 3-perm trick resolves them register-only,
+// elsewhere a byte LUT is used
+static __device__ __forceinline__ int iq4xs_lookup_word(const uint32_t nibbles) {
+#if defined(USE_ROCM) && defined(__gfx906__)
+    return lookup_iq4nl_values_gfx906(nibbles);
+#else
+    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
+    int out;
+    uint8_t * ob = (uint8_t *)&out;
+    const uint8_t * nb = (const uint8_t *)&nibbles;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) ob[t] = values[nb[t]];
+    return out;
+#endif
+}
+
+// MMQ tiles for iq4_xs. The payload word k (bytes 4k..4k+3 of the 128-byte
+// block payload) dequantizes to TWO consecutive 4-weight words: the lo
+// nibbles are weights 32*(k/4) + 4*(k%4) .. +3 and the hi nibbles the same
+// +16 (see dequantize_block_iq4_xs), so after the lattice lookup both words
+// are directly dp4a-able against consecutive q8_1 words. Tile layout per row:
+//   x_ql[i*(2W+1) + m]       = lo-nibble value word of payload word m
+//   x_ql[i*(2W+1) + W + m]   = hi-nibble value word of payload word m
+//   x_sc (as float*)[i*8+g]  = d * (ls_g - 32) per 32-weight group
+template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_iq4_xs(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+    __shared__ int   tile_x_ql[mmq_y * (2*WARP_SIZE_GGUF) + mmq_y];
+    __shared__ int   tile_x_sc[mmq_y * 8];
+    __shared__ half2 tile_x_dm[1];   // unused, satisfies the pointer contract
+
+    *x_ql = tile_x_ql;
+    *x_dm = tile_x_dm;
+    *x_qh = nullptr;
+    *x_sc = tile_x_sc;
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq4_xs(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm;
+    (void)x_qh;
+
+    const block_iq4_xs * bx0 = (const block_iq4_xs *) vx;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_iq4_xs * bxi = bx0 + i*blocks_per_row;   // kbx == 0: QI4_XS == WARP_SIZE
+        const int pw = get_int_from_uint8(bxi->qs, k);
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + k]                     = iq4xs_lookup_word(pw & 0x0F0F0F0F);
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + WARP_SIZE_GGUF + k]   = iq4xs_lookup_word((pw >> 4) & 0x0F0F0F0F);
+    }
+
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        if (k < 8) {
+            const block_iq4_xs * bxi = bx0 + i*blocks_per_row;
+            const int ls = ((bxi->scales_l[k >> 1] >> (4*(k & 1))) & 0x0F)
+                         | (((bxi->scales_h >> (2*k)) & 0x03) << 4);
+            x_scf[i*8 + k] = __half2float(bxi->d) * (ls - 32);
+        }
+    }
+}
+
+static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+    (void)x_dm;
+    (void)x_qh;
+
+    const float * scf  = (const float *) x_sc;
+    const float * y_df = (const float *) y_ds;   // need_sum == false: pre-cast ds.x
+
+    const int * ql = &x_ql[i * (2*WARP_SIZE_GGUF + 1)];
+    const int * yq = &y_qs[j * WARP_SIZE_GGUF];
+
+    // payload words k..k+7; the slab-local offset (k & 15) is either 0 or 8
+    int sumi[2] = {0, 0};
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int m  = k + l;                 // global payload word index in the block
+        // quad (4 weights) covered by payload word m inside the 128-weight slab
+        const int qa = ((k & 15) << 1) + l + 4*(l >> 2);
+        const int s  = __dp4a(ql[WARP_SIZE_GGUF + m], yq[qa + 4],
+                              __dp4a(ql[m], yq[qa], 0));
+        sumi[l >> 2] += s;
+    }
+
+    const int ir = k >> 4;          // slab (0 or 1) within the 256-weight block
+    const int g0 = 4*ir + ((k & 15) >> 2);
+    const int d8 = ((k & 15) >> 2); // q8_1 block index within the 4-block slab
+
+    return y_df[j*(WARP_SIZE_GGUF/QI8_1) + d8 + 0] * (scf[i*8 + g0 + 0] * (float)sumi[0])
+         + y_df[j*(WARP_SIZE_GGUF/QI8_1) + d8 + 1] * (scf[i*8 + g0 + 1] * (float)sumi[1]);
+}
+
+// ---------------------------------------------------------------------------
+// gfx906 MMQ tiles for the i-quant family (iq4_nl, iq2_xxs/xs/s, iq3_xxs/s,
+// iq1_s/m). Same scheme as iq4_xs above: the loader resolves each 256-weight
+// superblock ONCE into dp4a-ready value words (int word = 4 consecutive
+// weights as int8) stored span-major, plus float scales in x_sc, so the
+// vec_dot inner loop is a plain dp4a against the q8_1 activation words:
+//   x_ql[i*(2W+1) + span*W + w]  = value word w (weights 4w..4w+3) of the
+//                                  128-weight span `span` (0/1); W = 32
+//   x_sc (as float*): type-dependent scale slots per row (see loaders)
+// y tiles are span-local (the template reloads them per ir), so y word w
+// always pairs with x_ql[... + span*W + w].
+// iq1_m stores the raw iq1s grid word (both nibble planes) in x_ql instead
+// and unpacks in the vec_dot: its 32 scale pairs (one per 8-weight grid word)
+// would otherwise blow the LDS budget.
+
+#define VDR_IQ_Q8_1_MMQ 8
+
+// eight consecutive 32-weight iq4_nl blocks so the 256-weight template
+// arithmetic indexes them as one unit (same total bytes, contiguous)
+struct block_iq4_nl_x8 { block_iq4_nl b[8]; };
+
+template <int mmq_y, int ql_stride, int sc_stride> static __device__ __forceinline__ void allocate_tiles_iq(
+    int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+    __shared__ int   tile_x_ql[mmq_y * ql_stride];
+    __shared__ int   tile_x_sc[mmq_y * sc_stride];
+    __shared__ half2 tile_x_dm[1];   // unused, satisfies the pointer contract
+
+    *x_ql = tile_x_ql;
+    *x_dm = tile_x_dm;
+    *x_qh = nullptr;
+    *x_sc = tile_x_sc;
+}
+
+// one scale per 32 weights (4 per span): iq4_nl, iq2_xxs, iq3_xxs, iq3_s
+static __device__ __forceinline__ float vec_dot_iq_v4_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+    (void)x_dm; (void)x_qh;
+
+    const float * y_df = (const float *) y_ds;
+    const float * scf  = (const float *) x_sc;
+    const int * ql = &x_ql[i * (2*WARP_SIZE_GGUF + 1) + (k >> 4)*WARP_SIZE_GGUF];
+    const int * yq = &y_qs[j * WARP_SIZE_GGUF];
+    const int w0 = 2*(k & 15);
+    const int b0 = (k & 15) >> 2;   // q8 block base of this call within the span
+
+    int sumi[2] = {0, 0};
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int w = w0 + 2*l;
+        sumi[l >> 2] += __dp4a(ql[w+1], yq[w+1], __dp4a(ql[w], yq[w], 0));
+    }
+
+    return y_df[j*(WARP_SIZE_GGUF/QI8_1) + b0 + 0] * (scf[i*8 + (k>>4)*4 + b0 + 0] * (float)sumi[0])
+         + y_df[j*(WARP_SIZE_GGUF/QI8_1) + b0 + 1] * (scf[i*8 + (k>>4)*4 + b0 + 1] * (float)sumi[1]);
+}
+
+// one scale per 16 weights (8 per span): iq2_xs, iq2_s
+static __device__ __forceinline__ float vec_dot_iq_v8_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+    (void)x_dm; (void)x_qh;
+
+    const float * y_df = (const float *) y_ds;
+    const float * scf  = (const float *) x_sc;
+    const int * ql = &x_ql[i * (2*WARP_SIZE_GGUF + 1) + (k >> 4)*WARP_SIZE_GGUF];
+    const int * yq = &y_qs[j * WARP_SIZE_GGUF];
+    const int w0 = 2*(k & 15);
+    const int b0 = (k & 15) >> 2;   // q8 block base of this call within the span
+
+    // t = 2*block + half: 16 dp4a split at the 16-weight scale boundary
+    int sumi[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int w = w0 + 2*l;
+        sumi[2*(l >> 2) + ((l >> 1) & 1)] += __dp4a(ql[w+1], yq[w+1], __dp4a(ql[w], yq[w], 0));
+    }
+
+    const float * row = scf + i*16 + (k >> 4)*8;
+    float acc = 0.0f;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const int b = b0 + (t >> 1), h = t & 1;
+        acc += y_df[j*(WARP_SIZE_GGUF/QI8_1) + b] * (row[2*b + h] * (float)sumi[t]);
+    }
+    return acc;
+}
+
+// iq1_s: one (scale, scale*delta) pair per 32 weights; the delta term needs
+// the q8_1 block sum (ds.y), so these kernels run with need_sum=true and read
+// the unsplit half2 scales. sumy via dp4a is NOT equivalent: ds.y carries the
+// pre-quantization block sum like the MMVQ path.
+static __device__ __forceinline__ float vec_dot_iq1_s_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+    (void)x_dm; (void)x_qh;
+
+    const int * ql = &x_ql[i * (2*WARP_SIZE_GGUF + 1) + (k >> 4)*WARP_SIZE_GGUF];
+    const int * yq = &y_qs[j * WARP_SIZE_GGUF];
+    const int w0 = 2*(k & 15);
+    const int b0 = (k & 15) >> 2;   // q8 block base of this call within the span
+
+    int sumi[2] = {0, 0};
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int w = w0 + 2*l;
+        sumi[l >> 2] += __dp4a(ql[w+1], yq[w+1], __dp4a(ql[w], yq[w], 0));
+    }
+
+    const float * row = (const float *) x_sc + i*16;
+    float acc = 0.0f;
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        const int g = (k >> 4)*4 + b0 + b;
+        const half2 ds = y_ds[j*(WARP_SIZE_GGUF/QI8_1) + b0 + b];
+        // row[2g] = d1q, row[2g+1] = d1q*delta: d1q*(ds.x*sumi + ds.y*delta)
+        acc += __low2float(ds) * (row[2*g] * (float)sumi[b]) + __high2float(ds) * row[2*g + 1];
+    }
+    return acc;
+}
+
+// iq1_m: x_ql keeps the packed iq1s grid word (low plane = even quad, high
+// plane = odd quad); scales are per 8-weight grid word (one pair per word),
+// so the dot mixes ints and floats word by word. The MMVQ reference applies
+// each word's delta to that word's own quantized y-sum (dp4a of 0x01010101
+// against the q8 bytes), which this reproduces exactly.
+static __device__ __forceinline__ float vec_dot_iq1_m_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+    (void)x_dm; (void)x_qh;
+
+    const float * y_df = (const float *) y_ds;
+    const float * row  = (const float *) x_sc + i*64;
+    const int * ql = &x_ql[i * (WARP_SIZE_GGUF + 1)];
+    const int * yq = &y_qs[j * WARP_SIZE_GGUF];
+    const int pw0 = (k >> 4)*16 + (k & 15);
+    const int b0 = (k & 15) >> 2;   // q8 block base of this call within the span
+
+    float sumf[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int p = pw0 + l;                 // packed grid word, 0..31 per block
+        const int v  = ql[p];
+        const int yw = 2*(p & 15);
+        const int s  = __dp4a((v >> 4) & 0x0F0F0F0F, yq[yw+1], __dp4a(v & 0x0F0F0F0F, yq[yw], 0));
+        const int sy = __dp4a(0x01010101, yq[yw+1], __dp4a(0x01010101, yq[yw], 0));
+        sumf[l >> 2] += row[2*p] * (float)s + row[2*p + 1] * (float)sy;
+    }
+
+    return y_df[j*(WARP_SIZE_GGUF/QI8_1) + b0 + 0] * sumf[0]
+         + y_df[j*(WARP_SIZE_GGUF/QI8_1) + b0 + 1] * sumf[1];
+}
+
+// byte-wise sign apply: expand the low/high nibble of a sign byte into
+// 0x00/0xFF lanes, then (grid ^ mask) - mask negates the masked bytes
+static __device__ __forceinline__ void iq_sign_words(const uint32_t & grid_lo, const uint32_t & grid_hi,
+                                                     const uint8_t & signs, int & out_lo, int & out_hi) {
+    const uint32_t s0 = __vcmpeq4(((signs & 0x0f) * 0x01010101) & 0x08040201, 0x08040201);
+    const uint32_t s1 = __vcmpeq4(((signs >>  4) * 0x01010101) & 0x08040201, 0x08040201);
+    // __vsub4: the negation must not carry borrows across the 4 byte lanes
+    out_lo = (int)__vsub4(grid_lo ^ s0, s0);
+    out_hi = (int)__vsub4(grid_hi ^ s1, s1);
+}
+
+// value-word base inside the row for group g (0..7) lookup l (0..3):
+// group g covers quads 8*(g&3) + 2l..+1 of span g>>2
+#define IQ_VAL_BASE(g, l)  (((g) >> 2)*WARP_SIZE_GGUF + 8*((g) & 3) + 2*(l))
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq4_nl(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm; (void)x_qh;
+
+    const block_iq4_nl_x8 * bx0 = (const block_iq4_nl_x8 *) vx;
+    const int sub = k >> 2, m = k & 3;
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) i = min(i, i_max);
+        const block_iq4_nl_x8 * bxi = bx0 + i*blocks_per_row;   // 8 sub-blocks = 256 weights
+        // 16B payload: byte b -> lo nibble = weight b, hi = weight b+16, so
+        // payload word m (bytes 4m..4m+3) is lo quads m, hi quads m+4
+        const uint32_t pw = get_int_from_uint8(bxi->b[sub].qs, m);
+        const int qw = 8*sub;
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + qw + m]     = iq4xs_lookup_word(pw & 0x0F0F0F0F);
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + qw + m + 4] = iq4xs_lookup_word((pw >> 4) & 0x0F0F0F0F);
+        if (k < 8) {
+            x_scf[i*8 + k] = __half2float(bxi->b[k].d);
+        }
+    }
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xxs(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm; (void)x_qh;
+
+    const block_iq2_xxs * bx0 = (const block_iq2_xxs *) vx;
+    const int g = k >> 2, l = k & 3;
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) i = min(i, i_max);
+        const block_iq2_xxs * bxi = bx0 + i*blocks_per_row;
+        const uint32_t * w = (const uint32_t *) bxi->qs;    // w[2g]: 4 grid bytes, w[2g+1]: signs+scale
+        const uint32_t grid_lo = ((const uint32_t *)(iq2xxs_grid + ((w[2*g] >> (8*l)) & 0xFF)))[0];
+        const uint32_t grid_hi = ((const uint32_t *)(iq2xxs_grid + ((w[2*g] >> (8*l)) & 0xFF)))[1];
+        iq_sign_words(grid_lo, grid_hi, ksigns_iq2xs[(w[2*g + 1] >> (7*l)) & 127],
+                      x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l)],
+                      x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l) + 1]);
+        if (k < 8) {
+            x_scf[i*8 + k] = __half2float(bxi->d) * (0.5f + (w[2*k + 1] >> 28)) * 0.25f;
+        }
+    }
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xs(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm; (void)x_qh;
+
+    const block_iq2_xs * bx0 = (const block_iq2_xs *) vx;
+    const int g = k >> 2, l = k & 3;
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) i = min(i, i_max);
+        const block_iq2_xs * bxi = bx0 + i*blocks_per_row;
+        const uint16_t q2l = bxi->qs[4*g + l];
+        const uint32_t grid_lo = ((const uint32_t *)(iq2xs_grid + (q2l & 511)))[0];
+        const uint32_t grid_hi = ((const uint32_t *)(iq2xs_grid + (q2l & 511)))[1];
+        iq_sign_words(grid_lo, grid_hi, ksigns_iq2xs[q2l >> 9],
+                      x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l)],
+                      x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l) + 1]);
+        if (k < 8) {
+            const float d = __half2float(bxi->d) * 0.25f;
+            x_scf[i*16 + 2*k + 0] = d * (0.5f + (bxi->scales[k] & 0xf));
+            x_scf[i*16 + 2*k + 1] = d * (0.5f + (bxi->scales[k] >>  4));
+        }
+    }
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_s(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm; (void)x_qh;
+
+    const block_iq2_s * bx0 = (const block_iq2_s *) vx;
+    const int g = k >> 2, l = k & 3;
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) i = min(i, i_max);
+        const block_iq2_s * bxi = bx0 + i*blocks_per_row;
+        const int idx = bxi->qs[4*g + l] | ((bxi->qh[g] << (8 - 2*l)) & 0x300);
+        const uint32_t grid_lo = ((const uint32_t *)(iq2s_grid + idx))[0];
+        const uint32_t grid_hi = ((const uint32_t *)(iq2s_grid + idx))[1];
+        iq_sign_words(grid_lo, grid_hi, bxi->qs[QK_K/8 + 4*g + l],
+                      x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l)],
+                      x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l) + 1]);
+        if (k < 8) {
+            const float d = __half2float(bxi->d) * 0.25f;
+            x_scf[i*16 + 2*k + 0] = d * (0.5f + (bxi->scales[k] & 0xf));
+            x_scf[i*16 + 2*k + 1] = d * (0.5f + (bxi->scales[k] >>  4));
+        }
+    }
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq3_xxs(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm; (void)x_qh;
+
+    const block_iq3_xxs * bx0 = (const block_iq3_xxs *) vx;
+    const int g = k >> 2, l = k & 3;
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) i = min(i, i_max);
+        const block_iq3_xxs * bxi = bx0 + i*blocks_per_row;
+        const uint8_t * q3 = bxi->qs + 8*g;
+        const uint16_t * gas = (const uint16_t *)(bxi->qs + QK_K/4) + 2*g;
+        const uint32_t aux32 = (uint32_t)gas[0] | ((uint32_t)gas[1] << 16);
+        const uint32_t grid1 = iq3xxs_grid[q3[2*l + 0]];
+        const uint32_t grid2 = iq3xxs_grid[q3[2*l + 1]];
+        const uint32_t * sgn = (const uint32_t *)(ksigns64 + ((aux32 >> (7*l)) & 127));
+        const int base = i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l);
+        x_ql[base]     = (int)__vsub4(grid1 ^ sgn[0], sgn[0]);
+        x_ql[base + 1] = (int)__vsub4(grid2 ^ sgn[1], sgn[1]);
+        if (k < 8) {
+            // build the word as uint32_t: an inline (ga[0] | (ga[1] << 16))
+            // stays in promoted int and >> 28 becomes an arithmetic shift
+            const uint16_t * ga = (const uint16_t *)(bxi->qs + QK_K/4) + 2*k;
+            const uint32_t sc32 = (uint32_t)ga[0] | ((uint32_t)ga[1] << 16);
+            x_scf[i*8 + k] = __half2float(bxi->d) * (0.5f + (sc32 >> 28)) * 0.5f;
+        }
+    }
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq3_s(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm; (void)x_qh;
+
+    const block_iq3_s * bx0 = (const block_iq3_s *) vx;
+    const int g = k >> 2, l = k & 3;
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) i = min(i, i_max);
+        const block_iq3_s * bxi = bx0 + i*blocks_per_row;
+        const uint8_t * qs = bxi->qs + 8*g;
+        const uint32_t grid1 = iq3xs_grid[qs[2*l + 0] | ((bxi->qh[g] << (8 - 2*l)) & 256)];
+        const uint32_t grid2 = iq3xs_grid[qs[2*l + 1] | ((bxi->qh[g] << (7 - 2*l)) & 256)];
+        iq_sign_words(grid1, grid2, bxi->signs[4*g + l],
+                      x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l)],
+                      x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l) + 1]);
+        if (k < 8) {
+            const float s = 0.5f + ((bxi->scales[k >> 1] >> 4*(k & 1)) & 0xf);
+            x_scf[i*8 + k] = __half2float(bxi->d) * s * 0.5f;
+        }
+    }
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq1_s(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm; (void)x_qh;
+
+    const block_iq1_s * bx0 = (const block_iq1_s *) vx;
+    const int g = k >> 2, l = k & 3;
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) i = min(i, i_max);
+        const block_iq1_s * bxi = bx0 + i*blocks_per_row;
+        const int qh = bxi->qh[g];
+        const int grid = (int)iq1s_grid_gpu[bxi->qs[4*g + l] | (((qh >> 3*l) & 0x07) << 8)];
+        const int base = i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l);
+        x_ql[base]     = grid & 0x0F0F0F0F;
+        x_ql[base + 1] = (grid >> 4) & 0x0F0F0F0F;
+        if (k < 8) {
+            const int qhk = bxi->qh[k];
+            const float d1 = __half2float(bxi->d) * (((qhk >> 11) & 0x0E) + 1);
+            const float delta = -1.0f + IQ1S_DELTA - (qhk & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+            x_scf[i*16 + 2*k + 0] = d1;
+            x_scf[i*16 + 2*k + 1] = d1 * delta;
+        }
+    }
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq1_m(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    (void)x_dm; (void)x_qh;
+
+    const block_iq1_m * bx0 = (const block_iq1_m *) vx;
+    const int g = k >> 2, l = k & 3;   // packed grid word index p == 4*g + l == k
+    float * x_scf = (float *) x_sc;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) i = min(i, i_max);
+        const block_iq1_m * bxi = bx0 + i*blocks_per_row;
+        const int qhl = bxi->qh[2*g + (l >> 1)] >> (4 * (l & 1));
+        x_ql[i * (WARP_SIZE_GGUF + 1) + k] = (int)iq1s_grid_gpu[bxi->qs[k] | ((qhl & 0x07) << 8)];
+        if (k < 8) {
+            const uint16_t * sc = (const uint16_t *) bxi->scales;
+            iq1m_scale_t scale;
+            scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+            const float d = __half2float(scale.f16);
+            const int tmp = sc[k >> 1] >> (6*(k & 1));
+            const float sc0 = 2*((tmp >> 0) & 0x07) + 1;
+            const float sc1 = 2*((tmp >> 3) & 0x07) + 1;
+#pragma unroll
+            for (int ll = 0; ll < 4; ++ll) {
+                const int qhll = bxi->qh[2*k + (ll >> 1)] >> (4 * (ll & 1));
+                const float delta = -1.0f + IQ1M_DELTA - (qhll & 0x08) * (2.0f*IQ1M_DELTA/0x08);
+                const float scl = d * ((ll >> 1) ? sc1 : sc0);
+                x_scf[i*64 + 2*(4*k + ll) + 0] = scl;
+                x_scf[i*64 + 2*(4*k + ll) + 1] = scl * delta;
+            }
+        }
+    }
+}
 
 #define VDR_IQ4_XS_Q8_1_MMVQ 4
 

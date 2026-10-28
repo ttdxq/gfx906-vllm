@@ -34,8 +34,6 @@ class Gfx906GPTQWNA16LinearKernel(MPLinearKernel):
             return False, "Gfx906GPTQWNA16LinearKernel is only enabled on gfx906"
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
             return False, f"Unsupported quant type {c.weight_type}"
-        if c.has_g_idx:
-            return False, "Activation reordering is not supported"
         if c.partition_weight_shape[1] % (32 // c.weight_type.size_bits) != 0:
             return False, "Output features must be divisible by the pack factor"
 
@@ -55,8 +53,7 @@ class Gfx906GPTQWNA16LinearKernel(MPLinearKernel):
             # expects [K/pack, N], then an exllama/GPTQ shuffle.
             permute_param_layout_(x, input_dim=1, output_dim=0, packed_dim=1)
             x.data = x.data.t().contiguous()
-            empty_g_idx = torch.empty(0, dtype=torch.int32, device=x.data.device)
-            ops.gptq_shuffle(x.data, empty_g_idx, c.weight_type.size_bits)
+            ops.gptq_shuffle(x.data, c.weight_type.size_bits)
             return x
 
         def transform_w_s(x: BasevLLMParameter) -> BasevLLMParameter:
@@ -98,16 +95,6 @@ class Gfx906GPTQWNA16LinearKernel(MPLinearKernel):
                 torch.nn.Parameter(packed_zeros.contiguous(), requires_grad=False),
             )
 
-        self.w_gidx_name = "g_idx"
-        setattr(
-            layer,
-            self.w_gidx_name,
-            torch.nn.Parameter(
-                torch.empty(0, dtype=torch.int32, device=getattr(layer, self.w_q_name).device),
-                requires_grad=False,
-            ),
-        )
-
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -119,20 +106,18 @@ class Gfx906GPTQWNA16LinearKernel(MPLinearKernel):
         x_2d = x.reshape(-1, x.shape[-1])
         out_shape = x.shape[:-1] + (c.partition_weight_shape[1],)
 
-        w_q, w_s, w_zp, w_g_idx = self._get_weight_params(layer)
+        w_q, w_s, w_zp = self._get_weight_params(layer)
         if x_2d.dtype != torch.float16:
             x_2d = x_2d.to(torch.float16)
         if w_s.dtype != torch.float16:
             w_s = w_s.to(torch.float16)
 
         assert w_zp is not None
-        assert w_g_idx is not None
         output = ops.gptq_gemm(
             x_2d.contiguous(),
             w_q,
             w_zp,
             w_s,
-            w_g_idx,
             True,
             True,
             c.weight_type.size_bits,

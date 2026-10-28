@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
@@ -70,6 +71,7 @@ ENABLE_GGUF_SIGMOID_GATED_OUT_PROJ_MMVQ = _env_flag(
     "VLLM_GGUF_SIGMOID_GATED_OUT_PROJ_MMVQ", True
 )
 ENABLE_GGUF_Q8_0_FAST_MMVQ = _env_flag("VLLM_GGUF_Q8_0_FAST_MMVQ", False)
+ENABLE_GGUF_SHARED_ACTIVATION = os.getenv("VLLM_GGUF_SHARED_ACTIVATION", "0") == "1"
 ENABLE_GGUF_Q8_1_BUFFER_CACHE = _env_flag("VLLM_GGUF_Q8_1_BUFFER_CACHE", True)
 ENABLE_GGUF_SINGLE_MMVQ_Q8_CACHE = _env_flag(
     "VLLM_GGUF_SINGLE_MMVQ_Q8_CACHE", False
@@ -103,8 +105,12 @@ ENABLE_GGUF_LINEAR_PROFILE = _env_flag("VLLM_GGUF_LINEAR_PROFILE", False)
 ENABLE_GGUF_FORCE_DEQUANT_MATMUL = _env_flag(
     "VLLM_GGUF_FORCE_DEQUANT_MATMUL", False
 )
+# The repack doubles iq4_xs weight bytes (x2.09 VRAM) and its q8_0 decode
+# speed only reaches ~300-360 GB/s of effective (original-byte) bandwidth on
+# gfx906, below the native iq4_xs paths (~440-600 GB/s). Off by default; set
+# VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0=1 to restore the repacked layout.
 ENABLE_GGUF_REPACK_IQ4_XS_TO_Q8_0 = _env_flag(
-    "VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0", True
+    "VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0", False
 )
 
 _GGUF_Q8_1_BUFFER_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
@@ -141,6 +147,83 @@ def _gguf_gfx906_q4_mmvq_max_batch() -> int:
 @lru_cache(maxsize=1)
 def _gguf_gfx906_q6_mmvq_max_batch() -> int:
     return max(2, _env_int("VLLM_GGUF_GFX906_Q6_MMVQ_MAX_BATCH", 16))
+
+
+@lru_cache(maxsize=1)
+def _gguf_planar_k_enabled() -> bool:
+    # family switch for the plane-repacked K-quants (q4_K/q5_K/q6_K);
+    # VLLM_GGUF_Q6_K_PLANAR is kept as a legacy alias. On by default on
+    # gfx906: the wide-load q6_K MMVQ kernel on the planar layout raises the
+    # q6_K decode GEMV family from ~410-500 to ~500-670 GB/s and end-to-end
+    # decode by 5-7% on Q6_K models, and the per-tensor pack plus the
+    # post-layer empty_cache measurably enlarge the KV budget (61,352 vs
+    # 38,345 tokens on a 27B Q6_K model at the same utilization). Opt out
+    # via VLLM_GGUF_KQUANT_PLANAR=0 (or VLLM_GGUF_Q6_K_PLANAR=0).
+    legacy = os.getenv("VLLM_GGUF_Q6_K_PLANAR")
+    if legacy is not None:
+        if not _env_flag("VLLM_GGUF_Q6_K_PLANAR", True):
+            return False
+    elif not _env_flag("VLLM_GGUF_KQUANT_PLANAR", True):
+        return False
+    if ENABLE_GGUF_FORCE_DEQUANT_MATMUL:
+        return False
+    if not current_platform.is_rocm():
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx906
+
+        return on_gfx906()
+    except Exception:
+        return False
+
+
+# quant types eligible for the planar repack, mapped to their bytes per
+# 256-weight superblock. When the repack is enabled (VLLM_GGUF_KQUANT_PLANAR=1
+# by default on gfx906), q4_K/q5_K/q6_K are packed and served by the
+# wide-load planar kernels (~460-560 GB/s vs 410-500 for the block-layout
+# paths on decode shapes). q5_K used to stay out of the default set because
+# its old planar kernel lost ~19% on the 5376x4096-class shapes; the wide
+# kernel no longer has that weakness. Override with VLLM_GGUF_KQUANT_PLANAR_TYPES
+# (comma-separated WeightType values).
+_GGUF_PLANAR_K_TYPE_SIZES = {
+    int(WeightType.Q4_K): 144,
+    int(WeightType.Q5_K): 176,
+    int(WeightType.Q6_K): 210,
+}
+
+
+@lru_cache(maxsize=1)
+def _gguf_planar_k_types() -> frozenset:
+    default = frozenset({
+        int(WeightType.Q4_K),
+        int(WeightType.Q5_K),
+        int(WeightType.Q6_K),
+    })
+    raw = os.getenv("VLLM_GGUF_KQUANT_PLANAR_TYPES")
+    if not raw:
+        return default
+    chosen = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            t = int(part)
+        except ValueError:
+            continue
+        if t in _GGUF_PLANAR_K_TYPE_SIZES:
+            chosen.add(t)
+    return frozenset(chosen) if chosen else default
+
+
+def _qkv3_mmvq_planar_safe(qweight_types: list[int]) -> bool:
+    # the fused qkv3 MMVQ kernel only understands the original block layout,
+    # so it must not receive shards whose quant type is planar-packed
+    if not _gguf_planar_k_enabled():
+        return True
+    packed = _gguf_planar_k_types()
+    return qweight_types[0] not in packed and qweight_types[2] not in packed
+
 
 
 @lru_cache(maxsize=1)
@@ -754,7 +837,6 @@ STANDARD_QUANT_TYPES = {
     WeightType.Q5_0,
     WeightType.Q5_1,
     WeightType.Q8_0,
-    WeightType.Q8_1,
 }
 KQUANT_TYPES = {
     WeightType.Q2_K,
@@ -774,12 +856,44 @@ IMATRIX_QUANT_TYPES = {
     WeightType.IQ4_XS,
     WeightType.IQ4_NL,
 }
-# TODO(Isotr0py): Currently, we don't have MMQ kernel for I-Matrix quantization.
-# Consolidate DEQUANT_TYPES, MMVQ_QUANT_TYPES and MMQ_QUANT_TYPES after we add
-# MMQ kernel for I-Matrix quantization.
+# I-Matrix types with a native MMQ kernel. On gfx906 these kernels beat the
+# dequant+GEMM fallback only on k-heavy shapes (k > n), so their routing is
+# shape-gated in _fused_mul_mat_gguf.
+IQ_MMQ_QUANT_TYPES = {
+    WeightType.IQ1_M,
+    WeightType.IQ1_S,
+    WeightType.IQ2_XXS,
+    WeightType.IQ2_XS,
+    WeightType.IQ2_S,
+    WeightType.IQ3_XXS,
+    WeightType.IQ3_S,
+    WeightType.IQ4_NL,
+}
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+# Q8_1 is an activation format here; native weight kernels do not support it.
+MMQ_QUANT_TYPES = (
+    STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES
+)
+
+
+def _iq_mmq_beats_dequant(x: torch.Tensor, qweight: torch.Tensor,
+                          qweight_type: int) -> bool:
+    """Shape gate for the i-quant MMQ kernels.
+
+    gfx906 measurements at 256/2048-token batches: the dp4a MMQ kernels beat
+    the dequant+fp16-GEMM fallback on k-heavy tensors (k > n, e.g. down-proj
+    [5120, 17408]) at every batch size, but lose on tall tensors where the
+    matrix-core GEMM dominates (even at batch 256). iq4_nl additionally
+    needs k % 256 == 0 because its loader treats eight 32-weight blocks as
+    one 256-weight unit. iq1_m's per-word float dot loses on both
+    orientations, so it stays on the fallback until it is restructured.
+    """
+    if qweight_type == WeightType.IQ1_M:
+        return False
+    if qweight_type == WeightType.IQ4_NL and x.shape[1] % 256 != 0:
+        return False
+    return x.shape[1] > qweight.shape[0]
 
 
 def _fused_mul_mat_gguf(
@@ -821,12 +935,18 @@ def _fused_mul_mat_gguf(
             )
         else:
             y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Use MMQ Kernel if it's available (standard + k-quants)
-    elif qweight_type in MMQ_QUANT_TYPES:
+    # Use MMQ Kernel if it's available (standard + k-quants); the shape-gated
+    # i-quant kernels fall back to dequantize on shapes where the fp16 GEMM
+    # path is faster
+    elif qweight_type in MMQ_QUANT_TYPES and (
+        qweight_type not in IQ_MMQ_QUANT_TYPES
+        or _iq_mmq_beats_dequant(x, qweight, qweight_type)
+    ):
         if ENABLE_GGUF_LINEAR_PROFILE:
             _gguf_linear_profile_hit("single_mmq", x, [qweight], [qweight_type])
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
-    # If there is no available MMQ kernel, fallback to dequantize
+    # If there is no available MMQ kernel (or the shape gate sent an i-quant
+    # here), fallback to dequantize
     elif qweight_type in DEQUANT_TYPES:
         if ENABLE_GGUF_LINEAR_PROFILE:
             _gguf_linear_profile_hit("single_dequant", x, [qweight], [qweight_type])
@@ -952,20 +1072,30 @@ except AttributeError as error:
 
 
 def _mmvq_safe_batch(qweight: torch.Tensor, qweight_type: int) -> int:
+    # the planar MMVQ kernels only accept up to 4 activation rows; larger
+    # batches must fall through to the MMQ path, otherwise a packed weight
+    # would be read by an original-layout kernel and silently corrupt outputs
+    planar_cap = (
+        _gguf_planar_k_enabled() and int(qweight_type) in _gguf_planar_k_types()
+    )
     if qweight_type in IMATRIX_QUANT_TYPES:
-        return 8 if qweight.shape[0] > 5120 else 16
-    if qweight.shape[0] > 5120:
+        cap = 8 if qweight.shape[0] > 5120 else 16
+    elif qweight.shape[0] > 5120:
         if (
             qweight_type in MMQ_QUANT_TYPES
             and _gguf_gfx906_small_batch_mmvq_enabled()
         ):
             if qweight_type in {WeightType.Q4_0, WeightType.Q4_1, WeightType.Q4_K}:
-                return _gguf_gfx906_q4_mmvq_max_batch()
-            if qweight_type == WeightType.Q6_K:
-                return _gguf_gfx906_q6_mmvq_max_batch()
-            return _gguf_gfx906_mmvq_max_batch()
-        return 2
-    return 6
+                cap = _gguf_gfx906_q4_mmvq_max_batch()
+            elif qweight_type == WeightType.Q6_K:
+                cap = _gguf_gfx906_q6_mmvq_max_batch()
+            else:
+                cap = _gguf_gfx906_mmvq_max_batch()
+        else:
+            cap = 2
+    else:
+        cap = 6
+    return 4 if planar_cap and cap > 4 else cap
 
 
 def _can_share_mmvq_activation(
@@ -1114,6 +1244,18 @@ def _fused_mul_mat_gguf_sharded_mmvq(
     qweights: list[torch.Tensor],
     qweight_types: list[int],
 ) -> torch.Tensor:
+    if ENABLE_GGUF_SHARED_ACTIVATION and (
+        ENABLE_GGUF_FORCE_DEQUANT_MATMUL
+        or ENABLE_GGUF_Q8_0_FAST_MMVQ
+        or not _can_share_mmvq_activation(x, qweights, qweight_types)
+    ):
+        return torch.cat(
+            [
+                _fused_mul_mat_gguf(x, weight, weight_type)
+                for weight, weight_type in zip(qweights, qweight_types)
+            ],
+            dim=1,
+        )
     return ops.ggml_mul_mat_vec_a8_sharded(qweights, x, qweight_types)
 
 
@@ -1148,6 +1290,7 @@ def _fused_mul_mat_gguf_sharded_cached_mmvq(
         and qweight_types[0] == qweight_types[1]
         and qweight_types[0] in {WeightType.Q4_K, WeightType.Q5_K}
         and qweight_types[2] == WeightType.Q6_K
+        and _qkv3_mmvq_planar_safe(qweight_types)
         and hasattr(torch.ops._C, "ggml_mul_mat_vec_q8_qkv3")
     ):
         if ENABLE_GGUF_LINEAR_PROFILE:
@@ -1361,7 +1504,7 @@ def try_grouped_gguf_linear_mmvq(
     x: torch.Tensor,
     layers: list[torch.nn.Module],
 ) -> list[torch.Tensor] | None:
-    if x.shape[0] == 0:
+    if not ENABLE_GGUF_SHARED_ACTIVATION and x.shape[0] == 0:
         return None
 
     plan = _get_grouped_gguf_mmvq_plan(layers)
@@ -1375,6 +1518,9 @@ def try_grouped_gguf_linear_mmvq(
         mmvq_max_batch,
         use_same_type_kernel,
     ) = plan
+    if ENABLE_GGUF_SHARED_ACTIVATION:
+        out = fused_mul_mat_gguf_sharded_mmvq(x, qweights, qweight_types)
+        return list(out.split(split_sizes, dim=1))
     if x.shape[0] > mmvq_max_batch:
         return None
 
@@ -2213,9 +2359,73 @@ class GGUFLinearMethod(LinearMethodBase):
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
+        self._maybe_planar_pack_kquants(layer)
         self._maybe_repack_iq4_xs_to_q8_0(layer)
         self._cache_gguf_shards(layer)
         self._cache_gguf_shard_metadata(layer)
+        # The planar packing replaces weight storages one tensor at a time;
+        # the freed originals linger as cached blocks in the CUDA allocator,
+        # which the later KV-cache sizing counts as consumed GPU memory.
+        # Hand them back to the driver so the KV budget is measured cleanly.
+        if _gguf_planar_k_enabled():
+            torch.cuda.empty_cache()
+
+    def _maybe_planar_pack_kquants(self, layer: torch.nn.Module) -> None:
+        """Rewrite q4_K/q5_K/q6_K weights into the plane
+        planar layout. Byte count, tensor shape and the recorded quant type
+        are all unchanged; planar-aware MMVQ/MMQ kernels pick the buffer up
+        through the pointer registry in the C++ dispatch."""
+        if not _gguf_planar_k_enabled():
+            return
+        if not hasattr(torch.ops._C, "ggml_planar_pack"):
+            return
+        if isinstance(layer, VocabParallelEmbedding) and not isinstance(
+            layer, ParallelLMHead
+        ):
+            # Embedding rows are gathered and dequantized per row in the
+            # original block layout (_apply_gguf_embedding); only the matmul
+            # kernels can consume the planar layout. LM heads subclass the
+            # embedding module but only ever run as matmuls, so they pack.
+            return
+        qweight = layer.qweight
+        qweight_type = layer.qweight_type
+        if qweight is None or qweight_type is None:
+            return
+        if isinstance(qweight, GGUFUninitializedParameter):
+            return
+        if qweight.numel() == 0:
+            return
+        if not qweight.is_cuda or not qweight.is_contiguous():
+            return
+        merged = bool(getattr(qweight, "shard_offset_map", None))
+        if merged:
+            full = _get_full_mmvq_shard_weight(
+                layer, list(qweight_type.shard_weight_type.values())
+            )
+            if full is None:
+                return  # Mixed types are packed per shard in _cache_gguf_shards.
+            _, q_type = full
+        else:
+            q_type = int(qweight_type.weight_type)
+        if q_type not in _gguf_planar_k_types():
+            return
+        block_size = 256
+        type_size = _GGUF_PLANAR_K_TYPE_SIZES[q_type]
+        row = qweight.shape[0]
+        col = qweight.shape[1] // type_size * block_size
+        if col % block_size or col == 0 or row == 0:
+            return
+        packed = torch.ops._C.ggml_planar_pack(qweight, q_type, row, col)
+        qweight.data = packed
+        if merged:
+            # A planar tensor cannot be sliced at original block-row offsets.
+            # Canonicalize the complete same-type group before shard caching,
+            # so every MMVQ/MMQ consumer uses its registered base pointer.
+            qweight.shard_id = []
+            qweight.shard_offset_map = {}
+            qweight_type.weight_type = q_type
+            qweight_type.shard_weight_type = {}
+        logger.info_once("Packed GGUF K-quant weights into the planar layout.")
 
     def _maybe_repack_iq4_xs_to_q8_0(self, layer: torch.nn.Module) -> None:
         if not _gguf_repack_iq4_xs_to_q8_0_enabled():
@@ -2364,15 +2574,85 @@ class GGUFLinearMethod(LinearMethodBase):
         qweight = layer.qweight
         shard_offset_map = getattr(qweight, "shard_offset_map", None)
         if not shard_offset_map:
+            # Mixed-width merged layers keep standalone shard tensors in the
+            # cache from _create_padded_weight_param (no padded concat exists);
+            # repack those in place so the sharded dispatch can route them to
+            # the planar kernels
+            cache = getattr(layer, "_gguf_shard_cache", None)
+            if (
+                cache
+                and _gguf_planar_k_enabled()
+                and hasattr(torch.ops._C, "ggml_planar_pack")
+            ):
+                shard_weight_type = getattr(
+                    getattr(layer, "qweight_type", None), "shard_weight_type", {}
+                )
+                for idx, shard in list(cache.items()):
+                    shard_type = int(shard_weight_type.get(idx, -1))
+                    if (
+                        shard_type in _gguf_planar_k_types()
+                        and shard.is_cuda
+                        and shard.is_contiguous()
+                    ):
+                        type_size = _GGUF_PLANAR_K_TYPE_SIZES[shard_type]
+                        col = shard.shape[1] // type_size * 256
+                        if (
+                            col % 256 == 0
+                            and col > 0
+                            and shard.shape[0] > 0
+                        ):
+                            cache[idx] = torch.ops._C.ggml_planar_pack(
+                                shard, shard_type, shard.shape[0], col)
             return
 
         cache = {}
+        layer_qweight_type = getattr(layer, "qweight_type", None)
+        pack_shard = (
+            _gguf_planar_k_enabled()
+            and hasattr(torch.ops._C, "ggml_planar_pack")
+            and layer_qweight_type is not None
+        )
+        shard_weight_type = getattr(layer_qweight_type, "shard_weight_type", {})
+        # Same-type contiguous shard groups are served whole-tensor from the
+        # original block-layout qweight (_get_full_mmvq_shard_weight takes
+        # priority over the shard cache), so planar copies of their shards
+        # would never be read and would only double the resident memory.
+        if pack_shard and _get_full_mmvq_shard_weight(
+            layer, list(shard_weight_type.values())
+        ) is not None:
+            pack_shard = False
+        all_packed = True
         for idx, (start, end, offset) in shard_offset_map.items():
             shard = qweight[start:end, :offset]
             if not shard.is_contiguous():
                 shard = shard.contiguous()
+            shard_type = int(shard_weight_type.get(idx, -1))
+            packed_shard = False
+            if pack_shard and shard_type in _gguf_planar_k_types():
+                # repack each shard as its own planar tensor: the sharded
+                # MMVQ/MMQ dispatch receives shard base pointers, so the
+                # plane layout must be self-contained per shard
+                type_size = _GGUF_PLANAR_K_TYPE_SIZES[shard_type]
+                col = shard.shape[1] // type_size * 256
+                if col % 256 == 0 and col > 0 and shard.shape[0] > 0:
+                    shard = torch.ops._C.ggml_planar_pack(
+                        shard, shard_type, shard.shape[0], col)
+                    packed_shard = True
+            all_packed = all_packed and packed_shard
             cache[idx] = shard
         layer._gguf_shard_cache = cache
+        if all_packed and cache:
+            # every shard now lives as its own packed tensor in the cache;
+            # the padded concat buffer is dead weight, so replace it with a
+            # zero-element placeholder that keeps the shard metadata attrs
+            # (same pattern as the mixed-width branch above)
+            sh0 = next(iter(cache.values()))
+            placeholder = Parameter(
+                torch.empty(0, 0, dtype=sh0.dtype, device=sh0.device),
+                requires_grad=False,
+            )
+            set_weight_attrs(placeholder, vars(qweight))
+            layer.register_parameter("qweight", placeholder)
 
     def _cache_gguf_shard_metadata(self, layer: torch.nn.Module):
         if not getattr(layer.qweight, "shard_id", []):
@@ -2424,9 +2704,26 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = getattr(layer.qweight, "shard_id", [])
 
         if shard_id:
+            full_mmvq = getattr(layer, "_gguf_full_shard_mmvq", None)
+            if full_mmvq is not None:
+                # Keep batch-dependent MMVQ/MMQ selection inside the custom
+                # op. Tracing the Python small-batch branch during prefill
+                # otherwise leaves separate shard calls in the decode graph.
+                qweight, qweight_type, _ = full_mmvq
+                out = _fused_mul_mat_gguf_cached_mmvq(
+                    x, qweight, qweight_type, layer, "_gguf_full_mmvq_quant_x"
+                )
+                if bias is not None:
+                    out.add_(bias)
+                return out
             collected = _collect_gguf_linear_shards(layer)
             assert collected is not None
             qweights, qweight_types = collected
+            if ENABLE_GGUF_SHARED_ACTIVATION:
+                out = fused_mul_mat_gguf_sharded_mmvq(x, qweights, qweight_types)
+                if bias is not None:
+                    out.add_(bias)
+                return out
             mmvq_max_batch = getattr(layer, "_gguf_sharded_mmvq_max_batch", None)
             can_share_mmvq = (
                 x.shape[0] > 0
@@ -2436,34 +2733,23 @@ class GGUFLinearMethod(LinearMethodBase):
             if mmvq_max_batch is None:
                 can_share_mmvq = _can_share_mmvq_activation(x, qweights, qweight_types)
             if can_share_mmvq:
-                full_mmvq = getattr(layer, "_gguf_full_shard_mmvq", None)
-                if full_mmvq is not None and x.shape[0] <= full_mmvq[2]:
-                    qweight, qweight_type, _ = full_mmvq
-                    if ENABLE_GGUF_LINEAR_PROFILE:
-                        _gguf_linear_profile_hit(
-                            "sharded_full_mmvq", x, [qweight], [qweight_type]
-                        )
-                    out = _fused_mul_mat_gguf_cached_mmvq(
-                        x, qweight, qweight_type, layer, "_gguf_full_mmvq_quant_x"
-                    )
+                coalesced = getattr(layer, "_gguf_coalesced_shards", None)
+                if coalesced is not None and x.shape[0] <= coalesced[2]:
+                    qweights, qweight_types = coalesced[0], coalesced[1]
+                    profile_path = "sharded_coalesced_mmvq"
                 else:
-                    coalesced = getattr(layer, "_gguf_coalesced_shards", None)
-                    if coalesced is not None and x.shape[0] <= coalesced[2]:
-                        qweights, qweight_types = coalesced[0], coalesced[1]
-                        profile_path = "sharded_coalesced_mmvq"
-                    else:
-                        profile_path = "sharded_mmvq"
-                    if ENABLE_GGUF_LINEAR_PROFILE:
-                        _gguf_linear_profile_hit(
-                            profile_path, x, qweights, qweight_types
-                        )
-                    out = _fused_mul_mat_gguf_sharded_cached_mmvq(
-                        x,
-                        qweights,
-                        qweight_types,
-                        layer,
-                        "_gguf_sharded_mmvq_quant_x",
+                    profile_path = "sharded_mmvq"
+                if ENABLE_GGUF_LINEAR_PROFILE:
+                    _gguf_linear_profile_hit(
+                        profile_path, x, qweights, qweight_types
                     )
+                out = _fused_mul_mat_gguf_sharded_cached_mmvq(
+                    x,
+                    qweights,
+                    qweight_types,
+                    layer,
+                    "_gguf_sharded_mmvq_quant_x",
+                )
             else:
                 if ENABLE_GGUF_LINEAR_PROFILE:
                     _gguf_linear_profile_hit(

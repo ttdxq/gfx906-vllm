@@ -82,7 +82,7 @@ This is a modified version of [vLLM](https://github.com/vllm-project/vllm) for A
 - **Hardware**: AMD gfx906 GPU (Radeon VII, Radeon Pro VII, Instinct MI50, or Instinct MI60)
 - **ROCm**: One of the following community-supported combinations; both require the kernel-mode driver:
   - ROCm 6.3 + PyTorch 2.9 + triton-gfx906 v3.5.0+gfx906 (original compatibility stack)
-  - ROCm 7.2 + PyTorch 2.11 + triton-rocm 3.6.0 (current repository dependency stack)
+  - ROCm 7.2 + PyTorch 2.11 + Triton 3.8.0 (currently validated stack, using the native PyPI `triton` package)
 - **Python**: 3.10+
 - **Operating system**: Linux (tested on Ubuntu)
 
@@ -267,20 +267,12 @@ print(response.choices[0].message.content)
 Based on testing from the original project:
 
 - ⚠️ **GPTQ** - Some models work, but kernel, tensor-shape, and MoE combinations may still have compatibility or performance problems.
-- ⚠️ **AWQ** - Some dense models work. The Triton path is used by default, but some models may still produce invalid output or fail during startup.
+- ⚠️ **AWQ** - Some dense models work. Dense linear layers on gfx906 use the W4A16 HIP kernel selected by the mixed-precision backend, but some models may still produce invalid output or fail during startup.
 - ⚠️ **W4A16 INT** - Some models do not work (via llm-compressor).
 - ⚠️ **Quantized MoE models** - Significantly slower and not recommended.
 - ⚠️ **Unquantized models** - Slightly slower, but usable.
 
-AWQ uses the current conservative Triton path by default on gfx906. To test the
-GPTQ-compatible AWQ path based on `vllm-gfx906-mobydick`, set:
-
-```bash
-export VLLM_ROCM_USE_GFX906_MOBYDICK_AWQ=1
-```
-
-This option is disabled by default. Use it only to investigate Triton AWQ
-compatibility or to compare the two AWQ paths.
+Dense AWQ layers on gfx906 convert checkpoint weights to the shared packed format and use the gfx906 W4A16 HIP kernel selected by the mixed-precision backend; Marlin hardware support is not required.
 
 See [Issue #29](https://github.com/nlzy/vllm-gfx906/issues/29) for more information.
 
