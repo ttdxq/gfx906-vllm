@@ -19,10 +19,12 @@ from vllm.model_executor.models.qwen3_next import (
     _gdn_convert_state_layout,
     _gdn_recurrent_state_to_cache,
 )
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
+from vllm.v1.kv_cache_interface import MambaSpec
 
 
 def test_gfx906_mtp_gdn_uses_custom_update(monkeypatch):
@@ -75,21 +77,29 @@ def test_gfx906_mtp_gdn_uses_custom_update(monkeypatch):
     assert captured["num_accepted_tokens"] is num_accepted_tokens
 
 
-def test_gdn_mixed_batch_builds_prefill_only_metadata():
-    builder = object.__new__(GDNAttentionMetadataBuilder)
-    builder.use_spec_decode = False
-    builder.use_full_cuda_graph = False
-    # Mirror __init__: build() consults this flag to keep capture batches
-    # decode-only; this fixture bypasses __init__ via object.__new__.
-    builder._building_for_capture = False
+def test_gdn_mixed_batch_builds_prefill_only_metadata(default_vllm_config):
+    default_vllm_config.cache_config.mamba_cache_mode = "align"
+    builder = GDNAttentionMetadataBuilder(
+        kv_cache_spec=MambaSpec(
+            block_size=16,
+            shapes=((1, 1), (1, 1, 1)),
+            dtypes=(torch.float32, torch.float32),
+            mamba_cache_mode="align",
+        ),
+        layer_names=["model.layers.0.linear_attn"],
+        vllm_config=default_vllm_config,
+        device=torch.device("cpu"),
+    )
 
     query_start_loc = torch.tensor([0, 1, 2, 5], dtype=torch.int32)
-    common = SimpleNamespace(
+    common = CommonAttentionMetadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
-        num_computed_tokens_cpu=torch.tensor([8, 9, 0], dtype=torch.int32),
+        seq_lens=torch.tensor([9, 10, 3], dtype=torch.int32),
         block_table_tensor=torch.tensor([[3], [4], [5]], dtype=torch.int32),
+        slot_mapping=torch.tensor([56, 73, 80, 81, 82], dtype=torch.int64),
         max_query_len=3,
+        max_seq_len=10,
         num_reqs=3,
         num_actual_tokens=5,
     )
@@ -210,8 +220,9 @@ def test_qwen3_5_load_uses_native_checkpoint_mapper(monkeypatch):
     captured: dict[str, object] = {}
 
     class _FakeLoader:
-        def __init__(self, model, skip_prefixes):
-            del model, skip_prefixes
+        def __init__(self, model, ignore_unexpected_prefixes):
+            captured["model"] = model
+            captured["ignore_unexpected_prefixes"] = ignore_unexpected_prefixes
 
         def load_weights(self, weights, mapper=None):
             del weights
@@ -226,6 +237,8 @@ def test_qwen3_5_load_uses_native_checkpoint_mapper(monkeypatch):
 
     model.load_weights([])
 
+    assert captured["model"] is model
+    assert captured["ignore_unexpected_prefixes"] == ["mtp."]
     assert captured["mapper"] is model.hf_to_vllm_mapper
 
 

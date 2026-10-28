@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -10,6 +12,7 @@ from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
     RotaryEmbedding,
 )
+from vllm.model_executor.models import qwen3_next
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -35,8 +38,9 @@ ROPE_CASES = [
 @pytest.mark.parametrize("num_q_heads,num_kv_heads,mrope_section", ROPE_CASES)
 @pytest.mark.parametrize("num_tokens", [1, 4, 37])
 @torch.inference_mode()
-def test_fused_qk_norm_rope_gate_matches_reference(
+def test_qk_norm_rope_gate_paths_match_reference(
     default_vllm_config,
+    monkeypatch,
     num_tokens: int,
     num_q_heads: int,
     num_kv_heads: int,
@@ -95,21 +99,61 @@ def test_fused_qk_norm_rope_gate_matches_reference(
     q_ref, k_ref = rope.forward_native(positions, q_ref, k_ref)
     assert k_ref is not None
 
-    q_out, k_out, gate_out = fused_qk_rmsnorm_rope_gate(
-        q_gate,
-        k,
-        q_norm.weight,
-        k_norm.weight,
-        rope.cos_sin_cache,
-        positions,
-        RMS_NORM_EPS,
-        num_q_heads,
-        num_kv_heads,
-        HEAD_DIM,
-        ROTARY_DIM,
-        mrope_section=mrope_section,
-        norm_beta=1.0,
-    )
+    if mrope_section is None:
+        q_out, k_out, gate_out = fused_qk_rmsnorm_rope_gate(
+            q_gate,
+            k,
+            q_norm.weight.float() + 1.0,
+            k_norm.weight.float() + 1.0,
+            rope.cos_sin_cache,
+            positions,
+            RMS_NORM_EPS,
+            num_q_heads,
+            num_kv_heads,
+            HEAD_DIM,
+            ROTARY_DIM,
+        )
+    else:
+        monkeypatch.setenv("VLLM_QWEN35_FUSED_QK_NORM_ROPE", "1")
+        monkeypatch.setattr(
+            qwen3_next, "get_tensor_model_parallel_world_size", lambda: 1
+        )
+        monkeypatch.setattr(qwen3_next, "get_rope", lambda **kwargs: rope)
+        for name in ("QKVParallelLinear", "RowParallelLinear", "Attention"):
+            monkeypatch.setattr(
+                qwen3_next, name, lambda *args, **kwargs: torch.nn.Identity()
+            )
+
+        def reject_text_only_fusion(*args, **kwargs):
+            pytest.fail("Multimodal MRoPE must not use the text-only fused kernel")
+
+        monkeypatch.setattr(
+            qwen3_next, "fused_qk_rmsnorm_rope_gate", reject_text_only_fusion
+        )
+        config = SimpleNamespace(
+            hidden_size=8,
+            num_attention_heads=num_q_heads,
+            num_key_value_heads=num_kv_heads,
+            head_dim=HEAD_DIM,
+            max_position_embeddings=MAX_POSITION_EMBEDDINGS,
+            rope_parameters={},
+            rms_norm_eps=RMS_NORM_EPS,
+        )
+        attention = qwen3_next.Qwen3NextAttention(
+            config,
+            model_config=SimpleNamespace(
+                multimodal_config=SimpleNamespace(language_model_only=False)
+            ),
+        ).to(device=device, dtype=DTYPE)
+        attention.q_norm.weight.copy_(q_norm.weight)
+        attention.k_norm.weight.copy_(k_norm.weight)
+        assert not attention.use_fused_qk_norm_rope_gate
+
+        v = torch.randn_like(k)
+        qkv = torch.cat((q_gate, k, v), dim=-1)
+        q_out, k_out, v_out, gate_out = attention._project_qkv_gate(qkv, positions)
+        torch.testing.assert_close(v_out, v, atol=0, rtol=0)
+        assert gate_out is not None
 
     # The built-in reference performs RoPE in BF16, while the fused kernel
     # promotes the BF16-normalized values to FP32 for RoPE before storing BF16.

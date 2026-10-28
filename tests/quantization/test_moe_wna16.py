@@ -18,8 +18,11 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     convert_to_wna16_moe_kernel_format,
     map_wna16_backend,
 )
-from vllm.model_executor.layers.quantization import moe_wna16
-from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
+from vllm.model_executor.layers.quantization import auto_awq, moe_wna16
+from vllm.model_executor.layers.quantization.auto_awq import (
+    AutoAWQConfig,
+    AutoAWQMoEMethod,
+)
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.moe_wna16 import (
     MoeWNA16Config,
@@ -216,16 +219,17 @@ def test_gptq_nfirst_weights_pass_through_for_triton():
     assert torch.equal(converted[3], w2_scale)
 
 
-def test_moe_wna16_setup_forwards_selected_backend(monkeypatch):
-    method = object.__new__(MoeWNA16Method)
+def test_auto_awq_setup_forwards_selected_backend(monkeypatch):
+    method = object.__new__(AutoAWQMoEMethod)
     method.experts_cls = object
-    method.wna16_backend = WNA16MoEBackend.HUMMING
+    method.wna16_moe_backend = WNA16MoEBackend.HUMMING
     method.moe = object()
     quant_config = object()
     monkeypatch.setattr(
         method, "get_fused_moe_quant_config", lambda layer: quant_config
     )
-    layer = SimpleNamespace(_expert_routing_tables=lambda: (None, None, None))
+    routing_tables = (None, None, None)
+    layer = SimpleNamespace(_expert_routing_tables=lambda: routing_tables)
     captured = {}
     kernel = object()
 
@@ -233,12 +237,17 @@ def test_moe_wna16_setup_forwards_selected_backend(monkeypatch):
         captured.update(kwargs)
         return kernel
 
-    monkeypatch.setattr(moe_wna16, "make_wna16_moe_kernel", fake_make_wna16_moe_kernel)
+    monkeypatch.setattr(auto_awq, "make_wna16_moe_kernel", fake_make_wna16_moe_kernel)
 
     method._setup_kernel(layer)
 
     assert method.moe_kernel is kernel
+    assert method.moe_quant_config is quant_config
     assert captured["backend"] == WNA16MoEBackend.HUMMING
+    assert captured["moe_quant_config"] is quant_config
+    assert captured["moe_config"] is method.moe
+    assert captured["experts_cls"] is method.experts_cls
+    assert captured["routing_tables"] is routing_tables
 
 
 def test_moe_wna16_humming_adapter_repacks_uint8_tensors():
@@ -265,11 +274,11 @@ def test_moe_wna16_humming_adapter_repacks_uint8_tensors():
     assert converted["zero_point"].shape == (1, 2, 2)
 
 
-def test_moe_wna16_uses_humming_quant_config(monkeypatch):
+def test_auto_awq_uses_humming_quant_config(monkeypatch):
     from vllm.model_executor.layers.quantization.utils import humming as humming_utils
 
-    method = object.__new__(MoeWNA16Method)
-    method.wna16_backend = WNA16MoEBackend.HUMMING
+    method = object.__new__(AutoAWQMoEMethod)
+    method.wna16_moe_backend = WNA16MoEBackend.HUMMING
     layer = object()
     quant_config = object()
     monkeypatch.setattr(
@@ -586,6 +595,7 @@ def test_moe_wna16_w13_qzeros_shard_split_int8_asym_gptq(monkeypatch):
     method.moe = moe_config
 
     layer = torch.nn.Module()
+    layer.tp_size = 1
     layer.intermediate_size_per_partition = intermediate
     layer.moe_config = moe_config
     method.create_weights(
