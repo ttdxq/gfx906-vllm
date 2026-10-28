@@ -1082,11 +1082,81 @@ static bool try_mul_mat_vec_k45_prepared(
 #endif
 }
 
+static bool gguf_mmvq_type_selected(const char* selected, int64_t type) {
+  if (selected == nullptr) return true;
+  while (*selected != '\0') {
+    char* end;
+    const long value = std::strtol(selected, &end, 10);
+    if (end == selected) return false;
+    if (value == type) return true;
+    if (*end != ',') return false;
+    selected = end + 1;
+  }
+  return false;
+}
+
+template <typename scalar_t>
+static bool try_mul_mat_vec_iq_lut(
+    const void* W, const void* quant_X, scalar_t* dst, int col, int row,
+    int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
+#if defined(USE_ROCM)
+  const char* mode = std::getenv("VLLM_GGUF_IQ_LUT");
+  if (mode == nullptr) mode = "a";
+  if (mode != nullptr && mode[0] == 'a') {
+    if (type == 17 || type == 18 || type == 21 || type == 22 || type == 29) {
+      mode = "2";
+    } else if (type == 23 && col == 6144 && row >= 2048) {
+      mode = "3";
+    } else {
+      return false;
+    }
+  }
+  const char* selected = std::getenv("VLLM_GGUF_IQ_LUT_TYPE");
+  const char* master = std::getenv("VLLM_GGUF_IQ_WIDE");
+  const char* iq4_wide = std::getenv("VLLM_GGUF_IQ4XS_WIDE");
+  if (mode == nullptr || (mode[0] != '2' && mode[0] != '3') ||
+      !gguf_mmvq_type_selected(selected, type) ||
+      (master != nullptr && master[0] == '0') || vecs < 1 || vecs > 4 ||
+      (type == 23 && iq4_wide != nullptr && iq4_wide[0] == '0') ||
+      col <= 0 || col % QK_K != 0 ||
+      ((type == 20 || type == 23) && vecs == 1 && mode[0] == '2' &&
+       ((col + 511) / 512 * 512) / 32 * 36 > 32768) ||
+      std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+              .find("gfx906") != 0) return false;
+#define IQ_LUT_CASE(TYPE_, KIND_) \
+  case TYPE_: \
+    if (mode[0] == '2') \
+      mul_mat_vec_iq_lut_cuda<scalar_t, KIND_, true>( \
+          W, quant_X, dst, col, row, vecs, stream, dst_stride); \
+    else \
+      mul_mat_vec_iq_lut_cuda<scalar_t, KIND_, false>( \
+          W, quant_X, dst, col, row, vecs, stream, dst_stride); \
+    return true
+  switch (type) {
+    IQ_LUT_CASE(16, 0);
+    IQ_LUT_CASE(19, 1);
+    IQ_LUT_CASE(18, 2);
+    IQ_LUT_CASE(21, 3);
+    IQ_LUT_CASE(17, 4);
+    IQ_LUT_CASE(22, 5);
+    IQ_LUT_CASE(29, 6);
+    IQ_LUT_CASE(20, 7);
+    IQ_LUT_CASE(23, 8);
+  }
+#undef IQ_LUT_CASE
+#endif
+  return false;
+}
+
 template <typename scalar_t>
 static void ggml_mul_mat_vec_q8_dispatch(
     const void* W, const void* quant_X, scalar_t* dst, int col, int row,
     int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
   if (try_mul_mat_vec_k45_planar_wide(
+          W, quant_X, dst, col, row, vecs, type, stream, dst_stride)) {
+    return;
+  }
+  if (try_mul_mat_vec_iq_lut(
           W, quant_X, dst, col, row, vecs, type, stream, dst_stride)) {
     return;
   }
@@ -1507,17 +1577,50 @@ static void ggml_mul_mat_vec_q8_dispatch(
     case 22:
     case 29: {
       // Wide-load i-quant GEMV (decode path): decodes one whole 32-weight
-      // group per lane instead of the generic per-vec_dot template, which
-      // runs these types at 70-155 GB/s on gfx906. VLLM_GGUF_IQ_WIDE=0
-      // restores the generic templates.
-      // wide wins consistently only for these four; iq2_xxs/iq1_s are
-      // latency-bound at ~2bpw and the generic template matches them,
-      // iq4_nl/iq1_m are shape-mixed (measured on gfx906)
-      const bool iq_wide_type =
-          type == 17 || type == 18 || type == 21 || type == 22;
+      // group per lane instead of the generic per-vec_dot template.
+      // IQ2_XXS and IQ1_S default to the LDS path on gfx906.
       const char* iq_wide_env = std::getenv("VLLM_GGUF_IQ_WIDE");
-      if (iq_wide_type && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
-          (iq_wide_env == nullptr || iq_wide_env[0] != '0')) {
+      const char* iq2_xxs_wide_env =
+          std::getenv("VLLM_GGUF_IQ2_XXS_WIDE");
+      const char* iq1_s_wide_env = std::getenv("VLLM_GGUF_IQ1_S_WIDE");
+#if defined(USE_ROCM)
+      const char* iq_lut_env = type == 16 ? iq2_xxs_wide_env : iq1_s_wide_env;
+      if (iq_lut_env == nullptr) iq_lut_env = "2";
+      if ((type == 16 || type == 19) &&
+          (iq_lut_env[0] == '2' || iq_lut_env[0] == '3') &&
+          (iq_wide_env == nullptr || iq_wide_env[0] != '0') &&
+          vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
+          std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+                  .find("gfx906") == 0) {
+        if (type == 16) {
+          if (iq_lut_env[0] == '2') {
+            mul_mat_vec_iq_lut_cuda<scalar_t, false, true>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          } else {
+            mul_mat_vec_iq_lut_cuda<scalar_t, false, false>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          }
+        } else {
+          if (iq_lut_env[0] == '2') {
+            mul_mat_vec_iq_lut_cuda<scalar_t, true, true>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          } else {
+            mul_mat_vec_iq_lut_cuda<scalar_t, true, false>(
+                W, quant_X, dst, col, row, vecs, stream, dst_stride);
+          }
+        }
+        break;
+      }
+#endif
+      const bool iq_wide_enabled =
+          (iq_wide_env == nullptr || iq_wide_env[0] != '0') &&
+          ((type == 17 || type == 18 || type == 21 || type == 22) ||
+           (type == 16 && iq2_xxs_wide_env != nullptr &&
+            iq2_xxs_wide_env[0] == '1') ||
+           (type == 19 && iq1_s_wide_env != nullptr &&
+            iq1_s_wide_env[0] == '1'));
+      if (iq_wide_enabled && vecs >= 1 && vecs <= 4 &&
+          col % QK_K == 0) {
         switch (type) {
           case 16:
             mul_mat_vec_iq_wide_cuda<scalar_t, dec_iq2_xxs>(

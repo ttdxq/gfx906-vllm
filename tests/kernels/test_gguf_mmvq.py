@@ -209,6 +209,129 @@ def test_all_gguf_weight_formats_match_cpu_reference_and_graph(qtype, dtype):
                 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize(
+    ("qtype", "wide_env"),
+    [
+        (gguf.GGMLQuantizationType.IQ2_XXS, "VLLM_GGUF_IQ2_XXS_WIDE"),
+        (gguf.GGMLQuantizationType.IQ1_S, "VLLM_GGUF_IQ1_S_WIDE"),
+    ],
+    ids=["IQ2_XXS", "IQ1_S"],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("variant", ["1", "2", "3"])
+@torch.inference_mode()
+def test_iq_wide_candidates_match_reference_and_graph(
+    monkeypatch, qtype, wide_env, dtype, variant
+):
+    """Exercise IQ decoders against generic MMVQ and CPU math."""
+    if "gfx906" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""):
+        pytest.skip("gfx906 experimental IQ routing")
+    torch.manual_seed(817 + int(qtype))
+    monkeypatch.setenv("VLLM_GGUF_IQ_WIDE", "1")
+    monkeypatch.delenv("VLLM_GGUF_IQ2_XXS_WIDE", raising=False)
+    monkeypatch.delenv("VLLM_GGUF_IQ1_S_WIDE", raising=False)
+
+    for rows, cols in ((3, 768), (65, 4096), (5, 17408)):
+        if rows == 3:
+            data = _quantized_test_rows(qtype, rows, cols)
+        else:
+            block, size = gguf.GGML_QUANT_SIZES[qtype]
+            rng = np.random.default_rng(817 + int(qtype) + cols)
+            data = rng.integers(
+                0, 256, size=(rows, cols // block * size), dtype=np.uint8
+            )
+            metadata = data.reshape(-1, size)
+            metadata[:, :2] = np.array([0.03125], dtype=np.float16).view(np.uint8)
+        raw = torch.tensor(data, device="cuda")
+        _TEST_WEIGHT_STORAGE.append(raw)
+        for batch in (1, 2, 3, 4, 5, 8):
+            x = torch.randn((batch, cols), device="cuda", dtype=dtype) * 0.2
+            quant_x = ops.ggml_quantize_row_q8_1(x)
+            expected = _quantized_dot_reference(data, qtype, quant_x, cols)
+
+            monkeypatch.setenv(wide_env, "0")
+            generic = ops.ggml_mul_mat_vec_q8(
+                raw, quant_x, int(qtype), rows, cols, dtype
+            )
+            monkeypatch.setenv(wide_env, variant)
+            candidate = ops.ggml_mul_mat_vec_q8(
+                raw, quant_x, int(qtype), rows, cols, dtype
+            )
+            atol, rtol = (0.001, 2e-4) if dtype == torch.float32 else (0.02, 0.01)
+            torch.testing.assert_close(
+                generic.cpu().double(), expected, atol=atol, rtol=rtol
+            )
+            torch.testing.assert_close(
+                candidate.cpu().double(), expected, atol=atol, rtol=rtol
+            )
+            torch.testing.assert_close(candidate, generic, atol=atol, rtol=rtol)
+
+            if batch == 1:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = ops.ggml_mul_mat_vec_q8(
+                        raw, quant_x, int(qtype), rows, cols, dtype
+                    )
+                    observed = output.clone()
+                    output.fill_(float("nan"))
+                for _ in range(2):
+                    graph.replay()
+                    torch.testing.assert_close(observed, candidate, atol=0, rtol=0)
+                quant_x.copy_(ops.ggml_quantize_row_q8_1(torch.zeros_like(x)))
+                for _ in range(2):
+                    graph.replay()
+                    torch.testing.assert_close(
+                        observed, torch.zeros_like(candidate), atol=0, rtol=0
+                    )
+            monkeypatch.delenv(wide_env, raising=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize(
+    ("qtype", "wide_env"),
+    [
+        (gguf.GGMLQuantizationType.IQ2_XXS, "VLLM_GGUF_IQ2_XXS_WIDE"),
+        (gguf.GGMLQuantizationType.IQ1_S, "VLLM_GGUF_IQ1_S_WIDE"),
+    ],
+    ids=["IQ2_XXS", "IQ1_S"],
+)
+@torch.inference_mode()
+def test_iq_candidate_gates_launch_selected_kernel(monkeypatch, qtype, wide_env):
+    """Numerical equivalence alone must not accept an unused candidate gate."""
+    if "gfx906" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""):
+        pytest.skip("gfx906 experimental IQ routing")
+    raw = torch.tensor(_quantized_test_rows(qtype, 3, 768), device="cuda")
+    _TEST_WEIGHT_STORAGE.append(raw)
+    x = torch.randn((1, 768), device="cuda", dtype=torch.float16)
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    for master, variant, expected in (
+        ("1", "0", "mul_mat_vec_q<"),
+        ("1", "1", "mul_mat_vec_iq_wide<"),
+        ("1", "2", "mul_mat_vec_iq_lut<"),
+        ("1", "3", "mul_mat_vec_iq_lut<"),
+        ("0", "2", "mul_mat_vec_q<"),
+    ):
+        monkeypatch.setenv("VLLM_GGUF_IQ_WIDE", master)
+        monkeypatch.setenv(wide_env, variant)
+        ops.ggml_mul_mat_vec_q8(raw, quant_x, int(qtype), 3, 768, x.dtype)
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profile:
+            ops.ggml_mul_mat_vec_q8(raw, quant_x, int(qtype), 3, 768, x.dtype)
+            torch.cuda.synchronize()
+        kernels = [
+            event.name
+            for event in profile.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        assert any(expected in name for name in kernels), kernels
+
+
 def _make_layer(
     shard_offset_map: dict[int, tuple[int, int, int]],
     shard_weight_type: dict[int, int],

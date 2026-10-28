@@ -2497,6 +2497,333 @@ struct dec_iq1_s {
     }
 };
 
+#if defined(USE_ROCM)
+// Four independent rows share the small codebooks. The global-table variant
+// isolates the benefit of LDS from the signed-byte decode and block mapping.
+template <typename scalar_t, int VECS, int IQ_KIND, bool LDS>
+static __global__ void __launch_bounds__(256)
+mul_mat_vec_iq_lut(const uint8_t * __restrict__ vx,
+                   const block_q8_1 * __restrict__ y,
+                   scalar_t * __restrict__ dst, const int ncols,
+                   const int nrows, const int dst_stride) {
+    constexpr bool IQ1 = IQ_KIND == 1;
+    constexpr bool IQ2XXS = IQ_KIND == 0;
+    constexpr bool IQ3XXS = IQ_KIND == 2;
+    constexpr bool IQ3S = IQ_KIND == 3;
+    constexpr bool IQ2XS = IQ_KIND == 4;
+    constexpr bool IQ2S = IQ_KIND == 5;
+    constexpr bool IQ1M = IQ_KIND == 6;
+    constexpr bool IQ4NL = IQ_KIND == 7;
+    constexpr bool IQ4XS = IQ_KIND == 8;
+    constexpr int table_size = (IQ1 || IQ1M) ? 2048
+        : (IQ2XXS ? 768 : (IQ2XS ? 1280 : (IQ2S ? 2560
+        : (IQ3S ? 1024 : ((IQ4NL || IQ4XS) ? 1 : 512)))));
+    __shared__ uint32_t table[LDS ? table_size : 1];
+    if constexpr (LDS) {
+        for (int k = threadIdx.x; k < table_size; k += blockDim.x) {
+            if constexpr (IQ1 || IQ1M) {
+                table[k] = (uint32_t)iq1s_grid_gpu[k];
+            } else if constexpr (IQ2XXS) {
+                table[k] = k < 512
+                    ? ((const uint32_t *)iq2xxs_grid)[k]
+                    : ((const uint32_t *)ksigns64)[k - 512];
+            } else if constexpr (IQ2XS) {
+                table[k] = k < 1024 ? ((const uint32_t *)iq2xs_grid)[k]
+                    : ((const uint32_t *)ksigns64)[k - 1024];
+            } else if constexpr (IQ2S) {
+                if (k < 2048) table[k] = ((const uint32_t *)iq2s_grid)[k];
+                else {
+                    const int sign = (k - 2048) / 2;
+                    const int nibble = (k & 1) ? sign >> 4 : sign & 15;
+                    table[k] = __vcmpeq4((nibble * 0x01010101) & 0x08040201, 0x08040201);
+                }
+            } else if constexpr (IQ4NL || IQ4XS) {
+                table[k] = 0;
+            } else {
+                if constexpr (IQ3XXS) {
+                    table[k] = k < 256 ? iq3xxs_grid[k]
+                        : ((const uint32_t *)ksigns64)[k - 256];
+                } else {
+                    if (k < 512) table[k] = iq3xs_grid[k];
+                    else {
+                        const int sign = (k - 512) / 2;
+                        const int nibble = (k & 1) ? sign >> 4 : sign & 15;
+                        table[k] = __vcmpeq4((nibble * 0x01010101) & 0x08040201, 0x08040201);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    extern __shared__ int staged_activation[];
+    if constexpr ((IQ4NL || IQ4XS) && LDS && VECS == 1) {
+        const int words = ((ncols + 511) / 512 * 512) / 32 * 9;
+        for (int k = threadIdx.x; k < words; k += blockDim.x)
+            staged_activation[k] = ((const int *)y)[k];
+        __syncthreads();
+        y = (const block_q8_1 *)staged_activation;
+    }
+    const int row = 4 * blockIdx.x + (threadIdx.x >> 6);
+    if (row >= nrows) return;
+    const int lane = threadIdx.x & 63;
+    const int j = lane & 7;
+    const int nb = ncols / QK_K;
+    const int ny = ((ncols + 511) / 512 * 512) / QK8_1;
+    constexpr int block_bytes = IQ1 ? sizeof(block_iq1_s)
+        : (IQ2XXS ? sizeof(block_iq2_xxs)
+        : (IQ3XXS ? sizeof(block_iq3_xxs) : (IQ3S ? sizeof(block_iq3_s)
+        : (IQ2XS ? sizeof(block_iq2_xs) : (IQ2S ? sizeof(block_iq2_s)
+        : (IQ1M ? sizeof(block_iq1_m) : (IQ4NL ? 8*sizeof(block_iq4_nl)
+        : sizeof(block_iq4_xs))))))));
+    const uint8_t * wrow = vx + (size_t)row * nb * block_bytes;
+    float tmp[VECS] = {};
+    for (int i = lane >> 3; i < nb; i += 8) {
+        uint32_t indices, aux;
+        float scale, scale_other = 0.f;
+        float sub_scale[4], sub_delta[4];
+        if constexpr (IQ1) {
+            const block_iq1_s * b = (const block_iq1_s *)(wrow + (size_t)i * block_bytes);
+            indices = get_int_b2(b->qs, j);
+            aux = b->qh[j];
+            scale = __half2float(b->d) * (((aux >> 11) & 14) + 1);
+        } else if constexpr (IQ2XXS) {
+            const block_iq2_xxs * b = (const block_iq2_xxs *)(wrow + (size_t)i * block_bytes);
+            const uint16_t * q = b->qs + 4 * j;
+            indices = uint32_t(q[0]) | (uint32_t(q[1]) << 16);
+            aux = uint32_t(q[2]) | (uint32_t(q[3]) << 16);
+            scale = __half2float(b->d) * (0.5f + (aux >> 28));
+        } else if constexpr (IQ3XXS) {
+            const block_iq3_xxs * b = (const block_iq3_xxs *)(wrow + (size_t)i * block_bytes);
+            const uint16_t * gas = (const uint16_t *)(b->qs + QK_K / 4) + 2 * j;
+            aux = uint32_t(gas[0]) | (uint32_t(gas[1]) << 16);
+            indices = 0;
+            scale = __half2float(b->d) * (0.5f + (aux >> 28)) * 0.5f;
+        } else if constexpr (IQ3S) {
+            const block_iq3_s * b = (const block_iq3_s *)(wrow + (size_t)i * block_bytes);
+            indices = aux = 0;
+            const float s = 0.5f + ((b->scales[j >> 1] >> (4 * (j & 1))) & 0xf);
+            scale = __half2float(b->d) * s * 0.5f;
+        } else if constexpr (IQ2XS || IQ2S) {
+            const float d = IQ2XS
+                ? __half2float(((const block_iq2_xs *)(wrow + (size_t)i * block_bytes))->d)
+                : __half2float(((const block_iq2_s *)(wrow + (size_t)i * block_bytes))->d);
+            const int sc = IQ2XS
+                ? ((const block_iq2_xs *)(wrow + (size_t)i * block_bytes))->scales[j]
+                : ((const block_iq2_s *)(wrow + (size_t)i * block_bytes))->scales[j];
+            scale = d * 0.25f * (0.5f + (sc & 15));
+            scale_other = d * 0.25f * (0.5f + (sc >> 4));
+            indices = aux = 0;
+        } else if constexpr (IQ1M) {
+            const block_iq1_m * b = (const block_iq1_m *)(wrow + (size_t)i * block_bytes);
+            const uint16_t * sc = (const uint16_t *)b->scales;
+            iq1m_scale_t d;
+            d.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                    ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            const int tmps = sc[j >> 1] >> (6 * (j & 1));
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int qh = b->qh[2*j + (l >> 1)] >> (4 * (l & 1));
+                sub_scale[l] = 2*((tmps >> (3*(l >> 1))) & 7) + 1;
+                sub_delta[l] = -1.0f + IQ1M_DELTA - (qh & 8)*(2.0f*IQ1M_DELTA/8);
+            }
+            scale = __half2float(d.f16);
+            indices = aux = 0;
+        } else if constexpr (IQ4NL) {
+            const block_iq4_nl * b = (const block_iq4_nl *)(wrow + (size_t)i * block_bytes) + j;
+            scale = __half2float(b->d);
+            indices = aux = 0;
+        } else {
+            const block_iq4_xs * b = (const block_iq4_xs *)(wrow + (size_t)i * block_bytes);
+            const int ls = ((b->scales_l[j >> 1] >> (4*(j & 1))) & 15) |
+                           (((b->scales_h >> (2*j)) & 3) << 4);
+            scale = __half2float(b->d) * (ls - 32);
+            indices = aux = 0;
+        }
+        int weight[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            if constexpr (IQ1) {
+                const int k = ((indices >> (8*l)) & 255) |
+                              (((aux >> (3*l)) & 7) << 8);
+                const uint32_t grid = LDS ? table[k] : (uint32_t)iq1s_grid_gpu[k];
+                weight[2*l] = grid & 0x0F0F0F0F;
+                weight[2*l+1] = (grid >> 4) & 0x0F0F0F0F;
+            } else if constexpr (IQ2XXS) {
+                const int k = (indices >> (8*l)) & 255;
+                const int s = (aux >> (7*l)) & 127;
+                const uint32_t lo = LDS ? table[2*k] : ((const uint32_t *)iq2xxs_grid)[2*k];
+                const uint32_t hi = LDS ? table[2*k+1] : ((const uint32_t *)iq2xxs_grid)[2*k+1];
+                const uint32_t sl = LDS ? table[512+2*s] : ((const uint32_t *)ksigns64)[2*s];
+                const uint32_t sh = LDS ? table[512+2*s+1] : ((const uint32_t *)ksigns64)[2*s+1];
+                // IQ2_XXS magnitudes are strictly positive, so adding one
+                // to a negated byte cannot carry into the next byte.
+                weight[2*l] = (lo ^ sl) + (sl & 0x01010101);
+                weight[2*l+1] = (hi ^ sh) + (sh & 0x01010101);
+            } else if constexpr (IQ3XXS) {
+                const block_iq3_xxs * b = (const block_iq3_xxs *)(wrow + (size_t)i * block_bytes);
+                const int grid0 = b->qs[8*j + 2*l];
+                const int grid1 = b->qs[8*j + 2*l+1];
+                const uint32_t lo = LDS ? table[grid0] : iq3xxs_grid[grid0];
+                const uint32_t hi = LDS ? table[grid1] : iq3xxs_grid[grid1];
+                const int sign = (aux >> (7*l)) & 127;
+                const uint32_t sl = LDS ? table[256+2*sign]
+                    : ((const uint32_t *)ksigns64)[2*sign];
+                const uint32_t sh = LDS ? table[256+2*sign+1]
+                    : ((const uint32_t *)ksigns64)[2*sign+1];
+                weight[2*l] = (lo ^ sl) + (sl & 0x01010101);
+                weight[2*l+1] = (hi ^ sh) + (sh & 0x01010101);
+            } else if constexpr (IQ3S) {
+                const block_iq3_s * b = (const block_iq3_s *)(wrow + (size_t)i * block_bytes);
+                const int grid0 = b->qs[8*j + 2*l] | ((b->qh[j] << (8 - 2*l)) & 256);
+                const int grid1 = b->qs[8*j + 2*l+1] | ((b->qh[j] << (7 - 2*l)) & 256);
+                const int s0 = b->signs[4*j+l];
+                const uint32_t g0 = LDS ? table[grid0] : iq3xs_grid[grid0];
+                const uint32_t g1 = LDS ? table[grid1] : iq3xs_grid[grid1];
+                if constexpr (LDS) {
+                    const uint32_t sl = table[512+2*s0];
+                    const uint32_t sh = table[512+2*s0+1];
+                    weight[2*l] = (g0 ^ sl) + (sl & 0x01010101);
+                    weight[2*l+1] = (g1 ^ sh) + (sh & 0x01010101);
+                } else {
+                    iq_sign_words(g0, g1, s0, weight[2*l], weight[2*l+1]);
+                }
+            } else if constexpr (IQ2XS || IQ2S) {
+                const uint8_t * p = wrow + (size_t)i * block_bytes;
+                int index, sign;
+                if constexpr (IQ2XS) {
+                    const uint16_t q = ((const block_iq2_xs *)p)->qs[4*j+l];
+                    index = q & 511;
+                    sign = q >> 9;
+                } else {
+                    const block_iq2_s * b = (const block_iq2_s *)p;
+                    index = b->qs[4*j+l] | ((b->qh[j] << (8 - 2*l)) & 0x300);
+                    sign = b->qs[32+4*j+l];
+                }
+                const uint32_t * grid = IQ2XS ? (const uint32_t *)iq2xs_grid
+                                             : (const uint32_t *)iq2s_grid;
+                const uint32_t lo = LDS ? table[2*index] : grid[2*index];
+                const uint32_t hi = LDS ? table[2*index+1] : grid[2*index+1];
+                if constexpr (IQ2XS) {
+                    const uint32_t sl = LDS ? table[1024+2*sign]
+                        : ((const uint32_t *)ksigns64)[2*sign];
+                    const uint32_t sh = LDS ? table[1024+2*sign+1]
+                        : ((const uint32_t *)ksigns64)[2*sign+1];
+                    weight[2*l] = (lo ^ sl) + (sl & 0x01010101);
+                    weight[2*l+1] = (hi ^ sh) + (sh & 0x01010101);
+                } else {
+                    if constexpr (LDS) {
+                        const uint32_t sl = table[2048+2*sign];
+                        const uint32_t sh = table[2048+2*sign+1];
+                        weight[2*l] = (lo ^ sl) + (sl & 0x01010101);
+                        weight[2*l+1] = (hi ^ sh) + (sh & 0x01010101);
+                    } else {
+                        iq_sign_words(lo, hi, sign, weight[2*l], weight[2*l+1]);
+                    }
+                }
+            } else if constexpr (IQ1M) {
+                const block_iq1_m * b = (const block_iq1_m *)(wrow + (size_t)i * block_bytes);
+                const int qh = b->qh[2*j + (l >> 1)] >> (4 * (l & 1));
+                const int index = b->qs[4*j+l] | ((qh & 7) << 8);
+                const uint32_t grid = LDS ? table[index] : (uint32_t)iq1s_grid_gpu[index];
+                weight[2*l] = grid & 0x0f0f0f0f;
+                weight[2*l+1] = (grid >> 4) & 0x0f0f0f0f;
+            } else {
+                const uint8_t * q;
+                if constexpr (IQ4NL) {
+                    q = ((const block_iq4_nl *)(wrow + (size_t)i * block_bytes))[j].qs;
+                } else {
+                    q = ((const block_iq4_xs *)(wrow + (size_t)i * block_bytes))->qs + 16*j;
+                }
+                const uint32_t packed = get_int_b2(q, l);
+                weight[l] = lookup_iq4nl_values_gfx906(packed & 0x0f0f0f0f);
+                weight[l+4] = lookup_iq4nl_values_gfx906((packed >> 4) & 0x0f0f0f0f);
+            }
+        }
+#pragma unroll
+        for (int v = 0; v < VECS; ++v) {
+            const block_q8_1 * y8 = y + (size_t)v * ny + 8*i + j;
+            const int * qa = (const int *)y8->qs;
+            const float2 ds = __half22float2(y8->ds);
+            if constexpr (IQ1M) {
+                int sumi[2] = {};
+                float sumf[2] = {};
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const int k = l >> 1;
+                    sumi[k] = __dp4a(weight[2*l], qa[2*l],
+                                     __dp4a(weight[2*l+1], qa[2*l+1], sumi[k]));
+                    const int sy = __dp4a(qa[2*l], 0x01010101,
+                                         __dp4a(qa[2*l+1], 0x01010101, 0));
+                    sumf[k] += sub_delta[l] * sy;
+                }
+                tmp[v] += (scale * ds.x) *
+                          ((sumi[0] + sumf[0]) * sub_scale[0] +
+                           (sumi[1] + sumf[1]) * sub_scale[2]);
+                continue;
+            }
+            int sum0 = 0, sum1 = 0;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                if constexpr (IQ2XS || IQ2S) {
+                    sum0 = __dp4a(weight[l], qa[l], sum0);
+                    sum1 = __dp4a(weight[l+4], qa[l+4], sum1);
+                } else {
+                    sum0 = __dp4a(weight[2*l], qa[2*l], sum0);
+                    sum1 = __dp4a(weight[2*l+1], qa[2*l+1], sum1);
+                }
+            }
+            if constexpr (IQ1) {
+                const float delta = -1.0f + IQ1S_DELTA -
+                    (aux & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+                tmp[v] += scale * (ds.x * (sum0 + sum1) + ds.y * delta);
+            } else if constexpr (IQ2XXS) {
+                tmp[v] += (scale * ds.x * 0.25f) * (sum0 + sum1);
+            } else if constexpr (IQ2XS || IQ2S) {
+                tmp[v] += ds.x * (scale * sum0 + scale_other * sum1);
+            } else if constexpr (IQ3S || IQ3XXS) {
+                // Keep the deployed wide kernel's floating point order.
+                tmp[v] += ds.x * (scale * (sum0 + sum1));
+            } else if constexpr (IQ4XS) {
+                tmp[v] += scale * (ds.x * (sum0 + sum1));
+            } else if constexpr (IQ4NL) {
+                tmp[v] += (scale * ds.x) * (sum0 + sum1);
+            } else {
+                tmp[v] += ds.x * (scale * sum0) + ds.x * (scale * sum1);
+            }
+        }
+    }
+#pragma unroll
+    for (int v = 0; v < VECS; ++v) {
+        float t = tmp[v];
+#pragma unroll
+        for (int mask = 32; mask > 0; mask >>= 1)
+            t += VLLM_SHFL_XOR_SYNC(t, mask);
+        if (lane == 0) dst[v * dst_stride + row] = t;
+    }
+}
+
+template <typename scalar_t, int IQ_KIND, bool LDS>
+static void mul_mat_vec_iq_lut_cuda(
+        const void * vx, const void * vy, scalar_t * dst,
+        const int ncols, const int nrows, const int nvecs,
+        cudaStream_t stream, const int dst_stride) {
+    const int shared_bytes = (IQ_KIND >= 7 && LDS && nvecs == 1)
+        ? ((ncols + 511) / 512 * 512) / 32 * 36 : 0;
+#define IQL_LAUNCH(V_) \
+    mul_mat_vec_iq_lut<scalar_t, V_, IQ_KIND, LDS> \
+        <<<(nrows + 3) / 4, 256, shared_bytes, stream>>>( \
+            (const uint8_t *)vx, (const block_q8_1 *)vy, dst, \
+            ncols, nrows, dst_stride)
+    switch (nvecs) {
+      case 1: IQL_LAUNCH(1); break;
+      case 2: IQL_LAUNCH(2); break;
+      case 3: IQL_LAUNCH(3); break;
+      case 4: IQL_LAUNCH(4); break;
+    }
+#undef IQL_LAUNCH
+}
+#endif
+
 template <typename scalar_t, typename DEC>
 static void mul_mat_vec_iq_wide_cuda(const void * vx, const void * vy, scalar_t * dst,
         const int ncols, const int nrows, const int nvecs, cudaStream_t stream,
