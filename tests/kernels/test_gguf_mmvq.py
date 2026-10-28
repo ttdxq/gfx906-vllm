@@ -202,3 +202,62 @@ def test_planar_k45_matches_explicit_quantized_dot_product(monkeypatch):
                     torch.testing.assert_close(actual, expected, atol=0.001, rtol=2e-5)
                     if batch == 4:
                         assert torch.count_nonzero(actual[3]).item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("qtype", [12, 13])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_planar_k45_overwrites_poisoned_output_on_graph_replay(
+    monkeypatch, qtype, dtype
+):
+    """Every output must be written even when a prior replay left NaNs."""
+    if "gfx906" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""):
+        pytest.skip("gfx906 planar routing")
+    monkeypatch.setenv("VLLM_GGUF_K45_WIDE", "1")
+    quant_type = gguf.GGMLQuantizationType(qtype)
+    sample_dir = Path(snapshot_download("Isotr0py/test-gguf-sample"))
+    sample = gguf.GGUFReader(sample_dir / f"Quant_{quant_type.name}_1024.gguf")
+    block, size = gguf.GGML_QUANT_SIZES[quant_type]
+    keepalive = []
+    for rows, cols in ((1, 256), (3, 768), (65, 17408)):
+        width = cols // block * size
+        source = sample.tensors[0].data[:rows]
+        repeats = (width + source.shape[1] - 1) // source.shape[1]
+        raw = torch.tensor(
+            np.tile(source, (1, repeats))[:, :width].copy(), device="cuda"
+        )
+        packed = torch.ops._C.ggml_planar_pack(raw, qtype, rows, cols)
+        keepalive.extend((raw, packed))
+        for batch in (0, 1, 2, 3, 4):
+            x = torch.randn((batch, cols), device="cuda", dtype=dtype)
+            quant_x = ops.ggml_quantize_row_q8_1(x) if batch else raw[:0]
+            if not batch:
+                assert ops.ggml_mul_mat_vec_q8(
+                    packed, quant_x, qtype, rows, cols, dtype
+                ).shape == (0, rows)
+                continue
+            monkeypatch.setenv("VLLM_GGUF_MMVQ_ZERO_OUTPUT", "1")
+            expected = ops.ggml_mul_mat_vec_q8(
+                packed, quant_x, qtype, rows, cols, dtype
+            )
+            monkeypatch.setenv("VLLM_GGUF_MMVQ_ZERO_OUTPUT", "0")
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = ops.ggml_mul_mat_vec_q8(
+                    packed, quant_x, qtype, rows, cols, dtype
+                )
+                observed = output.clone()
+                output.fill_(float("nan"))
+            for zero_input in (False, True):
+                if zero_input:
+                    quant_x.copy_(ops.ggml_quantize_row_q8_1(torch.zeros_like(x)))
+                for _ in range(2):
+                    graph.replay()
+                    assert torch.isfinite(observed).all()
+                    torch.testing.assert_close(
+                        observed,
+                        torch.zeros_like(expected) if zero_input else expected,
+                        atol=0,
+                        rtol=0,
+                    )

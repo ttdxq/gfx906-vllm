@@ -990,9 +990,35 @@ static int q8_0_row_tile_min_rows() {
 }
 
 template <typename scalar_t>
+static bool try_mul_mat_vec_k45_planar_wide(
+    const void* W, const void* quant_X, scalar_t* dst, int col, int row,
+    int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
+  if ((type != 12 && type != 13) || !planar_k_enabled() || vecs < 1 ||
+      vecs > 4 || col % QK_K != 0 || !gguf_planar_is_planar(W)) {
+    return false;
+  }
+  const char* wide_env = std::getenv("VLLM_GGUF_K45_WIDE");
+  if (wide_env != nullptr && wide_env[0] == '0') {
+    return false;
+  }
+  if (type == 12) {
+    mul_mat_vec_k45_q8_1_planar_wide_cuda<scalar_t, false>(
+        W, quant_X, dst, col, row, vecs, stream, dst_stride);
+  } else {
+    mul_mat_vec_k45_q8_1_planar_wide_cuda<scalar_t, true>(
+        W, quant_X, dst, col, row, vecs, stream, dst_stride);
+  }
+  return true;
+}
+
+template <typename scalar_t>
 static void ggml_mul_mat_vec_q8_dispatch(
     const void* W, const void* quant_X, scalar_t* dst, int col, int row,
     int vecs, int64_t type, cudaStream_t stream, int dst_stride) {
+  if (try_mul_mat_vec_k45_planar_wide(
+          W, quant_X, dst, col, row, vecs, type, stream, dst_stride)) {
+    return;
+  }
   switch (type) {
     case 2:
       mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
@@ -1035,17 +1061,6 @@ static void ggml_mul_mat_vec_q8_dispatch(
     case 12: {
       if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
           gguf_planar_is_planar(W)) {
-        // q4_K: the software-pipelined single-row form wins or ties on every
-        // measured shape; the two-row tile measured 0.72-0.77x interleaved
-        // Wide-load variant first (read per call for in-process A/B): the
-        // 4-consecutive-p group loads reach ~460-540 GB/s on decode shapes.
-        const char* k45_wide_env = std::getenv("VLLM_GGUF_K45_WIDE");
-        const bool k45_wide = k45_wide_env == nullptr || k45_wide_env[0] != '0';
-        if (k45_wide) {
-          mul_mat_vec_k45_q8_1_planar_wide_cuda<scalar_t, false>(
-              W, quant_X, dst, col, row, vecs, stream, dst_stride);
-          break;
-        }
         static const int min_rows = [] {
           const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR_MIN_ROWS");
           return env == nullptr ? INT_MAX : std::max(1, std::atoi(env));
@@ -1176,18 +1191,6 @@ static void ggml_mul_mat_vec_q8_dispatch(
     case 13: {
       if (planar_k_enabled() && vecs >= 1 && vecs <= 4 && col % QK_K == 0 &&
           gguf_planar_is_planar(W)) {
-        // Wide-load variant first (read per call for in-process A/B): the
-        // 4-consecutive-p group loads reach ~435-560 GB/s on decode shapes.
-        const char* k45_wide_env = std::getenv("VLLM_GGUF_K45_WIDE");
-        // Shape-gating q5_K back to row_tile2/v1 looked 6-18% faster in a
-        // standalone loop (L2-warm weights) but measured ~0.75ms/step slower
-        // end-to-end on cold streaming weights; keep wide everywhere.
-        const bool k45_wide = k45_wide_env == nullptr || k45_wide_env[0] != '0';
-        if (k45_wide) {
-          mul_mat_vec_k45_q8_1_planar_wide_cuda<scalar_t, true>(
-              W, quant_X, dst, col, row, vecs, stream, dst_stride);
-          break;
-        }
         static const int min_rows = [] {
           const char* env = std::getenv("VLLM_GGUF_KQUANT_PLANAR_MIN_ROWS");
           return env == nullptr ? 1024 : std::max(1, std::atoi(env));
@@ -2280,15 +2283,23 @@ torch::Tensor ggml_mul_mat_vec_q8(torch::Tensor W, torch::Tensor quant_X,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
   int64_t vecs = quant_X.sizes()[0];
   auto options = torch::TensorOptions().dtype(dtype).device(W.device());
-  // Zero the output before the launch: under CUDA graph capture the output
-  // allocation comes from the graph pool, where one address can back several
-  // tensors' static buffers between replays, so any kernel-unwritten slot
-  // would leak values from an unrelated buffer.
   at::Tensor Y = torch::empty({vecs, row}, options);
-  Y.zero_();
+  if (Y.numel() == 0) {
+    return Y;
+  }
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   VLLM_DISPATCH_FLOATING_TYPES(dtype, "ggml_mul_mat_vec_q8", [&] {
+    const char* zero_env = std::getenv("VLLM_GGUF_MMVQ_ZERO_OUTPUT");
+    const bool force_zero = zero_env != nullptr && zero_env[0] == '1';
+    // Wide planar k45 writes every [vec, row] without reading dst. Other
+    // paths retain clearing for potentially unwritten graph-pool slots.
+    if (!force_zero && col > 0 && try_mul_mat_vec_k45_planar_wide(
+            W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+            col, row, vecs, type, stream, row)) {
+      return;
+    }
+    Y.zero_();
     ggml_mul_mat_vec_q8_dispatch<scalar_t>(
         (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
         col, row, vecs, type, stream, row);
