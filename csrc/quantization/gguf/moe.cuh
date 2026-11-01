@@ -51,7 +51,7 @@ static __device__ __forceinline__ void moe_q(
   for (int ib0 = 0; ib0 < blocks_per_row_x; ib0 += blocks_per_warp) {
     load_tiles(x + row_x_0 * blocks_per_row_x + ib0, tile_x_ql, tile_x_dm,
                tile_x_qh, tile_x_sc, threadIdx.y, nrows_x - row_x_0 - 1,
-               threadIdx.x, blocks_per_row_x);
+               threadIdx.x, blocks_per_row_x, blocks_per_row_x - ib0);
 
     const int n_per_r = ((qk * blocks_per_warp) / qr);
 #pragma unroll

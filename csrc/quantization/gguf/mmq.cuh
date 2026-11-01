@@ -65,7 +65,7 @@ static __device__ __forceinline__ void mul_mat_q(
     for (int ib0 = 0; ib0 < blocks_per_row_x; ib0 += blocks_per_warp) {
 
         load_tiles(x + row_x_0*blocks_per_row_x + ib0, tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc,
-                   threadIdx.y, nrows_x-row_x_0-1, threadIdx.x, blocks_per_row_x);
+                   threadIdx.y, nrows_x-row_x_0-1, threadIdx.x, blocks_per_row_x, blocks_per_row_x - ib0);
 
 #pragma unroll
         for (int ir = 0; ir < qr && ib0 + ir * blocks_per_warp/qr < blocks_per_row_x; ++ir) {

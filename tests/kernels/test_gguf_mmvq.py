@@ -44,6 +44,31 @@ _NATIVE_WEIGHT_TYPES = [
 _TEST_WEIGHT_STORAGE = []
 
 
+@pytest.mark.parametrize("qtype", _NATIVE_WEIGHT_TYPES[:5])
+@pytest.mark.parametrize("cols", [64, 256, 320])
+@pytest.mark.parametrize("rows", [128, 129])
+@pytest.mark.parametrize("num_tokens", [1, 25])
+@torch.inference_mode()
+def test_mmq_k_tail_ignores_adjacent_storage(qtype, cols, rows, num_tokens):
+    """An incomplete K tile must not read the following weight storage."""
+    rng = np.random.default_rng(42)
+    packed = gguf.quantize(rng.standard_normal((rows, cols)).astype(np.float32), qtype)
+    # Four extra rows cover the largest tile overread for a 64-wide input.
+    storage = torch.zeros(rows + 4, packed.shape[1], dtype=torch.uint8, device="cuda")
+    storage[:rows].copy_(torch.from_numpy(packed))
+    weight = storage[:rows]
+    torch.manual_seed(42)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda")
+
+    expected = ops.ggml_mul_mat_a8(weight, x, qtype, rows)
+    assert torch.isfinite(expected).all()
+    # 0xffff is a NaN FP16 scale in these formats, outside the logical weight.
+    storage[rows:].fill_(255)
+    actual = ops.ggml_mul_mat_a8(weight, x, qtype, rows)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @lru_cache(maxsize=1)
 def _quantized_sample_dir():
     return Path(snapshot_download("Isotr0py/test-gguf-sample"))
