@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-import re
 from collections.abc import Generator
 from pathlib import Path
 
-import gguf
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.gguf_adapters import (
+    get_mmproj_file,
+    get_weights_adapter,
+)
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -25,19 +26,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     get_gguf_weight_type_map,
     gguf_quant_weights_iterator,
 )
-from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
-
-_MULTIMODAL_GGUF_ARCHITECTURES = frozenset(
-    {
-        "Gemma3ForConditionalGeneration",
-        "Gemma4ForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-    }
-)
 
 
 class GGUFModelLoader(BaseModelLoader):
@@ -59,11 +50,7 @@ class GGUFModelLoader(BaseModelLoader):
     def _get_mmproj_file(
         model_config: ModelConfig, model_name_or_path: str | None = None
     ) -> Path | None:
-        if model_config.architecture not in _MULTIMODAL_GGUF_ARCHITECTURES:
-            return None
-        if getattr(model_config.hf_config, "vision_config", None) is None:
-            return None
-        return detect_gguf_multimodal(model_name_or_path or model_config.model)
+        return get_mmproj_file(model_config, model_name_or_path)
 
     def _prepare_weights(self, model_config: ModelConfig):
         model_name_or_path = model_config.model
@@ -95,311 +82,6 @@ class GGUFModelLoader(BaseModelLoader):
             "or <repo_id>:<quant_type>)"
         )
 
-    @staticmethod
-    def _get_qwen35_mtp_weights_map(model_config: ModelConfig) -> dict[str, str]:
-        text_config = model_config.hf_config.get_text_config()
-        num_mtp_layers = getattr(text_config, "mtp_num_hidden_layers", 1)
-        first_mtp_block = text_config.num_hidden_layers
-        is_moe = text_config.model_type == "qwen3_5_moe_text"
-
-        weights_map = {
-            "token_embd.weight": "model.embed_tokens.weight",
-            "output.weight": "lm_head.weight",
-        }
-        for mtp_idx in range(num_mtp_layers):
-            block_idx = first_mtp_block + mtp_idx
-            gguf_prefix = f"blk.{block_idx}"
-            hf_prefix = f"mtp.layers.{mtp_idx}"
-            weights_map.update(
-                {
-                    f"{gguf_prefix}.nextn.eh_proj.weight": "mtp.fc.weight",
-                    f"{gguf_prefix}.nextn.enorm.weight": (
-                        "mtp.pre_fc_norm_embedding.weight"
-                    ),
-                    f"{gguf_prefix}.nextn.hnorm.weight": (
-                        "mtp.pre_fc_norm_hidden.weight"
-                    ),
-                    f"{gguf_prefix}.nextn.shared_head_norm.weight": ("mtp.norm.weight"),
-                    f"{gguf_prefix}.attn_q.weight": (
-                        f"{hf_prefix}.self_attn.q_proj.weight"
-                    ),
-                    f"{gguf_prefix}.attn_k.weight": (
-                        f"{hf_prefix}.self_attn.k_proj.weight"
-                    ),
-                    f"{gguf_prefix}.attn_v.weight": (
-                        f"{hf_prefix}.self_attn.v_proj.weight"
-                    ),
-                    f"{gguf_prefix}.attn_output.weight": (
-                        f"{hf_prefix}.self_attn.o_proj.weight"
-                    ),
-                    f"{gguf_prefix}.attn_q_norm.weight": (
-                        f"{hf_prefix}.self_attn.q_norm.weight"
-                    ),
-                    f"{gguf_prefix}.attn_k_norm.weight": (
-                        f"{hf_prefix}.self_attn.k_norm.weight"
-                    ),
-                    f"{gguf_prefix}.attn_norm.weight": (
-                        f"{hf_prefix}.input_layernorm.weight"
-                    ),
-                    f"{gguf_prefix}.post_attention_norm.weight": (
-                        f"{hf_prefix}.post_attention_layernorm.weight"
-                    ),
-                }
-            )
-            if is_moe:
-                weights_map.update(
-                    {
-                        f"{gguf_prefix}.ffn_gate_inp.weight": (
-                            f"{hf_prefix}.mlp.gate.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_gate_exps.weight": (
-                            f"{hf_prefix}.mlp.experts.0.gate_proj.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_up_exps.weight": (
-                            f"{hf_prefix}.mlp.experts.0.up_proj.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_down_exps.weight": (
-                            f"{hf_prefix}.mlp.experts.0.down_proj.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_gate_shexp.weight": (
-                            f"{hf_prefix}.mlp.shared_expert.gate_proj.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_up_shexp.weight": (
-                            f"{hf_prefix}.mlp.shared_expert.up_proj.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_down_shexp.weight": (
-                            f"{hf_prefix}.mlp.shared_expert.down_proj.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_gate_inp_shexp.weight": (
-                            f"{hf_prefix}.mlp.shared_expert_gate.weight"
-                        ),
-                    }
-                )
-            else:
-                weights_map.update(
-                    {
-                        f"{gguf_prefix}.ffn_gate.weight": (
-                            f"{hf_prefix}.mlp.gate_proj.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_up.weight": (
-                            f"{hf_prefix}.mlp.up_proj.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_down.weight": (
-                            f"{hf_prefix}.mlp.down_proj.weight"
-                        ),
-                    }
-                )
-        return weights_map
-
-    @staticmethod
-    def _get_gemma4_weights_map(model_config: ModelConfig) -> dict[str, str]:
-        text_config = model_config.hf_config.get_text_config()
-        architecture = model_config.architecture
-        prefix = (
-            "model.language_model."
-            if architecture == "Gemma4ForConditionalGeneration"
-            else "model."
-        )
-        weights_map = {
-            "token_embd.weight": f"{prefix}embed_tokens.weight",
-            "output_norm.weight": f"{prefix}norm.weight",
-        }
-        for layer_idx, layer_type in enumerate(text_config.layer_types):
-            gguf_prefix = f"blk.{layer_idx}"
-            hf_prefix = f"{prefix}layers.{layer_idx}"
-            weights_map.update(
-                {
-                    f"{gguf_prefix}.layer_output_scale.weight": (
-                        f"{hf_prefix}.layer_scalar"
-                    ),
-                    f"{gguf_prefix}.attn_norm.weight": (
-                        f"{hf_prefix}.input_layernorm.weight"
-                    ),
-                    f"{gguf_prefix}.attn_q.weight": (
-                        f"{hf_prefix}.self_attn.q_proj.weight"
-                    ),
-                    f"{gguf_prefix}.attn_q_norm.weight": (
-                        f"{hf_prefix}.self_attn.q_norm.weight"
-                    ),
-                    f"{gguf_prefix}.attn_k.weight": (
-                        f"{hf_prefix}.self_attn.k_proj.weight"
-                    ),
-                    f"{gguf_prefix}.attn_k_norm.weight": (
-                        f"{hf_prefix}.self_attn.k_norm.weight"
-                    ),
-                    f"{gguf_prefix}.attn_output.weight": (
-                        f"{hf_prefix}.self_attn.o_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_gate.weight": (
-                        f"{hf_prefix}.mlp.gate_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_up.weight": (
-                        f"{hf_prefix}.mlp.up_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_down.weight": (
-                        f"{hf_prefix}.mlp.down_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_norm.weight": (
-                        f"{hf_prefix}.pre_feedforward_layernorm.weight"
-                    ),
-                    f"{gguf_prefix}.post_attention_norm.weight": (
-                        f"{hf_prefix}.post_attention_layernorm.weight"
-                    ),
-                    f"{gguf_prefix}.post_ffw_norm.weight": (
-                        f"{hf_prefix}.post_feedforward_layernorm.weight"
-                    ),
-                    f"{gguf_prefix}.post_ffw_norm_1.weight": (
-                        f"{hf_prefix}.post_feedforward_layernorm_1.weight"
-                    ),
-                    f"{gguf_prefix}.post_ffw_norm_2.weight": (
-                        f"{hf_prefix}.post_feedforward_layernorm_2.weight"
-                    ),
-                    f"{gguf_prefix}.pre_ffw_norm_2.weight": (
-                        f"{hf_prefix}.pre_feedforward_layernorm_2.weight"
-                    ),
-                    # MoE: the fused gate_up expert tensor is split into
-                    # gate/up halves by _split_gguf_fused_gate_up_exps before
-                    # it reaches the MoE weight loader.
-                    f"{gguf_prefix}.ffn_gate_up_exps.weight": (
-                        f"{hf_prefix}.experts.0.gate_up_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_down_exps.weight": (
-                        f"{hf_prefix}.experts.0.down_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_gate_inp.weight": (
-                        f"{hf_prefix}.router.proj.weight"
-                    ),
-                    # Router input scale and per-expert output scale. The
-                    # model folds these into its routing math; skipping them
-                    # silently leaves both at their ones init.
-                    f"{gguf_prefix}.ffn_gate_inp.scale": (
-                        f"{hf_prefix}.router.scale"
-                    ),
-                    f"{gguf_prefix}.ffn_down_exps.scale": (
-                        f"{hf_prefix}.router.per_expert_scale"
-                    ),
-                }
-            )
-            if layer_type == "sliding_attention":
-                weights_map[f"{gguf_prefix}.attn_v.weight"] = (
-                    f"{hf_prefix}.self_attn.v_proj.weight"
-                )
-        if architecture == "Gemma4ForConditionalGeneration":
-            vision_prefix = "model.vision_tower."
-            weights_map["mm.input_projection.weight"] = (
-                "model.embed_vision.embedding_projection.weight"
-            )
-            # The tower registers these as buffers with torch.empty init;
-            # skipping them feeds uninitialized values into the
-            # post-pooler standardization.
-            weights_map["v.std_bias"] = f"{vision_prefix}std_bias"
-            weights_map["v.std_scale"] = f"{vision_prefix}std_scale"
-            weights_map["v.patch_embd.weight"] = (
-                f"{vision_prefix}patch_embedder.input_proj.weight"
-            )
-            weights_map["v.position_embd.weight"] = (
-                f"{vision_prefix}patch_embedder.position_embedding_table"
-            )
-            vision_layers = model_config.hf_config.vision_config.num_hidden_layers
-            for layer_idx in range(vision_layers):
-                gguf_prefix = f"v.blk.{layer_idx}"
-                hf_prefix = f"{vision_prefix}encoder.layers.{layer_idx}"
-                weights_map.update(
-                    {
-                        f"{gguf_prefix}.ln1.weight": (
-                            f"{hf_prefix}.input_layernorm.weight"
-                        ),
-                        f"{gguf_prefix}.attn_q.weight": (
-                            f"{hf_prefix}.self_attn.q_proj.linear.weight"
-                        ),
-                        f"{gguf_prefix}.attn_k.weight": (
-                            f"{hf_prefix}.self_attn.k_proj.linear.weight"
-                        ),
-                        f"{gguf_prefix}.attn_v.weight": (
-                            f"{hf_prefix}.self_attn.v_proj.linear.weight"
-                        ),
-                        f"{gguf_prefix}.attn_out.weight": (
-                            f"{hf_prefix}.self_attn.o_proj.linear.weight"
-                        ),
-                        f"{gguf_prefix}.attn_q_norm.weight": (
-                            f"{hf_prefix}.self_attn.q_norm.weight"
-                        ),
-                        f"{gguf_prefix}.attn_k_norm.weight": (
-                            f"{hf_prefix}.self_attn.k_norm.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_gate.weight": (
-                            f"{hf_prefix}.mlp.gate_proj.linear.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_up.weight": (
-                            f"{hf_prefix}.mlp.up_proj.linear.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_down.weight": (
-                            f"{hf_prefix}.mlp.down_proj.linear.weight"
-                        ),
-                        f"{gguf_prefix}.attn_post_norm.weight": (
-                            f"{hf_prefix}.post_attention_layernorm.weight"
-                        ),
-                        f"{gguf_prefix}.ffn_post_norm.weight": (
-                            f"{hf_prefix}.post_feedforward_layernorm.weight"
-                        ),
-                        f"{gguf_prefix}.ln2.weight": (
-                            f"{hf_prefix}.pre_feedforward_layernorm.weight"
-                        ),
-                    }
-                )
-        return weights_map
-
-    @staticmethod
-    def _get_gemma4_mtp_weights_map(model_config: ModelConfig) -> dict[str, str]:
-        text_config = model_config.hf_config.get_text_config()
-        weights_map = {
-            "token_embd.weight": "model.embed_tokens.weight",
-            "output_norm.weight": "model.norm.weight",
-            "nextn.pre_projection.weight": "pre_projection.weight",
-            "nextn.post_projection.weight": "post_projection.weight",
-        }
-        for layer_idx in range(text_config.num_hidden_layers):
-            gguf_prefix = f"blk.{layer_idx}"
-            hf_prefix = f"model.layers.{layer_idx}"
-            weights_map.update(
-                {
-                    f"{gguf_prefix}.attn_norm.weight": (
-                        f"{hf_prefix}.input_layernorm.weight"
-                    ),
-                    f"{gguf_prefix}.layer_output_scale.weight": (
-                        f"{hf_prefix}.layer_scalar"
-                    ),
-                    f"{gguf_prefix}.attn_q.weight": (
-                        f"{hf_prefix}.self_attn.q_proj.weight"
-                    ),
-                    f"{gguf_prefix}.attn_q_norm.weight": (
-                        f"{hf_prefix}.self_attn.q_norm.weight"
-                    ),
-                    f"{gguf_prefix}.attn_output.weight": (
-                        f"{hf_prefix}.self_attn.o_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_gate.weight": (
-                        f"{hf_prefix}.mlp.gate_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_up.weight": (
-                        f"{hf_prefix}.mlp.up_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_down.weight": (
-                        f"{hf_prefix}.mlp.down_proj.weight"
-                    ),
-                    f"{gguf_prefix}.ffn_norm.weight": (
-                        f"{hf_prefix}.pre_feedforward_layernorm.weight"
-                    ),
-                    f"{gguf_prefix}.post_attention_norm.weight": (
-                        f"{hf_prefix}.post_attention_layernorm.weight"
-                    ),
-                    f"{gguf_prefix}.post_ffw_norm.weight": (
-                        f"{hf_prefix}.post_feedforward_layernorm.weight"
-                    ),
-                }
-            )
-        return weights_map
-
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """
         GGUF uses this naming convention for their tensors from HF checkpoint:
@@ -409,286 +91,7 @@ class GGUFModelLoader(BaseModelLoader):
         See "Standardized tensor names" in
         https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
         """
-        config = model_config.hf_config
-        vllm_arch = model_config.architecture
-        if vllm_arch in ("Qwen3_5MTP", "Qwen3_5MoeMTP"):
-            return self._get_qwen35_mtp_weights_map(model_config)
-        if vllm_arch in (
-            "Gemma4ForCausalLM",
-            "Gemma4ForConditionalGeneration",
-        ):
-            return self._get_gemma4_weights_map(model_config)
-        if vllm_arch == "Gemma4MTPModel":
-            return self._get_gemma4_mtp_weights_map(model_config)
-        # Get text config to handle both nested (multimodal) and flat
-        # (text-only) config structures. For multimodal models like
-        # Gemma3Config, this returns config.text_config. For text-only
-        # models, this returns config itself.
-        text_config = config.get_text_config()
-        model_type = config.model_type
-        is_qwen35_multimodal = vllm_arch in (
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-        )
-
-        def qwen35_text_hf_name(name: str) -> str:
-            if not is_qwen35_multimodal:
-                return name
-            if name.startswith("model."):
-                return f"model.language_model.{name.removeprefix('model.')}"
-            return name
-
-        is_multimodal = self._get_mmproj_file(model_config) is not None
-        gguf_to_hf_name_map = {}
-        # hack: ggufs have a different name than transformers
-        if model_type == "cohere":
-            model_type = "command-r"
-        if model_type == "gemma3_text":
-            # Gemma3 models use "gemma3_text" in HuggingFace but
-            # "gemma3" in GGUF architecture naming
-            model_type = "gemma3"
-        if model_type in ("qwen3_5", "qwen3_5_text"):
-            model_type = "qwen35"
-        if model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
-            model_type = "qwen35moe"
-            for idx in range(text_config.num_hidden_layers):
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
-                    qwen35_text_hf_name(
-                        f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
-                    )
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
-                    qwen35_text_hf_name(
-                        f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
-                    )
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
-                    qwen35_text_hf_name(
-                        f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
-                    )
-                )
-        if model_type in ("deepseek_v3", "deepseek_v2"):
-            model_type = "deepseek2"
-            # GGUF layer map assumes that we will have a merged expert weights
-            # so we need to map them manually
-            for idx in range(config.num_hidden_layers):
-                gguf_to_hf_name_map[f"blk.{idx}.exp_probs_b.bias"] = (
-                    f"model.layers.{idx}.mlp.gate.e_score_correction_bias"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
-                )
-        if model_type in ("qwen2_moe", "qwen3_moe"):
-            model_type = model_type.replace("_", "")
-            # GGUF layer map assumes that we will have a merged expert weights
-            # so we need to map them manually
-            for idx in range(config.num_hidden_layers):
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
-                )
-
-        arch = None
-        for key, value in gguf.MODEL_ARCH_NAMES.items():
-            if value == model_type:
-                arch = key
-                break
-        if arch is None:
-            raise RuntimeError(f"Unknown gguf model_type: {model_type}")
-        text_num_layers = text_config.num_hidden_layers
-        text_name_map = gguf.get_tensor_name_map(arch, text_num_layers)
-
-        if is_multimodal:
-            mm_proj_arch = gguf.MODEL_ARCH.MMPROJ
-            vision_num_layers = getattr(
-                config.vision_config,
-                "num_hidden_layers",
-                getattr(config.vision_config, "depth", None),
-            )
-            if vision_num_layers is None:
-                raise RuntimeError("GGUF vision config does not define its layer count")
-            vision_name_map = gguf.get_tensor_name_map(mm_proj_arch, vision_num_layers)
-        else:
-            vision_name_map = None
-
-        # Create dummy model to extract parameter names
-        # For multimodal: use AutoModelForImageTextToText to get
-        # language + vision + projector params
-        # For text-only: use AutoModelForCausalLM to get language model params
-        auto_cls = (
-            AutoModelForImageTextToText if is_multimodal else AutoModelForCausalLM
-        )
-        dummy_config = config
-        if not is_multimodal and config.model_type in ("qwen3_5", "qwen3_5_moe"):
-            dummy_config = text_config
-        with torch.device("meta"):
-            dummy_model = auto_cls.from_config(
-                dummy_config, trust_remote_code=model_config.trust_remote_code
-            )
-
-        state_dict = dummy_model.state_dict()
-        if hf_checkpoint_map := getattr(
-            dummy_model, "_checkpoint_conversion_mapping", None
-        ):
-
-            def revert_hf_rename(name: str) -> str:
-                for original_name, hf_name in hf_checkpoint_map.items():
-                    if hf_name in name:
-                        name = name.replace(hf_name, original_name).lstrip("^")
-                return name
-
-            state_dict = {
-                revert_hf_rename(name): tensor for name, tensor in state_dict.items()
-            }
-
-        def find_hf_name_in_tensor_map(hf_name: str) -> str | None:
-            """
-            Map HuggingFace parameter name to GGUF tensor name.
-
-            This function handles the mismatch between HF parameter naming
-            conventions and gguf-py's expected format:
-            1. Strips 'model.' prefix (common in multimodal models)
-            2. Converts '_weight' suffix to '.weight' (Gemma3 compatibility)
-            3. Searches vision_name_map for multimodal parameters
-            4. Falls back to text_name_map for language model parameters
-
-            Args:
-                hf_name: Full HuggingFace parameter name (e.g.,
-                        'model.multi_modal_projector.mm_soft_emb_norm.weight')
-
-            Returns:
-                GGUF tensor name with suffix (e.g., 'mm.soft_emb_norm.weight')
-                or None if no mapping found
-            """
-            # Strip 'language_model.' prefix for multimodal models - gguf-py
-            # tensor mappings expect parameter names without this prefix.
-            # Note: 'model.' prefix should be KEPT for text-only models as
-            # gguf-py expects it.
-            if is_qwen35_multimodal and hf_name.startswith("model.language_model."):
-                hf_name = "model." + hf_name.removeprefix("model.language_model.")
-            elif is_qwen35_multimodal and hf_name.startswith("model.visual."):
-                hf_name = hf_name.removeprefix("model.")
-            elif hf_name.startswith("language_model."):
-                hf_name = hf_name[15:]  # Remove 'language_model.'
-
-            # Parse parameter name and suffix
-            if hf_name.endswith((".weight", ".bias")):
-                base_name, suffix = hf_name.rsplit(".", 1)
-            else:
-                base_name, suffix = hf_name, ""
-                # Handle '_weight' suffix (Gemma3 naming: parameter ends with
-                # '_weight' instead of '.weight')
-                if base_name.endswith("_weight"):
-                    base_name = base_name[:-7]  # Remove '_weight'
-                    suffix = "weight"
-
-            if is_qwen35_multimodal:
-                base_name = {
-                    "visual.merger.norm": "visual.merger.ln_q",
-                    "visual.merger.linear_fc1": "visual.merger.mlp.0",
-                    "visual.merger.linear_fc2": "visual.merger.mlp.2",
-                }.get(base_name, base_name)
-
-            gguf_name = None
-            # Priority 1: Search vision/projector parameters for multimodal models
-            if vision_name_map is not None:
-                gguf_name = vision_name_map.get_name(base_name)
-
-            # Priority 2: Search text backbone parameters
-            if gguf_name is None:
-                gguf_name = text_name_map.get_name(base_name)
-
-            if gguf_name is None:
-                if model_type in ("qwen35", "qwen35moe"):
-                    if m := re.fullmatch(
-                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.dt_bias", hf_name
-                    ):
-                        return f"blk.{m['bid']}.ssm_dt.bias"
-                    if m := re.fullmatch(
-                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.in_proj_qkv",
-                        base_name,
-                    ):
-                        return f"blk.{m['bid']}.attn_qkv.{suffix}"
-                    if m := re.fullmatch(
-                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.in_proj_z",
-                        base_name,
-                    ):
-                        return f"blk.{m['bid']}.attn_gate.{suffix}"
-                    if m := re.fullmatch(
-                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.in_proj_b",
-                        base_name,
-                    ):
-                        return f"blk.{m['bid']}.ssm_beta.{suffix}"
-                    if m := re.fullmatch(
-                        r"model\.layers\.(?P<bid>\d+)\.linear_attn\.in_proj_a",
-                        base_name,
-                    ):
-                        return f"blk.{m['bid']}.ssm_alpha.{suffix}"
-                return None
-
-            if suffix:
-                return gguf_name + "." + suffix
-            else:
-                return gguf_name
-
-        # Build mapping and track unmapped parameters
-        unmapped_params = []
-        for hf_name in state_dict:
-            gguf_name_with_suffix = find_hf_name_in_tensor_map(hf_name)
-
-            # Track mapping success
-            if gguf_name_with_suffix is not None:
-                gguf_to_hf_name_map[gguf_name_with_suffix] = hf_name
-                logger.debug("Mapped GGUF %s → HF %s", gguf_name_with_suffix, hf_name)
-            elif hf_name not in gguf_to_hf_name_map.values():
-                # Parameter not in manual overrides either
-                unmapped_params.append(hf_name)
-
-        if model_type in ("qwen35", "qwen35moe") and vllm_arch in (
-            "Qwen3_5ForCausalLM",
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForCausalLM",
-            "Qwen3_5MoeForConditionalGeneration",
-        ):
-            for idx in range(text_num_layers):
-                if text_config.layer_types[idx] != "linear_attention":
-                    continue
-                gguf_to_hf_name_map[f"blk.{idx}.attn_qkv.weight"] = qwen35_text_hf_name(
-                    f"model.layers.{idx}.linear_attn.in_proj_qkv.weight"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.attn_gate.weight"] = (
-                    qwen35_text_hf_name(
-                        f"model.layers.{idx}.linear_attn.in_proj_z.weight"
-                    )
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ssm_beta.weight"] = qwen35_text_hf_name(
-                    f"model.layers.{idx}.linear_attn.in_proj_b.weight"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ssm_alpha.weight"] = (
-                    qwen35_text_hf_name(
-                        f"model.layers.{idx}.linear_attn.in_proj_a.weight"
-                    )
-                )
-
-        # All parameters must be mapped: both vision/projector and backbone
-        if unmapped_params:
-            raise RuntimeError(
-                f"Failed to map GGUF parameters "
-                f"({len(unmapped_params)}): "
-                f"{unmapped_params}"
-            )
-        return gguf_to_hf_name_map
+        return get_weights_adapter(model_config).build_name_map(model_config)
 
     def _get_gguf_weight_type(
         self,
@@ -716,100 +119,25 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """
         Iterate over GGUF model weights, loading from both main model file and
-        mmproj.gguf for multimodal Gemma3 models.
-
-        For Gemma3 multimodal GGUF models:
-        - Main file (gemma-3-*.gguf): Language model weights (model.*)
-        - mmproj file (mmproj*.gguf): Vision tower + projector weights (v.*, mm.*)
-
-        Yields:
-            Tuples of (parameter_name, tensor) for all model weights
+        mmproj.gguf for multimodal models.  Family-specific tensor transforms
+        (fused-tensor splits, layout permutations) are applied by the matched
+        weights adapter.
         """
+        adapter = get_weights_adapter(model_config)
         mmproj_file = self._get_mmproj_file(model_config, model_name_or_path)
         if mmproj_file is not None:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
             mmproj_weights = gguf_quant_weights_iterator(
                 mmproj_file, gguf_to_hf_name_map
             )
-            if model_config.architecture in (
-                "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-            ):
-                reader = gguf.GGUFReader(str(mmproj_file))
-                temporal_patch = next(
-                    (
-                        torch.tensor(tensor.data)
-                        for tensor in reader.tensors
-                        if tensor.name == "v.patch_embd.weight.1"
-                    ),
-                    None,
-                )
-                patch_embed_name = gguf_to_hf_name_map.get("v.patch_embd.weight")
-                for name, weight in mmproj_weights:
-                    if (
-                        temporal_patch is not None
-                        and name == patch_embed_name
-                        and weight.ndim == 4
-                    ):
-                        weight = torch.stack((weight, temporal_patch), dim=2)
-                    yield name, weight
-            elif model_config.architecture == "Gemma4ForConditionalGeneration":
-                # The vision patch projection ships as a conv kernel in
-                # ggml order [kw, kh, channels, out], i.e. [out, channels,
-                # kh, kw] once read as a torch tensor. HF patchifies each
-                # image as (patch_h, patch_w, channel) flattened with the
-                # channel fastest, so the Linear weight must be permuted to
-                # [out, kh, kw, channels] before flattening; flattening the
-                # raw layout scrambles the patch pixels.
-                for name, weight in mmproj_weights:
-                    if (
-                        name.endswith("patch_embedder.input_proj.weight")
-                        and weight.ndim == 4
-                    ):
-                        weight = weight.permute(0, 2, 3, 1).flatten(1)
-                    yield name, weight
-            else:
-                yield from mmproj_weights
+            yield from adapter.transform_mmproj_weights(
+                mmproj_weights, model_config, gguf_to_hf_name_map, mmproj_file
+            )
 
-        # Full-attention Gemma4 layers tie V to K; the model's own weights
-        # mapper (see _gemma4_layer_weights_mapper) loads their k_proj into
-        # both the K and V shards of qkv_proj, so no duplication is needed
-        # here.
-        yield from self._split_gguf_fused_gate_up_exps(
-            gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        yield from adapter.transform_weights(
+            gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map),
+            model_config,
         )
-
-    @staticmethod
-    def _split_gguf_fused_gate_up_exps(
-        weights: Generator[tuple[str, torch.Tensor], None, None],
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Split fused GGUF MoE gate_up expert tensors into gate/up pairs.
-
-        Gemma4 GGUF stores one ``ffn_gate_up_exps`` tensor per layer holding
-        both projections of every expert.  The GGUF reader exposes it as an
-        expert-major ``[experts, 2 * intermediate, packed]`` block-packed
-        array; the MoE weight loader expects separate gate_proj/up_proj
-        shards, so re-emit each fused tensor as its two dim-1 halves (gate
-        first, up second) under both shard names.
-        """
-        for name, weight in weights:
-            if ".gate_up_proj." not in name:
-                yield name, weight
-                continue
-            stem, _, suffix = name.rpartition(".gate_up_proj.")
-            if suffix == "qweight_type":
-                yield f"{stem}.gate_proj.qweight_type", weight
-                yield f"{stem}.up_proj.qweight_type", weight
-                continue
-            if weight.dim() != 3 or weight.shape[1] % 2 != 0:
-                raise ValueError(
-                    f"Cannot split fused GGUF gate_up tensor {name!r} "
-                    f"with shape {tuple(weight.shape)}"
-                )
-            gate, up = weight.chunk(2, dim=1)
-            target = "qweight" if suffix == "qweight" else "weight"
-            yield f"{stem}.gate_proj.{target}", gate.contiguous()
-            yield f"{stem}.up_proj.{target}", up.contiguous()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)

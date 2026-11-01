@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.model_executor.model_loader import gguf_loader
+from vllm.model_executor.model_loader import gguf_adapters, gguf_loader
 
 
 @pytest.mark.parametrize(
@@ -24,7 +24,9 @@ def test_get_mmproj_file_requires_multimodal_architecture(
     monkeypatch, architecture, has_vision_config, expected
 ):
     detected = Path("mmproj.gguf")
-    monkeypatch.setattr(gguf_loader, "detect_gguf_multimodal", lambda _: detected)
+    monkeypatch.setattr(
+        gguf_adapters.base, "detect_gguf_multimodal", lambda _: detected
+    )
     model_config = SimpleNamespace(
         architecture=architecture,
         model="model.gguf",
