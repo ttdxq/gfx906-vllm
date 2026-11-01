@@ -60,6 +60,7 @@ from vllm.transformers_utils.gguf_utils import (
     maybe_patch_hf_config_from_gguf,
     qwen35_gguf_config_dict,
     qwen35_gguf_tokenizer_path,
+    qwen4exp_gguf_tokenizer_path,
 )
 from vllm.tasks import PoolingTask, ScoreType, SupportedTask
 from vllm.transformers_utils.config import (
@@ -724,6 +725,15 @@ class ModelConfig:
             self.tokenizer = tokenizer_path
             logger.info("Using Gemma4 GGUF metadata tokenizer: %s", self.tokenizer)
 
+    def _maybe_use_qwen4exp_gguf_tokenizer(self) -> None:
+        if self.tokenizer is None or self.tokenizer != self.model:
+            return
+
+        tokenizer_path = qwen4exp_gguf_tokenizer_path(self.model)
+        if tokenizer_path is not None:
+            self.tokenizer = tokenizer_path
+            logger.info("Using qwen4exp GGUF metadata tokenizer: %s", self.tokenizer)
+
     def __post_init__(
         self,
         # Multimodal config init vars
@@ -765,6 +775,7 @@ class ModelConfig:
             self.tokenizer = self.model
         self._maybe_use_local_gguf_companion_tokenizer()
         self._maybe_use_qwen35_gguf_tokenizer()
+        self._maybe_use_qwen4exp_gguf_tokenizer()
         self._maybe_use_gemma4_gguf_tokenizer()
         if self.tokenizer_revision is None:
             self.tokenizer_revision = self.revision

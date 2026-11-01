@@ -351,12 +351,20 @@ steps:
   timeout_in_minutes: 40
   device: h200_35gb
   source_file_dependencies:
+  - requirements/common.txt
   - vllm/models/qwen4_exp/
+  - vllm/config/attention.py
+  - vllm/model_executor/layers/mamba/gdn_linear_attn.py
+  - vllm/model_executor/layers/vocab_parallel_embedding.py
+  - vllm/model_executor/model_loader/gguf_adapters/qwen4_exp.py
+  - vllm/model_executor/model_loader/weight_utils.py
+  - vllm/transformers_utils/gguf_utils.py
   - vllm/config/compilation.py
   - vllm/v1/attention/backends/short_conv_attn.py
   - vllm/model_executor/layers/mamba/checkpoint.py
   - tests/models/qwen4_exp/
   commands:
+    - uv pip install gguf==0.18.0
     - >-
       pytest -v -s
       models/qwen4_exp/test_hc_ops.py
@@ -371,6 +379,7 @@ steps:
       depends_on:
       - image-build-amd
       commands:
+      - uv pip install gguf==0.18.0
       - >-
         pytest -v -s
         models/qwen4_exp/test_qsa_amd.py
@@ -387,13 +396,24 @@ steps:
   depends_on:
   - image-build-amd
   source_file_dependencies:
+  - requirements/common.txt
   - vllm/models/qwen4_exp/
+  - vllm/config/attention.py
+  - vllm/model_executor/layers/mamba/gdn_linear_attn.py
+  - vllm/model_executor/layers/vocab_parallel_embedding.py
+  - vllm/model_executor/model_loader/gguf_adapters/qwen4_exp.py
+  - vllm/model_executor/model_loader/weight_utils.py
+  - vllm/transformers_utils/gguf_utils.py
   - vllm/config/compilation.py
   - vllm/v1/attention/backends/short_conv_attn.py
   - vllm/model_executor/layers/mamba/checkpoint.py
   - tests/models/qwen4_exp/
   commands:
-  - pytest -v -s models/qwen4_exp/test_qsa_amd.py models/qwen4_exp/test_qsa_prepare_amd.py
+  - uv pip install gguf==0.18.0
+  - >-
+    pytest -v -s
+    models/qwen4_exp/test_qsa_amd.py
+    models/qwen4_exp/test_qsa_prepare_amd.py
   # PLE and QSA import conflicting HC registrations in a shared process.
   - pytest -v -s models/qwen4_exp/test_ple.py
 
@@ -404,11 +424,19 @@ steps:
   timeout_in_minutes: 20
   device: cpu-small
   source_file_dependencies:
+  - requirements/common.txt
   - vllm/models/qwen4_exp/
+  - vllm/config/attention.py
+  - vllm/model_executor/layers/mamba/gdn_linear_attn.py
+  - vllm/model_executor/layers/vocab_parallel_embedding.py
+  - vllm/model_executor/model_loader/gguf_adapters/qwen4_exp.py
+  - vllm/model_executor/model_loader/weight_utils.py
+  - vllm/transformers_utils/gguf_utils.py
   - vllm/config/compilation.py
   - vllm/v1/attention/backends/short_conv_attn.py
   - tests/models/qwen4_exp/
   commands:
+    - uv pip install gguf==0.18.0
     - >-
       pytest -v -s
       models/qwen4_exp/test_config.py

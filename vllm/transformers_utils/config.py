@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.gguf_utils import (
     gemma4_gguf_config_dict,
     gemma4_mtp_gguf_config_dict,
+    qwen4exp_gguf_config_dict,
     qwen35_gguf_config_dict,
 )
 from vllm.transformers_utils.repo_utils import is_mistral_model_repo
@@ -162,9 +163,6 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     k3_dspark="K3DSparkConfig",
     funaudiochat="FunAudioChatConfig",
     granite4_vision="Granite4VisionConfig",
-    glm5_next="Glm5NextConfig",
-    glm5_next_text="Glm5NextTextConfig",
-    glm5_next_vision="Glm5NextVisionConfig",
     hyperclovax="HyperCLOVAXConfig",
     hy_v3="HYV3Config",
     hy_v4="HYV4Config",
@@ -207,8 +205,6 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     step5_vl="Step5VLConfig",
     qwen3_asr="Qwen3ASRConfig",
     qwen3_next="Qwen3NextConfig",
-    qwen4_exp="Qwen4ExpConfig",
-    qwen4_exp_text="Qwen4ExpTextConfig",
     qwen3_5="Qwen3_5Config",
     qwen3_5_text="Qwen3_5TextConfig",
     qwen3_5_moe="Qwen3_5MoeConfig",
@@ -418,8 +414,11 @@ class HFConfigParser(ConfigParserBase):
         if gguf_file is not None:
             gguf_path = Path(model) / gguf_file
             config_dict = qwen35_gguf_config_dict(str(gguf_path)) or (
-                gemma4_gguf_config_dict(str(gguf_path))
-                or gemma4_mtp_gguf_config_dict(str(gguf_path))
+                qwen4exp_gguf_config_dict(str(gguf_path))
+                or (
+                    gemma4_gguf_config_dict(str(gguf_path))
+                    or gemma4_mtp_gguf_config_dict(str(gguf_path))
+                )
             )
             if config_dict is not None:
                 model_type = config_dict["model_type"]
@@ -441,8 +440,11 @@ class HFConfigParser(ConfigParserBase):
             # metadata builders first; the transformers attempt below stays
             # as the fallback for architectures they do not cover.
             config_dict = qwen35_gguf_config_dict(str(model)) or (
-                gemma4_gguf_config_dict(str(model))
-                or gemma4_mtp_gguf_config_dict(str(model))
+                qwen4exp_gguf_config_dict(str(model))
+                or (
+                    gemma4_gguf_config_dict(str(model))
+                    or gemma4_mtp_gguf_config_dict(str(model))
+                )
             )
             if config_dict is not None:
                 model_type = config_dict["model_type"]
@@ -479,6 +481,7 @@ class HFConfigParser(ConfigParserBase):
                 )
                 if config_dict := (
                     qwen35_gguf_config_dict(str(gguf_path))
+                    or qwen4exp_gguf_config_dict(str(gguf_path))
                     or gemma4_gguf_config_dict(str(gguf_path))
                     or gemma4_mtp_gguf_config_dict(str(gguf_path))
                 ):

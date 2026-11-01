@@ -382,6 +382,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             group_size=None,
             norm_before_gate=True,
             device=current_platform.current_device(),
+            activation=getattr(config, "output_gate_type", None) or "silu",
         )
 
         self.out_proj = RowParallelLinear(
@@ -561,14 +562,24 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None = None,
     ):
         num_tokens = hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
+            if hasattr(self, "in_proj_ba"):
+                ba, _ = self.in_proj_ba(hidden_states)
+            else:
+                # Split projection construction: b and a come from their
+                # own linears (same [b; a] layout the merged ba projection
+                # produces).
+                b, _ = self.in_proj_b(hidden_states)
+                a, _ = self.in_proj_a(hidden_states)
+                ba = None
             if self.gqa_interleaved_layout:
+                if ba is None:
+                    ba = torch.cat([b, a], dim=-1)
                 mixed_qkv_grouped = mixed_qkv.view(
                     mixed_qkv.size(0),
                     self.num_k_heads // self.tp_size,
@@ -597,7 +608,8 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 mixed_qkv = torch.cat((query, key, value), dim=-1)
             else:
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
-                b, a = ba.chunk(2, dim=-1)
+                if ba is not None:
+                    b, a = ba.chunk(2, dim=-1)
                 b = b.contiguous()
                 a = a.contiguous()
         else:
@@ -652,7 +664,13 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens], _ = self.out_proj(core_attn_out)
+        projected, _ = self.out_proj(core_attn_out)
+        if output is None:
+            # Buffer-less callers (upstream DecoderLayer contract) receive
+            # the projection as the return value.
+            return projected
+        output[:num_tokens] = projected
+        return output
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
         if hasattr(self, "_prefill_kernels_warmed_up"):

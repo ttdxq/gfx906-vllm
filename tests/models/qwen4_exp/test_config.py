@@ -9,7 +9,7 @@ import pytest
 import torch
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
-from vllm.config import CacheConfig, ParallelConfig
+from vllm.config import CacheConfig, ModelConfig, ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
@@ -53,6 +53,74 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     }
     values.update(kwargs)
     return Qwen4ExpTextConfig(**values)
+
+
+def test_gguf_adapter_restores_gdn_head_order_and_norm_weights(tmp_path) -> None:
+    """GGUF value heads and zero-centred gammas retain their HF meaning."""
+    import gguf
+
+    from vllm.model_executor.model_loader.gguf_adapters import Qwen4ExpGGUFAdapter
+
+    config = _text_config(
+        architectures=["Qwen4ExpForCausalLM"],
+        hidden_size=32,
+        num_hidden_layers=1,
+        layer_types=["linear_attention"],
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        ple_layer_ids=[],
+        output_gate_type="sigmoid",
+    )
+    config.save_pretrained(tmp_path)
+    model_config = ModelConfig(model=str(tmp_path), dtype="half", max_model_len=4096)
+    torch.manual_seed(0)
+    qtype = gguf.GGMLQuantizationType.Q4_0
+    qkv = gguf.quantize(torch.randn(256, 32).numpy(), qtype)
+    out = gguf.quantize(torch.randn(32, 128).numpy(), qtype)
+    prefix = "model.layers.0.linear_attn"
+    decay = -torch.exp(torch.tensor([0.25, -1.0, 2.0, 0.5]))
+    weights = [
+        (f"{prefix}.in_proj_qkv.qweight_type", torch.tensor(int(qtype))),
+        (f"{prefix}.out_proj.qweight_type", torch.tensor(int(qtype))),
+        (f"{prefix}.in_proj_qkv.qweight", torch.from_numpy(qkv)),
+        (f"{prefix}.out_proj.qweight", torch.from_numpy(out)),
+        (f"{prefix}.A_log", decay),
+        (f"{prefix}.norm.weight", torch.ones(32)),
+        ("model.layers.0.attn_hyper_connection.hc_norm.weight", torch.ones(64)),
+    ]
+    restored = dict(
+        Qwen4ExpGGUFAdapter().transform_weights(iter(weights), model_config)
+    )
+    permutation = torch.tensor([0, 2, 1, 3])
+    qkv_ref = torch.from_numpy(gguf.dequantize(qkv, qtype))
+    qkv_ref = torch.cat(
+        [qkv_ref[:128], qkv_ref[128:].view(4, 32, 32)[permutation].flatten(0, 1)]
+    )
+    actual_qkv = torch.from_numpy(
+        gguf.dequantize(restored[f"{prefix}.in_proj_qkv.qweight"].numpy(), qtype)
+    )
+    torch.testing.assert_close(actual_qkv, qkv_ref, rtol=0, atol=0)
+    out_ref = torch.from_numpy(gguf.dequantize(out, qtype))
+    out_ref = out_ref.view(32, 4, 32)[:, permutation].flatten(1).half()
+    torch.testing.assert_close(
+        restored[f"{prefix}.out_proj.qweight"], out_ref, rtol=0, atol=0
+    )
+    assert (
+        int(restored[f"{prefix}.out_proj.qweight_type"])
+        == gguf.GGMLQuantizationType.F16
+    )
+    torch.testing.assert_close(
+        restored[f"{prefix}.A_log"], torch.log(-decay)[permutation], rtol=0, atol=0
+    )
+    assert torch.equal(restored[f"{prefix}.norm.weight"], torch.ones(32))
+    assert (
+        torch.count_nonzero(
+            restored["model.layers.0.attn_hyper_connection.hc_norm.weight"]
+        )
+        == 0
+    )
 
 
 def test_moe_sp_rejects_pipeline_parallel() -> None:

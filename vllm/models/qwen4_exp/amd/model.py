@@ -14,9 +14,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    QwenGatedDeltaNetAttention,
-)
+from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -218,12 +216,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         if layer_type == "linear_attention":
-            self.linear_attn = QwenGatedDeltaNetAttention(
-                config,
+            self.linear_attn = GatedDeltaNetAttention(
+                config=config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                reduce_results=not self.use_hc_sequence_parallel,
+                create_in_proj_qkvz=False,
+                create_in_proj_ba=False,
             )
         elif layer_type in _QSA_LAYER_TYPES:
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
@@ -428,7 +427,11 @@ class Qwen4ExpModel(nn.Module):
         self.embed_tokens: VocabParallelEmbedding | PPMissingLayer
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
-                self.vocab_size, config.hidden_size
+                # GGUF checkpoints ship a quantized token_embd; the quant
+                # method must own the parameter.
+                self.vocab_size,
+                config.hidden_size,
+                quant_config=vllm_config.quant_config,
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -695,6 +698,9 @@ class Qwen4ExpForCausalLM(
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
+                # GGUF checkpoints ship a quantized lm_head (output.weight);
+                # the quant method must own the parameter.
+                quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:

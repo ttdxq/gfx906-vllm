@@ -4,12 +4,14 @@
     Please note that GGUF support in vLLM is highly experimental and under-optimized at the moment, it might be incompatible with other features. Currently, you can use GGUF as a way to reduce memory footprint. If you encounter any issues, please report them to the vLLM team.
 
 !!! note
-    GGUF support has migrated to OOT [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin). Make sure you have GGUF plugin installed before serving a GGUF model.
+    This fork includes a GGUF loader with model-specific adapters. Upstream
+    vLLM provides GGUF support through
+    [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin).
 
-Before serving a GGUF model, make sure to install the [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin):
+The built-in loader requires the GGUF Python package:
 
 ```bash
-uv pip install vllm-gguf-plugin
+uv pip install 'gguf>=0.18.0'
 ```
 
 To run a GGUF model with vLLM, you can use the `repo_id:quant_type` format to load directly from HuggingFace. For example, to load a Q4_K_M quantized model from [unsloth/Qwen3-0.6B-GGUF](https://huggingface.co/unsloth/Qwen3-0.6B-GGUF):
@@ -33,6 +35,19 @@ Alternatively, you can download and use a local GGUF file:
 wget https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
 vllm serve ./Qwen3-0.6B-Q4_K_M.gguf --tokenizer Qwen/Qwen3-0.6B
 ```
+
+## Qwen4Exp on ROCm
+
+The built-in adapter supports `qwen4exp` GGUF checkpoints such as
+Swift-1.5-Qwen3.8-Flash-Next. Pass the first file of a numbered split; the
+loader finds the remaining files in the same directory. The config and text
+tokenizer are constructed from the GGUF metadata.
+
+PLE stays enabled. Its table uses pinned host memory by default and retains
+the GGUF quantization format; only requested rows are dequantized on the GPU.
+For the IQ2_XS checkpoint, the Q4_0 PLE table occupies about 26.8 GiB of host
+memory across the tensor-parallel ranks, rather than about 95.4 GiB as FP16.
+GGUF checkpoints with more than one PLE table are currently unsupported.
 
 !!! warning
     We recommend using the tokenizer from base model instead of GGUF model. Because the tokenizer conversion from GGUF is time-consuming and unstable, especially for some models with large vocab size.

@@ -875,6 +875,11 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES
 )
+# The grouped MoE MMQ path (moe_align_block_size + ggml_moe_a8) only covers
+# the standard and K-quant layouts: ggml_moe_get_block_size returns 0 for
+# i-quants, whose MMQ kernels are dense-path only.  Routing an i-quant MoE
+# through the grouped kernel would divide by that zero block size.
+MOE_MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 
 def _iq_mmq_beats_dequant(x: torch.Tensor, qweight: torch.Tensor,
@@ -1875,8 +1880,8 @@ def _fused_moe_gguf(
 
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
-        qweight_type2 in MMQ_QUANT_TYPES
-        and qweight_type in MMQ_QUANT_TYPES
+        qweight_type2 in MOE_MMQ_QUANT_TYPES
+        and qweight_type in MOE_MMQ_QUANT_TYPES
         and x.shape[0] >= _gguf_moe_mmq_min_tokens()
     ):
         # lazy import to avoid triggering triton import in CPU/backend decode paths

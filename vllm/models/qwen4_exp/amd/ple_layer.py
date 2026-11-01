@@ -326,7 +326,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if embedding.supports_prefetch:
             output = ngram_ids.new_empty(
                 (ngram_ids.shape[0], self.embedding_dim),
-                dtype=embedding.weight.dtype,
+                dtype=embedding.embedding_method.lookup_dtype(embedding),
             )
             torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_pinned(
                 ngram_ids,

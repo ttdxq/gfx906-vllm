@@ -46,6 +46,7 @@ from vllm.model_executor.model_loader.ep_weight_filter import (
 )
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
+from vllm.transformers_utils.gguf_utils import get_gguf_shard_files
 from vllm.transformers_utils.repo_utils import hf_api, hf_fs
 from vllm.utils.cpu_resource_utils import get_available_memory
 from vllm.utils.import_utils import PlaceholderModule
@@ -1962,9 +1963,11 @@ def _init_loader(
 def get_gguf_extra_tensor_names(
     gguf_file: str, gguf_to_hf_name_map: dict[str, str]
 ) -> list[str]:
-    reader = gguf.GGUFReader(gguf_file)
+    exact_gguf_keys = set()
+    for shard in get_gguf_shard_files(gguf_file):
+        reader = gguf.GGUFReader(shard)
+        exact_gguf_keys |= {tensor.name for tensor in reader.tensors}
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
-    exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
     extra_keys = expected_gguf_keys - exact_gguf_keys
     return [gguf_to_hf_name_map[key] for key in extra_keys]
 
@@ -1974,12 +1977,17 @@ def get_gguf_weight_type_map(
     """
     Return GGUF mapped weight's name and its quant type
     """
-    reader = gguf.GGUFReader(gguf_file)
-    return {
-        gguf_to_hf_name_map[tensor.name]: tensor.tensor_type.name
-        for tensor in reader.tensors
-        if tensor.name in gguf_to_hf_name_map
-    }
+    weight_type_map: dict[str, str] = {}
+    for shard in get_gguf_shard_files(gguf_file):
+        reader = gguf.GGUFReader(shard)
+        weight_type_map.update(
+            {
+                gguf_to_hf_name_map[tensor.name]: tensor.tensor_type.name
+                for tensor in reader.tensors
+                if tensor.name in gguf_to_hf_name_map
+            }
+        )
+    return weight_type_map
 
 def gguf_quant_weights_iterator(
     gguf_file: str, gguf_to_hf_name_map: dict[str, str]
@@ -1993,32 +2001,50 @@ def gguf_quant_weights_iterator(
     layer with different quant types.
     """
 
-    reader = gguf.GGUFReader(gguf_file)
+    # Copy-on-write mappings keep loader transforms safe while avoiding a
+    # full host copy of large tensors such as the Qwen4Exp PLE table.
+    readers = [
+        gguf.GGUFReader(shard, mode="c")
+        for shard in get_gguf_shard_files(gguf_file)
+    ]
 
-    for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+    for reader in readers:
+        for tensor in reader.tensors:
+            if tensor.name in gguf_to_hf_name_map:
+                weight_type = tensor.tensor_type
+                name = gguf_to_hf_name_map[tensor.name]
 
-            if weight_type.name not in ("F32", "BF16", "F16"):
-                weight_type_name = name.replace("weight", "qweight_type")
-                weight_type = torch.tensor(weight_type)
-                yield weight_type_name, weight_type
+                if weight_type.name not in ("F32", "BF16", "F16"):
+                    # Only the trailing ".weight" becomes ".qweight_type":
+                    # parameter names like "input_mix_weight_down" embed the
+                    # substring and must not be rewritten.
+                    weight_type_name = (
+                        name[: -len(".weight")] + ".qweight_type"
+                        if name.endswith(".weight")
+                        else name + "_qweight_type"
+                    )
+                    weight_type = torch.tensor(weight_type)
+                    yield weight_type_name, weight_type
 
-    for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight = tensor.data
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
-            if weight_type.name not in ("F32", "BF16", "F16"):
-                name = name.replace("weight", "qweight")
-            param = torch.tensor(weight)
-            if weight_type.name == "BF16" and param.dtype == torch.uint8:
-                # numpy has no bfloat16, so the gguf reader exposes BF16
-                # tensors as raw uint8 bytes (last dim doubled); reinterpret
-                # them back to the logical bfloat16 shape.
-                param = param.view(torch.uint16).view(torch.bfloat16)
-            yield name, param
+    for reader in readers:
+        for tensor in reader.tensors:
+            if tensor.name in gguf_to_hf_name_map:
+                weight = tensor.data
+                weight_type = tensor.tensor_type
+                name = gguf_to_hf_name_map[tensor.name]
+                if weight_type.name not in ("F32", "BF16", "F16"):
+                    name = (
+                        name[: -len(".weight")] + ".qweight"
+                        if name.endswith(".weight")
+                        else name + "_qweight"
+                    )
+                param = torch.from_numpy(weight)
+                if weight_type.name == "BF16" and param.dtype == torch.uint8:
+                    # numpy has no bfloat16, so the gguf reader exposes BF16
+                    # tensors as raw uint8 bytes (last dim doubled); reinterpret
+                    # them back to the logical bfloat16 shape.
+                    param = param.view(torch.uint16).view(torch.bfloat16)
+                yield name, param
 
 def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     """convert PySafeSlice object from safetensors to torch.Tensor

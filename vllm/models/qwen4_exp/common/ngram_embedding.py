@@ -9,6 +9,7 @@ Unified Virtual Addressing on any CUDA-alike platform.
 
 import threading
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import ClassVar
 
 import torch
@@ -198,6 +199,18 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             )
         if quant_config is None:
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if quant_config.get_name() == "gguf":
+            from vllm.model_executor.layers.quantization.gguf import (
+                is_layer_skipped_gguf,
+            )
+
+            if is_layer_skipped_gguf(
+                prefix,
+                quant_config.unquantized_modules,
+                quant_config.packed_modules_mapping,
+            ):
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+            return Qwen4ExpPLEGGUFEmbeddingMethod()
         if isinstance(quant_config, ModelOptQuantConfigBase):
             if quant_config.is_layer_excluded(prefix):
                 return Qwen4ExpPLEUnquantizedEmbeddingMethod()
@@ -336,6 +349,170 @@ class Qwen4ExpPLEUnquantizedEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
     ) -> torch.Tensor:
         del layer, output_dtype
         return embeddings
+
+
+class Qwen4ExpPLEGGUFEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
+    """Keep GGUF rows packed and dequantize only the requested embeddings."""
+
+    def create_weights(
+        self,
+        layer: Qwen4ExpPLEEmbedding,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size_per_partition, output_partition_sizes
+        del input_size, output_size, params_dtype
+        weight = nn.Parameter(
+            layer.allocate_embedding_weight(0, 0, torch.uint8),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"weight_loader": partial(self._load_weight, layer)})
+        layer.register_parameter("weight", weight)
+        weight_type = nn.Parameter(
+            torch.zeros(1, dtype=torch.uint8, device="cpu"), requires_grad=False
+        )
+        set_weight_attrs(weight_type, {"is_gguf_weight_type": True})
+        set_weight_attrs(weight_type, extra_weight_attrs)
+        layer.register_parameter("weight_type", weight_type)
+
+    def _load_weight(
+        self,
+        layer: Qwen4ExpPLEEmbedding,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        import gguf
+
+        from vllm.model_executor.layers.quantization.gguf import DEQUANT_TYPES
+
+        qtype = getattr(layer.weight_type, "weight_type", None)
+        if qtype not in DEQUANT_TYPES:
+            raise ValueError(f"Unsupported or missing GGUF PLE weight type: {qtype}")
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
+        if layer.embedding_dim % block_size:
+            raise ValueError("GGUF PLE embedding width must contain whole quant blocks")
+        row_bytes = layer.embedding_dim // block_size * type_size
+        expected_shape = (layer.org_vocab_size, row_bytes)
+        if loaded_weight.dtype != torch.uint8 or loaded_weight.shape != expected_shape:
+            raise ValueError(
+                f"GGUF PLE table must have uint8 shape {expected_shape}, "
+                f"got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
+            )
+        with torch.device(param.device):
+            param.data = layer.allocate_embedding_weight(
+                layer.num_embeddings_per_partition, row_bytes, torch.uint8
+            )
+        layer._copy_embedding_shard_(param, loaded_weight, checkpoint_start=0)
+        param.data[layer.num_org_embeddings_per_partition :].zero_()
+
+    def lookup_dtype(self, layer: nn.Module) -> torch.dtype:
+        return layer.params_dtype
+
+    def _lookup_q4_0(
+        self, layer: nn.Module, ids: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        pinned = isinstance(layer, Qwen4ExpPLEPinnedHostEmbedding)
+        start = layer.shard_indices.org_vocab_start_index if pinned else 0
+        end = (
+            layer.shard_indices.org_vocab_end_index
+            if pinned
+            else layer.num_org_embeddings_per_partition
+        )
+        if ids.numel():
+            _lookup_gguf_q4_0_ple_kernel[(ids.numel(),)](
+                layer._uva_weight if pinned else layer.weight,
+                ids.reshape(-1),
+                output,
+                start,
+                end,
+                EMBEDDING_DIM=layer.embedding_dim,
+                ROW_BYTES=layer.weight.shape[1],
+                BLOCK_D=triton.next_power_of_2(layer.embedding_dim),
+            )
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        from gguf import GGMLQuantizationType
+
+        from vllm.model_executor.layers.quantization.gguf import apply_gguf_embedding
+
+        if layer.weight_type.weight_type == GGMLQuantizationType.Q4_0:
+            output = torch.empty(
+                (*input_.shape, layer.embedding_dim),
+                dtype=layer.params_dtype,
+                device=input_.device,
+            )
+            self._lookup_q4_0(layer, input_, output)
+            return output
+        return apply_gguf_embedding(
+            input_,
+            layer.weight,
+            layer.weight_type.weight_type,
+            layer.embedding_dim,
+            dtype=torch.float32,
+        ).to(layer.params_dtype)
+
+    def lookup_from_pinned(
+        self,
+        layer: "Qwen4ExpPLEPinnedHostEmbedding",
+        ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        from gguf import GGMLQuantizationType
+
+        from vllm import _custom_ops as ops
+
+        if layer.weight_type.weight_type == GGMLQuantizationType.Q4_0:
+            self._lookup_q4_0(layer, ids, output)
+            return
+        row_bytes = layer.weight.shape[1]
+        packed = torch.empty(
+            ids.numel(), row_bytes, dtype=torch.uint8, device=ids.device
+        )
+        _lookup_ple_embedding_from_pinned_kernel[(ids.numel(),)](
+            layer._uva_weight,
+            ids,
+            packed,
+            row_bytes,
+            layer.shard_indices.org_vocab_start_index,
+            layer.shard_indices.org_vocab_end_index,
+            BLOCK_D=triton.next_power_of_2(row_bytes),
+        )
+        dequantized = ops.ggml_dequantize(
+            packed,
+            layer.weight_type.weight_type,
+            layer.embedding_dim,
+            ids.numel(),
+            torch.float32,
+        )
+        output.copy_(dequantized.view_as(output).to(output.dtype))
+
+    def dequantize(
+        self,
+        layer: nn.Module,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return embeddings.to(output_dtype)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        if layer.weight.numel() == 0:
+            raise ValueError("GGUF PLE embedding table was not loaded")
+        if isinstance(layer, Qwen4ExpPLEPinnedHostEmbedding):
+            layer._uva_weight = get_accelerator_view_from_cpu_tensor(layer.weight)
+        logger.info(
+            "Loaded GGUF PLE table: type=%s, local_shape=%s, "
+            "storage=%.2f GiB on %s, lookup_dtype=%s",
+            layer.weight_type.weight_type,
+            tuple(layer.weight.shape),
+            layer.weight.numel() / 2**30,
+            layer.weight.device,
+            layer.params_dtype,
+        )
+        super().process_weights_after_loading(layer)
 
 
 class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
@@ -653,6 +830,35 @@ def _lookup_ple_embedding_from_pinned_kernel(
     )
 
 
+@triton.jit
+def _lookup_gguf_q4_0_ple_kernel(
+    weight_ptr,
+    ids_ptr,
+    output_ptr,
+    vocab_start,
+    vocab_end,
+    EMBEDDING_DIM: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Read Q4_0 rows and round FP32 dequantization once to the model dtype."""
+    row = tl.program_id(0).to(tl.int64)
+    idx = tl.load(ids_ptr + row)
+    owned = (idx >= vocab_start) & (idx < vocab_end)
+    local_idx = tl.where(owned, idx - vocab_start, 0)
+    dims = tl.arange(0, BLOCK_D)
+    valid = (dims < EMBEDDING_DIM) & owned
+    block = dims // 32
+    block_ptr = weight_ptr + local_idx * ROW_BYTES + block * 18
+    scale_lo = tl.load(block_ptr, mask=valid, other=0).to(tl.uint16)
+    scale_hi = tl.load(block_ptr + 1, mask=valid, other=0).to(tl.uint16)
+    scale = (scale_lo | (scale_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    packed = tl.load(block_ptr + 2 + dims % 16, mask=valid, other=0)
+    codes = tl.where(dims % 32 < 16, packed & 15, packed >> 4).to(tl.float32)
+    values = (codes - 8.0) * scale
+    tl.store(output_ptr + row * EMBEDDING_DIM + dims, values, mask=dims < EMBEDDING_DIM)
+
+
 class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
     """PLE table loaded into pinned CPU memory and looked up through UVA."""
 
@@ -686,7 +892,11 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             data_parallel_rank=data_parallel_rank,
             reduce_results=reduce_results,
         )
-        self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
+        self._uva_weight = (
+            get_accelerator_view_from_cpu_tensor(self.weight)
+            if self.weight.numel()
+            else None
+        )
         self._prefetch_stream: torch.cuda.Stream | None = None
         self._prefetch_buffer: torch.Tensor | None = None
         self._prefetch_alloc_lock = threading.Lock()

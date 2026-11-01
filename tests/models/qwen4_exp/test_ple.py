@@ -1012,6 +1012,59 @@ def test_ple_pinned_embedding_loads_on_cpu_and_looks_up_through_uva(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_gguf_ple_lookup_keeps_table_packed_and_dequantizes_selected_rows(
+    dist_init, dtype: torch.dtype, cpu_offload: bool
+) -> None:
+    """A Q4_0 table returns model-dtype rows without expanding resident storage."""
+    import gguf
+
+    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+
+    torch.manual_seed(0)
+    checkpoint = torch.randn(257, 160)
+    qtype = gguf.GGMLQuantizationType.Q4_0
+    packed = gguf.quantize(checkpoint.numpy(), qtype)
+    prefix = "test.ple_embedding.ngram_embedding"
+    method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(GGUFConfig(), prefix)
+    embedding_cls = (
+        Qwen4ExpPLEPinnedHostEmbedding if cpu_offload else Qwen4ExpPLEDeviceEmbedding
+    )
+    with torch.device("cuda:0"):
+        embedding = embedding_cls(
+            257,
+            160,
+            params_dtype=dtype,
+            padding_size=8,
+            prefix=prefix,
+            embedding_method=method,
+        )
+    AutoWeightsLoader(embedding).load_weights(
+        [
+            ("weight_type", torch.tensor(int(qtype))),
+            ("weight", torch.from_numpy(packed)),
+        ]
+    )
+    method.process_weights_after_loading(embedding)
+    ids = torch.tensor([[256, 0], [7, 256]], device="cuda:0")
+    actual = embedding.sync_lookup(ids) if cpu_offload else embedding(ids)
+    expected = torch.from_numpy(gguf.dequantize(packed, qtype))[ids.cpu()].to(
+        device="cuda:0", dtype=dtype
+    )
+    assert embedding.weight.dtype == torch.uint8
+    assert embedding.weight.shape == (embedding.num_embeddings_per_partition, 90)
+    assert embedding.weight.device.type == ("cpu" if cpu_offload else "cuda")
+    if cpu_offload:
+        assert embedding.weight.is_pinned()
+        masked = embedding.sync_lookup(torch.tensor([[-1, 257]], device="cuda:0"))
+        assert torch.count_nonzero(masked) == 0
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_pinned_embedding_start_prefetch_allocates_lazily(
     monkeypatch: pytest.MonkeyPatch,
