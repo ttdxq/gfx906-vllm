@@ -15,7 +15,7 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.rocm import on_gfx9
+from vllm.platforms.rocm import on_gfx9, on_gfx906
 from vllm.utils.flashinfer import (
     flashinfer_bf16_mm,
     is_flashinfer_cutedsl_bf16_gemm_supported,
@@ -481,6 +481,11 @@ def rocm_unquantized_gemm_impl(
     m = weight.shape[0]
     k = weight.shape[1]
 
+    # gfx906 has no native bf16 MFMA: Triton cannot lower tl.dot with bf16
+    # operands and the skinny GEMV kernel rejects the dtype, so bf16 falls
+    # back to rocBLAS, which covers it through conversion paths.
+    gfx906_bf16 = x.dtype == torch.bfloat16 and on_gfx906()
+
     # For FP16/BF16 without bias and k % 8 == 0, prefer skinny GEMV kernel
     if (
         x.dtype in [torch.float16, torch.bfloat16]
@@ -490,11 +495,12 @@ def rocm_unquantized_gemm_impl(
         and n == 1
         and k <= 8192
         and k % 8 == 0
+        and not gfx906_bf16
     ):
         out = ops.LLMM1(weight, x_view, 4)
         return out.view(*x.shape[:-1], weight.shape[0])
 
-    if n <= 16 and not on_gfx9():
+    if n <= 16 and not on_gfx9() and not gfx906_bf16:
         out = triton_matmul(x_view, weight).view(*x.shape[:-1], weight.shape[0])
         if bias is not None:
             out = out + bias

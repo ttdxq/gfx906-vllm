@@ -238,9 +238,11 @@ def _rocm_supported_dtypes() -> list[torch.dtype]:
     """Supported dtypes for the current ROCm device.
 
     gfx906 lacks native bfloat16, so returns fp16/fp32 there; other
-    GFX9 (gfx90a+) additionally include bfloat16.
+    GFX9 (gfx90a+) additionally include bfloat16. BF16 remains usable on
+    gfx906 through rocBLAS conversion paths, which models can opt into
+    with VLLM_ROCM_GFX906_ALLOW_BF16=1.
     """
-    if _ON_GFX906:
+    if _ON_GFX906 and not envs.VLLM_ROCM_GFX906_ALLOW_BF16:
         return [torch.float16, torch.float32]
     return [torch.float16, torch.bfloat16, torch.float32]
 

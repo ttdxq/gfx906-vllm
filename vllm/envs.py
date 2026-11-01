@@ -164,6 +164,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
     VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE: bool = False
+    VLLM_ROCM_GFX906_ALLOW_BF16: bool = False
 
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
@@ -1458,6 +1459,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE": lambda: (
         os.getenv("VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE", "False").lower()
         in ("true", "1")
+    ),
+    # Allow bfloat16 as the model dtype on gfx906 through rocBLAS conversion
+    # paths. The default keeps the fp16-only policy for existing workloads.
+    "VLLM_ROCM_GFX906_ALLOW_BF16": lambda: (
+        os.getenv("VLLM_ROCM_GFX906_ALLOW_BF16", "False").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE
