@@ -545,7 +545,7 @@ class Qwen3_5GatedDeltaNet(GatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None = None,
     ):
         num_tokens = hidden_states.size(0)
         profile_linear_attn = self._use_qwen35_linear_attn_profile(hidden_states)
@@ -694,6 +694,9 @@ class Qwen3_5GatedDeltaNet(GatedDeltaNetAttention):
             return projected_out
 
         projected_out = timed("out", run_out_proj)
+        if output is None:
+            # Buffer-less callers (upstream DecoderLayer contract).
+            return projected_out
         output[:num_tokens] = projected_out
         if profile_linear_attn:
             self._record_qwen35_linear_attn_profile(hidden_states, profile_events)
@@ -790,6 +793,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
+
+        # The upstream Qwen3NextDecoderLayer.forward (reached via super()
+        # when layer profiling is off) reads this flag set by its own
+        # __init__, which this subclass intentionally skips.
+        self.use_attn_reduce_scatter_for_moe = False
 
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
@@ -928,9 +936,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     output=self_attention_output,
                 )
             elif self.layer_type == "full_attention":
-                self.self_attn(
+                # Qwen3NextAttention moved to the upstream return-value
+                # contract (no output buffer argument).
+                self_attention_output[:] = self.self_attn(
                     hidden_states=hidden_states,
-                    output=self_attention_output,
                     positions=positions,
                 )
             else:
