@@ -36,7 +36,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
-    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
@@ -636,25 +635,12 @@ def prepare_kernel_block_sizes(
             # This is an attention backend that supports virtual block splitting.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
-            storage_block_size = (
-                kv_cache_spec.storage_block_size
-                if isinstance(kv_cache_spec, MLAAttentionSpec)
-                else None
+            # MLAAttentionSpec lost storage_block_size in the packed-KV-layout
+            # rework (the GLM-5.3-Flash kpool cache it served is gone with the
+            # model); the backend vote below is the only selector now.
+            kernel_block_sizes.append(
+                select_common_block_size(kv_manager_block_size, group_backends)
             )
-            if storage_block_size is not None and _block_size_is_supported(
-                group_backends, storage_block_size
-            ):
-                # Storage-block specs (e.g. the GLM-5.3-Flash kpool indexer
-                # cache) address the cache in pool pages, and every other
-                # consumer (cache views, metadata builders, hisparse) already
-                # uses storage_block_size as the kernel block. Fall back to the
-                # backend vote when the group's backends do not accept it.
-                selected_kernel_size = storage_block_size
-            else:
-                selected_kernel_size = select_common_block_size(
-                    kv_manager_block_size, group_backends
-                )
-            kernel_block_sizes.append(selected_kernel_size)
         elif isinstance(kv_cache_spec, MambaSpec):
             # This is likely Mamba or other non-attention cache, no splitting.
             kernel_block_sizes.append(kv_cache_spec.block_size)
