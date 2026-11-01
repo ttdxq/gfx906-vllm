@@ -97,10 +97,10 @@ CPU offload requires a GPU with UVA support;
 vLLM fails fast when it is unavailable.
 
 Qwen4Exp GGUF PLE tables retain their packed quantization format in host memory.
-The GPU retrieves and dequantizes only the selected rows into the model dtype.
-For Q4_0 tables, lookup and dequantization are fused.
-See [GGUF serving](quantization/gguf.md#qwen4exp-on-rocm) for split-checkpoint
-support.
+The GPU retrieves and dequantizes only the selected rows into the model dtype,
+including FP16 on ROCm. For Q4_0 tables, lookup and dequantization are fused.
+See [GGUF serving](quantization/gguf.md#qwen4exp-on-rocm) for a split-checkpoint
+example.
 
 ## Disk offload (Qwen4Exp)
 

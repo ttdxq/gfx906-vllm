@@ -53,7 +53,11 @@ from vllm.v1.worker.workspace import (
 )
 
 from ..common.qsa import Qwen4ExpQSAMetadata, Qwen4ExpQSAMetadataBuilder
-from ..common.qsa_indexer import QSAIndexerMetadata, qsa_kv_cache_dtype
+from ..common.qsa_indexer import (
+    QSA_ACTIVATION_DTYPES,
+    QSAIndexerMetadata,
+    qsa_kv_cache_dtype,
+)
 from . import model
 from .qsa_indexer import QSAIndexer
 
@@ -107,6 +111,7 @@ _OCTAVE_CACHE_DTYPES: tuple[CacheDType, ...] = (
 )
 _QSA_CACHE_DTYPES: tuple[CacheDType, ...] = (
     "auto",
+    "float16",
     "bfloat16",
     "fp8",
     "fp8_e4m3",
@@ -122,7 +127,7 @@ class Qwen4ExpQSABackend(AttentionBackend):
     sparse decode kernel over the selected positions.
     """
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = list(QSA_ACTIVATION_DTYPES)
     # fp8/fp8_e4m3: uint8 storage read by the QSA Triton kernel.
     # octave_*: packed slots handled by the Octave kernels.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = list(_QSA_CACHE_DTYPES)
@@ -181,7 +186,7 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             )
         if kv_cache_dtype not in _QSA_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16, FP8-e4m3, or Octave main KV cache"
+                "Qwen4Exp QSA requires an FP16, BF16, FP8-e4m3, or Octave KV cache"
             )
         self.num_heads = num_heads
         self.head_size = head_size
@@ -352,9 +357,11 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             fp8_dtype = current_platform.fp8_dtype()
             key_cache = key_cache.view(fp8_dtype)
             value_cache = value_cache.view(fp8_dtype)
-        if query.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 queries")
-        if key_cache.dtype != torch.bfloat16 and (
+        if query.dtype not in QSA_ACTIVATION_DTYPES:
+            raise NotImplementedError("Qwen4Exp QSA requires FP16 or BF16 queries")
+        if key_cache.dtype in QSA_ACTIVATION_DTYPES and key_cache.dtype != query.dtype:
+            raise ValueError("Qwen4Exp QSA cache dtype must match its query dtype")
+        if self.kv_cache_dtype in ("fp8", "fp8_e4m3") and (
             layer._k_scale_float != 1.0 or layer._v_scale_float != 1.0
         ):
             raise NotImplementedError(
@@ -397,12 +404,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         model_config = vllm_config.model_config
         if cache_config is None:
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
-        if model_config.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
+        if model_config.dtype not in QSA_ACTIVATION_DTYPES:
+            raise NotImplementedError("Qwen4Exp QSA requires FP16 or BF16")
         cache_dtype = qsa_kv_cache_dtype(cache_config, prefix)
         if cache_dtype not in _QSA_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16, FP8-e4m3, or Octave main KV cache"
+                "Qwen4Exp QSA requires an FP16, BF16, FP8-e4m3, or Octave KV cache"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -486,11 +493,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.kv_cache_dtype, model_config
         )
         if (
-            self.kv_cache_dtype not in _QSA_CACHE_DTYPES
-            and self.kv_cache_torch_dtype != torch.bfloat16
+            self.kv_cache_dtype in ("auto", "float16", "bfloat16")
+            and self.kv_cache_torch_dtype != model_config.dtype
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16, FP8-e4m3, or Octave main KV cache"
+                "Qwen4Exp QSA cache storage must match the model dtype"
             )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
@@ -512,7 +519,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.indexer",
         )
-        # The fused prepare writes bf16 or platform-fp8 K/V; an Octave cache
+        # The fused prepare writes 16-bit or platform-fp8 K/V; an Octave cache
         # is packed by do_kv_cache_update instead.
         self.use_fused_qsa_prepare = (
             self.attn_output_gate

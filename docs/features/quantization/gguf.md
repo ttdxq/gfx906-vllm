@@ -43,11 +43,33 @@ Swift-1.5-Qwen3.8-Flash-Next. Pass the first file of a numbered split; the
 loader finds the remaining files in the same directory. The config and text
 tokenizer are constructed from the GGUF metadata.
 
+The AMD QSA backend supports FP16 activations and FP16 main and indexer caches.
+Use `--dtype half` on gfx906. FP32 accumulation remains enabled for attention
+and normalization, and no BF16 opt-in is required.
+
 PLE stays enabled. Its table uses pinned host memory by default and retains
 the GGUF quantization format; only requested rows are dequantized on the GPU.
 For the IQ2_XS checkpoint, the Q4_0 PLE table occupies about 26.8 GiB of host
 memory across the tensor-parallel ranks, rather than about 95.4 GiB as FP16.
 GGUF checkpoints with more than one PLE table are currently unsupported.
+
+```bash
+vllm serve /path/to/Swift-1.5-Qwen3.8-Flash-Next-IQ2_XS-00001-of-00002.gguf \
+  --tensor-parallel-size 2 \
+  --dtype half \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-batched-tokens 256 \
+  --max-num-seqs 32 \
+  --mamba-ssm-cache-dtype float32 \
+  --attention-config '{"indexer_kv_dtype": "fp16"}' \
+  --engram-config '{"cpu_offload": true}' \
+  --enforce-eager
+```
+
+The FP32 recurrent cache is independent of the FP16 QSA caches. Choose batch
+size and GPU memory utilization to fit the backbone, recurrent state, and
+attention cache together. On 32 GiB GPUs, smaller prefill batches may be needed.
 
 !!! warning
     We recommend using the tokenizer from base model instead of GGUF model. Because the tokenizer conversion from GGUF is time-consuming and unstable, especially for some models with large vocab size.

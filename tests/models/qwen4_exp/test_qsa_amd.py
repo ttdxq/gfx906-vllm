@@ -401,6 +401,13 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
 @requires_qsa_kernels
 @pytest.mark.parametrize("use_fp8", [False, True])
 @pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.bfloat16, id="bf16"),
+        pytest.param(torch.float16, id="fp16"),
+    ],
+)
+@pytest.mark.parametrize(
     "num_rows,num_query_heads,num_kv_heads,page_size",
     [
         pytest.param(1, 24, 2, 1792, id="tp1_split64"),
@@ -416,6 +423,7 @@ def test_qsa_sparse_paged_attention_matches_reference(
     num_kv_heads: int,
     page_size: int,
     use_fp8: bool,
+    dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(2)
     head_dim = 256
@@ -427,7 +435,7 @@ def test_qsa_sparse_paged_attention_matches_reference(
     indexer_compress_ratio = 4
     selection_width = indexer_budget + indexer_compress_ratio - 1
     q = torch.randn(
-        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype
     )
     kv_cache = torch.randn(
         num_cache_blocks,
@@ -435,14 +443,14 @@ def test_qsa_sparse_paged_attention_matches_reference(
         num_kv_heads,
         2 * head_dim,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     if use_fp8:
         fp8_dtype = current_platform.fp8_dtype()
         # The kernel's contract is that the cache already holds values in
         # the attention dtype's numeric space; quantize the stored cache and
         # have the reference consume the stored (quantized) values upcast
-        # to float, not the original bf16 — the fp8 cast is lossy.
+        # to float, not the original input — the fp8 cast is lossy.
         kv_stored = kv_cache.to(fp8_dtype)
         k_cache, v_cache = kv_stored.split(head_dim, dim=-1)
         ref_k, ref_v = k_cache.float(), v_cache.float()
@@ -509,7 +517,8 @@ def test_qsa_sparse_paged_attention_matches_reference(
         q.shape[-1] ** -0.5,
     )
 
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    tolerance = 2e-3 if dtype == torch.float16 else 2e-2
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
 
 
 @requires_qsa_kernels

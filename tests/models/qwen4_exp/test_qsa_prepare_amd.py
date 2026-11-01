@@ -77,7 +77,9 @@ def assert_fp8_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor) -> N
     assert bool(((code_diff <= 1) | (abs_diff <= 2**-8)).all())
 
 
-def _make_main_inputs(num_tokens: int, main_fp8: bool = False) -> dict:
+def _make_main_inputs(
+    num_tokens: int, dtype: torch.dtype, main_fp8: bool = False
+) -> dict:
     """Random main-attention arguments with a paged cache in vLLM's layout."""
     num_blocks = num_tokens // MAIN_PAGE + 2
     # FP8 configs store e4m3 codes in the platform's native flavor
@@ -87,17 +89,17 @@ def _make_main_inputs(num_tokens: int, main_fp8: bool = False) -> dict:
         MAIN_HK,
         MAIN_PAGE,
         2 * MAIN_D,
-        dtype=current_platform.fp8_dtype() if main_fp8 else torch.bfloat16,
+        dtype=current_platform.fp8_dtype() if main_fp8 else dtype,
         device="cuda",
     ).transpose(1, 2)
     slots = torch.randperm(num_blocks * MAIN_PAGE, device="cuda")[:num_tokens]
     slots[-1] = -1
-    norm_weights = torch.randn(2, MAIN_D, dtype=torch.bfloat16, device="cuda") * 0.2
+    norm_weights = torch.randn(2, MAIN_D, dtype=dtype, device="cuda") * 0.2
     return dict(
         main_qkv=torch.randn(
             num_tokens,
             2 * (MAIN_HQ + MAIN_HK) * MAIN_D,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             device="cuda",
         ),
         main_q_norm_weight=norm_weights[0],
@@ -109,7 +111,7 @@ def _make_main_inputs(num_tokens: int, main_fp8: bool = False) -> dict:
         main_v_scale=2.0 if main_fp8 else 1.0,
         # The AMD op hands the gate back through a buffer it does not own.
         main_gate_out=torch.empty(
-            num_tokens, MAIN_HQ, MAIN_D, dtype=torch.bfloat16, device="cuda"
+            num_tokens, MAIN_HQ, MAIN_D, dtype=dtype, device="cuda"
         ),
     )
 
@@ -119,6 +121,9 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
     from vllm._custom_ops import reshape_and_cache_flash
 
     num_tokens = main["main_qkv"].shape[0]
+    rtol, atol = (
+        (2e-3, 2e-3) if main["main_qkv"].dtype == torch.float16 else (RTOL, ATOL)
+    )
     q_gate, k, v = main["main_qkv"].split(
         [2 * MAIN_HQ * MAIN_D, MAIN_HK * MAIN_D, MAIN_HK * MAIN_D], dim=-1
     )
@@ -132,7 +137,7 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
     q, k = rope(positions, q, k)
     kv_cache = main["main_kv_cache"]
     if kv_cache.dtype in (torch.float8_e4m3fnuz, torch.float8_e4m3fn):
-        torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
+        torch.testing.assert_close(q_out.flatten(1), q, rtol=rtol, atol=atol)
         assert torch.equal(gate_out, gate)
 
         # C++ reference: both the fused Triton kernel and the C++
@@ -216,18 +221,17 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
         scale,
         scale,
     )
-    torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(q_out.flatten(1), q, rtol=rtol, atol=atol)
     assert torch.equal(gate_out, gate)
-    torch.testing.assert_close(kv_cache[..., :MAIN_D], key_ref, rtol=RTOL, atol=ATOL)
-    torch.testing.assert_close(kv_cache[..., MAIN_D:], value_ref, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(kv_cache[..., :MAIN_D], key_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(kv_cache[..., MAIN_D:], value_ref, rtol=rtol, atol=atol)
 
 
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
 @pytest.mark.parametrize("main_fp8", [False, True])
-@pytest.mark.parametrize(
-    "indexer_dtype", [torch.bfloat16, pytest.param(None, id="fp8_platform")]
-)
+@pytest.mark.parametrize("indexer_fp8", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,seq_lens,query_lens,history_lens",
     [
@@ -252,7 +256,8 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
 )
 def test_qsa_fused_prepare_matches_unfused(
     main_fp8,
-    indexer_dtype,
+    indexer_fp8,
+    dtype,
     mrope,
     is_2d_positions,
     cache_rope_positions,
@@ -263,8 +268,7 @@ def test_qsa_fused_prepare_matches_unfused(
 ) -> None:
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
-    if indexer_dtype is None:
-        indexer_dtype = current_platform.fp8_dtype()
+    indexer_dtype = current_platform.fp8_dtype() if indexer_fp8 else dtype
     # The FP8 comparison below is a one-ulp bound on data this test generates,
     # so an unseeded run decides for itself whether it reproduces a rounding
     # difference. Seed it, or the kernel's bit-exactness is only sampled.
@@ -284,7 +288,7 @@ def test_qsa_fused_prepare_matches_unfused(
             head_size=256,
             max_position=32768,
             rope_parameters=rope_params,
-            dtype=torch.bfloat16,
+            dtype=dtype,
         )
 
     token_to_req = torch.cat(
@@ -372,7 +376,7 @@ def test_qsa_fused_prepare_matches_unfused(
     fused_raw_storage = torch.zeros(
         num_raw_blocks,
         raw_page_elements + 16,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device=device,
     )
     fused_raw = torch.as_strided(
@@ -385,7 +389,7 @@ def test_qsa_fused_prepare_matches_unfused(
         for position in range(history_end - history_len, history_end):
             block = int(raw_block_table[request, 0])
             row = fused_raw[block, position % state_size, 0]
-            row[:D] = torch.randn(D, dtype=torch.bfloat16, device=device)
+            row[:D] = torch.randn(D, dtype=dtype, device=device)
             if cache_rope_positions:
                 row[ROPE_POS_OFFSET:].view(torch.int64).copy_(
                     torch.tensor(
@@ -409,14 +413,12 @@ def test_qsa_fused_prepare_matches_unfused(
     )
     unfused_compressed = fused_compressed.clone()
 
-    projected_qk = torch.randn(
-        num_tokens, (HQ + 1) * D, dtype=torch.bfloat16, device=device
-    )
-    q_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
-    k_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
+    projected_qk = torch.randn(num_tokens, (HQ + 1) * D, dtype=dtype, device=device)
+    q_weight = torch.randn(D, dtype=dtype, device=device) * 0.2
+    k_weight = torch.randn(D, dtype=dtype, device=device) * 0.2
 
     fused_query = torch.empty(num_tokens, HQ, D, dtype=indexer_dtype, device=device)
-    main = _make_main_inputs(num_tokens, main_fp8)
+    main = _make_main_inputs(num_tokens, dtype, main_fp8)
     main_q_out, main_gate_out = qsa_prepare(
         projected_qk[:, : HQ * D],
         projected_qk[:, HQ * D :],
@@ -478,7 +480,8 @@ def test_qsa_fused_prepare_matches_unfused(
     if rope_positions is not None:
         qsa_store_cache_rows(rope_positions, raw_slots, position_rows)
 
-    if indexer_dtype != torch.bfloat16:
+    rtol, atol = (2e-3, 2e-3) if dtype == torch.float16 else (RTOL, ATOL)
+    if indexer_fp8:
         # Both paths round the same ~bf16 intermediates to e4m3. Bitwise
         # equality (the dsv4 indexer test's bar) does not hold here: the 1D
         # reference rope (forward_cuda) differs from _norm_rope by up to 1
@@ -486,11 +489,11 @@ def test_qsa_fused_prepare_matches_unfused(
         unfused_query = unfused_query.to(indexer_dtype)
         assert_fp8_within_one_ulp(fused_query, unfused_query)
     else:
-        torch.testing.assert_close(fused_query, unfused_query, rtol=RTOL, atol=ATOL)
+        torch.testing.assert_close(fused_query, unfused_query, rtol=rtol, atol=atol)
     assert torch.equal(fused_raw.view(torch.int16), unfused_raw.view(torch.int16))
-    if indexer_dtype != torch.bfloat16:
+    if indexer_fp8:
         assert_fp8_within_one_ulp(fused_compressed, unfused_compressed)
     else:
         torch.testing.assert_close(
-            fused_compressed, unfused_compressed, rtol=RTOL, atol=ATOL
+            fused_compressed, unfused_compressed, rtol=rtol, atol=atol
         )

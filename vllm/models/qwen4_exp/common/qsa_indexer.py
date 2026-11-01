@@ -44,6 +44,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+QSA_ACTIVATION_DTYPES = (torch.bfloat16, torch.float16)
+
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
     """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
@@ -733,10 +735,11 @@ class QSAIndexerMetadataBuilder(AttentionMetadataBuilder[QSAIndexerMetadata]):
 class QSAIndexerBackend(AttentionBackend):
     """Key-only dummy backend for out-of-band QSA indexer cache operations."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = list(QSA_ACTIVATION_DTYPES)
     # fp8 entries allow the optional e4m3 compressed indexer cache.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
+        "float16",
         "bfloat16",
         "fp8",
         "fp8_e4m3",
@@ -815,7 +818,7 @@ class _QSAIndexerCache(nn.Module, AttentionLayerBase):
 
 
 class QSARawKeyCache(_QSAIndexerCache):
-    """Raw BF16 key, optionally followed by exact int64 MRoPE positions."""
+    """Raw 16-bit key, optionally followed by exact int64 MRoPE positions."""
 
     _BF16_PER_INT64 = 4
     _NUM_ROPE_AXES = 3
@@ -881,6 +884,7 @@ class QSACompressedKeyCache(_QSAIndexerCache):
 
 
 __all__ = [
+    "QSA_ACTIVATION_DTYPES",
     "QSACompressedKeyCache",
     "QSAIndexerMetadata",
     "QSARawKeyCache",
