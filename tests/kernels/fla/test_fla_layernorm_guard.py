@@ -501,6 +501,42 @@ def test_rmsnorm_gated_forward_native_dtype(
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize("norm_before_gate", [True, False])
+@pytest.mark.parametrize("num_tokens", [1, 5])
+@torch.inference_mode()
+def test_rmsnorm_gated_forward_respects_activation(
+    default_vllm_config,
+    dtype: torch.dtype,
+    activation: str,
+    norm_before_gate: bool,
+    num_tokens: int,
+) -> None:
+    """GDN output gates must retain their activation on the dispatched path."""
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+
+    default_vllm_config.compilation_config.custom_ops.append("+rms_norm_gated")
+    set_random_seed(42)
+    layer = RMSNormGated(
+        128,
+        eps=1e-6,
+        norm_before_gate=norm_before_gate,
+        activation=activation,
+        device=DEVICE,
+        dtype=dtype,
+    )
+    x = torch.randn(num_tokens, 128, dtype=dtype, device=DEVICE) * 0.01
+    z = torch.linspace(-4, 4, 128, dtype=dtype, device=DEVICE)
+    z = z.expand_as(x).contiguous()
+
+    actual = layer(x, z)
+    expected = layer.forward_native(x, z)
+    tolerance = 1e-3 if dtype == torch.float16 else 1e-2
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    assert actual.dtype == dtype
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.inference_mode()
 def test_rmsnorm_gated_3d_matches_flattened_2d(

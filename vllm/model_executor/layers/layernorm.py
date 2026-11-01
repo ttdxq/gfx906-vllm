@@ -385,6 +385,7 @@ class RMSNormGated(CustomOp):
     ) -> torch.Tensor:
         if (
             self._use_native_rocm_gfx90
+            and self.activation in ("silu", "swish")
             and z is not None
             and self.group_size is None
             and x.dim() == 2
