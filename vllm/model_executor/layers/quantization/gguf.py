@@ -13,16 +13,17 @@ import torch.nn as nn
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
-)
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoEMethodBase,
-    RoutedExperts,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -915,10 +916,23 @@ def _fused_mul_mat_gguf(
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
+        if (
+            envs.VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV
+            and current_platform.is_rocm()
+            and x.ndim == 2
+            and x.shape == (1, 3072)
+            and qweight.shape == (2560, 3072)
+            and x.dtype == qweight.dtype == torch.float16
+            and x.device == qweight.device
+            and x.stride(1) == qweight.stride(1) == 1
+            and hasattr(torch.ops.vllm, "qwen4_exp_gemv_gfx906")
+        ):
+            from vllm.platforms.rocm import on_gfx906
+
+            if on_gfx906():
+                return torch.ops.vllm.qwen4_exp_gemv_gfx906(x, qweight)
         if ENABLE_GGUF_LINEAR_PROFILE:
-            _gguf_linear_profile_hit(
-                "single_unquantized", x, [qweight], [qweight_type]
-            )
+            _gguf_linear_profile_hit("single_unquantized", x, [qweight], [qweight_type])
         return x @ qweight.T
     if ENABLE_GGUF_FORCE_DEQUANT_MATMUL:
         if ENABLE_GGUF_LINEAR_PROFILE:

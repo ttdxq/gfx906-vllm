@@ -356,6 +356,7 @@ steps:
   - vllm/envs.py
   - vllm/config/attention.py
   - vllm/model_executor/layers/mamba/gdn_linear_attn.py
+  - vllm/model_executor/layers/quantization/gguf.py
   - vllm/model_executor/layers/vocab_parallel_embedding.py
   - vllm/model_executor/model_loader/gguf_adapters/qwen4_exp.py
   - vllm/model_executor/model_loader/weight_utils.py
@@ -406,6 +407,7 @@ steps:
   - vllm/envs.py
   - vllm/config/attention.py
   - vllm/model_executor/layers/mamba/gdn_linear_attn.py
+  - vllm/model_executor/layers/quantization/gguf.py
   - vllm/model_executor/layers/vocab_parallel_embedding.py
   - vllm/model_executor/model_loader/gguf_adapters/qwen4_exp.py
   - vllm/model_executor/model_loader/weight_utils.py

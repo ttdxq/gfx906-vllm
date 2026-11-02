@@ -80,8 +80,11 @@ FP16 HC down projections with input widths above 8192 and up to 16384 use
 a dedicated GEMV for batches of 1–16 tokens on gfx906. Larger batches,
 biased projections, batch invariant mode, and explicitly selected linear
 backends retain their existing implementation. Set `VLLM_QWEN4EXP_HC_GEMV=0`
-to disable this optimization. These switches apply to Qwen4Exp; Qwen3.5
-models such as Qwen3.8-27B retain their existing GDN path.
+to disable this optimization. The FP16 GDN output projection with shape
+`[2560, 3072]` also uses the GEMV for single-token decode on gfx906. Set
+`VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV=0` to disable that dispatch. These switches
+apply to Qwen4Exp; Qwen3.5 models such as Qwen3.8-27B retain their existing GDN
+path.
 
 IQ2_XS and IQ4_NL experts use grouped quantized matrix multiplication for
 prefill batches at or above `VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS` (default: 256).

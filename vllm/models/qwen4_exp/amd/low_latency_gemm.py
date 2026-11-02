@@ -58,7 +58,7 @@ def _hc_gemv_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 direct_register_custom_op(
-    op_name="qwen4_exp_hc_gemv_gfx906",
+    op_name="qwen4_exp_gemv_gfx906",
     op_func=_hc_gemv,
     fake_impl=_hc_gemv_fake,
 )
@@ -84,7 +84,7 @@ class Qwen4ExpHCGemvMethod(UnquantizedLinearMethod):
             and 8192 < weight.shape[1] <= 16384
             and x.stride(1) == weight.stride(1) == 1
         ):
-            return torch.ops.vllm.qwen4_exp_hc_gemv_gfx906(x, weight)
+            return torch.ops.vllm.qwen4_exp_gemv_gfx906(x, weight)
         return super().apply(layer, x, bias)
 
 

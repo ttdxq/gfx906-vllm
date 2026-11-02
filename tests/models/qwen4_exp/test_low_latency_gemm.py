@@ -6,6 +6,10 @@ import torch
 from torch import nn
 
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.quantization.gguf import (
+    WeightType,
+    _fused_mul_mat_gguf,
+)
 from vllm.models.qwen4_exp.amd.low_latency_gemm import (
     _hc_gemv,
     enable_qwen4_exp_low_latency_gemm,
@@ -57,3 +61,15 @@ def test_hc_linear_hook_preserves_projection(
         from vllm.models.qwen4_exp.amd.low_latency_gemm import Qwen4ExpHCGemvMethod
 
         assert isinstance(layer.quant_method, Qwen4ExpHCGemvMethod)
+
+
+@pytest.mark.parametrize("tokens", [1, 2])
+@torch.inference_mode()
+def test_gguf_f16_gdn_out_proj_gemv_matches_mm(tokens: int):
+    """Use the long-K GEMV only for the single-token GDN out projection."""
+    torch.manual_seed(7319)
+    x = torch.randn(tokens, 3072, device="cuda", dtype=torch.float16)
+    weight = torch.randn(2560, 3072, device="cuda", dtype=torch.float16) * 0.01
+    actual = _fused_mul_mat_gguf(x, weight, WeightType.F16)
+    expected = x @ weight.T
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-3)
