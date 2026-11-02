@@ -353,6 +353,7 @@ steps:
   source_file_dependencies:
   - requirements/common.txt
   - vllm/models/qwen4_exp/
+  - vllm/envs.py
   - vllm/config/attention.py
   - vllm/model_executor/layers/mamba/gdn_linear_attn.py
   - vllm/model_executor/layers/vocab_parallel_embedding.py
@@ -384,6 +385,10 @@ steps:
         pytest -v -s
         models/qwen4_exp/test_qsa_amd.py
         models/qwen4_exp/test_qsa_prepare_amd.py
+      - >-
+        pytest -v -s
+        models/qwen4_exp/test_gdn_chunk_prefill.py
+        models/qwen4_exp/test_low_latency_gemm.py
       # PLE and QSA import conflicting HC registrations in a shared process.
       - pytest -v -s models/qwen4_exp/test_ple.py
 
@@ -398,6 +403,7 @@ steps:
   source_file_dependencies:
   - requirements/common.txt
   - vllm/models/qwen4_exp/
+  - vllm/envs.py
   - vllm/config/attention.py
   - vllm/model_executor/layers/mamba/gdn_linear_attn.py
   - vllm/model_executor/layers/vocab_parallel_embedding.py
@@ -414,6 +420,10 @@ steps:
     pytest -v -s
     models/qwen4_exp/test_qsa_amd.py
     models/qwen4_exp/test_qsa_prepare_amd.py
+  - >-
+    pytest -v -s
+    models/qwen4_exp/test_gdn_chunk_prefill.py
+    models/qwen4_exp/test_low_latency_gemm.py
   # PLE and QSA import conflicting HC registrations in a shared process.
   - pytest -v -s models/qwen4_exp/test_ple.py
 

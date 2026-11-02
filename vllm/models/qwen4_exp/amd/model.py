@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
@@ -223,6 +224,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 gqa_interleaved_layout=False,
                 create_in_proj_qkvz=False,
                 create_in_proj_ba=False,
+                use_chunk_prefill_on_gfx906=envs.VLLM_QWEN4EXP_GDN_CHUNK_PREFILL,
             )
         elif layer_type in _QSA_LAYER_TYPES:
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
