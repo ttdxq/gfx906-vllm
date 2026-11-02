@@ -24,14 +24,14 @@ static __device__ __forceinline__ void moe_q(
 
   const auto col_dst_0 = blockIdx.y * mmq_x;
 
+  if (col_dst_0 >= num_tokens_post_padded[0]) return;
+  const int exp_idx = expert_ids[blockIdx.y];
+  if (exp_idx < 0) return;
+
   int token_offs[mmq_x / nwarps];
   for (int i = 0; i < mmq_x; i += nwarps) {
     token_offs[i / nwarps] = sorted_token_ids[col_dst_0 + threadIdx.y + i];
   }
-
-  const int exp_idx = expert_ids[blockIdx.y];
-  if (exp_idx > 255 || exp_idx < 0) return;
-  if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
 
   const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
   const block_q8_1* y = (const block_q8_1*)(vy);
@@ -74,7 +74,7 @@ static __device__ __forceinline__ void moe_q(
 
       if (threadIdx.x < n_per_r / QK8_1) {
         const auto kby = threadIdx.x % (WARP_SIZE_GGUF / QI8_1);
-        const int col_y_eff = token_offs[threadIdx.y] / top_k;
+        const int col_y_eff = token_offs[0] / top_k;
         const int block_x =
             ib0 * (qk / QK8_1) + ir * (WARP_SIZE_GGUF / QI8_1) + kby;
 

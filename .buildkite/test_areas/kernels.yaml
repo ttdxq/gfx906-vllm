@@ -385,6 +385,7 @@ steps:
           kernels/test_relu2_fp8_quant.py
           --deselect=tests/kernels/test_bf16_skinny_gemm.py::test_every_dsv3_routed_shape_is_instantiated
       - pytest -v -s kernels/test_fused_muse_spark_qknorm_rope_kv_insert.py -k rocm
+      - pytest -v -s kernels/test_gguf_mmvq.py -k grouped_moe_matches_mmvq_with_512_experts
 
 - label: ":nvidia: (L4) Attention Kernels"
   key: kernels-attention-test

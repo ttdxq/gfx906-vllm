@@ -90,6 +90,46 @@ def _quantized_test_rows(qtype, rows, cols):
     ].copy()
 
 
+@pytest.mark.parametrize(
+    "qtype,cols",
+    [
+        (gguf.GGMLQuantizationType.Q4_0, 256),
+        (gguf.GGMLQuantizationType.Q4_0, 2560),
+        (gguf.GGMLQuantizationType.Q8_0, 256),
+        (gguf.GGMLQuantizationType.Q8_0, 2560),
+    ],
+)
+@pytest.mark.parametrize("num_tokens", [7, 65])
+@pytest.mark.parametrize("top_k", [1, 10])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts(qtype, num_tokens, cols, top_k):
+    """Grouped prefill must compute experts above 255 and padded token tiles."""
+    from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+    rows, experts = 129, 512
+    data = _quantized_test_rows(qtype, rows, cols)
+    data = np.tile(data[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    weight = torch.tensor(data, device="cuda")
+    torch.manual_seed(73)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda")
+    # Include both sides of the old limit and the last expert. Repetition
+    # exercises a full token tile as well as expert padding.
+    ids = torch.tensor(
+        [0, 1, 127, 254, 255, 256, 257, 383, 510, 511], device="cuda", dtype=torch.int32
+    ).repeat(num_tokens, 1)
+    if top_k == 1:
+        ids = ids.flatten()[:num_tokens, None].contiguous()
+    block_size = ops.ggml_moe_get_block_size(qtype)
+    aligned = moe_align_block_size(ids, block_size, experts)
+    expected = ops.ggml_moe_a8_vec(x, weight, ids, top_k, qtype, rows, num_tokens)
+    actual = ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, num_tokens)
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
 def _dequantized_reference(data, qtype):
     decoded = gguf.dequantize(data, qtype)
     if qtype not in (gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.Q5_K):
