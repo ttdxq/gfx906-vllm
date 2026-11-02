@@ -93,6 +93,12 @@ def _quantized_test_rows(qtype, rows, cols):
 @pytest.mark.parametrize(
     "qtype,cols",
     [
+        (gguf.GGMLQuantizationType.IQ2_XS, 256),
+        (gguf.GGMLQuantizationType.IQ2_XS, 2560),
+        (gguf.GGMLQuantizationType.IQ4_NL, 256),
+        (gguf.GGMLQuantizationType.IQ4_NL, 320),
+        (gguf.GGMLQuantizationType.IQ4_NL, 640),
+        (gguf.GGMLQuantizationType.IQ4_NL, 2560),
         (gguf.GGMLQuantizationType.Q4_0, 256),
         (gguf.GGMLQuantizationType.Q4_0, 2560),
         (gguf.GGMLQuantizationType.Q8_0, 256),
