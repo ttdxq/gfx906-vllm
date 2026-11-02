@@ -94,6 +94,7 @@ ENABLE_GGUF_SHARDED_MMVQ_Q8_CACHE = _env_flag(
 ENABLE_GGUF_GROUPED_SAME_TYPE_MMVQ = _env_flag(
     "VLLM_GGUF_GROUPED_SAME_TYPE_MMVQ", True
 )
+ENABLE_GGUF_IQ_MOE_MMQ = _env_flag("VLLM_GGUF_IQ_MOE_MMQ", True)
 ENABLE_GGUF_QKV3_MMVQ = _env_flag("VLLM_GGUF_QKV3_MMVQ", False)
 ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2 = _env_flag(
     "VLLM_GGUF_MOE_HOST_FUSED_ACT_W2", True
@@ -243,6 +244,11 @@ def _gguf_repack_iq4_xs_to_q8_0_enabled() -> bool:
 @lru_cache(maxsize=1)
 def _gguf_moe_mmq_min_tokens() -> int:
     return max(1, _env_int("VLLM_GGUF_MOE_MMQ_MIN_TOKENS", 5))
+
+
+@lru_cache(maxsize=1)
+def _gguf_iq_moe_mmq_min_tokens() -> int:
+    return max(1, _env_int("VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS", 256))
 
 
 @lru_cache(maxsize=1)
@@ -875,11 +881,9 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES
 )
-# The grouped MoE MMQ path (moe_align_block_size + ggml_moe_a8) only covers
-# the standard and K-quant layouts: ggml_moe_get_block_size returns 0 for
-# i-quants, whose MMQ kernels are dense-path only.  Routing an i-quant MoE
-# through the grouped kernel would divide by that zero block size.
-MOE_MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+# IQ2_XS and IQ4_NL share the normalized IQ tile loaders with dense MMQ.
+IQ_MOE_MMQ_QUANT_TYPES = {WeightType.IQ2_XS, WeightType.IQ4_NL}
+MOE_MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IQ_MOE_MMQ_QUANT_TYPES
 
 
 def _iq_mmq_beats_dequant(x: torch.Tensor, qweight: torch.Tensor,
@@ -1878,10 +1882,19 @@ def _fused_moe_gguf(
             raise ValueError(f"Unsupported activation: {activation}")
         return out
 
+    iq_mmq = (
+        not ({qweight_type, qweight_type2} & IQ_MOE_MMQ_QUANT_TYPES)
+        or (
+            ENABLE_GGUF_IQ_MOE_MMQ
+            and x.shape[0] >= _gguf_iq_moe_mmq_min_tokens()
+        )
+    )
+
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
         qweight_type2 in MOE_MMQ_QUANT_TYPES
         and qweight_type in MOE_MMQ_QUANT_TYPES
+        and iq_mmq
         and x.shape[0] >= _gguf_moe_mmq_min_tokens()
     ):
         # lazy import to avoid triggering triton import in CPU/backend decode paths

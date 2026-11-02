@@ -71,6 +71,14 @@ The FP32 recurrent cache is independent of the FP16 QSA caches. Choose batch
 size and GPU memory utilization to fit the backbone, recurrent state, and
 attention cache together. On 32 GiB GPUs, smaller prefill batches may be needed.
 
+IQ2_XS and IQ4_NL experts use grouped quantized matrix multiplication for
+prefill batches at or above `VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS` (default: 256).
+The general `VLLM_GGUF_MOE_MMQ_MIN_TOKENS` threshold also applies. The IQ path
+uses 8-token tiles on ROCm and supports models with more than 256 experts and
+IQ4_NL input widths such as 320. Smaller batches and decode keep MMVQ.
+Set `VLLM_GGUF_IQ_MOE_MMQ=0` before starting the server to use MMVQ for these
+experts during prefill as well.
+
 !!! warning
     We recommend using the tokenizer from base model instead of GGUF model. Because the tokenizer conversion from GGUF is time-consuming and unstable, especially for some models with large vocab size.
 
