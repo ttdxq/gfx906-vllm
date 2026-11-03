@@ -343,9 +343,10 @@ def rms_norm_gated_gfx906(
     gate: torch.Tensor,
     epsilon: float,
     norm_before_gate: bool,
+    sigmoid_gate: bool = False,
 ) -> torch.Tensor:
     return torch.ops._C.rms_norm_gated_gfx906(
-        input, weight, gate, epsilon, norm_before_gate
+        input, weight, gate, epsilon, norm_before_gate, sigmoid_gate
     )
 
 
@@ -358,6 +359,7 @@ if hasattr(torch.ops._C, "rms_norm_gated_gfx906"):
         gate: torch.Tensor,
         epsilon: float,
         norm_before_gate: bool,
+        sigmoid_gate: bool = False,
     ) -> torch.Tensor:
         return torch.empty_like(input)
 

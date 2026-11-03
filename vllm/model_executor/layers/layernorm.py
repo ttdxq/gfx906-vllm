@@ -408,7 +408,43 @@ class RMSNormGated(CustomOp):
                 self.norm_before_gate,
             )
 
-        if torch.compiler.is_compiling() or self._use_native_rocm_gfx90:
+        use_native = self._use_native_rocm_gfx90
+        if (
+            use_native
+            and self.activation == "sigmoid"
+            and self.group_size is None
+            and z is not None
+            and x.dim() >= 2
+            and x.numel() > 0
+            and x.shape == z.shape
+            and x.is_cuda
+            and z.is_cuda
+            and x.dtype == z.dtype == self.weight.dtype == torch.float16
+        ):
+            from vllm.platforms.rocm import on_gfx906
+
+            # Flash GDN uses [tokens, heads, head_dim] with a sigmoid gate.
+            use_native = not on_gfx906()
+            # Up to 16 TP2 GDN tokens; larger prefill uses the tiled FLA kernel.
+            if (
+                not use_native
+                and not torch.compiler.is_compiling()
+                and x.shape[-1] == 128
+                and x.numel() <= 384 * 128
+                and x.stride(-1) == z.stride(-1) == 1
+            ):
+                from vllm import _custom_ops as ops
+
+                return ops.rms_norm_gated_gfx906(
+                    x.reshape(-1, 128),
+                    self.weight,
+                    z.reshape(-1, 128),
+                    self.eps,
+                    self.norm_before_gate,
+                    sigmoid_gate=True,
+                ).reshape(x.shape)
+
+        if torch.compiler.is_compiling() or use_native:
             return self.forward_native(x, z)
 
         return torch.ops.vllm.fla_rms_norm_gated(

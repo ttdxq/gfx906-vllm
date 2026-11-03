@@ -89,7 +89,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def(
       "rms_norm_gated_gfx906(Tensor input, Tensor weight, Tensor gate, "
-      "float epsilon, bool norm_before_gate) -> Tensor");
+      "float epsilon, bool norm_before_gate, bool sigmoid_gate=False) -> Tensor");
   ops.impl("rms_norm_gated_gfx906", torch::kCUDA, &rms_norm_gated_gfx906);
 
   ops.def(

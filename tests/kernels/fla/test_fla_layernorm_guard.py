@@ -332,6 +332,60 @@ def test_layer_norm_rows_per_block(
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="Requires ROCm")
+@pytest.mark.parametrize("num_tokens", [1, 16, 17, 32, 512, 2048])
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("norm_before_gate", [True, False])
+@torch.inference_mode()
+def test_rmsnorm_gated_gfx906_sigmoid_is_fused(
+    default_vllm_config, num_tokens, contiguous, norm_before_gate
+) -> None:
+    """Flash's per-head sigmoid norm must avoid native pointwise dispatches."""
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        pytest.skip("Requires gfx906")
+    default_vllm_config.compilation_config.custom_ops.append("+rms_norm_gated")
+    set_random_seed(42)
+    layer = RMSNormGated(
+        128,
+        eps=1e-6,
+        norm_before_gate=norm_before_gate,
+        activation="sigmoid",
+        device=DEVICE,
+        dtype=torch.float16,
+    )
+    packed = torch.randn(num_tokens, 24, 2, 128, device=DEVICE, dtype=torch.float16)
+    x, z = packed[:, :, 0, :], packed[:, :, 1, :]
+    if contiguous:
+        x, z = x.contiguous(), z.contiguous()
+    expected = layer.forward_native(x, z)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
+        actual = layer(x, z)
+    fused_op = (
+        "_C::rms_norm_gated_gfx906"
+        if num_tokens <= 16
+        else "vllm::fla_rms_norm_gated"
+    )
+    assert fused_op in {event.key for event in prof.key_averages()}
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+    assert actual.dtype == x.dtype
+    assert actual.shape == x.shape
+    if num_tokens == 1 and contiguous and norm_before_gate:
+        empty = x[:0]
+        torch.testing.assert_close(
+            layer(empty, empty), layer.forward_native(empty, empty), atol=0, rtol=0
+        )
+        torch.library.opcheck(
+            torch.ops._C.rms_norm_gated_gfx906.default,
+            (x.reshape(-1, 128), layer.weight, z.reshape(-1, 128), 1e-6, True, True),
+            test_utils=("test_schema", "test_faketensor"),
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.inference_mode()
 def test_strided_input(dtype: torch.dtype) -> None:

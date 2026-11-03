@@ -93,7 +93,7 @@ void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
 
 torch::Tensor rms_norm_gated_gfx906(torch::Tensor input, torch::Tensor weight,
                                     torch::Tensor gate, double epsilon,
-                                    bool norm_before_gate);
+                                    bool norm_before_gate, bool sigmoid_gate);
 
 torch::Tensor gemma_rms_norm_gfx906(torch::Tensor input, torch::Tensor weight,
                                     double epsilon);
