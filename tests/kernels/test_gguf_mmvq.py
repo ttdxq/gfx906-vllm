@@ -136,6 +136,46 @@ def test_grouped_moe_matches_mmvq_with_512_experts(qtype, num_tokens, cols, top_
     torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("num_tokens", [191, 192, 217])
+@torch.inference_mode()
+def test_iq_moe_prefill_crossover_matches_vector(num_tokens):
+    """The full IQ2/IQ4 pipeline preserves outputs across the prefill crossover."""
+    experts, hidden, intermediate, top_k = 512, 256, 128, 10
+    w1 = torch.tensor(
+        np.tile(
+            _quantized_test_rows(gguf.GGMLQuantizationType.IQ2_XS, 256, hidden)[None],
+            (experts, 1, 1),
+        ),
+        device="cuda",
+    )
+    w2 = torch.tensor(
+        np.tile(
+            _quantized_test_rows(
+                gguf.GGMLQuantizationType.IQ4_NL, hidden, intermediate
+            )[None],
+            (experts, 1, 1),
+        ),
+        device="cuda",
+    )
+    torch.manual_seed(7319)
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.float16) * 0.1
+    ids = torch.topk(torch.randn(num_tokens, experts, device="cuda"), top_k).indices
+    ids = ids.to(torch.int32)
+    weights = torch.softmax(torch.randn(num_tokens, top_k, device="cuda"), dim=-1)
+    first = ops.ggml_moe_a8_vec(x, w1, ids, top_k, 17, 256, num_tokens)
+    activated = torch.empty(
+        num_tokens * top_k, intermediate, device=x.device, dtype=x.dtype
+    )
+    torch.ops._C.silu_and_mul(activated, first)
+    second = ops.ggml_moe_a8_vec(
+        activated, w2, ids, 1, 20, hidden, num_tokens * top_k
+    ).reshape(num_tokens, top_k, hidden)
+    expected = torch.empty_like(x)
+    ops.moe_weighted_sum(second, weights, expected)
+    actual = gguf_layer._fused_moe_gguf(x, w1, w2, weights, ids, 17, 20, "silu")
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
 def _dequantized_reference(data, qtype):
     decoded = gguf.dequantize(data, qtype)
     if qtype not in (gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.Q5_K):

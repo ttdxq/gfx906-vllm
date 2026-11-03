@@ -249,7 +249,13 @@ def _gguf_moe_mmq_min_tokens() -> int:
 
 @lru_cache(maxsize=1)
 def _gguf_iq_moe_mmq_min_tokens() -> int:
-    return max(1, _env_int("VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS", 256))
+    default = 256
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx906
+
+        if on_gfx906():
+            default = 192
+    return max(1, _env_int("VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS", default))
 
 
 @lru_cache(maxsize=1)

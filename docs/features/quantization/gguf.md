@@ -94,7 +94,8 @@ Set `VLLM_QWEN4EXP_GDN_KV_STATE=0` before starting the server to restore V×K
 storage.
 
 IQ2_XS and IQ4_NL experts use grouped quantized matrix multiplication for
-prefill batches at or above `VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS` (default: 256).
+prefill batches at or above `VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS` (default: 192 on
+gfx906, 256 on other GPUs).
 The general `VLLM_GGUF_MOE_MMQ_MIN_TOKENS` threshold also applies. The IQ path
 uses 8-token tiles on ROCm and supports models with more than 256 experts and
 IQ4_NL input widths such as 320. Smaller batches and decode keep MMVQ.
