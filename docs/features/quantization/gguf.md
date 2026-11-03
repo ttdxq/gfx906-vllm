@@ -101,6 +101,11 @@ IQ4_NL input widths such as 320. Smaller batches and decode keep MMVQ.
 Set `VLLM_GGUF_IQ_MOE_MMQ=0` before starting the server to use MMVQ for these
 experts during prefill as well.
 
+Qwen4Exp FP16 QSA on gfx906 uses narrow 16-token attention tiles for prefill
+with 256-wide heads and 12 query heads per KV head. This avoids the register
+pressure of the wider GPU profile; single-token decode and other head or cache
+formats retain their existing dispatch.
+
 !!! warning
     We recommend using the tokenizer from base model instead of GGUF model. Because the tokenizer conversion from GGUF is time-consuming and unstable, especially for some models with large vocab size.
 

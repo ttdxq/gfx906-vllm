@@ -10,6 +10,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -891,6 +892,24 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+    if (
+        on_gfx906()
+        and q.dtype == torch.float16
+        and not is_fp8
+        and head_dim == 256
+        and group_size == 12
+        and base_programs >= 32
+    ):
+        # Narrow tiles avoid the wide dot's register pressure on gfx906.
+        block_n, partial_warps = 16, 4
+        if base_programs <= 64:
+            target_splits = 16
+        elif base_programs <= 256:
+            target_splits = 8
+        elif base_programs <= 512:
+            target_splits = 4
+        else:
+            target_splits = 1
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
     partial_stages = 1 if current_platform.is_rocm() else 2
