@@ -81,7 +81,10 @@ class Qwen4ExpHCGemvMethod(UnquantizedLinearMethod):
             and x.device == weight.device
             and x.dtype == weight.dtype == torch.float16
             and x.shape[1] == weight.shape[1]
-            and 8192 < weight.shape[1] <= 16384
+            and (
+                8192 < weight.shape[1] <= 16384
+                or (weight.shape[0] == 1 and 0 < weight.shape[1] <= 8192)
+            )
             and x.stride(1) == weight.stride(1) == 1
         ):
             return torch.ops.vllm.qwen4_exp_gemv_gfx906(x, weight)
@@ -92,22 +95,33 @@ def enable_qwen4_exp_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
 ) -> None:
-    """Use a long-K GEMV for gfx906 FP16 HC down projections."""
-    if not on_gfx906() or dtype != torch.float16 or not envs.VLLM_QWEN4EXP_HC_GEMV:
+    """Use reduction GEMVs for gfx906 FP16 HC and scalar expert gates."""
+    if not on_gfx906() or dtype != torch.float16:
         return
     config = get_current_vllm_config_or_none()
     if config is not None and config.kernel_config.linear_backend != "auto":
         return
     for name, child in module.named_modules():
-        if not name.endswith(
-            ("input_mix_weight_down", "input_mix_weight_down_block_inject")
-        ):
-            continue
         if not (
             isinstance(child, LinearBase)
             and type(child.quant_method) is UnquantizedLinearMethod
         ):
             continue
         weight = child.weight
-        if weight.ndim == 2 and 8192 < weight.shape[1] <= 16384:
+        if weight.ndim != 2:
+            continue
+        hc_projection = (
+            envs.VLLM_QWEN4EXP_HC_GEMV
+            and name.endswith(
+                ("input_mix_weight_down", "input_mix_weight_down_block_inject")
+            )
+            and 8192 < weight.shape[1] <= 16384
+        )
+        scalar_gate = (
+            envs.VLLM_QWEN4EXP_SHARED_EXPERT_GATE_GEMV
+            and name.endswith("shared_expert_gate")
+            and weight.shape[0] == 1
+            and 0 < weight.shape[1] <= 8192
+        )
+        if hc_projection or scalar_gate:
             child.quant_method = Qwen4ExpHCGemvMethod()

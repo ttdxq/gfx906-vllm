@@ -11,6 +11,7 @@ from vllm.model_executor.layers.quantization.gguf import (
     _fused_mul_mat_gguf,
 )
 from vllm.models.qwen4_exp.amd.low_latency_gemm import (
+    Qwen4ExpHCGemvMethod,
     _hc_gemv,
     enable_qwen4_exp_low_latency_gemm,
 )
@@ -73,3 +74,57 @@ def test_gguf_f16_gdn_out_proj_gemv_matches_mm(tokens: int):
     actual = _fused_mul_mat_gguf(x, weight, WeightType.F16)
     expected = x @ weight.T
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 16])
+@pytest.mark.parametrize("k", [257, 2560, 8192])
+@torch.inference_mode()
+def test_scalar_expert_gate_gemv_matches_fp32(tokens: int, k: int):
+    """Scalar gates also support odd K and strided token/weight rows."""
+    torch.manual_seed(7319)
+    x = torch.randn(tokens, k + 11, device="cuda", dtype=torch.float16)[:, :k]
+    weight = torch.randn(1, k + 7, device="cuda", dtype=torch.float16)[:, :k]
+    actual = _hc_gemv(x, weight)
+    expected = torch.nn.functional.linear(x.float(), weight.float()).half()
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("tokens", [1, 16, 17])
+@pytest.mark.parametrize("bias", [False, True])
+@torch.inference_mode()
+def test_scalar_expert_gate_hook_preserves_linear(
+    default_vllm_config, dist_init, tokens, bias
+):
+    """Check the real linear hook and bias/large-batch fallback."""
+    torch.manual_seed(7319)
+    model = nn.Module()
+    with torch.device("cuda"):
+        model.shared_expert_gate = ReplicatedLinear(
+            2560, 1, bias=bias, params_dtype=torch.float16
+        )
+    layer = model.shared_expert_gate
+    layer.weight.normal_(std=0.01)
+    if layer.bias is not None:
+        layer.bias.normal_(std=0.01)
+    x = torch.randn(tokens, 2560, device="cuda", dtype=torch.float16)
+    expected, _ = layer(x)
+    enable_qwen4_exp_low_latency_gemm(model, torch.float16)
+    actual, _ = layer(x)
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-3)
+    if on_gfx906():
+        assert isinstance(layer.quant_method, Qwen4ExpHCGemvMethod)
+
+
+@torch.inference_mode()
+def test_scalar_expert_gate_hook_opt_out(default_vllm_config, dist_init, monkeypatch):
+    from vllm import envs
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_SHARED_EXPERT_GATE_GEMV", False)
+    model = nn.Module()
+    with torch.device("cuda"):
+        model.shared_expert_gate = ReplicatedLinear(
+            2560, 1, bias=False, params_dtype=torch.float16
+        )
+    enable_qwen4_exp_low_latency_gemm(model, torch.float16)
+    assert type(model.shared_expert_gate.quant_method) is UnquantizedLinearMethod

@@ -167,6 +167,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_GFX906_ALLOW_BF16: bool = False
     VLLM_QWEN4EXP_GDN_CHUNK_PREFILL: bool = True
     VLLM_QWEN4EXP_HC_GEMV: bool = True
+    VLLM_QWEN4EXP_SHARED_EXPERT_GATE_GEMV: bool = True
     VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV: bool = True
     VLLM_QWEN4EXP_GDN_KV_STATE: bool = True
 
@@ -1477,6 +1478,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen4Exp HC down projections have K > 8192, beyond LLMM1's block limit.
     "VLLM_QWEN4EXP_HC_GEMV": lambda: (
         os.getenv("VLLM_QWEN4EXP_HC_GEMV", "1").lower() in ("true", "1")
+    ),
+    # The scalar shared-expert gate needs a dot reduction, not a tiled GEMM.
+    "VLLM_QWEN4EXP_SHARED_EXPERT_GATE_GEMV": lambda: (
+        os.getenv("VLLM_QWEN4EXP_SHARED_EXPERT_GATE_GEMV", "1").lower()
+        in ("true", "1")
     ),
     "VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV": lambda: (
         os.getenv("VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV", "1").lower() in ("true", "1")
