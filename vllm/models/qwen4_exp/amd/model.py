@@ -69,6 +69,7 @@ from vllm.model_executor.models.utils import (
 from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.platforms.rocm import on_gfx906
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -226,6 +227,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 create_in_proj_ba=False,
                 use_chunk_prefill_on_gfx906=envs.VLLM_QWEN4EXP_GDN_CHUNK_PREFILL,
             )
+            if (
+                on_gfx906()
+                and envs.VLLM_QWEN4EXP_GDN_KV_STATE
+                and config.linear_key_head_dim == config.linear_value_head_dim == 128
+            ):
+                # Match chunk state to the existing coalesced packed decode.
+                self.linear_attn.use_transposed_state_for_packed_decode = True
         elif layer_type in _QSA_LAYER_TYPES:
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
             if not use_qsa:

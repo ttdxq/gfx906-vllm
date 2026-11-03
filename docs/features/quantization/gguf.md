@@ -86,6 +86,13 @@ to disable this optimization. The FP16 GDN output projection with shape
 apply to Qwen4Exp; Qwen3.5 models such as Qwen3.8-27B retain their existing GDN
 path.
 
+On gfx906, Qwen4Exp GDN with 128-wide key and value heads keeps its recurrent
+state in K×V order. This enables the existing warp-cooperative single-token
+decode kernel and lets chunk prefill write the same cache layout. Mixed
+prefill/decode and recurrent fallback calls receive a V×K view of that cache.
+Set `VLLM_QWEN4EXP_GDN_KV_STATE=0` before starting the server to restore V×K
+storage.
+
 IQ2_XS and IQ4_NL experts use grouped quantized matrix multiplication for
 prefill batches at or above `VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS` (default: 256).
 The general `VLLM_GGUF_MOE_MMQ_MIN_TOKENS` threshold also applies. The IQ path

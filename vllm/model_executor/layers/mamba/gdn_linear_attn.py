@@ -1023,6 +1023,9 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
+        recurrent_decode_state = ssm_state
+        if self._uses_transposed_temporal_state():
+            recurrent_decode_state = ssm_state.transpose(-1, -2)
         if split_non_spec:
             assert query_decode is not None
             assert key_decode is not None
@@ -1035,7 +1038,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 q=query_decode,
                 k=key_decode,
                 v=value_decode,
-                initial_state=ssm_state,
+                initial_state=recurrent_decode_state,
                 inplace_final_state=True,
                 cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
                 ssm_state_indices=non_spec_state_indices_tensor[
@@ -1153,7 +1156,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    initial_state=ssm_state,
+                    initial_state=recurrent_decode_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor,
@@ -1168,7 +1171,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    initial_state=ssm_state,
+                    initial_state=recurrent_decode_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor,
