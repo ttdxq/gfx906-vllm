@@ -90,6 +90,45 @@ def _quantized_test_rows(qtype, rows, cols):
     ].copy()
 
 
+@pytest.mark.parametrize("num_tokens", [1, 3])
+@pytest.mark.parametrize("cols", [256, 2560])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_iq3_lut_decode(
+    monkeypatch, num_tokens, cols
+):
+    """Routed LUT GEMV keeps the dense LUT math and full expert indices."""
+    rows, experts, top_k = 129, 512, 10
+    qtype = gguf.GGMLQuantizationType.IQ3_S
+    data = np.tile(_quantized_test_rows(qtype, rows, cols)[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    weight = torch.tensor(data, device="cuda")
+    torch.manual_seed(7319)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda")
+    route = [0, 1, 127, 254, 255, 256, 257, 383, 510, 511]
+    ids = torch.tensor(route, device="cuda", dtype=torch.int32).repeat(num_tokens, 1)
+    monkeypatch.setenv("VLLM_GGUF_IQ_WIDE", "1")
+    monkeypatch.setenv("VLLM_GGUF_IQ_LUT", "2")
+    expected = []
+    for token in range(num_tokens):
+        quant_x = ops.ggml_quantize_row_q8_1(x[token : token + 1])
+        for expert in route:
+            expected.append(
+                ops.ggml_mul_mat_vec_q8(
+                    weight[expert], quant_x, qtype, rows, cols, x.dtype
+                )
+            )
+    expected = torch.cat(expected)
+    monkeypatch.setenv("VLLM_GGUF_MOE_IQ3_S_LUT", "1")
+    output = torch.full_like(expected, float("nan"))
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    ops.ggml_moe_a8_vec_out(
+        x, weight, ids, output, quant_x, top_k, qtype, rows, num_tokens
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "qtype,cols",
     [

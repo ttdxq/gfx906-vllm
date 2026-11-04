@@ -330,6 +330,19 @@ static void moe_vec_iq3_s_q8_1_cuda(const void* vx, const void* vy,
                                     const int ncols, const int nrows,
                                     const int token_stride,
                                     cudaStream_t stream) {
+#ifdef USE_ROCM
+  const char* lut_env = std::getenv("VLLM_GGUF_MOE_IQ3_S_LUT");
+  if (lut_env != nullptr && lut_env[0] == '1' &&
+      std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+              .find("gfx906") == 0) {
+    const dim3 grid((nrows + 3) / 4, 1, tokens * top_k);
+    mul_mat_vec_iq_lut<scalar_t, 1, 3, true, true>
+        <<<grid, 256, 0, stream>>>(
+            (const uint8_t*)vx, (const block_q8_1*)vy, dst, ncols,
+            nrows, nrows, topk_ids, top_k, token_stride);
+    return;
+  }
+#endif
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
