@@ -90,6 +90,60 @@ def _quantized_test_rows(qtype, rows, cols):
     ].copy()
 
 
+@pytest.mark.parametrize(
+    "qtype", [gguf.GGMLQuantizationType.Q8_0, gguf.GGMLQuantizationType.IQ4_NL]
+)
+@pytest.mark.parametrize("cols", [256, 320, 512, 640])
+@pytest.mark.parametrize("top_k", [1, 10])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_small_k_subwarp(
+    monkeypatch, qtype, cols, top_k
+):
+    """Short W2 rows retain exact sums, routing and padded-row coverage."""
+    rows, experts, tokens = 129, 512, 10 // top_k
+    data = np.tile(_quantized_test_rows(qtype, rows, cols)[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    weight = torch.tensor(data, device="cuda")
+    torch.manual_seed(2026)
+    x = torch.randn(tokens, cols, dtype=torch.float16, device="cuda")
+    ids = torch.tensor(
+        [0, 1, 127, 254, 255, 256, 257, 383, 510, 511], device="cuda", dtype=torch.int32
+    ).view(tokens, top_k)
+    monkeypatch.setenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", "0")
+    expected = ops.ggml_moe_a8_vec(x, weight, ids, top_k, qtype, rows, tokens)
+    monkeypatch.setenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", "1")
+    output = torch.full_like(expected, float("nan"))
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    ops.ggml_moe_a8_vec_out(x, weight, ids, output, quant_x, top_k, qtype, rows, tokens)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    if (
+        "gfx906" in getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+        and qtype == gguf.GGMLQuantizationType.IQ4_NL
+        and cols == 320
+        and top_k == 10
+    ):
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profile:
+            ops.ggml_moe_a8_vec_out(
+                x, weight, ids, output, quant_x, top_k, qtype, rows, tokens
+            )
+            torch.cuda.synchronize()
+        kernels = [
+            event.name
+            for event in profile.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        assert any("moe_vec_q<" in name and ", 32>" in name for name in kernels), (
+            kernels
+        )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 3])
 @pytest.mark.parametrize("cols", [256, 2560])
 @torch.inference_mode()
