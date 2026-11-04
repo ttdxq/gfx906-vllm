@@ -803,7 +803,7 @@ static __device__ __forceinline__ void load_tiles_moe_iq4_nl(
   }
 }
 
-template <typename scalar_t, bool need_check>
+template <typename scalar_t, bool need_check, int TILE_ROWS = MOE_Y_IQ>
 static __global__ void
 #if defined(USE_ROCM)
 __launch_bounds__(WARP_SIZE_GGUF * NWARPS_IQ, 2)
@@ -815,9 +815,9 @@ __launch_bounds__(WARP_SIZE_GGUF * NWARPS_IQ, 2)
                const int ncols_y, const int nrows_y, const int nrows_dst,
                const int top_k) {
   moe_q<scalar_t, QK_K, QR4_XS, QI4_XS, false, block_iq4_nl,
-        MOE_X_IQ, MOE_Y_IQ, NWARPS_IQ,
-        allocate_tiles_iq<MOE_Y_IQ, 2 * WARP_SIZE_GGUF + 1, 8>,
-        load_tiles_moe_iq4_nl<MOE_Y_IQ, NWARPS_IQ, need_check>,
+        MOE_X_IQ, TILE_ROWS, NWARPS_IQ,
+        allocate_tiles_iq<TILE_ROWS, 2 * WARP_SIZE_GGUF + 1, 8>,
+        load_tiles_moe_iq4_nl<TILE_ROWS, NWARPS_IQ, need_check>,
         VDR_IQ_Q8_1_MMQ, vec_dot_iq_v4_mul_mat, QK4_NL>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
       exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
@@ -831,21 +831,34 @@ static void ggml_moe_iq4_nl_q8_1_cuda(
     const int ncols_x, const int nrows_x, const int ncols_y,
     const int nrows_y, const int nrows_dst, const int top_k,
     const int tokens_post_padded, cudaStream_t stream) {
-  const dim3 block_nums((nrows_x + MOE_Y_IQ - 1) / MOE_Y_IQ,
-                        tokens_post_padded / MOE_X_IQ, 1);
+  const char* tile_env = std::getenv("VLLM_GGUF_MOE_IQ4_NL_TILE_ROWS");
+  const int tile_rows = tile_env == nullptr ? MOE_Y_IQ : std::atoi(tile_env);
   const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
-  if (nrows_x % MOE_Y_IQ == 0) {
-    moe_iq4_nl<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+#define LAUNCH_IQ_TILE(ROWS_) \
+  do { \
+    const dim3 grid((nrows_x + ROWS_ - 1) / ROWS_, \
+                    tokens_post_padded / MOE_X_IQ, 1); \
+    if (nrows_x % ROWS_ == 0) { \
+      moe_iq4_nl<scalar_t, false, ROWS_><<<grid, block_dims, 0, stream>>>( \
+          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k); \
+    } else { \
+      moe_iq4_nl<scalar_t, true, ROWS_><<<grid, block_dims, 0, stream>>>( \
+          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k); \
+    } \
+  } while (0)
+  if (tile_rows == 32) {
+    LAUNCH_IQ_TILE(32);
+  } else if (tile_rows == 64) {
+    LAUNCH_IQ_TILE(64);
   } else {
-    moe_iq4_nl<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+    LAUNCH_IQ_TILE(MOE_Y_IQ);
   }
+#undef LAUNCH_IQ_TILE
 }
 
-template <typename scalar_t, bool need_check>
+template <typename scalar_t, bool need_check, int TILE_ROWS = MOE_Y_IQ>
 static __global__ void
 #if defined(USE_ROCM)
 __launch_bounds__(WARP_SIZE_GGUF * NWARPS_IQ, 2)
@@ -857,9 +870,9 @@ __launch_bounds__(WARP_SIZE_GGUF * NWARPS_IQ, 2)
               const int ncols_y, const int nrows_y, const int nrows_dst,
               const int top_k) {
   moe_q<scalar_t, QK_K, QR4_XS, QI4_XS, false, block_iq3_s,
-        MOE_X_IQ, MOE_Y_IQ, NWARPS_IQ,
-        allocate_tiles_iq<MOE_Y_IQ, 2 * WARP_SIZE_GGUF + 1, 8>,
-        load_tiles_iq3_s<MOE_Y_IQ, NWARPS_IQ, need_check>,
+        MOE_X_IQ, TILE_ROWS, NWARPS_IQ,
+        allocate_tiles_iq<TILE_ROWS, 2 * WARP_SIZE_GGUF + 1, 8>,
+        load_tiles_iq3_s<TILE_ROWS, NWARPS_IQ, need_check>,
         VDR_IQ_Q8_1_MMQ, vec_dot_iq_v4_mul_mat>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
       exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
@@ -873,18 +886,31 @@ static void ggml_moe_iq3_s_q8_1_cuda(
     const int ncols_x, const int nrows_x, const int ncols_y,
     const int nrows_y, const int nrows_dst, const int top_k,
     const int tokens_post_padded, cudaStream_t stream) {
-  const dim3 block_nums((nrows_x + MOE_Y_IQ - 1) / MOE_Y_IQ,
-                       tokens_post_padded / MOE_X_IQ, 1);
+  const char* tile_env = std::getenv("VLLM_GGUF_MOE_IQ3_S_TILE_ROWS");
+  const int tile_rows = tile_env == nullptr ? MOE_Y_IQ : std::atoi(tile_env);
   const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
-  if (nrows_x % MOE_Y_IQ == 0) {
-    moe_iq3_s<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+#define LAUNCH_IQ_TILE(ROWS_) \
+  do { \
+    const dim3 grid((nrows_x + ROWS_ - 1) / ROWS_, \
+                    tokens_post_padded / MOE_X_IQ, 1); \
+    if (nrows_x % ROWS_ == 0) { \
+      moe_iq3_s<scalar_t, false, ROWS_><<<grid, block_dims, 0, stream>>>( \
+          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k); \
+    } else { \
+      moe_iq3_s<scalar_t, true, ROWS_><<<grid, block_dims, 0, stream>>>( \
+          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k); \
+    } \
+  } while (0)
+  if (tile_rows == 32) {
+    LAUNCH_IQ_TILE(32);
+  } else if (tile_rows == 64) {
+    LAUNCH_IQ_TILE(64);
   } else {
-    moe_iq3_s<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+    LAUNCH_IQ_TILE(MOE_Y_IQ);
   }
+#undef LAUNCH_IQ_TILE
 }
 
 template <typename scalar_t, bool need_check>

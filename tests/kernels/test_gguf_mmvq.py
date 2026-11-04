@@ -183,6 +183,51 @@ def test_grouped_moe_matches_mmvq_with_512_experts_iq3_lut_decode(
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("qtype,cols", [(21, 2560), (20, 320)])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_prefill_row_tiles(
+    monkeypatch, qtype, cols
+):
+    from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+    qtype = gguf.GGMLQuantizationType(qtype)
+    rows, experts, tokens, top_k = 129, 512, 65, 10
+    weight = torch.tensor(
+        np.tile(_quantized_test_rows(qtype, rows, cols)[None], (experts, 1, 1)),
+        device="cuda",
+    )
+    ids = torch.tensor(
+        [0, 1, 127, 254, 255, 256, 257, 383, 510, 511], device="cuda", dtype=torch.int32
+    ).repeat(tokens, 1)
+    torch.manual_seed(7319)
+    x = torch.randn(tokens, cols, dtype=torch.float16, device="cuda")
+    aligned = moe_align_block_size(ids, ops.ggml_moe_get_block_size(qtype), experts)
+    env_name = f"VLLM_GGUF_MOE_{qtype.name}_TILE_ROWS"
+    monkeypatch.setenv(env_name, "128")
+    expected = ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, tokens)
+    for tile in (32, 64):
+        monkeypatch.setenv(env_name, str(tile))
+        actual = ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, tokens)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profile:
+            ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, tokens)
+            torch.cuda.synchronize()
+        kernels = [
+            e.name
+            for e in profile.events()
+            if e.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        assert any(
+            f"moe_{qtype.name.lower()}<" in name and f", {tile}>" in name
+            for name in kernels
+        ), kernels
+
+
 @pytest.mark.parametrize(
     "qtype,cols",
     [
