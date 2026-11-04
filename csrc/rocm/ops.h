@@ -2,6 +2,11 @@
 
 #include <torch/all.h>
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> qwen4exp_hc_mix(
+    torch::Tensor residual, std::optional<torch::Tensor> block,
+    std::optional<torch::Tensor> injection, torch::Tensor norm,
+    torch::Tensor down, torch::Tensor up, double eps);
+
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
                     const int64_t rows_per_block);
 

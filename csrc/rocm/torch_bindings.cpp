@@ -18,6 +18,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 // (gfx9/gfx11 ISA, unsupported there); skip these registrations to avoid
 // undefined symbols. vLLM uses default/Triton GEMM for these ops on gfx1250.
 #ifndef VLLM_SKIP_SKINNY_GEMMS
+  rocm_ops.def("qwen4exp_hc_mix(Tensor residual, Tensor? block, Tensor? injection, "
+               "Tensor norm, Tensor down, Tensor up, float eps) -> (Tensor, Tensor, Tensor)");
+  rocm_ops.impl("qwen4exp_hc_mix", torch::kCUDA, &qwen4exp_hc_mix);
   // Custom gemm op for matrix-vector multiplication
   rocm_ops.def(
       "LLMM1(Tensor in_a, Tensor in_b, int rows_per_block) -> "

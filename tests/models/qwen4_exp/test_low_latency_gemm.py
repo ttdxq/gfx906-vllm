@@ -23,6 +23,57 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("per_branch_norm", [False, True])
+@torch.inference_mode()
+def test_native_hc_decode_mix_preserves_real_layer(
+    default_vllm_config, dist_init, monkeypatch, pending, per_branch_norm
+):
+    from vllm.models.qwen4_exp.amd.hyperconnection import (
+        GatedResidual,
+        HyperConnectionConfig,
+    )
+
+    monkeypatch.setenv("VLLM_QWEN4EXP_GGUF_HC_UP_QUANT", "0")
+    torch.manual_seed(7319)
+    with torch.device("cuda"):
+        layer = GatedResidual(
+            HyperConnectionConfig(
+                hidden_size=2560,
+                hc_lowrank=320,
+                hc_count=4,
+                params_dtype=torch.float16,
+                hc_per_branch_norm=per_branch_norm,
+            )
+        )
+    for param in layer.parameters():
+        param.normal_(std=0.01)
+    enable_qwen4_exp_low_latency_gemm(layer, torch.float16)
+    residual = torch.randn(1, 10240, dtype=torch.float16, device="cuda")
+    block = torch.randn(1, 2560, dtype=torch.float16, device="cuda")
+    injection = torch.randn(1, 4, dtype=torch.float16, device="cuda")
+
+    def run():
+        return (
+            layer.combine_and_mix(residual, block, injection)
+            if pending
+            else layer.mix(residual)
+        )
+
+    monkeypatch.setenv("VLLM_QWEN4EXP_NATIVE_HC_MIX", "0")
+    expected = run()
+    monkeypatch.setenv("VLLM_QWEN4EXP_NATIVE_HC_MIX", "1")
+    actual = run()
+    for observed, reference in zip(actual, expected):
+        torch.testing.assert_close(observed, reference, atol=2e-3, rtol=1e-3)
+    if on_gfx906():
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as profile:
+            run()
+        assert any(e.key == "_rocm_C::qwen4exp_hc_mix" for e in profile.key_averages())
+
+
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("rows,k", [(320, 10240), (336, 10240), (19, 8193), (7, 16384)])
 @torch.inference_mode()

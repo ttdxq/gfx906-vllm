@@ -139,6 +139,16 @@ class GatedResidual(nn.Module):
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self._use_native_decode_mix(hidden_states):
+            return torch.ops._rocm_C.qwen4exp_hc_mix(
+                hidden_states,
+                None,
+                None,
+                self.hc_norm.weight,
+                self.input_mix_weight_down_block_inject.weight,
+                self.input_mix_weight_up.weight,
+                self.config.rms_norm_eps,
+            )
         xn = grouped_gemma_rmsnorm(
             hidden_states,
             self.hc_norm.weight,
@@ -173,6 +183,16 @@ class GatedResidual(nn.Module):
         block's mix. Its combine with ``block_output`` is fused with this
         module's input RMSNorm.
         """
+        if self._use_native_decode_mix(hidden_states):
+            return torch.ops._rocm_C.qwen4exp_hc_mix(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.input_mix_weight_down_block_inject.weight,
+                self.input_mix_weight_up.weight,
+                self.config.rms_norm_eps,
+            )
         hidden_states, xn = hc_combine_norm(
             hidden_states,
             prev_block_output,
@@ -204,6 +224,24 @@ class GatedResidual(nn.Module):
         injection: torch.Tensor,
     ) -> torch.Tensor:
         return hc_combine(hidden_states, block_output, injection, self.hc_count)
+
+    def _use_native_decode_mix(self, hidden_states: torch.Tensor) -> bool:
+        if (
+            os.getenv("VLLM_QWEN4EXP_NATIVE_HC_MIX", "0") != "1"
+            or not self.use_combine
+            or self.hc_count != 4
+            or self.hc_lowrank != 320
+            or hidden_states.shape != (1, 10240)
+            or hidden_states.dtype != torch.float16
+            or not hidden_states.is_cuda
+            or not hidden_states.is_contiguous()
+            or not hasattr(self.input_mix_weight_up, "weight")
+            or not hasattr(torch.ops._rocm_C, "qwen4exp_hc_mix")
+        ):
+            return False
+        from vllm.platforms.rocm import on_gfx906
+
+        return on_gfx906()
 
     @property
     def hyper_hidden_size(self) -> int:

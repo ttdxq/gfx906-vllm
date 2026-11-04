@@ -22,6 +22,173 @@ static constexpr int64_t kWvSlots = 8;
 // Slots held back for capturing streams, which cannot allocate one themselves.
 static constexpr int64_t kWvCaptureSlots = 8;
 
+__global__ void qwen4exp_hc_down_vec_kernel(
+    const half* __restrict__ x, const half* __restrict__ weight,
+    half* __restrict__ out, int rows) {
+  const int row = blockIdx.x;
+  const int token = blockIdx.y;
+  const auto* xv = reinterpret_cast<const float4*>(x + token * 10240);
+  const auto* wv = reinterpret_cast<const float4*>(weight + row * 10240);
+  float acc[8] = {};
+#pragma unroll
+  for (int i = threadIdx.x; i < 1280; i += 256) {
+    const float4 a = xv[i];
+    const float4 b = wv[i];
+    const half* ah = reinterpret_cast<const half*>(&a);
+    const half* bh = reinterpret_cast<const half*>(&b);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      acc[j] += __fmul_rn(__half2float(ah[j]), __half2float(bh[j]));
+    }
+  }
+  float sum = ((acc[0] + acc[1]) + (acc[2] + acc[3])) +
+              ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+  for (int offset = 32; offset; offset >>= 1) sum += __shfl_xor(sum, offset, 64);
+  __shared__ float partial[4];
+  if ((threadIdx.x & 63) == 0) partial[threadIdx.x >> 6] = sum;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    out[token * rows + row] = __float2half_rn(
+        (partial[0] + partial[1]) + (partial[2] + partial[3]));
+  }
+}
+
+static torch::Tensor qwen4exp_hc_down(torch::Tensor x, torch::Tensor weight) {
+  auto out = torch::empty({1, 336}, x.options());
+  qwen4exp_hc_down_vec_kernel<<<336, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()), 336);
+  return out;
+}
+
+torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
+                   const int64_t rows_per_block);
+
+template <bool COMBINE>
+__global__ void qwen4exp_hc_norm_kernel(
+    const half* residual, const half* block, const half* injection,
+    const half* norm, half* materialized, half* normalized, float eps,
+    bool shared_norm) {
+  constexpr int dim = 2560;
+  const int branch = blockIdx.x;
+  const int tid = threadIdx.x;
+  float scale = 0.f;
+  if constexpr (COMBINE) {
+    const float logit = __half2float(injection[branch]) * 0.25f;
+    scale = 2.f / (1.f + __expf(-logit));
+  }
+  float values[10];
+  float sum = 0.f;
+#pragma unroll
+  for (int i = 0; i < 10; ++i) {
+    const int col = tid + i * 256;
+    half value = residual[branch * dim + col];
+    if constexpr (COMBINE) {
+      value = __float2half_rn(__half2float(value) +
+                             __half2float(block[col]) * scale);
+      materialized[branch * dim + col] = value;
+    }
+    values[i] = __half2float(value);
+    sum += __fmul_rn(values[i], values[i]);
+  }
+  for (int offset = 32; offset; offset >>= 1) sum += __shfl_xor(sum, offset, 64);
+  __shared__ float partial[4];
+  if ((tid & 63) == 0) partial[tid >> 6] = sum;
+  __syncthreads();
+  const float rrms = rsqrtf(((partial[0] + partial[1]) +
+                             (partial[2] + partial[3])) / dim + eps);
+#pragma unroll
+  for (int i = 0; i < 10; ++i) {
+    const int col = tid + i * 256;
+    const float w = __half2float(norm[(shared_norm ? 0 : branch * dim) + col]);
+    const float y = values[i] * rrms;
+    normalized[branch * dim + col] = __float2half_rn(fmaf(y, w, y));
+  }
+}
+
+__global__ void qwen4exp_hc_silu_kernel(const half* down, half* lowrank) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col < 320) {
+    const float x = __half2float(down[col]) * 0.25f;
+    lowrank[col] = __float2half_rn(x / (1.f + __expf(-x)));
+  }
+}
+
+__global__ void qwen4exp_hc_gate_kernel(
+    const half* normalized, const half* gate, half* output) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= 2560) return;
+  float sum = 0.f;
+#pragma unroll
+  for (int branch = 0; branch < 4; ++branch) {
+    const int offset = branch * 2560 + col;
+    const float g = __half2float(gate[offset]);
+    const float x = __half2float(normalized[offset]);
+    sum += x / (1.f + __expf(-g));
+  }
+  output[col] = __float2half_rn(sum * 0.25f);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> qwen4exp_hc_mix(
+    torch::Tensor residual, std::optional<torch::Tensor> block,
+    std::optional<torch::Tensor> injection, torch::Tensor norm,
+    torch::Tensor down, torch::Tensor up, double eps) {
+  TORCH_CHECK(residual.is_cuda() && residual.scalar_type() == at::kHalf &&
+                  residual.sizes() == at::IntArrayRef({1, 10240}) &&
+                  residual.is_contiguous(), "HC mix requires contiguous FP16 [1,10240]");
+  TORCH_CHECK(down.sizes() == at::IntArrayRef({336, 10240}) &&
+                  up.sizes() == at::IntArrayRef({10240, 320}) &&
+                  down.is_contiguous() && up.is_contiguous(),
+              "HC mix requires the padded 320/4 projection shapes");
+  for (const auto& tensor : {norm, down, up}) {
+    TORCH_CHECK(tensor.device() == residual.device() &&
+                    tensor.scalar_type() == at::kHalf,
+                "HC mix weights must be FP16 on the residual GPU");
+  }
+  TORCH_CHECK(norm.is_contiguous() && (norm.numel() == 2560 || norm.numel() == 10240),
+              "Invalid HC mix norm weight");
+  TORCH_CHECK(block.has_value() == injection.has_value(),
+              "HC mix needs both block and injection or neither");
+  if (block.has_value()) {
+    TORCH_CHECK(block->sizes() == at::IntArrayRef({1, 2560}) &&
+                    injection->sizes() == at::IntArrayRef({1, 4}) &&
+                    block->device() == residual.device() &&
+                    injection->device() == residual.device() &&
+                    block->scalar_type() == at::kHalf &&
+                    injection->scalar_type() == at::kHalf &&
+                    block->stride(1) == 1 && injection->stride(1) == 1,
+                "Invalid HC mix pending block or injection");
+  }
+  const at::cuda::OptionalCUDAGuard guard(device_of(residual));
+  TORCH_CHECK(std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+                      .find("gfx906") == 0,
+              "HC decode mix requires gfx906 wave64 execution");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  auto materialized = block.has_value() ? torch::empty_like(residual) : residual;
+  auto normalized = torch::empty_like(residual);
+  const auto ptr = [](const torch::Tensor& t) {
+    return reinterpret_cast<half*>(t.data_ptr<at::Half>());
+  };
+  if (block.has_value()) {
+    qwen4exp_hc_norm_kernel<true><<<4, 256, 0, stream>>>(
+        ptr(residual), ptr(*block), ptr(*injection), ptr(norm), ptr(materialized),
+        ptr(normalized), eps, norm.numel() == 2560);
+  } else {
+    qwen4exp_hc_norm_kernel<false><<<4, 256, 0, stream>>>(
+        ptr(residual), nullptr, nullptr, ptr(norm), ptr(materialized),
+        ptr(normalized), eps, norm.numel() == 2560);
+  }
+  auto projected = qwen4exp_hc_down(normalized, down);
+  auto lowrank = torch::empty({1, 320}, residual.options());
+  qwen4exp_hc_silu_kernel<<<2, 256, 0, stream>>>(ptr(projected), ptr(lowrank));
+  auto gate = LLMM1(up, lowrank, 4);
+  auto output = torch::empty({1, 2560}, residual.options());
+  qwen4exp_hc_gate_kernel<<<10, 256, 0, stream>>>(
+      ptr(normalized), ptr(gate), ptr(output));
+  return {materialized, output, projected.narrow(1, 320, 4)};
+}
+
 // TODO(rasmith): The kernels in this file are susceptible to integer overflow
 // issues, do not take strides, and are unable to handle PyTorch tensors that
 // return is_contiguous() as False (the tensors may actually be contiguous
