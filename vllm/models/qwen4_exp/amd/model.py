@@ -66,6 +66,7 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.model_executor.offloader import get_offloader
 from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -443,6 +444,19 @@ class Qwen4ExpModel(nn.Module):
                 config.hidden_size,
                 quant_config=vllm_config.quant_config,
             )
+            offloader = get_offloader()
+            if (
+                vllm_config.quant_config is not None
+                and vllm_config.quant_config.get_name() == "gguf"
+                and offloader.supports_tower_offload
+                and "embed_tokens" in getattr(offloader, "cpu_offload_params", set())
+            ):
+                # Embedding queries read selected rows, so allow the existing
+                # parameter filter to offload this table independently of MoE.
+                self.embed_tokens = offloader.wrap_modules(
+                    (module for module in (self.embed_tokens,)),
+                    prefix=maybe_prefix(prefix, "embed_tokens"),
+                )[0]
         else:
             self.embed_tokens = PPMissingLayer()
 

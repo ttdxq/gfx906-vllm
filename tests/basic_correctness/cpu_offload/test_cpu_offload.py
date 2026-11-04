@@ -10,6 +10,7 @@ from gguf import GGMLQuantizationType, quantize
 
 import vllm.envs as envs
 from vllm.model_executor.layers.quantization.gguf import (
+    GGUFConfig,
     GGUFUninitializedParameter,
     fused_moe_gguf,
 )
@@ -17,6 +18,7 @@ from vllm.model_executor.layers.quantization.gguf_moe_staging import (
     GGUFMoEStaging,
     get_gguf_moe_staging,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.model_executor.offloader import (
     PrefetchOffloader,
@@ -27,6 +29,37 @@ from vllm.model_executor.offloader import (
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from ...utils import compare_two_settings
+
+
+@pytest.mark.parametrize("filter_name", ["embed_tokens", "experts"])
+@torch.inference_mode()
+def test_gguf_embedding_offload_respects_parameter_filter(
+    default_vllm_config, dist_init, filter_name
+):
+    with torch.device("cuda"):
+        embedding = VocabParallelEmbedding(
+            256, 256, params_dtype=torch.float16, quant_config=GGUFConfig()
+        )
+    offloader = UVAOffloader(2**20, {filter_name})
+    offloader.wrap_modules(iter([embedding]), prefix="model.embed_tokens")
+    qtype = GGMLQuantizationType.Q8_0
+    torch.manual_seed(7319)
+    packed = torch.from_numpy(quantize(torch.randn(256, 256).numpy(), qtype))
+    embedding.weight_loader(embedding.qweight_type, torch.tensor(int(qtype)))
+    embedding.weight_loader(embedding.qweight, packed)
+    embedding.quant_method.process_weights_after_loading(embedding)
+    ids = torch.tensor([0, 3, 128, 255], device="cuda")
+    actual = embedding(ids)
+    from gguf import dequantize
+
+    expected = torch.from_numpy(dequantize(packed.numpy(), qtype))[ids.cpu()].half()
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    selected = filter_name == "embed_tokens"
+    assert bool(getattr(embedding.qweight, "_vllm_is_uva_offloaded", False)) == selected
+    if selected:
+        assert offloader.cpu_offload_bytes >= packed.numel()
+    else:
+        assert offloader.cpu_offload_bytes == 0
 
 
 def test_gguf_prefill_staging_reuses_bounded_storage_across_streams():
