@@ -102,6 +102,11 @@ IQ4_NL input widths such as 320. Smaller batches and decode keep MMVQ.
 Set `VLLM_GGUF_IQ_MOE_MMQ=0` before starting the server to use MMVQ for these
 experts during prefill as well.
 
+GGUF MoE selects the prefill algorithm independently for the gate/up and down
+projections. A supported down projection can use grouped MMQ while gate/up
+keeps MMVQ, and vice versa. Token alignment is shared only when both products
+use the same tile size. Decode retains its MMVQ path.
+
 UVA-offloaded GGUF experts use a shared prefill staging buffer when a batch
 has at least 32 tokens and at least twice as many expert routes as experts.
 Each eligible matrix is copied to the buffer immediately before its product;

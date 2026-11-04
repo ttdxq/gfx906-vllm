@@ -176,6 +176,89 @@ def test_iq_moe_prefill_crossover_matches_vector(num_tokens):
     torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "w1_type,w2_type,grouped_w1,grouped_w2",
+    [
+        (
+            gguf.GGMLQuantizationType.IQ3_S,
+            gguf.GGMLQuantizationType.IQ4_NL,
+            False,
+            True,
+        ),
+        (
+            gguf.GGMLQuantizationType.IQ2_XS,
+            gguf.GGMLQuantizationType.IQ4_XS,
+            True,
+            False,
+        ),
+        (gguf.GGMLQuantizationType.IQ4_NL, gguf.GGMLQuantizationType.Q8_0, True, True),
+    ],
+)
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_mixed_formats(
+    w1_type, w2_type, grouped_w1, grouped_w2
+):
+    """Each supported projection uses MMQ even if its partner needs MMVQ."""
+    from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+    experts, hidden, intermediate, top_k, tokens = 512, 256, 256, 10, 257
+    w1 = torch.tensor(
+        np.tile(
+            _quantized_test_rows(w1_type, 2 * intermediate, hidden)[None],
+            (experts, 1, 1),
+        ),
+        device="cuda",
+    )
+    w2 = torch.tensor(
+        np.tile(
+            _quantized_test_rows(w2_type, hidden, intermediate)[None], (experts, 1, 1)
+        ),
+        device="cuda",
+    )
+    torch.manual_seed(7319)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.float16) * 0.1
+    ids = torch.topk(torch.randn(tokens, experts, device="cuda"), top_k).indices.int()
+    weights = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
+    if grouped_w1:
+        aligned = moe_align_block_size(
+            ids, ops.ggml_moe_get_block_size(w1_type), experts
+        )
+        first = ops.ggml_moe_a8(
+            x, w1, *aligned, w1_type, 2 * intermediate, top_k, tokens
+        )
+    else:
+        first = ops.ggml_moe_a8_vec(
+            x, w1, ids, top_k, w1_type, 2 * intermediate, tokens
+        )
+    activated = torch.empty(
+        tokens * top_k, intermediate, device=x.device, dtype=x.dtype
+    )
+    torch.ops._C.silu_and_mul(activated, first)
+    if grouped_w2:
+        aligned = moe_align_block_size(
+            ids, ops.ggml_moe_get_block_size(w2_type), experts
+        )
+        second = ops.ggml_moe_a8(
+            activated, w2, *aligned, w2_type, hidden, 1, tokens * top_k
+        )
+    else:
+        second = ops.ggml_moe_a8_vec(
+            activated, w2, ids, 1, w2_type, hidden, tokens * top_k
+        )
+    second = second.reshape(tokens, top_k, hidden)
+    expected = torch.empty_like(x)
+    ops.moe_weighted_sum(second, weights, expected)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:
+        actual = gguf_layer.fused_moe_gguf(
+            x, w1, w2, weights, ids, w1_type, w2_type, "silu"
+        )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert sum(e.count for e in p.key_averages() if e.key == "_C::ggml_moe_a8") == (
+        int(grouped_w1) + int(grouped_w2)
+    )
+
+
+
 def _dequantized_reference(data, qtype):
     decoded = gguf.dequantize(data, qtype)
     if qtype not in (gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.Q5_K):

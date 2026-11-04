@@ -899,6 +899,16 @@ IQ_MOE_MMQ_QUANT_TYPES = {WeightType.IQ2_XS, WeightType.IQ4_NL}
 MOE_MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IQ_MOE_MMQ_QUANT_TYPES
 
 
+def _gguf_moe_use_mmq(qweight_type: int, num_tokens: int) -> bool:
+    if qweight_type not in MOE_MMQ_QUANT_TYPES:
+        return False
+    if num_tokens < _gguf_moe_mmq_min_tokens():
+        return False
+    return qweight_type not in IQ_MOE_MMQ_QUANT_TYPES or (
+        ENABLE_GGUF_IQ_MOE_MMQ and num_tokens >= _gguf_iq_moe_mmq_min_tokens()
+    )
+
+
 def _iq_mmq_beats_dequant(x: torch.Tensor, qweight: torch.Tensor,
                           qweight_type: int) -> bool:
     """Shape gate for the i-quant MMQ kernels.
@@ -1944,20 +1954,12 @@ def _fused_moe_gguf_impl(
             raise ValueError(f"Unsupported activation: {activation}")
         return out
 
-    iq_mmq = (
-        not ({qweight_type, qweight_type2} & IQ_MOE_MMQ_QUANT_TYPES)
-        or (
-            ENABLE_GGUF_IQ_MOE_MMQ
-            and x.shape[0] >= _gguf_iq_moe_mmq_min_tokens()
-        )
-    )
-
-    # unless we decent expert reuse we are better off running moe_vec kernel
+    w1_mmq = _gguf_moe_use_mmq(qweight_type, x.shape[0])
+    w2_mmq = _gguf_moe_use_mmq(qweight_type2, x.shape[0])
     if (
-        qweight_type2 in MOE_MMQ_QUANT_TYPES
-        and qweight_type in MOE_MMQ_QUANT_TYPES
-        and iq_mmq
-        and x.shape[0] >= _gguf_moe_mmq_min_tokens()
+        (w1_mmq or w2_mmq)
+        and qweight_type in MMVQ_QUANT_TYPES
+        and qweight_type2 in MMVQ_QUANT_TYPES
     ):
         # lazy import to avoid triggering triton import in CPU/backend decode paths
         from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
@@ -1979,39 +1981,55 @@ def _fused_moe_gguf_impl(
             qweight_type,
             qweight_type2,
         )
-        BLOCK_SIZE = ops.ggml_moe_get_block_size(qweight_type)
+        alignments: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = timer.record(
-            "align",
-            lambda: moe_align_block_size(topk_ids, BLOCK_SIZE, E),
-        )
+        def mmq(inp, weight, weight_type, offloaded, product_top_k, tokens):
+            block_size = ops.ggml_moe_get_block_size(weight_type)
+            if block_size not in alignments:
+                alignments[block_size] = timer.record(
+                    "align", lambda: moe_align_block_size(topk_ids, block_size, E)
+                )
+            return ops.ggml_moe_a8(
+                inp,
+                staging.stage(weight, offloaded) if staging is not None else weight,
+                *alignments[block_size],
+                weight_type,
+                weight.shape[1],
+                product_top_k,
+                tokens,
+            )
+
         out = timer.record(
             "w1",
-            lambda: ops.ggml_moe_a8(
-                x,
-                staging.stage(w1, w1_offloaded) if staging is not None else w1,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                qweight_type,
-                N,
-                top_k,
-                num_tokens,
+            lambda: (
+                mmq(x, w1, qweight_type, w1_offloaded, top_k, num_tokens)
+                if w1_mmq
+                else _gguf_moe_a8_vec_cached(
+                    x,
+                    staging.stage(w1, w1_offloaded) if staging is not None else w1,
+                    topk_ids,
+                    top_k,
+                    qweight_type,
+                    N,
+                    num_tokens,
+                )
             ),
         )
         out = timer.record("act", lambda: act(out))
         out = timer.record(
             "w2",
-            lambda: ops.ggml_moe_a8(
-                out,
-                staging.stage(w2, w2_offloaded) if staging is not None else w2,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                qweight_type2,
-                w2.shape[1],
-                1,
-                num_tokens * top_k,
+            lambda: (
+                mmq(out, w2, qweight_type2, w2_offloaded, 1, num_tokens * top_k)
+                if w2_mmq
+                else ops.ggml_moe_a8_vec(
+                    out,
+                    staging.stage(w2, w2_offloaded) if staging is not None else w2,
+                    topk_ids,
+                    1,
+                    qweight_type2,
+                    w2.shape[1],
+                    num_tokens * top_k,
+                )
             ),
         )
         out = out.reshape(num_tokens, top_k, w2.shape[1])
