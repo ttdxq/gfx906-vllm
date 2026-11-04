@@ -22,9 +22,12 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+import os
+
 import torch
 from torch import nn
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -114,12 +117,21 @@ class GatedResidual(nn.Module):
                 prefix=maybe_prefix(prefix, "input_mix_weight_down"),
                 return_bias=False,
             )
+        vllm_config = get_current_vllm_config_or_none()
+        up_quant_config = None
+        if (
+            os.getenv("VLLM_QWEN4EXP_GGUF_HC_UP_QUANT", "0") == "1"
+            and vllm_config is not None
+            and vllm_config.quant_config is not None
+            and vllm_config.quant_config.get_name() == "gguf"
+        ):
+            up_quant_config = vllm_config.quant_config
         self.input_mix_weight_up = ReplicatedLinear(
             self.hc_lowrank,
             self.hyper_hidden_size,
             bias=False,
             params_dtype=config.params_dtype,
-            quant_config=None,
+            quant_config=up_quant_config,
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )

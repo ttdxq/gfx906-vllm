@@ -55,6 +55,49 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     return Qwen4ExpTextConfig(**values)
 
 
+@pytest.mark.parametrize("keep_quantized", [False, True])
+def test_gguf_hc_up_preserves_checkpoint_precision(
+    tmp_path, monkeypatch, keep_quantized
+) -> None:
+    import gguf
+
+    from vllm.model_executor.model_loader.gguf_adapters import Qwen4ExpGGUFAdapter
+
+    monkeypatch.setenv("VLLM_QWEN4EXP_GGUF_HC_UP_QUANT", str(int(keep_quantized)))
+    _text_config(architectures=["Qwen4ExpForCausalLM"]).save_pretrained(tmp_path)
+    model_config = ModelConfig(model=str(tmp_path), dtype="half", max_model_len=4096)
+    qtype = gguf.GGMLQuantizationType.Q8_0
+    packed = torch.from_numpy(
+        gguf.quantize(
+            torch.arange(1024, dtype=torch.float32).view(32, 32).numpy(), qtype
+        )
+    )
+    base = "model.layers.0.attn_hyper_connection"
+    weights = []
+    for suffix in ("input_mix_weight_up", "input_mix_weight_down"):
+        weights.extend(
+            [
+                (f"{base}.{suffix}.qweight_type", torch.tensor(int(qtype))),
+                (f"{base}.{suffix}.qweight", packed),
+            ]
+        )
+    restored = dict(
+        Qwen4ExpGGUFAdapter().transform_weights(iter(weights), model_config)
+    )
+    expected = torch.from_numpy(gguf.dequantize(packed.numpy(), qtype)).half()
+    torch.testing.assert_close(
+        restored[f"{base}.input_mix_weight_down.weight"], expected
+    )
+    if keep_quantized:
+        assert restored[f"{base}.input_mix_weight_up.qweight"] is packed
+        assert restored[f"{base}.input_mix_weight_up.qweight_type"].item() == int(qtype)
+        assert f"{base}.input_mix_weight_up.weight" not in restored
+    else:
+        torch.testing.assert_close(
+            restored[f"{base}.input_mix_weight_up.weight"], expected
+        )
+
+
 def test_gguf_adapter_restores_gdn_head_order_and_norm_weights(tmp_path) -> None:
     """GGUF value heads and zero-centred gammas retain their HF meaning."""
     import gguf

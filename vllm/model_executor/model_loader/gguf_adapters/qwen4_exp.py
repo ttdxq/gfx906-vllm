@@ -10,6 +10,7 @@ supports host storage with selected-row dequantization.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import gguf
@@ -31,6 +32,15 @@ _HC_PROJ_SUFFIXES = (
     ".input_mix_weight_down",
     ".input_mix_weight_up",
 )
+
+
+def _dequantize_hc_projection(name: str) -> bool:
+    if (
+        name.endswith(".input_mix_weight_up")
+        and os.getenv("VLLM_QWEN4EXP_GGUF_HC_UP_QUANT", "0") == "1"
+    ):
+        return False
+    return name.endswith(_HC_PROJ_SUFFIXES)
 
 
 class Qwen4ExpGGUFAdapter(BaseGGUFWeightsAdapter):
@@ -301,14 +311,14 @@ class Qwen4ExpGGUFAdapter(BaseGGUFWeightsAdapter):
                 continue
             if name.endswith(".qweight_type"):
                 base = name[: -len(".qweight_type")]
-                if base.endswith(_HC_PROJ_SUFFIXES):
+                if _dequantize_hc_projection(base):
                     # Consumed by the dequant path below (types stream
                     # before weights).
                     hc_qtypes[base] = weight
                     continue
             elif name.endswith(".qweight"):
                 base = name[: -len(".qweight")]
-                if base.endswith(_HC_PROJ_SUFFIXES):
+                if _dequantize_hc_projection(base):
                     # The hyper-connection mixers are plain unquantized
                     # modules (their down-projection also merges the block
                     # injection via the model's stacked weight mapper), so
