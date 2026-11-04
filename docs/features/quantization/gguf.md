@@ -107,6 +107,15 @@ projections. A supported down projection can use grouped MMQ while gate/up
 keeps MMVQ, and vice versa. Token alignment is shared only when both products
 use the same tile size. Decode retains its MMVQ path.
 
+Eager prefill batches larger than four tokens share the W1 MMVQ output and
+Q8 activation scratch across layers and tail shapes. This scratch belongs
+to each runner execution slot and grows only during warmup. Larger unwarmed
+shapes use temporary storage, and GPU events protect reuse across streams.
+Returned outputs have independent storage. Decode and CUDA Graph capture
+retain their existing caches. This reduces persistent memory when increasing
+`--max-num-batched-tokens`; attention and other temporary allocations still
+need sufficient free memory.
+
 UVA-offloaded GGUF experts use a shared prefill staging buffer when a batch
 has at least 32 tokens and at least twice as many expert routes as experts.
 Each eligible matrix is copied to the buffer immediately before its product;

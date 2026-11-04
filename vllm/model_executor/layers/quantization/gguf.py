@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from functools import lru_cache
+from threading import Lock
 from types import MappingProxyType
 from typing import Any, Optional
 
@@ -474,6 +476,84 @@ def _gguf_q8_1_packed_cols(cols: int) -> int:
     return ((cols + 511) // 512 * 512) // 32 * 9
 
 
+class _GGUFMoEWorkspace:
+    """One prefill scratch allocation per execution slot, shared across layers."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.buffer: torch.Tensor | None = None
+        self.done: torch.cuda.Event | None = None
+        self.lock = Lock()
+
+    @contextmanager
+    def lease(
+        self, x: torch.Tensor, rows: int, top_k: int, allow_growth: bool
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor] | None]:
+        tokens, cols = x.shape
+        output_bytes = tokens * top_k * rows * x.element_size()
+        quant_offset = (output_bytes + 255) // 256 * 256
+        quant_cols = _gguf_q8_1_packed_cols(cols)
+        size = quant_offset + tokens * quant_cols * 4
+        with self.lock:
+            if self.buffer is None or self.buffer.numel() < size:
+                if not allow_growth:
+                    yield None
+                    return
+                self.buffer = torch.empty(size, dtype=torch.uint8, device=self.device)
+            stream = torch.cuda.current_stream(self.device)
+            if self.done is not None:
+                stream.wait_event(self.done)
+            self.buffer.record_stream(stream)
+            output = self.buffer[:output_bytes].view(x.dtype).view(tokens * top_k, rows)
+            quant_x = self.buffer[quant_offset:size].view(torch.int32).view(
+                tokens, quant_cols
+            )
+            try:
+                yield output, quant_x
+            finally:
+                if self.done is None:
+                    self.done = torch.cuda.Event()
+                self.done.record(stream)
+
+
+@contextmanager
+def _gguf_moe_prefill_workspace(
+    x: torch.Tensor, w1: torch.Tensor, top_k: int, qweight_type: int
+) -> Iterator[tuple[torch.Tensor, torch.Tensor] | None]:
+    if (
+        x.shape[0] <= 4
+        or not ENABLE_GGUF_Q8_1_BUFFER_CACHE
+        or not x.is_cuda
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        yield None
+        return
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    if not is_workspace_manager_initialized():
+        yield None
+        return
+    manager = current_workspace_manager()
+    # Register during warmup even when W1 uses MMQ; runtime tails may use MMVQ.
+    try:
+        workspace = manager.get_persistent_resource(
+            _GGUFMoEWorkspace, lambda: _GGUFMoEWorkspace(x.device)
+        )
+    except AssertionError:
+        if not manager.is_locked():
+            raise
+        yield None
+        return
+    if _gguf_moe_use_mmq(qweight_type, x.shape[0]):
+        yield None
+        return
+    with workspace.lease(x, w1.shape[1], top_k, not manager.is_locked()) as buffers:
+        yield buffers
+
+
 def _get_gguf_q8_1_buffer(
     owner: Any,
     cache_name: Any,
@@ -646,21 +726,31 @@ def _gguf_moe_a8_vec_cached(
     qweight_type: int,
     row: int,
     num_tokens: int,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if hasattr(torch.ops._C, "ggml_moe_a8_vec_out"):
-        output = _get_gguf_tensor_buffer(
-            ("_gguf_moe_w1_out", w1.data_ptr(), row, num_tokens, top_k),
-            (num_tokens * top_k, row),
-            x.dtype,
-            x.device,
-        )
-        quant_x = _get_gguf_q8_1_buffer(
-            None,
-            ("_gguf_moe_w1_quant_x", w1.data_ptr(), num_tokens, x.shape[1]),
-            num_tokens,
-            x.shape[1],
-            x.device,
-        )
+        if workspace is not None:
+            output, quant_x = workspace
+        elif num_tokens > 4 and not torch.cuda.is_current_stream_capturing():
+            # Unwarmed shapes use temporary storage rather than retaining a
+            # buffer for every layer and tail size. Decode/capture keep theirs.
+            return ops.ggml_moe_a8_vec(
+                x, w1, topk_ids, top_k, qweight_type, row, num_tokens
+            )
+        else:
+            output = _get_gguf_tensor_buffer(
+                ("_gguf_moe_w1_out", w1.data_ptr(), row, num_tokens, top_k),
+                (num_tokens * top_k, row),
+                x.dtype,
+                x.device,
+            )
+            quant_x = _get_gguf_q8_1_buffer(
+                None,
+                ("_gguf_moe_w1_quant_x", w1.data_ptr(), num_tokens, x.shape[1]),
+                num_tokens,
+                x.shape[1],
+                x.device,
+            )
         if output is not None and quant_x is not None:
             ops.ggml_moe_a8_vec_out(
                 x,
@@ -1892,24 +1982,26 @@ def _fused_moe_gguf(
     w2_offloaded: bool = False,
 ) -> torch.Tensor:
     staging = get_gguf_moe_staging(x, w1, w2, topk_ids, w1_offloaded, w2_offloaded)
-    if staging is not None:
-        with staging.lease():
-            return _fused_moe_gguf_impl(
-                x,
-                w1,
-                w2,
-                topk_weights,
-                topk_ids,
-                qweight_type,
-                qweight_type2,
-                activation,
-                staging,
-                w1_offloaded,
-                w2_offloaded,
-            )
-    return _fused_moe_gguf_impl(
-        x, w1, w2, topk_weights, topk_ids, qweight_type, qweight_type2, activation
-    )
+    with ExitStack() as stack:
+        workspace = stack.enter_context(
+            _gguf_moe_prefill_workspace(x, w1, topk_ids.shape[1], qweight_type)
+        )
+        if staging is not None:
+            stack.enter_context(staging.lease())
+        return _fused_moe_gguf_impl(
+            x,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            qweight_type,
+            qweight_type2,
+            activation,
+            staging,
+            w1_offloaded,
+            w2_offloaded,
+            workspace,
+        )
 
 
 def _fused_moe_gguf_impl(
@@ -1924,6 +2016,7 @@ def _fused_moe_gguf_impl(
     staging: GGUFMoEStaging | None = None,
     w1_offloaded: bool = False,
     w2_offloaded: bool = False,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     (
         use_weighted_sum,
@@ -2012,6 +2105,7 @@ def _fused_moe_gguf_impl(
                     qweight_type,
                     N,
                     num_tokens,
+                    workspace,
                 )
             ),
         )
@@ -2048,6 +2142,7 @@ def _fused_moe_gguf_impl(
 
         if (
             staging is None
+            and (num_tokens <= 4 or torch.cuda.is_current_stream_capturing())
             and ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2
             and use_fused_act_quant
             and use_fused_w2_weighted_sum
@@ -2106,6 +2201,7 @@ def _fused_moe_gguf_impl(
                 qweight_type,
                 N,
                 num_tokens,
+                workspace,
             ),
         )
         if (

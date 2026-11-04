@@ -139,6 +139,157 @@ def test_grouped_moe_matches_mmvq_with_512_experts(qtype, num_tokens, cols, top_
     torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "w1_type,w2_type,top_k",
+    [
+        (gguf.GGMLQuantizationType.IQ4_XS, gguf.GGMLQuantizationType.Q8_0, 10),
+        (gguf.GGMLQuantizationType.IQ3_S, gguf.GGMLQuantizationType.Q8_0, 10),
+        (gguf.GGMLQuantizationType.IQ3_S, gguf.GGMLQuantizationType.IQ4_NL, 10),
+        (gguf.GGMLQuantizationType.IQ3_S, gguf.GGMLQuantizationType.IQ4_NL, 2),
+    ],
+)
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_bounds_prefill_cache(
+    workspace_init, w1_type, w2_type, top_k
+):
+    """Layers and tail chunks must share scratch without retaining each shape."""
+    torch.manual_seed(2026)
+    experts, rows, cols = 512, 512, 256
+    w1 = torch.from_numpy(
+        np.tile(_quantized_test_rows(w1_type, rows, cols)[None], (experts, 1, 1))
+    )
+    w1 = w1.reshape(experts, rows, -1).cuda()
+    w2 = torch.from_numpy(
+        np.tile(_quantized_test_rows(w2_type, cols, rows // 2)[None], (experts, 1, 1))
+    )
+    w2 = w2.reshape(experts, cols, -1).cuda()
+    layers = [(w1, w2), (w1.clone(), w2.clone())]
+    x = torch.randn(513, cols, dtype=torch.float16, device="cuda")
+    ids = torch.randint(experts, (513, top_k), dtype=torch.int32, device="cuda")
+    weights = torch.softmax(torch.randn(513, top_k, device="cuda"), dim=-1)
+    tensor_cache = set(gguf_layer._GGUF_TENSOR_BUFFER_CACHE)
+    q8_cache = set(gguf_layer._GGUF_Q8_1_BUFFER_CACHE)
+    initial = gguf_layer.fused_moe_gguf(
+        x[:257], w1, w2, weights[:257], ids[:257], int(w1_type), int(w2_type), "silu"
+    )
+    assert torch.isfinite(initial).all()
+    expected = initial.clone()
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    current_workspace_manager().lock()
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    for w1, w2 in layers:
+        for tokens in [143, 32, 257, 97, 513]:
+            output = gguf_layer.fused_moe_gguf(
+                x[:tokens],
+                w1,
+                w2,
+                weights[:tokens],
+                ids[:tokens],
+                int(w1_type),
+                int(w2_type),
+                "silu",
+            )
+            assert torch.isfinite(output).all()
+            if tokens == 257 and w1 is layers[0][0]:
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            del output
+    torch.cuda.synchronize()
+    torch.testing.assert_close(initial, expected, rtol=0, atol=0)
+    assert torch.cuda.memory_allocated() == allocated
+    assert set(gguf_layer._GGUF_TENSOR_BUFFER_CACHE) == tensor_cache
+    assert set(gguf_layer._GGUF_Q8_1_BUFFER_CACHE) == q8_cache
+
+
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_prefill_streams(workspace_init):
+    """The scratch lease must cover activation and all consumers on each stream."""
+    torch.manual_seed(2027)
+    experts, rows, cols, tokens, top_k = 512, 512, 256, 257, 10
+    w1_type = gguf.GGMLQuantizationType.IQ4_XS
+    w2_type = gguf.GGMLQuantizationType.Q8_0
+    w1 = torch.from_numpy(
+        np.tile(_quantized_test_rows(w1_type, rows, cols)[None], (experts, 1, 1))
+    )
+    w1 = w1.reshape(experts, rows, -1).cuda()
+    w2 = torch.from_numpy(
+        np.tile(_quantized_test_rows(w2_type, cols, rows // 2)[None], (experts, 1, 1))
+    )
+    w2 = w2.reshape(experts, cols, -1).cuda()
+    inputs = [
+        torch.randn(tokens, cols, dtype=torch.float16, device="cuda") for _ in range(4)
+    ]
+    ids = torch.randint(experts, (tokens, top_k), dtype=torch.int32, device="cuda")
+    weights = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
+
+    def forward(x):
+        return gguf_layer.fused_moe_gguf(
+            x, w1, w2, weights, ids, int(w1_type), int(w2_type), "silu"
+        )
+
+    expected = [forward(x).clone() for x in inputs]
+    assert all(torch.isfinite(output).all() for output in expected)
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    current_workspace_manager().lock()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    actual = []
+    for index in range(12):
+        with torch.cuda.stream(streams[index % 2]):
+            actual.append(forward(inputs[index % len(inputs)]))
+    for stream in streams:
+        torch.cuda.current_stream().wait_stream(stream)
+    for index, output in enumerate(actual):
+        torch.testing.assert_close(
+            output, expected[index % len(inputs)], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("tokens", [1, 32])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_workspace_graph(
+    workspace_init, tokens
+):
+    """Decode and capture retain stable, independent storage for graph replay."""
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    torch.manual_seed(2028)
+    experts, rows, cols, top_k = 512, 512, 256, 10
+    w1_type = gguf.GGMLQuantizationType.IQ4_XS
+    w2_type = gguf.GGMLQuantizationType.Q8_0
+    w1 = torch.tensor(
+        np.tile(_quantized_test_rows(w1_type, rows, cols)[None], (experts, 1, 1)),
+        device="cuda",
+    )
+    w2 = torch.tensor(
+        np.tile(_quantized_test_rows(w2_type, cols, rows // 2)[None], (experts, 1, 1)),
+        device="cuda",
+    )
+    x = torch.randn(tokens, cols, dtype=torch.float16, device="cuda") * 0.1
+    ids = torch.randint(experts, (tokens, top_k), dtype=torch.int32, device="cuda")
+    weights = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
+
+    def forward():
+        return gguf_layer.fused_moe_gguf(
+            x, w1, w2, weights, ids, int(w1_type), int(w2_type), "silu"
+        )
+
+    expected = forward().clone()
+    assert torch.isfinite(expected).all()
+    current_workspace_manager().lock()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = forward()
+    for scale in [1.0, 0.5, 0.0]:
+        x.mul_(scale)
+        expected = forward().clone()
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("num_tokens", [191, 192, 217])
 @torch.inference_mode()
 def test_iq_moe_prefill_crossover_matches_vector(num_tokens):
