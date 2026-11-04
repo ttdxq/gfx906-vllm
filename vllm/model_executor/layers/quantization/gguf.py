@@ -35,6 +35,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.gguf_moe_staging import (
+    GGUFMoEStaging,
+    get_gguf_moe_staging,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
@@ -596,10 +600,12 @@ def _gguf_moe_q8_vec_weighted_sum_cached(
     num_tokens: int,
     col: int,
     dtype: torch.dtype,
+    cache_owner: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if hasattr(torch.ops._C, "ggml_moe_q8_vec_weighted_sum_out"):
+        owner_ptr = w2.data_ptr() if cache_owner is None else cache_owner.data_ptr()
         output = _get_gguf_tensor_buffer(
-            ("_gguf_moe_w2_weighted_sum", w2.data_ptr(), row, num_tokens),
+            ("_gguf_moe_w2_weighted_sum", owner_ptr, row, num_tokens),
             (num_tokens, row),
             dtype,
             w2.device,
@@ -1872,6 +1878,42 @@ def _fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    w1_offloaded: bool = False,
+    w2_offloaded: bool = False,
+) -> torch.Tensor:
+    staging = get_gguf_moe_staging(x, w1, w2, topk_ids, w1_offloaded, w2_offloaded)
+    if staging is not None:
+        with staging.lease():
+            return _fused_moe_gguf_impl(
+                x,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                qweight_type,
+                qweight_type2,
+                activation,
+                staging,
+                w1_offloaded,
+                w2_offloaded,
+            )
+    return _fused_moe_gguf_impl(
+        x, w1, w2, topk_weights, topk_ids, qweight_type, qweight_type2, activation
+    )
+
+
+def _fused_moe_gguf_impl(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    qweight_type: int,
+    qweight_type2: int,
+    activation: str,
+    staging: GGUFMoEStaging | None = None,
+    w1_offloaded: bool = False,
+    w2_offloaded: bool = False,
 ) -> torch.Tensor:
     (
         use_weighted_sum,
@@ -1947,7 +1989,7 @@ def _fused_moe_gguf(
             "w1",
             lambda: ops.ggml_moe_a8(
                 x,
-                w1,
+                staging.stage(w1, w1_offloaded) if staging is not None else w1,
                 sorted_token_ids,
                 expert_ids,
                 num_tokens_post_padded,
@@ -1962,7 +2004,7 @@ def _fused_moe_gguf(
             "w2",
             lambda: ops.ggml_moe_a8(
                 out,
-                w2,
+                staging.stage(w2, w2_offloaded) if staging is not None else w2,
                 sorted_token_ids,
                 expert_ids,
                 num_tokens_post_padded,
@@ -1987,7 +2029,8 @@ def _fused_moe_gguf(
         ) = _gguf_moe_ops_available()
 
         if (
-            ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2
+            staging is None
+            and ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2
             and use_fused_act_quant
             and use_fused_w2_weighted_sum
             and activation == "silu"
@@ -2038,7 +2081,13 @@ def _fused_moe_gguf(
         out = timer.record(
             "w1",
             lambda: _gguf_moe_a8_vec_cached(
-                x, w1, topk_ids, top_k, qweight_type, N, num_tokens
+                x,
+                staging.stage(w1, w1_offloaded) if staging is not None else w1,
+                topk_ids,
+                top_k,
+                qweight_type,
+                N,
+                num_tokens,
             ),
         )
         if (
@@ -2078,7 +2127,7 @@ def _fused_moe_gguf(
                     "w2_weighted_sum",
                     lambda: _gguf_moe_q8_vec_weighted_sum_cached(
                         quant_out,
-                        w2,
+                        staging.stage(w2, w2_offloaded) if staging is not None else w2,
                         topk_ids,
                         topk_weights,
                         top_k,
@@ -2087,6 +2136,7 @@ def _fused_moe_gguf(
                         num_tokens,
                         out.shape[-1] // 2,
                         x.dtype,
+                        cache_owner=w2,
                     ),
                 )
                 timer.report()
@@ -2103,7 +2153,7 @@ def _fused_moe_gguf(
                     "w2_vec",
                     lambda: ops.ggml_moe_q8_vec(
                         quant_out,
-                        w2,
+                        staging.stage(w2, w2_offloaded) if staging is not None else w2,
                         topk_ids,
                         1,
                         qweight_type2,
@@ -2126,7 +2176,7 @@ def _fused_moe_gguf(
                 "w2",
                 lambda: ops.ggml_moe_a8_vec(
                     out,
-                    w2,
+                    staging.stage(w2, w2_offloaded) if staging is not None else w2,
                     topk_ids,
                     1,
                     qweight_type2,
@@ -2182,6 +2232,8 @@ def _fused_moe_gguf_fake(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    w1_offloaded: bool = False,
+    w2_offloaded: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -2922,6 +2974,8 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             layer.w13_qweight_type.weight_type,
             layer.w2_qweight_type.weight_type,
             activation,
+            getattr(layer.w13_qweight, "_vllm_is_uva_offloaded", False),
+            getattr(layer.w2_qweight, "_vllm_is_uva_offloaded", False),
         )
 
 

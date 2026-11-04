@@ -6,9 +6,17 @@ from operator import attrgetter
 import pytest
 import torch
 import torch.nn as nn
+from gguf import GGMLQuantizationType, quantize
 
 import vllm.envs as envs
-from vllm.model_executor.layers.quantization.gguf import GGUFUninitializedParameter
+from vllm.model_executor.layers.quantization.gguf import (
+    GGUFUninitializedParameter,
+    fused_moe_gguf,
+)
+from vllm.model_executor.layers.quantization.gguf_moe_staging import (
+    GGUFMoEStaging,
+    get_gguf_moe_staging,
+)
 from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.model_executor.offloader import (
     PrefetchOffloader,
@@ -19,6 +27,104 @@ from vllm.model_executor.offloader import (
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from ...utils import compare_two_settings
+
+
+def test_gguf_prefill_staging_reuses_bounded_storage_across_streams():
+    module = nn.Module()
+    for index, size in enumerate([4096, 2048, 8192]):
+        data = torch.arange(size, device="cuda").to(torch.uint8)
+        module.register_parameter(
+            f"weight{index}", nn.Parameter(data, requires_grad=False)
+        )
+    UVAOffloader(16384).wrap_modules(iter([module]))
+    staging = GGUFMoEStaging(module.weight0.device, 4096)
+    assert staging.stage(module.weight2, True) is module.weight2
+    assert staging.stage(module.weight0, False) is module.weight0
+    assert staging.buffer is None
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    outputs = []
+    pointers = []
+    for index in range(8):
+        weight = getattr(module, f"weight{index % 2}")
+        with torch.cuda.stream(streams[index % 2]), staging.lease():
+            staged = staging.stage(weight, True)
+            pointers.append(staged.data_ptr())
+            outputs.append(staged.clone())
+    for stream in streams:
+        torch.cuda.current_stream().wait_stream(stream)
+    assert len(set(pointers)) == 1
+    assert staging.buffer.numel() == 4096
+    for index, output in enumerate(outputs):
+        weight = getattr(module, f"weight{index % 2}")
+        torch.testing.assert_close(output, weight, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("host_weights", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize(
+    "w1_type", [GGMLQuantizationType.Q4_0, GGMLQuantizationType.IQ4_NL]
+)
+@torch.inference_mode()
+def test_gguf_prefill_staging_matches_uva_moe_exactly(
+    monkeypatch, host_weights, w1_type
+):
+    monkeypatch.setenv("VLLM_GGUF_MOE_PREFILL_STAGING_MB", "1")
+    torch.manual_seed(0)
+    module = nn.Module()
+    for name, shape, quant_type in [
+        ("w1", (8, 512, 256), GGMLQuantizationType.Q4_0),
+        ("w2", (8, 256, 256), GGMLQuantizationType.Q8_0),
+    ]:
+        # IQ4_NL has the same scale/nibble layout as Q4_0. Interpreting
+        # these finite blocks as IQ4_NL also exercises the MMVQ path.
+        packed = quantize((torch.randn(shape) * 0.01).numpy(), quant_type)
+        module.register_parameter(
+            name, nn.Parameter(torch.from_numpy(packed).cuda(), requires_grad=False)
+        )
+    original = [weight.cpu() for weight in module.parameters()]
+    host_names = {name for name, host in zip(["w1", "w2"], host_weights) if host}
+    UVAOffloader(2**30, host_names).wrap_modules(iter([module]))
+    x = torch.randn((64, 256), device="cuda", dtype=torch.float16)
+    ids = torch.randint(8, (64, 2), device="cuda", dtype=torch.int32)
+    weights = torch.softmax(torch.randn(64, 2, device="cuda"), dim=-1)
+    args = (x, module.w1, module.w2, weights, ids, int(w1_type), 8, "silu")
+    reference = fused_moe_gguf(*args).clone()
+    assert torch.isfinite(reference).all()
+    actual = fused_moe_gguf(*args, *host_weights)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    # A later layer may reuse the scratch, but not the returned output.
+    second = nn.Module()
+    second.register_parameter("w1", module.w1)
+    second.register_parameter(
+        "w2", nn.Parameter(module.w2.clone(), requires_grad=False)
+    )
+    if host_weights[1]:
+        UVAOffloader(2**30, {"w2"}).wrap_modules(iter([second]))
+    fused_moe_gguf(
+        x * 0.5,
+        second.w1,
+        second.w2,
+        weights,
+        ids,
+        int(w1_type),
+        8,
+        "silu",
+        *host_weights,
+    )
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for weight, expected in zip(module.parameters(), original):
+        torch.testing.assert_close(weight.cpu(), expected, rtol=0, atol=0)
+
+    # Decode and device-only weights must not acquire the prefill scratch.
+    assert (
+        get_gguf_moe_staging(x[:1], module.w1, module.w2, ids[:1], *host_weights)
+        is None
+    )
+    assert get_gguf_moe_staging(x, module.w1, module.w2, ids, False, False) is None
 
 
 @pytest.mark.parametrize("disable_uva", [False, True])

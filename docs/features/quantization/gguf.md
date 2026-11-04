@@ -102,6 +102,21 @@ IQ4_NL input widths such as 320. Smaller batches and decode keep MMVQ.
 Set `VLLM_GGUF_IQ_MOE_MMQ=0` before starting the server to use MMVQ for these
 experts during prefill as well.
 
+UVA-offloaded GGUF experts use a shared prefill staging buffer when a batch
+has at least 32 tokens and at least twice as many expert routes as experts.
+Each eligible matrix is copied to the buffer immediately before its product;
+W1, W2, and successive layers reuse the same storage. Packed weights and
+quantized arithmetic are unchanged. CUDA Graph capture and smaller batches
+keep direct UVA reads.
+
+`VLLM_GGUF_MOE_PREFILL_STAGING_MB` bounds this buffer per device (default:
+512 MiB; set to `0` to disable). Matrices larger than the budget or with
+noncontiguous storage keep direct UVA reads. The buffer is allocated lazily
+and counted by the normal memory profiling run. If allocation fails, staging
+is disabled for that device. Leave sufficient space for this scratch buffer
+when choosing `--cpu-offload-gb`; the setting does not increase the offload
+budget automatically.
+
 Qwen4Exp FP16 QSA on gfx906 uses narrow 16-token attention tiles for prefill
 with 256-wide heads and 12 query heads per KV head. This avoids the register
 pressure of the wider GPU profile; single-token decode and other head or cache
