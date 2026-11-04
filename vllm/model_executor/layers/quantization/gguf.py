@@ -894,8 +894,8 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES
 )
-# IQ2_XS and IQ4_NL share the normalized IQ tile loaders with dense MMQ.
-IQ_MOE_MMQ_QUANT_TYPES = {WeightType.IQ2_XS, WeightType.IQ4_NL}
+# These formats share the normalized IQ tile loaders with dense MMQ.
+IQ_MOE_MMQ_QUANT_TYPES = {WeightType.IQ2_XS, WeightType.IQ3_S, WeightType.IQ4_NL}
 MOE_MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IQ_MOE_MMQ_QUANT_TYPES
 
 

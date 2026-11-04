@@ -761,7 +761,7 @@ static void ggml_moe_q6_K_q8_1_cuda(
   }
 }
 
-// IQ2_XS/IQ4_NL use the normalized 256-weight i-quant tile loaders from
+// IQ2_XS/IQ3_S/IQ4_NL use the normalized 256-weight i-quant tile loaders from
 // mmq.cuh.  Keeping the same expert/token grouping as the K-quant kernels
 // avoids the one-warp-per-token MMVQ fallback during long prefill batches.
 #if defined(USE_ROCM)
@@ -840,6 +840,48 @@ static void ggml_moe_iq4_nl_q8_1_cuda(
         exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
   } else {
     moe_iq4_nl<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  }
+}
+
+template <typename scalar_t, bool need_check>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF * NWARPS_IQ, 2)
+#endif
+    moe_iq3_s(const void* __restrict__ vx, const void* __restrict__ vy,
+              scalar_t* __restrict__ dst, const int* sorted_token_ids,
+              const int* expert_ids, const int* num_tokens_post_padded,
+              const int exp_stride, const int ncols_x, const int nrows_x,
+              const int ncols_y, const int nrows_y, const int nrows_dst,
+              const int top_k) {
+  moe_q<scalar_t, QK_K, QR4_XS, QI4_XS, false, block_iq3_s,
+        MOE_X_IQ, MOE_Y_IQ, NWARPS_IQ,
+        allocate_tiles_iq<MOE_Y_IQ, 2 * WARP_SIZE_GGUF + 1, 8>,
+        load_tiles_iq3_s<MOE_Y_IQ, NWARPS_IQ, need_check>,
+        VDR_IQ_Q8_1_MMQ, vec_dot_iq_v4_mul_mat>(
+      vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+}
+
+template <typename scalar_t>
+static void ggml_moe_iq3_s_q8_1_cuda(
+    const void* inp, const void* w, scalar_t* dst,
+    const int* sorted_token_ids, const int* expert_ids,
+    const int* num_tokens_post_padded, const int exp_stride,
+    const int ncols_x, const int nrows_x, const int ncols_y,
+    const int nrows_y, const int nrows_dst, const int top_k,
+    const int tokens_post_padded, cudaStream_t stream) {
+  const dim3 block_nums((nrows_x + MOE_Y_IQ - 1) / MOE_Y_IQ,
+                       tokens_post_padded / MOE_X_IQ, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
+  if (nrows_x % MOE_Y_IQ == 0) {
+    moe_iq3_s<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  } else {
+    moe_iq3_s<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
         exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
   }

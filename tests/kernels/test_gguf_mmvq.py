@@ -93,6 +93,8 @@ def _quantized_test_rows(qtype, rows, cols):
 @pytest.mark.parametrize(
     "qtype,cols",
     [
+        pytest.param(gguf.GGMLQuantizationType.IQ3_S, 256, id="iq3_s-256"),
+        pytest.param(gguf.GGMLQuantizationType.IQ3_S, 2560, id="iq3_s-2560"),
         (gguf.GGMLQuantizationType.IQ2_XS, 256),
         (gguf.GGMLQuantizationType.IQ2_XS, 2560),
         (gguf.GGMLQuantizationType.IQ4_NL, 256),
@@ -129,6 +131,7 @@ def test_grouped_moe_matches_mmvq_with_512_experts(qtype, num_tokens, cols, top_
     if top_k == 1:
         ids = ids.flatten()[:num_tokens, None].contiguous()
     block_size = ops.ggml_moe_get_block_size(qtype)
+    assert block_size > 0, "grouped MoE kernel is unavailable for this format"
     aligned = moe_align_block_size(ids, block_size, experts)
     expected = ops.ggml_moe_a8_vec(x, weight, ids, top_k, qtype, rows, num_tokens)
     actual = ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, num_tokens)
@@ -182,7 +185,7 @@ def test_iq_moe_prefill_crossover_matches_vector(num_tokens):
         (
             gguf.GGMLQuantizationType.IQ3_S,
             gguf.GGMLQuantizationType.IQ4_NL,
-            False,
+            True,
             True,
         ),
         (

@@ -93,7 +93,7 @@ prefill/decode and recurrent fallback calls receive a V×K view of that cache.
 Set `VLLM_QWEN4EXP_GDN_KV_STATE=0` before starting the server to restore V×K
 storage.
 
-IQ2_XS and IQ4_NL experts use grouped quantized matrix multiplication for
+IQ2_XS, IQ3_S, and IQ4_NL experts use grouped quantized matrix multiplication for
 prefill batches at or above `VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS` (default: 192 on
 gfx906, 256 on other GPUs).
 The general `VLLM_GGUF_MOE_MMQ_MIN_TOKENS` threshold also applies. The IQ path
