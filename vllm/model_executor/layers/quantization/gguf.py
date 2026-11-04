@@ -2945,3 +2945,12 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
 class GGUFUninitializedParameter(UninitializedParameter):
     cls_to_become = Parameter
     data_container: list[torch.Tensor]
+
+    def defer_cpu_offload(self, callback: Callable[[Parameter], bool]) -> None:
+        self._cpu_offload_callback = callback
+
+    def materialize(self, shape, device=None, dtype=None) -> None:
+        callback = self.__dict__.pop("_cpu_offload_callback", None)
+        super().materialize(shape, device=device, dtype=dtype)
+        if callback is not None:
+            callback(self)

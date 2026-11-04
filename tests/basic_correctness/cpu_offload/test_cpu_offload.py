@@ -4,9 +4,12 @@
 from operator import attrgetter
 
 import pytest
+import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.model_executor.layers.quantization.gguf import GGUFUninitializedParameter
+from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.model_executor.offloader import (
     PrefetchOffloader,
     UVAOffloader,
@@ -16,6 +19,60 @@ from vllm.model_executor.offloader import (
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from ...utils import compare_two_settings
+
+
+@pytest.mark.parametrize("disable_uva", [False, True])
+def test_gguf_lazy_offload_preserves_hot_weights_and_counts_loaded_bytes(
+    monkeypatch, disable_uva
+):
+    monkeypatch.setenv("VLLM_WEIGHT_OFFLOADING_DISABLE_UVA", str(int(disable_uva)))
+    module = nn.Module()
+    module.register_parameter(
+        "expert", GGUFUninitializedParameter(device="cuda", requires_grad=False)
+    )
+    module.add_module("hot", nn.Linear(32, 32, bias=False, device="cuda"))
+    offloader = UVAOffloader(4096, {"expert"})
+    offloader.wrap_modules(iter([module]))
+
+    assert not getattr(module.expert, "_vllm_is_uva_offloaded", False)
+    assert offloader.cpu_offload_bytes == 0
+    before = torch.cuda.memory_allocated()
+    module.expert.materialize((4096,), dtype=torch.uint8)
+    assert offloader.cpu_offload_bytes == 4096
+    assert torch.cuda.memory_allocated() == before
+    expected = torch.arange(4096).to(torch.uint8)
+    module.expert.data.copy_(expected)
+    torch.testing.assert_close(module.expert.cpu(), expected, rtol=0, atol=0)
+    assert module.hot.weight.is_cuda
+    assert not getattr(module.hot.weight, "_vllm_is_uva_offloaded", False)
+
+
+def test_gguf_lazy_offload_stops_at_materialized_budget():
+    module = nn.Module()
+    for name in ["first", "second"]:
+        module.register_parameter(
+            name, GGUFUninitializedParameter(device="cuda", requires_grad=False)
+        )
+    offloader = UVAOffloader(4096)
+    offloader.wrap_modules(iter([module]))
+    module.first.materialize((4096,), dtype=torch.uint8)
+    before = torch.cuda.memory_allocated()
+    module.second.materialize((4096,), dtype=torch.uint8)
+    assert offloader.cpu_offload_bytes == 4096
+    assert torch.cuda.memory_allocated() - before == 4096
+    assert getattr(module.first, "_vllm_is_uva_offloaded", False)
+    assert not getattr(module.second, "_vllm_is_uva_offloaded", False)
+
+
+def test_uva_postload_restores_replaced_storage_with_retained_marker():
+    module = nn.Linear(32, 32, bias=False, device="cuda")
+    expected = module.weight.detach().cpu()
+    UVAOffloader(4096).wrap_modules(iter([module]))
+    before = torch.cuda.memory_allocated()
+    with device_loading_context(module, torch.device("cuda")):
+        module.weight.data = module.weight.data.clone()
+    assert torch.cuda.memory_allocated() == before
+    torch.testing.assert_close(module.weight.cpu(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("disable_pin_memory", [False, True])

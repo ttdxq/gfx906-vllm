@@ -237,7 +237,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         return
 
     cpu_params: set[str] = set()
-    uva_offloaded_parameters: list[str] = []
+    uva_offloaded_parameters: dict[str, int] = {}
 
     # Store which parameters are on CPU and move them to the GPU
     for name, p in module.named_parameters():
@@ -245,7 +245,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             cpu_params.add(name)
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):
-            uva_offloaded_parameters.append(name)
+            uva_offloaded_parameters[name] = p.data.data_ptr()
         # Parameters already on target device are not touched
 
     try:
@@ -265,8 +265,9 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
             # parameter is UVA offloaded, but was replaced with a new device tensor
             # re-offload it to CPU using UVA
-            if name in uva_offloaded_parameters and not getattr(
-                p, "_vllm_is_uva_offloaded", False
+            if name in uva_offloaded_parameters and (
+                not getattr(p, "_vllm_is_uva_offloaded", False)
+                or p.data.data_ptr() != uva_offloaded_parameters[name]
             ):
                 cpu_data = torch.empty_like(
                     p.data, device="cpu", pin_memory=use_pin_memory
