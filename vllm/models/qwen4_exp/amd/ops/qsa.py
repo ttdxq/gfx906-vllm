@@ -13,6 +13,8 @@ from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from .qsa_decode import launch_qsa, qsa_topk
+
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
@@ -642,7 +644,9 @@ def qsa_mqa_paged(
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     block_n = 32
-    _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
+    launch_qsa(
+        _qsa_mqa_paged_kernel,
+        (q.shape[0], triton.cdiv(columns, block_n)),
         q,
         k_cache,
         page_table,
@@ -710,9 +714,9 @@ def expand_qsa_block_indices_cuda(
     if not block_indices.shape[0]:
         return out
     column_block = 256
-    _expand_qsa_indices_kernel[
-        (block_indices.shape[0], triton.cdiv(output_width, column_block))
-    ](
+    launch_qsa(
+        _expand_qsa_indices_kernel,
+        (block_indices.shape[0], triton.cdiv(output_width, column_block)),
         block_indices,
         query_positions,
         sequence_lengths,
@@ -804,7 +808,8 @@ def qsa_select_paged_tokens(
                 columns,
             )
         else:
-            ops.top_k_per_row_decode(
+            qsa_topk(
+                ops.top_k_per_row_decode,
                 logits,
                 1,
                 visible_blocks,
@@ -936,7 +941,9 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
-    _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
+    launch_qsa(
+        _qsa_sparse_paged_gqa_splitk_kernel,
+        partial_grid,
         q,
         k_cache,
         v_cache,
@@ -978,7 +985,9 @@ def qsa_sparse_paged_attention(
     if num_splits == 1:
         return out
 
-    _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
+    launch_qsa(
+        _qsa_merge_splitk_kernel,
+        (q.shape[0], q.shape[1]),
         partial_output,
         partial_lse,
         out,

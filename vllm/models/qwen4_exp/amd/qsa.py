@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import ClassVar, cast
 
 import torch
@@ -586,6 +587,35 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             QSAIndexerMetadata,
             metadata[self.indexer.raw_key_cache.prefix],
         )
+        if (
+            os.getenv("VLLM_QWEN4EXP_NATIVE_QSA_DECODE", "0") == "1"
+            and self.use_fused_qsa_prepare
+            and num_tokens == hidden_states.shape[0] == output.shape[0] == 1
+            and qkv is not None
+            and gate is not None
+            and qkv.dtype == hidden_states.dtype == torch.float16
+            and self.kv_cache.dtype == self.indexer.indexer_dtype == torch.float16
+            and self.impl.octave_fmt is None
+            and not self.indexer.skip_topk
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from vllm.platforms.rocm import on_gfx906
+
+            from .ops.qsa_decode import run_qsa_decode
+
+            if on_gfx906():
+                run_qsa_decode(
+                    self,
+                    hidden_states,
+                    positions,
+                    qkv,
+                    output,
+                    gate,
+                    main_metadata,
+                    indexer_metadata,
+                    metadata[self.indexer.compressed_key_cache.prefix],
+                )
+                return
         selected, main_outputs = self.indexer(
             hidden_states,
             positions,

@@ -13,6 +13,8 @@ from torch import nn
 
 from vllm.triton_utils import tl, triton
 
+from .qsa_decode import launch_qsa
+
 
 def supports_fused_pre_indexer(
     rotary_emb: nn.Module,
@@ -645,7 +647,9 @@ def qsa_prepare(
     num_k_work = k_work_metadata.shape[0]
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
     num_main_work = num_tokens * (num_main_q_heads + num_main_kv_heads)
-    _qsa_prepare_kernel[(num_k_work + num_q_work + num_main_work,)](
+    launch_qsa(
+        _qsa_prepare_kernel,
+        (num_k_work + num_q_work + num_main_work,),
         q,
         q.stride(0),
         k,

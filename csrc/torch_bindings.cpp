@@ -5,6 +5,9 @@
 
 #include <torch/library.h>
 #include <torch/version.h>
+#ifdef USE_ROCM
+#include "rocm/qsa_decode_plan.h"
+#endif
 
 // Note on op signatures:
 // The X_meta signatures are for the meta functions corresponding to op X.
@@ -17,6 +20,13 @@
 // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+#ifdef USE_ROCM
+  ops.class_<Qwen4ExpQSADecodePlan>("Qwen4ExpQSADecodePlan")
+      .def(torch::init<int64_t>())
+      .def("add_kernel", &Qwen4ExpQSADecodePlan::add_kernel)
+      .def("add_topk", &Qwen4ExpQSADecodePlan::add_topk)
+      .def("run", &Qwen4ExpQSADecodePlan::run);
+#endif
   // vLLM custom ops
   //
 
