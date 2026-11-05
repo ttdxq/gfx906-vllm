@@ -74,9 +74,12 @@ class DraftTokensHandler:
         )
 
     def set_draft_tokens(
-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+        self,
+        input_batch: InputBatch,
+        draft_tokens: torch.Tensor,
+        copy_unstructured_drafts: bool = False,
     ) -> None:
-        if not input_batch.has_structured_output_reqs:
+        if not input_batch.has_structured_output_reqs and not copy_unstructured_drafts:
             # No draft token validation needs to be performed by
             # the scheduler for this batch. Record draft token widths only.
             num_draft_tokens = draft_tokens.shape[1]
@@ -84,8 +87,8 @@ class DraftTokensHandler:
                 self._draft_tokens_by_req[req_id] = num_draft_tokens
             return
 
-        # For spec decoding + structured outputs, we must transfer the
-        # draft tokens back to the scheduler for grammar validation.
+        # Structured outputs need draft IDs for grammar validation. Synchronous
+        # n-gram decoding also needs them so the scheduler can trim invalid slots.
         current_stream = torch.cuda.current_stream(self.device)
         self.copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.copy_stream):

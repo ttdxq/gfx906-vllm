@@ -159,14 +159,14 @@ def test_no_match_clears_previous_proposal(max_model_len):
     row = [0] * (max_model_len - 5) + [1, 2, 3, 1, 2]
     assert _propose(spec, [row]) == [[3, 1]]
     drafts = _propose(spec, [[1, 2, 3, 4, 5]], last_sampled=[42])
-    assert drafts == [[42, 42]]
+    assert drafts == [[-1, -1]]
 
 
 def test_no_4gram_match_only():
     """No 4-gram match in [1,2,3,4,1,2,3] → 0 valid drafts."""
     spec = _make_speculator(min_n=4, max_n=4, k=2)
     drafts = _propose(spec, [[1, 2, 3, 4, 1, 2, 3]], last_sampled=[7])
-    assert drafts == [[7, 7]]
+    assert drafts == [[-1, -1]]
 
 
 def test_falls_back_to_3gram_when_4gram_missing():
@@ -204,18 +204,18 @@ def test_short_context_yields_zero_valid():
     """The only length-2 window overlaps the suffix itself → no match."""
     spec = _make_speculator(min_n=2, max_n=2, k=2)
     drafts = _propose(spec, [[5, 6]], last_sampled=[99])
-    assert drafts == [[99, 99]]
+    assert drafts == [[-1, -1]]
 
 
 def test_zero_sampled_disables_proposal():
     """num_sampled==0 disables proposals for that request regardless of match."""
     spec = _make_speculator(min_n=2, max_n=2, k=2)
     drafts = _propose(spec, [[1, 2, 3, 1, 2]], num_sampled=[0], last_sampled=[77])
-    assert drafts == [[77, 77]]
+    assert drafts == [[-1, -1]]
 
 
-def test_tail_falls_back_when_few_tokens_after_match():
-    """Fewer than k tokens after the match → the tail falls back.
+def test_tail_is_padded_when_few_tokens_after_match():
+    """Fewer than k tokens after the match → invalid tail slots use -1.
 
     Tokens: [1, 2, 1, 2] (seq_len=4). Suffix (1, 2) matches at position 0
     (the match at position 2 is the suffix itself and is excluded). With
@@ -223,7 +223,7 @@ def test_tail_falls_back_when_few_tokens_after_match():
     """
     spec = _make_speculator(min_n=2, max_n=2, k=3)
     drafts = _propose(spec, [[1, 2, 1, 2]], last_sampled=[55])
-    assert drafts == [[1, 2, 55]]
+    assert drafts == [[1, 2, -1]]
 
 
 def test_multibatch_mixed():
@@ -235,7 +235,7 @@ def test_multibatch_mixed():
         last_sampled=[10, 20],
     )
     assert drafts[0] == [3, 1]
-    assert drafts[1] == [20, 20]
+    assert drafts[1] == [-1, -1]
 
 
 def test_multibatch_independent_choice_of_n():

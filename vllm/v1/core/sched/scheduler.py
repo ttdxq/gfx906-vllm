@@ -2868,6 +2868,14 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            speculative_config = self.vllm_config.speculative_config
+            if speculative_config is not None and speculative_config.use_ngram():
+                first_invalid = next(
+                    (i for i, token_id in enumerate(spec_token_ids) if token_id < 0),
+                    len(spec_token_ids),
+                )
+                del spec_token_ids[first_invalid:]
+
             # Add newly generated spec token ids to the request.
             request.spec_token_ids = self.structured_output_manager.trim_spec_tokens(
                 request, spec_token_ids

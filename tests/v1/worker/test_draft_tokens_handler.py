@@ -21,9 +21,14 @@ def _set_draft_toks(
     req_ids: list[str],
     tokens: list[list[int]],
     structured: bool,
+    copy_unstructured_drafts: bool = False,
 ) -> None:
     batch = _input_batch(req_ids=req_ids, structured=structured)
-    handler.set_draft_tokens(batch, torch.tensor(tokens, device="cuda"))
+    handler.set_draft_tokens(
+        batch,
+        torch.tensor(tokens, device="cuda"),
+        copy_unstructured_drafts=copy_unstructured_drafts,
+    )
 
 
 def _get_draft_toks(handler: DraftTokensHandler) -> dict[str, list[int]]:
@@ -82,3 +87,20 @@ def test_draft_tokens_follow_request_lifecycle() -> None:
     handler.discard("b")
     handler.discard("plain")
     assert _get_draft_toks(handler) == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_unstructured_ngram_drafts_preserve_invalid_suffix() -> None:
+    handler = DraftTokensHandler(torch.device("cuda"))
+    _set_draft_toks(
+        handler,
+        req_ids=["matched", "unmatched"],
+        tokens=[[11, -1], [-1, -1]],
+        structured=False,
+        copy_unstructured_drafts=True,
+    )
+
+    assert _get_draft_toks(handler) == {
+        "matched": [11, -1],
+        "unmatched": [-1, -1],
+    }

@@ -2793,6 +2793,43 @@ def test_schedule_spec_decoding_stats(
         assert "per_step_accepted" not in payload  # summary level
 
 
+@pytest.mark.parametrize(
+    "drafts,expected",
+    [
+        ([-1, -1], []),
+        ([13, -1], [13]),
+        ([13, 14], [13, 14]),
+    ],
+)
+def test_ngram_scheduler_trims_invalid_draft_suffix(drafts, expected):
+    scheduler = create_scheduler(
+        num_speculative_tokens=2,
+        speculative_method="ngram",
+    )
+    request = create_requests(num_requests=1, num_tokens=1)[0]
+    scheduler.add_request(request)
+    first_step = scheduler.schedule()
+    scheduler.update_from_output(
+        first_step,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[5]],
+        ),
+    )
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [drafts.copy()])
+    )
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 1 + len(expected)
+    if expected:
+        assert output.scheduled_spec_decode_tokens[request.request_id] == expected
+    else:
+        assert request.request_id not in output.scheduled_spec_decode_tokens
+
+
 def _run_spec_verify_steps(scheduler, rounds, num_invalid_per_round=None):
     """Drive prefill + one draft/verify step per round for a single request.
 

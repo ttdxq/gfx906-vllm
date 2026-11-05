@@ -2362,8 +2362,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]
+            copy_unstructured_ngram_drafts = (
+                self.speculative_config is not None
+                and self.speculative_config.use_ngram()
+                and not self.vllm_config.scheduler_config.async_scheduling
+            )
             self.draft_tokens_handler.set_draft_tokens(
-                input_batch, draft_tokens[:, :num_spec_tokens]
+                input_batch,
+                draft_tokens[:, :num_spec_tokens],
+                copy_unstructured_drafts=copy_unstructured_ngram_drafts,
             )
             # Drafts aren't used when none were proposed this step (e.g. skip_drafts).
             if self.pp_handler is not None and num_spec_tokens > 0:
