@@ -91,6 +91,54 @@ def _quantized_test_rows(qtype, rows, cols):
 
 
 @pytest.mark.parametrize(
+    "qtype,cols", [(8, 320), (8, 2560), (20, 320), (21, 256), (21, 2560), (23, 256)]
+)
+@pytest.mark.parametrize("tokens,top_k", [(1, 10), (3, 1)])
+@torch.inference_mode()
+def test_indirect_moe_mixed_residency(monkeypatch, qtype, cols, tokens, top_k):
+    """Mixed HBM/UVA experts preserve exact sums, repeated routes and tail rows."""
+    from vllm.model_executor.offloader import UVAOffloader
+
+    monkeypatch.setenv("VLLM_GGUF_MOE_IQ3_S_LUT", "1")
+    monkeypatch.setenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", "1")
+    qtype = gguf.GGMLQuantizationType(qtype)
+    experts, rows = 512, 129
+    data = np.tile(_quantized_test_rows(qtype, rows, cols)[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    module = torch.nn.Module()
+    module.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.tensor(data, device="cuda"), requires_grad=False),
+    )
+    UVAOffloader(2**30, {"weight"}).wrap_modules(iter([module]))
+    weight = module.weight
+    assert getattr(weight, "_vllm_is_uva_offloaded", False)
+    selected = torch.tensor([0, 257, 511], device="cuda")
+    cached = weight.index_select(0, selected)
+    expert_bytes = weight[0].numel()
+    pointers = torch.arange(experts, device="cuda") * expert_bytes + weight.data_ptr()
+    pointers[selected] = (
+        torch.arange(3, device="cuda") * expert_bytes + cached.data_ptr()
+    )
+    routes = [511, 1, 257, 511, 255, 0, 256, 383, 510, 127]
+    ids = torch.tensor(routes[: tokens * top_k], dtype=torch.int32, device="cuda").view(
+        tokens, top_k
+    )
+    x = torch.randn(tokens, cols, device="cuda", dtype=torch.float16)
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    expected = ops.ggml_moe_q8_vec(
+        quant_x, weight, ids, top_k, qtype, rows, tokens, cols, x.dtype
+    )
+    actual = torch.ops._C.ggml_moe_q8_vec_indirect(
+        quant_x, pointers, ids, qtype, rows, tokens, cols, x.dtype
+    )
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
     "qtype", [gguf.GGMLQuantizationType.Q8_0, gguf.GGMLQuantizationType.IQ4_NL]
 )
 @pytest.mark.parametrize("cols", [256, 320, 512, 640])
@@ -139,9 +187,9 @@ def test_grouped_moe_matches_mmvq_with_512_experts_small_k_subwarp(
             for event in profile.events()
             if event.device_type == torch.autograd.DeviceType.CUDA
         ]
-        assert any("moe_vec_q<" in name and ", 32>" in name for name in kernels), (
-            kernels
-        )
+        assert any(
+            "moe_vec_q<" in name and ", 32, false>" in name for name in kernels
+        ), kernels
 
 
 @pytest.mark.parametrize("num_tokens", [1, 3])

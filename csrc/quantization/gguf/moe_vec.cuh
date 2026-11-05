@@ -1,13 +1,14 @@
 // copied and adapted from
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_cuda_t vec_dot_q_cuda, int LANES = 0>
+          vec_dot_q_cuda_t vec_dot_q_cuda, int LANES = 0, bool INDIRECT = false>
 static __global__ void moe_vec_q(const void* __restrict__ vx,
                                  const void* __restrict__ vy,
                                  scalar_t* __restrict__ dst,
                                  const int* topk_ids, const int topk,
                                  const int ncols, const int nrows,
-                                 const int token_stride) {
+                                 const int token_stride,
+                                 const int64_t* expert_ptrs = nullptr) {
   const auto row = blockIdx.x * blockDim.y + threadIdx.y;
 
   const auto token = blockIdx.z / topk;
@@ -24,7 +25,12 @@ static __global__ void moe_vec_q(const void* __restrict__ vx,
   // partial sum for each thread
   float tmp = 0.0f;
 
-  const block_q_t* x = ((const block_q_t*)vx) + expert * nrows * blocks_per_row;
+  const block_q_t* x;
+  if constexpr (INDIRECT) {
+    x = reinterpret_cast<const block_q_t*>(expert_ptrs[expert]);
+  } else {
+    x = ((const block_q_t*)vx) + expert * nrows * blocks_per_row;
+  }
   const block_q8_1* y =
       (const block_q8_1*)(((const int*)vy) + token * token_stride);
 

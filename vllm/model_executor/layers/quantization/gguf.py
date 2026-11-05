@@ -1981,6 +1981,57 @@ def _fused_moe_gguf(
     w1_offloaded: bool = False,
     w2_offloaded: bool = False,
 ) -> torch.Tensor:
+    if (
+        os.getenv("VLLM_GGUF_MOE_EXPERT_CACHE", "0") == "1"
+        and w1_offloaded
+        and w2_offloaded
+        and qweight_type in (8, 20, 21, 23)
+        and qweight_type2 in (8, 20, 21, 23)
+        and activation == "silu"
+        and w1.is_contiguous()
+        and w2.is_contiguous()
+        and topk_ids.dtype == torch.int32
+        and current_platform.is_rocm()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        from vllm.model_executor.layers.quantization.gguf_moe_expert_cache import (
+            get_gguf_expert_cache,
+        )
+        from vllm.platforms.rocm import on_gfx906
+
+        if on_gfx906():
+            entry = get_gguf_expert_cache(x.device).observe(w1, w2, topk_ids)
+            if entry is not None:
+                quant_x = _quantize_row_q8_1_cached(
+                    x, None, ("_gguf_expert_cache_x", w1.data_ptr())
+                )
+                out = torch.ops._C.ggml_moe_q8_vec_indirect(
+                    quant_x,
+                    entry.pointers[0],
+                    topk_ids,
+                    qweight_type,
+                    w1.shape[1],
+                    1,
+                    x.shape[1],
+                    x.dtype,
+                )
+                quant_out = _silu_and_mul_quantize_row_q8_1_cached(
+                    out, None, ("_gguf_expert_cache_act", w2.data_ptr())
+                )
+                top_k = topk_ids.shape[1]
+                out = torch.ops._C.ggml_moe_q8_vec_indirect(
+                    quant_out,
+                    entry.pointers[1],
+                    topk_ids.reshape(-1, 1),
+                    qweight_type2,
+                    w2.shape[1],
+                    top_k,
+                    out.shape[1] // 2,
+                    x.dtype,
+                ).view(1, top_k, w2.shape[1])
+                output = torch.empty_like(x)
+                ops.moe_weighted_sum(out, topk_weights, output)
+                return output
     staging = get_gguf_moe_staging(x, w1, w2, topk_ids, w1_offloaded, w2_offloaded)
     with ExitStack() as stack:
         workspace = stack.enter_context(

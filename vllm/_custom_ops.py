@@ -1162,6 +1162,23 @@ def moe_gptq_gemm_rdna3(
         ) -> torch.Tensor:
             return torch.empty((tokens * top_k, row), dtype=dtype, device=W.device)
 
+    if hasattr(torch.ops._C, "ggml_moe_q8_vec_indirect"):
+
+        @register_fake("_C::ggml_moe_q8_vec_indirect")
+        def _ggml_moe_q8_vec_indirect_fake(
+            quant_X: torch.Tensor,
+            expert_ptrs: torch.Tensor,
+            topk_ids: torch.Tensor,
+            quant_type: int,
+            row: torch.SymInt,
+            tokens: torch.SymInt,
+            col: torch.SymInt,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            return torch.empty(
+                (tokens * topk_ids.shape[1], row), dtype=dtype, device=quant_X.device
+            )
+
     if hasattr(torch.ops._C, "ggml_moe_q8_vec_weighted_sum"):
 
         @register_fake("_C::ggml_moe_q8_vec_weighted_sum")

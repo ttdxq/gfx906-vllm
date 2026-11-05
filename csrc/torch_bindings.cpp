@@ -274,6 +274,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("ggml_moe_a8_vec_out", torch::kCUDA, &ggml_moe_a8_vec_out);
 
   ops.def(
+      "ggml_moe_q8_vec_indirect(Tensor quant_X, Tensor expert_ptrs, "
+      "Tensor topk_ids, int type, SymInt row, SymInt tokens, SymInt col, "
+      "ScalarType dtype) -> Tensor");
+  ops.impl("ggml_moe_q8_vec_indirect", torch::kCUDA, &ggml_moe_q8_vec_indirect);
+
+  ops.def(
       "ggml_moe_q8_vec(Tensor quant_X, Tensor W, "
       "Tensor topk_ids, int top_k, "
       "int type, SymInt row, SymInt tokens, SymInt col, ScalarType dtype) "

@@ -21,12 +21,14 @@ class GGUFMoEStaging:
         self.buffer: torch.Tensor | None = None
         self.lock = Lock()
         self.done: torch.cuda.Event | None = None
+        self.generation = 0
 
     @contextmanager
     def lease(self) -> Iterator["GGUFMoEStaging"]:
         # Keep enqueueing atomic across streams. The event protects the buffer
         # until its last consumer, not just its last copy, has finished.
         with self.lock:
+            self.generation += 1
             stream = torch.cuda.current_stream(self.device)
             if self.done is not None:
                 stream.wait_event(self.done)

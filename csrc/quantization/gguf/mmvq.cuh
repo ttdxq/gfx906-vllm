@@ -2518,14 +2518,16 @@ struct dec_iq1_s {
 #if defined(USE_ROCM)
 // Four independent rows share the small codebooks. The global-table variant
 // isolates the benefit of LDS from the signed-byte decode and block mapping.
-template <typename scalar_t, int VECS, int IQ_KIND, bool LDS, bool ROUTED = false>
+template <typename scalar_t, int VECS, int IQ_KIND, bool LDS, bool ROUTED = false,
+          bool INDIRECT = false>
 static __global__ void __launch_bounds__(256)
 mul_mat_vec_iq_lut(const uint8_t * __restrict__ vx,
                    const block_q8_1 * __restrict__ y,
                    scalar_t * __restrict__ dst, const int ncols,
                    const int nrows, const int dst_stride,
                    const int * __restrict__ topk_ids,
-                   const int top_k, const int token_stride) {
+                   const int top_k, const int token_stride,
+                   const int64_t * expert_ptrs = nullptr) {
     constexpr bool IQ1 = IQ_KIND == 1;
     constexpr bool IQ2XXS = IQ_KIND == 0;
     constexpr bool IQ3XXS = IQ_KIND == 2;
@@ -2599,7 +2601,11 @@ mul_mat_vec_iq_lut(const uint8_t * __restrict__ vx,
         static_assert(VECS == 1);
         const int token = blockIdx.z / top_k;
         const int expert = topk_ids[blockIdx.z];
-        vx += (size_t)expert * nrows * nb * block_bytes;
+        if constexpr (INDIRECT) {
+            vx = reinterpret_cast<const uint8_t *>(expert_ptrs[expert]);
+        } else {
+            vx += (size_t)expert * nrows * nb * block_bytes;
+        }
         y = (const block_q8_1 *)((const int *)y + (size_t)token * token_stride);
         dst += (size_t)blockIdx.z * nrows;
     }
