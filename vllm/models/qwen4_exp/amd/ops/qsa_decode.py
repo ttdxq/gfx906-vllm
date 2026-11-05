@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Eager native submission of the existing single-token QSA kernel chain.
 
-Opt in with VLLM_QWEN4EXP_NATIVE_QSA_DECODE=1 on gfx906 with FP16 caches.
+Enabled by default on gfx906 with FP16 caches; disable with
+VLLM_QWEN4EXP_NATIVE_QSA_DECODE=0.
 Inputs and metadata are rebound on every call; per-stream workspaces retain
 ordinary compiled HIP kernels, without GPU graph capture. The existing top-k
 selection remains unordered, so long-context attention retains its existing

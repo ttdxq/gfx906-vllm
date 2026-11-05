@@ -588,7 +588,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             metadata[self.indexer.raw_key_cache.prefix],
         )
         if (
-            os.getenv("VLLM_QWEN4EXP_NATIVE_QSA_DECODE", "0") == "1"
+            os.getenv("VLLM_QWEN4EXP_NATIVE_QSA_DECODE", "1") == "1"
             and self.use_fused_qsa_prepare
             and num_tokens == hidden_states.shape[0] == output.shape[0] == 1
             and qkv is not None

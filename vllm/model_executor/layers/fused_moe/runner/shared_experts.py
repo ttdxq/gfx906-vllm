@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -71,7 +72,14 @@ class SharedExperts(torch.nn.Module):
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
         # and other execution modes
-        if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
+        disable_stream = envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM
+        if "VLLM_DISABLE_SHARED_EXPERTS_STREAM" not in os.environ:
+            from vllm.model_executor.layers.quantization.gguf_moe_staging import (
+                use_gfx906_qwen4exp_decode_defaults,
+            )
+
+            disable_stream |= use_gfx906_qwen4exp_decode_defaults(vllm_config)
+        if disable_stream:
             logger.debug_once("Disabling MoE shared_experts cuda stream")
             self._stream = None
         else:

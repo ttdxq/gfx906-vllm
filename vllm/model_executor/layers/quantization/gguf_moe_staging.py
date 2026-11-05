@@ -14,6 +14,31 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def use_gfx906_qwen4exp_decode_defaults(config) -> bool:
+    """Use measured decode policies only for the validated serving workload."""
+    if config is None:
+        return False
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+    model = config.model_config
+    if model is None:
+        return False
+    if (
+        model.hf_text_config.model_type not in ("qwen4_exp", "qwen4_exp_text")
+        or model.quantization != "gguf"
+        or model.dtype != torch.float16
+        or not model.enforce_eager
+        or config.scheduler_config.max_num_seqs != 1
+        or config.parallel_config.enable_dbo
+    ):
+        return False
+    from vllm.platforms.rocm import on_gfx906
+
+    return on_gfx906()
+
+
 class GGUFMoEStaging:
     def __init__(self, device: torch.device, max_bytes: int):
         self.device = device

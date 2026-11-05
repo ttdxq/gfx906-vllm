@@ -11,11 +11,63 @@ from vllm.model_executor.layers.quantization.gguf_moe_expert_cache import (
 )
 from vllm.model_executor.layers.quantization.gguf_moe_staging import GGUFMoEStaging
 from vllm.model_executor.offloader import UVAOffloader
+from vllm.platforms import current_platform
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["supported", "qwen3_5", "non_gguf", "float32", "non_eager", "batch", "dbo"],
+)
+def test_flash_gguf_default_policy_uses_text_config(tmp_path, variant):
+    from transformers import Qwen4ExpTextConfig
+
+    from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+    from vllm.model_executor.layers.quantization.gguf_moe_staging import (
+        use_gfx906_qwen4exp_decode_defaults,
+    )
+
+    Qwen4ExpTextConfig(
+        architectures=["Qwen4ExpForCausalLM"], eos_token_id=1, ple_layer_ids=[]
+    ).save_pretrained(tmp_path)
+    config = VllmConfig(
+        model_config=ModelConfig(
+            model=str(tmp_path),
+            dtype="half",
+            max_model_len=4096,
+            quantization="gguf",
+            enforce_eager=True,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_model_len=4096, is_encoder_decoder=False
+        ),
+    )
+    assert config.model_config.hf_text_config.model_type == "qwen4_exp_text"
+    if variant == "qwen3_5":
+        config.model_config.hf_text_config.model_type = "qwen3_5"
+    elif variant == "non_gguf":
+        config.model_config.quantization = None
+    elif variant == "float32":
+        config.model_config.dtype = torch.float32
+    elif variant == "non_eager":
+        config.model_config.enforce_eager = False
+    elif variant == "batch":
+        config.scheduler_config.max_num_seqs = 2
+    elif variant == "dbo":
+        config.parallel_config.enable_dbo = True
+    supported = False
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx906
+
+        supported = on_gfx906()
+    assert use_gfx906_qwen4exp_decode_defaults(config) == (
+        variant == "supported" and supported
+    )
 
 
 @pytest.mark.parametrize("top_k", [2, 10])
+@pytest.mark.parametrize("cache_env", [None, "1"])
 @torch.inference_mode()
-def test_cached_fused_moe_matches_original(monkeypatch, top_k):
+def test_cached_fused_moe_matches_original(monkeypatch, top_k, cache_env):
     from vllm.model_executor.layers.quantization import gguf as gg
     from vllm.model_executor.layers.quantization import gguf_moe_expert_cache as ec
     from vllm.model_executor.layers.quantization import gguf_moe_staging as gs
@@ -41,12 +93,22 @@ def test_cached_fused_moe_matches_original(monkeypatch, top_k):
     weights = torch.softmax(torch.randn(1, top_k, device=device), dim=-1)
     args = (x, module.w1, module.w2, weights, routes, 8, 8, "silu", True, True)
     monkeypatch.setenv("VLLM_GGUF_MOE_EXPERT_CACHE", "0")
-    expected = gg._fused_moe_gguf(*args).clone()
-    monkeypatch.setenv("VLLM_GGUF_MOE_EXPERT_CACHE", "1")
+    expected = gg.fused_moe_gguf(*args, expert_cache_default=True).clone()
+    assert cache.steps == 0
+    if cache_env is None:
+        monkeypatch.delenv("VLLM_GGUF_MOE_EXPERT_CACHE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GGUF_MOE_EXPERT_CACHE", cache_env)
     cache.observe(module.w1, module.w2, prompt)
     for _ in range(3):
-        actual = gg._fused_moe_gguf(*args)
+        actual = gg.fused_moe_gguf(*args, expert_cache_default=True)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    cache_supported = False
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx906
+
+        cache_supported = on_gfx906()
+    assert cache.steps == (3 if cache_supported else 0)
 
 
 @pytest.mark.parametrize("interval", [1, 4])

@@ -17,6 +17,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
@@ -40,6 +41,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.gguf_moe_staging import (
     GGUFMoEStaging,
     get_gguf_moe_staging,
+    use_gfx906_qwen4exp_decode_defaults,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -1980,9 +1982,10 @@ def _fused_moe_gguf(
     activation: str,
     w1_offloaded: bool = False,
     w2_offloaded: bool = False,
+    expert_cache_default: bool = False,
 ) -> torch.Tensor:
     if (
-        os.getenv("VLLM_GGUF_MOE_EXPERT_CACHE", "0") == "1"
+        os.getenv("VLLM_GGUF_MOE_EXPERT_CACHE", str(int(expert_cache_default))) == "1"
         and w1_offloaded
         and w2_offloaded
         and qweight_type in (8, 20, 21, 23)
@@ -2399,6 +2402,7 @@ def _fused_moe_gguf_fake(
     activation: str,
     w1_offloaded: bool = False,
     w2_offloaded: bool = False,
+    expert_cache_default: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -3040,6 +3044,9 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     ):
         super().__init__(moe)
         self.quant_config = quant_config
+        self._expert_cache_default = use_gfx906_qwen4exp_decode_defaults(
+            get_current_vllm_config_or_none()
+        )
 
     def create_weights(
         self,
@@ -3141,6 +3148,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             activation,
             getattr(layer.w13_qweight, "_vllm_is_uva_offloaded", False),
             getattr(layer.w2_qweight, "_vllm_is_uva_offloaded", False),
+            self._expert_cache_default,
         )
 
 

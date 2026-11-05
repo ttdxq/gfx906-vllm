@@ -3383,7 +3383,7 @@ static void moe_vec_indirect_cuda(
 #ifdef USE_ROCM
   const char* enabled = std::getenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP");
   const int active = cols / qk * (qi / vdr);
-  if (qk == 32 && enabled && enabled[0] == '1' && active <= 32 &&
+  if (qk == 32 && (!enabled || enabled[0] == '1') && active <= 32 &&
       std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
               .find("gfx906") == 0) {
     if (active <= 16) {
@@ -3450,7 +3450,7 @@ torch::Tensor ggml_moe_q8_vec_indirect(
       case 21: {
 #ifdef USE_ROCM
         const char* lut = std::getenv("VLLM_GGUF_MOE_IQ3_S_LUT");
-        if (lut && lut[0] == '1' &&
+        if ((!lut || lut[0] == '1') &&
             std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
                     .find("gfx906") == 0) {
           mul_mat_vec_iq_lut<scalar_t, 1, 3, true, true, true>

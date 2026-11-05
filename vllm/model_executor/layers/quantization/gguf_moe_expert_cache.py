@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Packed expert residency using the idle prefill staging allocation.
 
-Opt in on gfx906 with VLLM_GGUF_MOE_EXPERT_CACHE=1. The existing
+Enabled by default for single-request eager FP16 qwen4_exp GGUF on gfx906
+without DBO. Override with VLLM_GGUF_MOE_EXPERT_CACHE=0 or 1. The existing
 VLLM_GGUF_MOE_PREFILL_STAGING_MB budget bounds residency; the cache does not
 allocate another weight buffer. VLLM_GGUF_MOE_EXPERT_CACHE_REFRESH controls
 the refresh interval (256 decode steps by default). Filling the cache can
-outweigh savings on short outputs, so this remains disabled by default.
+outweigh savings on short outputs; other serving configurations retain opt-in.
 """
 
 import os

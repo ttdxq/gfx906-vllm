@@ -832,7 +832,14 @@ static void ggml_moe_iq4_nl_q8_1_cuda(
     const int nrows_y, const int nrows_dst, const int top_k,
     const int tokens_post_padded, cudaStream_t stream) {
   const char* tile_env = std::getenv("VLLM_GGUF_MOE_IQ4_NL_TILE_ROWS");
-  const int tile_rows = tile_env == nullptr ? MOE_Y_IQ : std::atoi(tile_env);
+  int default_tile_rows = MOE_Y_IQ;
+#ifdef USE_ROCM
+  if (std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+          .find("gfx906") == 0) {
+    default_tile_rows = 32;
+  }
+#endif
+  const int tile_rows = tile_env == nullptr ? default_tile_rows : std::atoi(tile_env);
   const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
 #define LAUNCH_IQ_TILE(ROWS_) \
   do { \
@@ -887,7 +894,14 @@ static void ggml_moe_iq3_s_q8_1_cuda(
     const int nrows_y, const int nrows_dst, const int top_k,
     const int tokens_post_padded, cudaStream_t stream) {
   const char* tile_env = std::getenv("VLLM_GGUF_MOE_IQ3_S_TILE_ROWS");
-  const int tile_rows = tile_env == nullptr ? MOE_Y_IQ : std::atoi(tile_env);
+  int default_tile_rows = MOE_Y_IQ;
+#ifdef USE_ROCM
+  if (std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+          .find("gfx906") == 0) {
+    default_tile_rows = 32;
+  }
+#endif
+  const int tile_rows = tile_env == nullptr ? default_tile_rows : std::atoi(tile_env);
   const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
 #define LAUNCH_IQ_TILE(ROWS_) \
   do { \

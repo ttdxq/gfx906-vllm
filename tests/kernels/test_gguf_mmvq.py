@@ -143,9 +143,10 @@ def test_indirect_moe_mixed_residency(monkeypatch, qtype, cols, tokens, top_k):
 )
 @pytest.mark.parametrize("cols", [256, 320, 512, 640])
 @pytest.mark.parametrize("top_k", [1, 10])
+@pytest.mark.parametrize("subwarp_env", [None, "1"])
 @torch.inference_mode()
 def test_grouped_moe_matches_mmvq_with_512_experts_small_k_subwarp(
-    monkeypatch, qtype, cols, top_k
+    monkeypatch, qtype, cols, top_k, subwarp_env
 ):
     """Short W2 rows retain exact sums, routing and padded-row coverage."""
     rows, experts, tokens = 129, 512, 10 // top_k
@@ -161,7 +162,10 @@ def test_grouped_moe_matches_mmvq_with_512_experts_small_k_subwarp(
     ).view(tokens, top_k)
     monkeypatch.setenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", "0")
     expected = ops.ggml_moe_a8_vec(x, weight, ids, top_k, qtype, rows, tokens)
-    monkeypatch.setenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", "1")
+    if subwarp_env is None:
+        monkeypatch.delenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", subwarp_env)
     output = torch.full_like(expected, float("nan"))
     quant_x = ops.ggml_quantize_row_q8_1(x)
     ops.ggml_moe_a8_vec_out(x, weight, ids, output, quant_x, top_k, qtype, rows, tokens)
@@ -194,9 +198,10 @@ def test_grouped_moe_matches_mmvq_with_512_experts_small_k_subwarp(
 
 @pytest.mark.parametrize("num_tokens", [1, 3])
 @pytest.mark.parametrize("cols", [256, 2560])
+@pytest.mark.parametrize("lut_env", [None, "1"])
 @torch.inference_mode()
 def test_grouped_moe_matches_mmvq_with_512_experts_iq3_lut_decode(
-    monkeypatch, num_tokens, cols
+    monkeypatch, num_tokens, cols, lut_env
 ):
     """Routed LUT GEMV keeps the dense LUT math and full expert indices."""
     rows, experts, top_k = 129, 512, 10
@@ -222,7 +227,10 @@ def test_grouped_moe_matches_mmvq_with_512_experts_iq3_lut_decode(
                 )
             )
     expected = torch.cat(expected)
-    monkeypatch.setenv("VLLM_GGUF_MOE_IQ3_S_LUT", "1")
+    if lut_env is None:
+        monkeypatch.delenv("VLLM_GGUF_MOE_IQ3_S_LUT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GGUF_MOE_IQ3_S_LUT", lut_env)
     output = torch.full_like(expected, float("nan"))
     quant_x = ops.ggml_quantize_row_q8_1(x)
     ops.ggml_moe_a8_vec_out(
@@ -253,8 +261,18 @@ def test_grouped_moe_matches_mmvq_with_512_experts_prefill_row_tiles(
     env_name = f"VLLM_GGUF_MOE_{qtype.name}_TILE_ROWS"
     monkeypatch.setenv(env_name, "128")
     expected = ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, tokens)
-    for tile in (32, 64):
-        monkeypatch.setenv(env_name, str(tile))
+    for tile in (None, 32, 64):
+        if tile is None:
+            monkeypatch.delenv(env_name, raising=False)
+            expected_tile = (
+                32
+                if "gfx906"
+                in getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+                else 128
+            )
+        else:
+            monkeypatch.setenv(env_name, str(tile))
+            expected_tile = tile
         actual = ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, tokens)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         with torch.profiler.profile(
@@ -271,7 +289,7 @@ def test_grouped_moe_matches_mmvq_with_512_experts_prefill_row_tiles(
             if e.device_type == torch.autograd.DeviceType.CUDA
         ]
         assert any(
-            f"moe_{qtype.name.lower()}<" in name and f", {tile}>" in name
+            f"moe_{qtype.name.lower()}<" in name and f", {expected_tile}>" in name
             for name in kernels
         ), kernels
 

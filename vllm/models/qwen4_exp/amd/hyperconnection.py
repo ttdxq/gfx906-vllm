@@ -227,7 +227,7 @@ class GatedResidual(nn.Module):
 
     def _use_native_decode_mix(self, hidden_states: torch.Tensor) -> bool:
         if (
-            os.getenv("VLLM_QWEN4EXP_NATIVE_HC_MIX", "0") != "1"
+            os.getenv("VLLM_QWEN4EXP_NATIVE_HC_MIX", "1") != "1"
             or not self.use_combine
             or self.hc_count != 4
             or self.hc_lowrank != 320
@@ -235,6 +235,7 @@ class GatedResidual(nn.Module):
             or hidden_states.dtype != torch.float16
             or not hidden_states.is_cuda
             or not hidden_states.is_contiguous()
+            or torch.cuda.is_current_stream_capturing()
             or not hasattr(self.input_mix_weight_up, "weight")
             or not hasattr(torch.ops._rocm_C, "qwen4exp_hc_mix")
         ):

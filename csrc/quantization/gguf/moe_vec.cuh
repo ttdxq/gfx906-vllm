@@ -68,7 +68,7 @@ static bool try_moe_vec_small_k(
 #ifdef USE_ROCM
   const char* enabled = std::getenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP");
   const int active_lanes = (ncols / qk) * (qi / vdr);
-  if (enabled == nullptr || enabled[0] != '1' || qk != 32 || ncols <= 0 ||
+  if ((enabled != nullptr && enabled[0] != '1') || qk != 32 || ncols <= 0 ||
       ncols % qk != 0 || active_lanes > 32 ||
       std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
               .find("gfx906") != 0) {
@@ -388,7 +388,7 @@ static void moe_vec_iq3_s_q8_1_cuda(const void* vx, const void* vy,
                                     cudaStream_t stream) {
 #ifdef USE_ROCM
   const char* lut_env = std::getenv("VLLM_GGUF_MOE_IQ3_S_LUT");
-  if (lut_env != nullptr && lut_env[0] == '1' &&
+  if ((lut_env == nullptr || lut_env[0] == '1') &&
       std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
               .find("gfx906") == 0) {
     const dim3 grid((nrows + 3) / 4, 1, tokens * top_k);
