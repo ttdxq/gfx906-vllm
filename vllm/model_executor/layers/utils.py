@@ -3,6 +3,7 @@
 """Utility methods for model layers."""
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -24,6 +25,7 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+_ROCM_GEMM_TRACE_COUNTS: dict[tuple[str, tuple[int, ...], tuple[int, ...], str], int] = {}
 
 
 def get_autotune_config():
@@ -594,6 +596,35 @@ def rocm_unquantized_gemm(
     # through the device-agnostic fallback instead of hard-crashing.
     if not x.is_cuda:
         return default_unquantized_gemm(layer, x, weight, bias)
+    if os.getenv("VLLM_ROCM_GEMM_TRACE") == "1":
+        x_view = x.reshape(-1, x.size(-1))
+        if x_view.shape[0] <= 16:
+            m, k = weight.shape
+            n = x_view.shape[0]
+            gfx906_bf16 = x.dtype == torch.bfloat16 and on_gfx906()
+            if (
+                x.dtype in [torch.float16, torch.bfloat16]
+                and bias is None
+                and weight.is_contiguous()
+                and m % 4 == 0
+                and n == 1
+                and k <= 8192
+                and k % 8 == 0
+                and not gfx906_bf16
+            ):
+                path = "LLMM1"
+            elif n <= 16 and not on_gfx9() and not gfx906_bf16:
+                path = "triton"
+            else:
+                path = "torch"
+            key = (getattr(layer, "prefix", ""), tuple(x.shape), tuple(weight.shape), path)
+            count = _ROCM_GEMM_TRACE_COUNTS.get(key, 0) + 1
+            _ROCM_GEMM_TRACE_COUNTS[key] = count
+            if count == 1 or count % 256 == 0:
+                logger.warning(
+                    "ROCM_GEMM_TRACE prefix=%s x=%s weight=%s dtype=%s path=%s count=%d",
+                    key[0], key[1], key[2], x.dtype, path, count,
+                )
     return torch.ops.vllm.rocm_unquantized_gemm(x, weight, bias)
 
 
