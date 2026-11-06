@@ -617,14 +617,19 @@ class Worker(WorkerBase):
             )
 
         # The weight load leaves GPU-registered host shmem behind (pinned
-        # model tables plus the host allocator's cached pin blocks). Reclaim
-        # or compaction of those pages stops every KFD queue of this worker
-        # until the whole buffer is re-faulted; lock them now that the load
-        # stopped churning them.
+        # model tables plus the host allocator's cached pin blocks), and the
+        # offloaded expert host tensors are anonymous pages read through UVA.
+        # Reclaim/compaction of the former stops every KFD queue of this
+        # worker; swap of the latter stalls reading kernels in GPU page
+        # faults. Lock both now that the load stopped churning them.
         if envs.VLLM_ROCM_MLOCK_HOST_SHMEM and current_platform.is_rocm():
-            from vllm.utils.host_memory_lock import mlock_shared_mappings
+            from vllm.utils.host_memory_lock import (
+                mlock_private_mappings,
+                mlock_shared_mappings,
+            )
 
             mlock_shared_mappings()
+            mlock_private_mappings()
 
         # Preserve parallel weight loading, then use serving's thread count
         # for profiling and compilation so Dynamo's global-state guards remain

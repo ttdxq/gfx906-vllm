@@ -181,13 +181,15 @@ def sweep_shared_mappings_until(
     stop: threading.Event,
     interval_s: float = 2.0,
 ) -> None:
-    """Re-sweep shared mappings on a timer until ``stop`` is set.
+    """Re-sweep shared and private mappings on a timer until ``stop`` is set.
 
-    The weight load pins fresh host shmem blocks as it streams; re-locking
-    every couple of seconds keeps reclaim from finding an unlocked registered
-    window. mlock2 on an already-locked range is a cheap no-op.
+    The weight load pins fresh host shmem blocks and faults private host
+    tensors (e.g. offloaded experts) as it streams; re-locking every couple
+    of seconds keeps reclaim or swap from finding an unlocked window. mlock2
+    on an already-locked range is a cheap no-op.
     """
     assert isinstance(stop, threading.Event)
     while not stop.is_set():
         mlock_shared_mappings(verbose=False)
+        mlock_private_mappings(verbose=False)
         stop.wait(interval_s)
