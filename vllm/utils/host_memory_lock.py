@@ -127,6 +127,56 @@ def maybe_mlock_pinned_host_buffer(tensor) -> None:
         )
 
 
+def mlock_private_mappings(
+    min_bytes: int = 1 << 20, max_bytes: int = 8 << 30, *, verbose: bool = True
+) -> tuple[int, int]:
+    """Lock every writable private mapping with mlock2(MLOCK_ONFAULT).
+
+    Used by the frontend process, whose tokenizer/detokenizer heap otherwise
+    ages into swap while the engine loads; the first long generation then
+    stalls behind major faults on the output handler thread. Also used by
+    workers whose offloaded expert host tensors are read through UVA: a
+    swapped expert page stalls the reading kernel in a GPU page fault.
+    Mappings smaller than ``min_bytes`` are skipped, and locking stops once
+    ``max_bytes`` has been locked so a process that hosts the model itself
+    is left alone.
+    """
+    if not os.path.exists("/proc/self/smaps"):
+        return 0, 0
+    locked = failed = 0
+    with open("/proc/self/smaps") as smaps:
+        for line in smaps:
+            match = _MAP_HEADER.match(line)
+            if match is None:
+                continue
+            num_bytes = int(match[2], 16) - int(match[1], 16)
+            if "w" in match[3] and "p" in match[3] and num_bytes >= min_bytes:
+                if locked >= max_bytes:
+                    logger.info(
+                        "private mapping lock cap (%.1f GiB) reached; leaving the"
+                        " rest swappable",
+                        max_bytes / 2**30,
+                    )
+                    break
+                error = mlock_range(int(match[1], 16), num_bytes, onfault=True)
+                if error is None:
+                    locked += num_bytes
+                else:
+                    failed += num_bytes
+                    logger.warning(
+                        "mlock2(MLOCK_ONFAULT) failed on %d-byte private mapping: %s",
+                        num_bytes,
+                        error,
+                    )
+    if verbose and (locked or failed):
+        logger.info(
+            "mlocked %.2f GiB of private frontend mappings (%.2f GiB failed)",
+            locked / 2**30,
+            failed / 2**30,
+        )
+    return locked, failed
+
+
 def sweep_shared_mappings_until(
     stop: threading.Event,
     interval_s: float = 2.0,

@@ -179,6 +179,18 @@ class AsyncLLM(EngineClient):
             admission_stats=self.admission_stats,
         )
 
+        # The engine load streams tens of GiB through the page cache while
+        # this process idles, which pushes the tokenizer vocabulary into
+        # swap; the first long generation would then stall behind major
+        # faults on the output handler thread. Keep the frontend's private
+        # memory resident and fault the whole vocabulary up front.
+        if envs.VLLM_WARM_LOCK_DETOKENIZER and renderer.tokenizer is not None:
+            from vllm.utils.host_memory_lock import mlock_private_mappings
+            from vllm.v1.engine.detokenizer import warm_detokenizer_vocab
+
+            mlock_private_mappings()
+            warm_detokenizer_vocab(renderer.tokenizer)
+
         # EngineCore (starts the engine in background process).
         if _use_v1_async_multiprocessing():
             # Hand the renderer to the client so it can start the frontend MM

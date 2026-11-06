@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_GFX906_TRITON_CAUSAL_CONV1D_UPDATE: bool = False
     VLLM_ROCM_GFX906_ALLOW_BF16: bool = False
     VLLM_ROCM_MLOCK_HOST_SHMEM: bool = True
+    VLLM_WARM_LOCK_DETOKENIZER: bool = True
     VLLM_QWEN4EXP_GDN_CHUNK_PREFILL: bool = True
     VLLM_QWEN4EXP_HC_GEMV: bool = True
     VLLM_QWEN4EXP_SHARED_EXPERT_GATE_GEMV: bool = True
@@ -1477,6 +1478,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with vm.compact_unevictable_allowed=0 to also stop compaction migration.
     "VLLM_ROCM_MLOCK_HOST_SHMEM": lambda: (
         os.getenv("VLLM_ROCM_MLOCK_HOST_SHMEM", "1").lower() in ("true", "1")
+    ),
+    # The frontend detokenizes on the output handler thread; under host memory
+    # pressure its vocabulary pages get swapped out while the engine loads and
+    # the first long generation then stalls behind major faults. Fault the
+    # whole vocabulary once at startup and keep the frontend's private memory
+    # resident.
+    "VLLM_WARM_LOCK_DETOKENIZER": lambda: (
+        os.getenv("VLLM_WARM_LOCK_DETOKENIZER", "1").lower() in ("true", "1")
     ),
     # Qwen4Exp gfx906 prefill uses the parallel chunk GDN algorithm. Keep
     # the recurrent implementation available for numerical/performance A/B.

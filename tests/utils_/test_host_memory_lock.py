@@ -75,3 +75,17 @@ def test_maybe_mlock_pinned_host_buffer_opt_out(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_ROCM_MLOCK_HOST_SHMEM", False)
     maybe_mlock_pinned_host_buffer(tensor)
     assert calls == []
+
+
+def test_mlock_private_mappings_locks_plain_host_tensor():
+    from vllm.utils.host_memory_lock import mlock_private_mappings
+
+    tensor = torch.empty(2 << 20, dtype=torch.uint8)  # plain anonymous pages
+    ptr = tensor.data_ptr()
+    assert " lo " not in _vmflags_for(ptr)
+
+    locked, failed = mlock_private_mappings(min_bytes=1 << 20)
+
+    assert failed == 0
+    assert locked >= tensor.nbytes
+    assert " lo " in _vmflags_for(ptr)
