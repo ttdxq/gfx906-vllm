@@ -4,6 +4,7 @@
 
 import gc
 import os
+import threading
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -577,13 +578,32 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        with (
-            self._maybe_get_memory_pool_context(tag="weights"),
-            set_current_vllm_config(self.vllm_config),
-            # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
-        ):
-            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        # The weight stream pins fresh host shmem blocks (staging copies plus
+        # the host allocator's cached pin blocks) while it runs, and reclaim of
+        # those pages stops every KFD queue of this worker. Sweep them with
+        # mlock2(MLOCK_ONFAULT) while the load is still churning them.
+        sweep_stop: threading.Event | None = None
+        sweep_thread: threading.Thread | None = None
+        if envs.VLLM_ROCM_MLOCK_HOST_SHMEM and current_platform.is_rocm():
+            from vllm.utils.host_memory_lock import sweep_shared_mappings_until
+
+            sweep_stop = threading.Event()
+            sweep_thread = threading.Thread(
+                target=sweep_shared_mappings_until, args=(sweep_stop,), daemon=True
+            )
+            sweep_thread.start()
+        try:
+            with (
+                self._maybe_get_memory_pool_context(tag="weights"),
+                set_current_vllm_config(self.vllm_config),
+                # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
+                self._scoped_allocator_max_split(max_split_size_mb=20),
+            ):
+                self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        finally:
+            if sweep_stop is not None and sweep_thread is not None:
+                sweep_stop.set()
+                sweep_thread.join()
 
         if has_ec_transfer():
             get_ec_transfer().start_worker_services()
@@ -595,6 +615,16 @@ class Worker(WorkerBase):
                 self.device,
                 self.model_runner.get_model(),
             )
+
+        # The weight load leaves GPU-registered host shmem behind (pinned
+        # model tables plus the host allocator's cached pin blocks). Reclaim
+        # or compaction of those pages stops every KFD queue of this worker
+        # until the whole buffer is re-faulted; lock them now that the load
+        # stopped churning them.
+        if envs.VLLM_ROCM_MLOCK_HOST_SHMEM and current_platform.is_rocm():
+            from vllm.utils.host_memory_lock import mlock_shared_mappings
+
+            mlock_shared_mappings()
 
         # Preserve parallel weight loading, then use serving's thread count
         # for profiling and compilation so Dynamo's global-state guards remain

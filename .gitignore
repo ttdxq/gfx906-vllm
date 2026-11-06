@@ -301,6 +301,7 @@ verify_*.py
 test_*.py
 !tests/v1/core/test_mamba_align_chunk_split.py
 !tests/v1/attention/test_gdn_metadata_builder.py
+!tests/utils_/test_host_memory_lock.py
 *_test.py
 *_verify.py
 *_validation.py

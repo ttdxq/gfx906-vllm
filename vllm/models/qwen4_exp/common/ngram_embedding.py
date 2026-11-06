@@ -911,13 +911,20 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """Allocate the complete PLE weight directly in pinned CPU memory."""
-        return torch.empty(
+        host = torch.empty(
             num_embeddings,
             embedding_dim,
             dtype=dtype,
             device="cpu",
             pin_memory=True,
         )
+        # This table stays GPU-registered for the process lifetime while the
+        # rest of the weights stream in; lock it now so kernel reclaim cannot
+        # trigger KFD queue evictions against it during model load.
+        from vllm.utils.host_memory_lock import maybe_mlock_pinned_host_buffer
+
+        maybe_mlock_pinned_host_buffer(host)
+        return host
 
     def _lookup(
         self,
