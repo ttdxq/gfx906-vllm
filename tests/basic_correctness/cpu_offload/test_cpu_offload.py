@@ -95,6 +95,33 @@ def test_gguf_prefill_staging_reuses_bounded_storage_across_streams():
         torch.testing.assert_close(output, weight, rtol=0, atol=0)
 
 
+def test_gguf_prefill_staging_compacts_routed_experts():
+    weight = torch.arange(8 * 4 * 2, device="cuda", dtype=torch.uint8).reshape(
+        8, 4, 2
+    )
+    topk_ids = torch.tensor(
+        [[1, 1], [5, 1], [5, 1], [1, 5]], device="cuda", dtype=torch.int32
+    )
+    staging = GGUFMoEStaging(weight.device, 4096)
+
+    with staging.lease(topk_ids, expert_count=8, compact=True):
+        staged = staging.stage(weight, True)
+        remapped = staging.remap_topk_ids(topk_ids)
+        assert staged.shape == (2, 4, 2)
+        assert staging.effective_expert_count(8) == 2
+        torch.testing.assert_close(staged, weight[[1, 5]], rtol=0, atol=0)
+        torch.testing.assert_close(
+            remapped,
+            torch.tensor(
+                [[0, 0], [1, 0], [1, 0], [0, 1]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            rtol=0,
+            atol=0,
+        )
+
+
 @pytest.mark.parametrize("host_weights", [(True, False), (False, True), (True, True)])
 @pytest.mark.parametrize(
     "w1_type", [GGMLQuantizationType.Q4_0, GGMLQuantizationType.IQ4_NL]

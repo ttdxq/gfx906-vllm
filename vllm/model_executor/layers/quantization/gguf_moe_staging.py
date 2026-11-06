@@ -47,9 +47,17 @@ class GGUFMoEStaging:
         self.lock = Lock()
         self.done: torch.cuda.Event | None = None
         self.generation = 0
+        self._route_ids: torch.Tensor | None = None
+        self._route_index: torch.Tensor | None = None
+        self._route_count = 0
 
     @contextmanager
-    def lease(self) -> Iterator["GGUFMoEStaging"]:
+    def lease(
+        self,
+        topk_ids: torch.Tensor | None = None,
+        expert_count: int | None = None,
+        compact: bool = False,
+    ) -> Iterator["GGUFMoEStaging"]:
         # Keep enqueueing atomic across streams. The event protects the buffer
         # until its last consumer, not just its last copy, has finished.
         with self.lock:
@@ -57,6 +65,21 @@ class GGUFMoEStaging:
             stream = torch.cuda.current_stream(self.device)
             if self.done is not None:
                 stream.wait_event(self.done)
+            self._route_ids = None
+            self._route_index = None
+            self._route_count = 0
+            if compact and topk_ids is not None and expert_count is not None:
+                route_ids, route_index = torch.unique(
+                    topk_ids.reshape(-1), sorted=True, return_inverse=True
+                )
+                # A nearly dense route does not save enough transfer to pay for
+                # the unique/remap work and the compact kernel indexing.
+                if route_ids.numel() * 4 < expert_count * 3:
+                    self._route_ids = route_ids
+                    self._route_index = route_index.to(topk_ids.dtype).view_as(
+                        topk_ids
+                    )
+                    self._route_count = route_ids.numel()
             try:
                 yield self
             finally:
@@ -64,6 +87,31 @@ class GGUFMoEStaging:
                     if self.done is None:
                         self.done = torch.cuda.Event()
                     self.done.record(stream)
+                self._route_ids = None
+                self._route_index = None
+                self._route_count = 0
+
+    def can_compact(
+        self,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        w1_offloaded: bool,
+        w2_offloaded: bool,
+    ) -> bool:
+        return all(
+            offloaded
+            and weight.is_contiguous()
+            and weight.numel() * weight.element_size() <= self.max_bytes
+            for weight, offloaded in ((w1, w1_offloaded), (w2, w2_offloaded))
+        )
+
+    def remap_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        if self._route_index is None:
+            return topk_ids
+        return self._route_index
+
+    def effective_expert_count(self, default: int) -> int:
+        return self._route_count or default
 
     def stage(self, weight: torch.Tensor, offloaded: bool) -> torch.Tensor:
         size = weight.numel() * weight.element_size()
@@ -82,6 +130,16 @@ class GGUFMoEStaging:
                     "VLLM_GGUF_MOE_PREFILL_STAGING_MB."
                 )
                 return weight
+        if self._route_ids is not None:
+            row_shape = weight.shape[1:]
+            size = self._route_count * weight[0].numel() * weight.element_size()
+            if size > self.max_bytes:
+                return weight
+            staged = self.buffer[:size].view(weight.dtype).view(
+                (self._route_count, *row_shape)
+            )
+            torch.index_select(weight, 0, self._route_ids, out=staged)
+            return staged
         staged = self.buffer[:size].view(weight.dtype).view(weight.shape)
         staged.copy_(weight, non_blocking=True)
         return staged

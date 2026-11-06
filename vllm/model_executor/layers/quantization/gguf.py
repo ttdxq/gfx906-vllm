@@ -2042,7 +2042,15 @@ def _fused_moe_gguf(
             _gguf_moe_prefill_workspace(x, w1, topk_ids.shape[1], qweight_type)
         )
         if staging is not None:
-            stack.enter_context(staging.lease())
+            stack.enter_context(
+                staging.lease(
+                    topk_ids,
+                    w1.shape[0],
+                    compact=staging.can_compact(
+                        w1, w2, w1_offloaded, w2_offloaded
+                    ),
+                )
+            )
         return _fused_moe_gguf_impl(
             x,
             w1,
@@ -2081,6 +2089,9 @@ def _fused_moe_gguf_impl(
         fused_w2_weighted_sum_max_topk,
     ) = _gguf_moe_runtime_config()
 
+    if staging is not None:
+        topk_ids = staging.remap_topk_ids(topk_ids)
+
     def reduce_expert_outputs(out: torch.Tensor, output: torch.Tensor) -> None:
         if use_weighted_sum:
             ops.moe_weighted_sum(out, topk_weights, output)
@@ -2114,6 +2125,8 @@ def _fused_moe_gguf_impl(
 
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
+        if staging is not None:
+            E = staging.effective_expert_count(E)
         top_k = topk_ids.shape[1]
         _gguf_moe_profile_hit(
             "mmq_prefill",
