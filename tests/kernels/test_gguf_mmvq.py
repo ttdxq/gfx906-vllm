@@ -91,7 +91,18 @@ def _quantized_test_rows(qtype, rows, cols):
 
 
 @pytest.mark.parametrize(
-    "qtype,cols", [(8, 320), (8, 2560), (20, 320), (21, 256), (21, 2560), (23, 256)]
+    "qtype,cols",
+    [
+        (8, 320),
+        (8, 2560),
+        (20, 320),
+        (21, 256),
+        (21, 2560),
+        (23, 256),
+        (6, 640),
+        (6, 2560),
+        (18, 2560),
+    ],
 )
 @pytest.mark.parametrize("tokens,top_k", [(1, 10), (3, 1)])
 @torch.inference_mode()
@@ -301,6 +312,11 @@ def test_grouped_moe_matches_mmvq_with_512_experts_prefill_row_tiles(
         pytest.param(gguf.GGMLQuantizationType.IQ3_S, 2560, id="iq3_s-2560"),
         (gguf.GGMLQuantizationType.IQ2_XS, 256),
         (gguf.GGMLQuantizationType.IQ2_XS, 2560),
+        (gguf.GGMLQuantizationType.IQ2_S, 256),
+        (gguf.GGMLQuantizationType.IQ2_S, 2560),
+        (gguf.GGMLQuantizationType.IQ3_XXS, 256),
+        (gguf.GGMLQuantizationType.IQ3_XXS, 2560),
+        (gguf.GGMLQuantizationType.IQ4_XS, 2560),
         (gguf.GGMLQuantizationType.IQ4_NL, 256),
         (gguf.GGMLQuantizationType.IQ4_NL, 320),
         (gguf.GGMLQuantizationType.IQ4_NL, 640),
@@ -547,7 +563,7 @@ def test_iq_moe_prefill_crossover_matches_vector(num_tokens):
             gguf.GGMLQuantizationType.IQ2_XS,
             gguf.GGMLQuantizationType.IQ4_XS,
             True,
-            False,
+            True,
         ),
         (gguf.GGMLQuantizationType.IQ4_NL, gguf.GGMLQuantizationType.Q8_0, True, True),
     ],

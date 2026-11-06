@@ -968,3 +968,132 @@ static void ggml_moe_iq2_xs_q8_1_cuda(
         exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
   }
 }
+
+// The remaining normalized i-quant families (IQ3_XXS v4, IQ2_S v8 and the
+// IQ4_XS tile pair) use the same expert/token grouping so long prefill
+// batches avoid the per-token MMVQ fallback on them too.
+template <typename scalar_t, bool need_check, int TILE_ROWS = MOE_Y_IQ>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF * NWARPS_IQ, 2)
+#endif
+    moe_iq3_xxs(const void* __restrict__ vx, const void* __restrict__ vy,
+                scalar_t* __restrict__ dst, const int* sorted_token_ids,
+                const int* expert_ids, const int* num_tokens_post_padded,
+                const int exp_stride, const int ncols_x, const int nrows_x,
+                const int ncols_y, const int nrows_y, const int nrows_dst,
+                const int top_k) {
+  moe_q<scalar_t, QK_K, QR4_XS, QI4_XS, false, block_iq3_xxs,
+        MOE_X_IQ, TILE_ROWS, NWARPS_IQ,
+        allocate_tiles_iq<TILE_ROWS, 2 * WARP_SIZE_GGUF + 1, 8>,
+        load_tiles_iq3_xxs<TILE_ROWS, NWARPS_IQ, need_check>,
+        VDR_IQ_Q8_1_MMQ, vec_dot_iq_v4_mul_mat>(
+      vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+}
+
+template <typename scalar_t>
+static void ggml_moe_iq3_xxs_q8_1_cuda(
+    const void* inp, const void* w, scalar_t* dst,
+    const int* sorted_token_ids, const int* expert_ids,
+    const int* num_tokens_post_padded, const int exp_stride,
+    const int ncols_x, const int nrows_x, const int ncols_y,
+    const int nrows_y, const int nrows_dst, const int top_k,
+    const int tokens_post_padded, cudaStream_t stream) {
+  const dim3 block_nums((nrows_x + MOE_Y_IQ - 1) / MOE_Y_IQ,
+                        tokens_post_padded / MOE_X_IQ, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
+  if (nrows_x % MOE_Y_IQ == 0) {
+    moe_iq3_xxs<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  } else {
+    moe_iq3_xxs<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  }
+}
+
+template <typename scalar_t, bool need_check, int TILE_ROWS = MOE_Y_IQ>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF * NWARPS_IQ, 2)
+#endif
+    moe_iq2_s(const void* __restrict__ vx, const void* __restrict__ vy,
+              scalar_t* __restrict__ dst, const int* sorted_token_ids,
+              const int* expert_ids, const int* num_tokens_post_padded,
+              const int exp_stride, const int ncols_x, const int nrows_x,
+              const int ncols_y, const int nrows_y, const int nrows_dst,
+              const int top_k) {
+  moe_q<scalar_t, QK_K, QR4_XS, QI4_XS, false, block_iq2_s,
+        MOE_X_IQ, TILE_ROWS, NWARPS_IQ,
+        allocate_tiles_iq<TILE_ROWS, 2 * WARP_SIZE_GGUF + 1, 16>,
+        load_tiles_iq2_s<TILE_ROWS, NWARPS_IQ, need_check>,
+        VDR_IQ_Q8_1_MMQ, vec_dot_iq_v8_mul_mat>(
+      vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+}
+
+template <typename scalar_t>
+static void ggml_moe_iq2_s_q8_1_cuda(
+    const void* inp, const void* w, scalar_t* dst,
+    const int* sorted_token_ids, const int* expert_ids,
+    const int* num_tokens_post_padded, const int exp_stride,
+    const int ncols_x, const int nrows_x, const int ncols_y,
+    const int nrows_y, const int nrows_dst, const int top_k,
+    const int tokens_post_padded, cudaStream_t stream) {
+  const dim3 block_nums((nrows_x + MOE_Y_IQ - 1) / MOE_Y_IQ,
+                        tokens_post_padded / MOE_X_IQ, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
+  if (nrows_x % MOE_Y_IQ == 0) {
+    moe_iq2_s<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  } else {
+    moe_iq2_s<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  }
+}
+
+template <typename scalar_t, bool need_check, int TILE_ROWS = MOE_Y_IQ>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF * NWARPS_IQ, 2)
+#endif
+    moe_iq4_xs(const void* __restrict__ vx, const void* __restrict__ vy,
+               scalar_t* __restrict__ dst, const int* sorted_token_ids,
+               const int* expert_ids, const int* num_tokens_post_padded,
+               const int exp_stride, const int ncols_x, const int nrows_x,
+               const int ncols_y, const int nrows_y, const int nrows_dst,
+               const int top_k) {
+  moe_q<scalar_t, QK_K, QR4_XS, QI4_XS, false, block_iq4_xs,
+        MOE_X_IQ, TILE_ROWS, NWARPS_IQ,
+        allocate_tiles_iq4_xs<TILE_ROWS>,
+        load_tiles_iq4_xs<TILE_ROWS, NWARPS_IQ, need_check>,
+        VDR_IQ4_XS_Q8_1_MMQ, vec_dot_iq4_xs_q8_1_mul_mat>(
+      vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+}
+
+template <typename scalar_t>
+static void ggml_moe_iq4_xs_q8_1_cuda(
+    const void* inp, const void* w, scalar_t* dst,
+    const int* sorted_token_ids, const int* expert_ids,
+    const int* num_tokens_post_padded, const int exp_stride,
+    const int ncols_x, const int nrows_x, const int ncols_y,
+    const int nrows_y, const int nrows_dst, const int top_k,
+    const int tokens_post_padded, cudaStream_t stream) {
+  const dim3 block_nums((nrows_x + MOE_Y_IQ - 1) / MOE_Y_IQ,
+                        tokens_post_padded / MOE_X_IQ, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
+  if (nrows_x % MOE_Y_IQ == 0) {
+    moe_iq4_xs<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  } else {
+    moe_iq4_xs<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  }
+}

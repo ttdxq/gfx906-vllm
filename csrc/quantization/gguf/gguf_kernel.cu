@@ -3200,6 +3200,30 @@ torch::Tensor ggml_moe_a8(torch::Tensor X,  // input
             (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
             tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
         break;
+      case 18:
+        ggml_moe_iq3_xxs_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
+      case 22:
+        ggml_moe_iq2_s_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
+      case 23:
+        ggml_moe_iq4_xs_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
     }
   });
   return Y;
@@ -3425,12 +3449,14 @@ torch::Tensor ggml_moe_q8_vec_indirect(
                   tokens > 0 && topk_ids.size(1) > 0 && expert_ptrs.numel() > 0,
               "Expected int32 routing indices [tokens, top_k]");
   TORCH_CHECK(row > 0 && col > 0 &&
-                  col % ((type == 21 || type == 23) ? 256 : 32) == 0 &&
+                  col % ((type == 18 || type == 21 || type == 23) ? 256 : 32) == 0 &&
                   quant_X.size(0) == tokens &&
                   quant_X.size(1) == ((col + 511) / 512 * 512) / 32 * 9,
               "Invalid expert dimensions or activation layout");
-  TORCH_CHECK(type == 8 || type == 20 || type == 21 || type == 23,
-              "Indirect experts support Q8_0, IQ4_NL, IQ3_S and IQ4_XS");
+  TORCH_CHECK(
+      type == 6 || type == 8 || type == 18 || type == 20 || type == 21 ||
+          type == 23,
+      "Indirect experts support Q5_0, Q8_0, IQ3_XXS, IQ4_NL, IQ3_S and IQ4_XS");
   const at::cuda::OptionalCUDAGuard guard(device_of(quant_X));
   const int top_k = topk_ids.size(1);
   auto out = torch::empty({tokens * top_k, row}, quant_X.options().dtype(dtype));
@@ -3473,6 +3499,16 @@ torch::Tensor ggml_moe_q8_vec_indirect(
       case 23:
         moe_vec_indirect_cuda<scalar_t, QK_K, QI4_XS, block_iq4_xs,
                              VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1>(
+            qx, y, ids, ptrs, top_k, tokens, col, row, stride, stream);
+        break;
+      case 6:
+        moe_vec_indirect_cuda<scalar_t, QK5_0, QI5_0, block_q5_0,
+                             VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
+            qx, y, ids, ptrs, top_k, tokens, col, row, stride, stream);
+        break;
+      case 18:
+        moe_vec_indirect_cuda<scalar_t, QK_K, QI3_XXS, block_iq3_xxs, 1,
+                             vec_dot_iq3_xxs_q8_1>(
             qx, y, ids, ptrs, top_k, tokens, col, row, stride, stream);
         break;
     }
@@ -3971,8 +4007,11 @@ int64_t ggml_moe_get_block_size(int64_t type) {
     case 14:
       return MOE_X_Q6_K;
     case 17:
+    case 18:
     case 20:
     case 21:
+    case 22:
+    case 23:
       return MOE_X_IQ;
   }
   return 0;

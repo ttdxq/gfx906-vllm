@@ -995,7 +995,14 @@ MMQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES
 )
 # These formats share the normalized IQ tile loaders with dense MMQ.
-IQ_MOE_MMQ_QUANT_TYPES = {WeightType.IQ2_XS, WeightType.IQ3_S, WeightType.IQ4_NL}
+IQ_MOE_MMQ_QUANT_TYPES = {
+    WeightType.IQ2_XS,
+    WeightType.IQ2_S,
+    WeightType.IQ3_XXS,
+    WeightType.IQ3_S,
+    WeightType.IQ4_XS,
+    WeightType.IQ4_NL,
+}
 MOE_MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IQ_MOE_MMQ_QUANT_TYPES
 
 
@@ -1992,13 +1999,14 @@ def _fused_moe_gguf(
     w1_offloaded: bool = False,
     w2_offloaded: bool = False,
     expert_cache_default: bool = False,
+    expert_cache_decode_tokens: int = 1,
 ) -> torch.Tensor:
     if (
         os.getenv("VLLM_GGUF_MOE_EXPERT_CACHE", str(int(expert_cache_default))) == "1"
         and w1_offloaded
         and w2_offloaded
-        and qweight_type in (8, 20, 21, 23)
-        and qweight_type2 in (8, 20, 21, 23)
+        and qweight_type in (6, 8, 18, 20, 21, 23)
+        and qweight_type2 in (6, 8, 18, 20, 21, 23)
         and activation == "silu"
         and w1.is_contiguous()
         and w2.is_contiguous()
