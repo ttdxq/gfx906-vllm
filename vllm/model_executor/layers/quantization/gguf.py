@@ -980,8 +980,16 @@ IQ_MMQ_QUANT_TYPES = {
     WeightType.IQ3_S,
     WeightType.IQ4_NL,
 }
-DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
+# Q2_0 (GGML type 42): 2-bit single-scale blocks. Only the dequant path and
+# the MoE vec (MMVQ) kernels exist; no MMQ kernels, so it stays out of the
+# MMQ/MOE_MMQ sets and MoE layers route through the vec paths.
+Q2_0_QUANT_TYPES = {WeightType.Q2_0}
+DEQUANT_TYPES = (
+    STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | Q2_0_QUANT_TYPES
+)
+MMVQ_QUANT_TYPES = (
+    STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | Q2_0_QUANT_TYPES
+)
 # Q8_1 is an activation format here; native weight kernels do not support it.
 MMQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES

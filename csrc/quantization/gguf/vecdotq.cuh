@@ -490,6 +490,38 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
 #endif
 }
 
+// Q2_0 (group 64): one f16 scale per 64-weight block and four 2-bit codes per
+// payload byte (w = d*(code-1)); each iqs chunk of 16 weights covers half of a
+// 32-value q8_1 block. VDR 1 keeps four lanes per weight block.
+#define VDR_Q2_0_Q8_1_MMVQ 1
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq;
+
+    const int v = get_int_from_uint8(bq2_0->qs, iqs);
+
+    const block_q8_1 * bq8 = bq8_1 + (iqs >> 1);
+    const int u[4] = {
+        get_int_from_int8_aligned(bq8->qs, (iqs & 1)*4 + 0),
+        get_int_from_int8_aligned(bq8->qs, (iqs & 1)*4 + 1),
+        get_int_from_int8_aligned(bq8->qs, (iqs & 1)*4 + 2),
+        get_int_from_int8_aligned(bq8->qs, (iqs & 1)*4 + 3),
+    };
+
+    int sumi = 0;
+#pragma unroll
+    for (int w = 0; w < 16; ++w) {
+        const int code = (v >> (2*w)) & 3;
+        const int q8 = (int8_t)((u[w >> 2] >> (8*(w & 3))) & 0xFF);
+        sumi += (code - 1) * q8;
+    }
+
+    const float d8 = __half2float(__low2half(bq8->ds));
+    return __half2float(bq2_0->d) * d8 * sumi;
+}
+
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 

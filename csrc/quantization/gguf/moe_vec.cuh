@@ -178,6 +178,21 @@ static void moe_vec_q8_0_q8_1_cuda(const void* vx, const void* vy,
 }
 
 template <typename scalar_t>
+static void moe_vec_q2_0_q8_1_cuda(const void* vx, const void* vy,
+                                   scalar_t* dst, const int* topk_ids,
+                                   const int top_k, const int tokens,
+                                   const int ncols, const int nrows,
+                                   const int token_stride,
+                                   cudaStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, 1, tokens * top_k);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  moe_vec_q<scalar_t, QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ,
+            vec_dot_q2_0_q8_1><<<block_nums, block_dims, 0, stream>>>(
+      vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+}
+
+template <typename scalar_t>
 static void moe_vec_q2_K_q8_1_cuda(const void* vx, const void* vy,
                                    scalar_t* dst, const int* topk_ids,
                                    const int top_k, const int tokens,

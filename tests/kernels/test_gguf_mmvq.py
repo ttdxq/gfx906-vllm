@@ -1223,9 +1223,12 @@ def test_prepared_k45_preserves_math_graph_replay_and_fallback(
 def test_q8_1_weight_type_is_rejected():
     """Q8_1 activation records do not implement the GGUF weight format."""
     qtype = gguf.GGMLQuantizationType.Q8_1
-    assert set(_NATIVE_WEIGHT_TYPES) == gguf_layer.MMVQ_QUANT_TYPES
+    # Q2_0 ships the dequant and MoE vec kernels only; the other native
+    # formats cover MMVQ, MMQ and dequant alike.
+    vec_only = {gguf.GGMLQuantizationType.Q2_0}
+    assert set(_NATIVE_WEIGHT_TYPES) | vec_only == gguf_layer.MMVQ_QUANT_TYPES
     assert set(_NATIVE_WEIGHT_TYPES) == gguf_layer.MMQ_QUANT_TYPES
-    assert set(_NATIVE_WEIGHT_TYPES) == gguf_layer.DEQUANT_TYPES
+    assert set(_NATIVE_WEIGHT_TYPES) | vec_only == gguf_layer.DEQUANT_TYPES
     assert qtype not in gguf_layer.MMVQ_QUANT_TYPES
     assert qtype not in gguf_layer.MMQ_QUANT_TYPES
     assert qtype not in gguf_layer.DEQUANT_TYPES
@@ -1603,3 +1606,170 @@ def test_q8_m1_preserves_math_graph_and_multivec_fallback(monkeypatch, dtype):
         if e.device_type == torch.autograd.DeviceType.CUDA
     ]
     assert any("q8_0_q8_1_row_tile<" in n and ", true>" in n for n in names), names
+
+
+def _q2_0_test_rows(rows, cols, seed):
+    rng = np.random.default_rng(seed)
+    return gguf.quantize(
+        rng.standard_normal((rows, cols)).astype(np.float32),
+        gguf.GGMLQuantizationType.Q2_0,
+    )
+
+
+def _q8_1_dequantized_rows(quant_x, cols):
+    batch = quant_x.shape[0]
+    blocks = quant_x.cpu().view(torch.uint8).reshape(batch, -1, 36)
+    ds = blocks[..., :4].contiguous().view(torch.float16).double()
+    qs = blocks[..., 4:].contiguous().view(torch.int8).double()
+    return (ds[..., :1] * qs).reshape(batch, -1)[:, :cols]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("cols", [640, 2560])
+@pytest.mark.parametrize("rows", [3, 129])
+@torch.inference_mode()
+def test_q2_0_dequant_matches_cpu_reference(rows, cols):
+    """The Q2_0 dequant kernel must reproduce d*(code-1) exactly."""
+    data = _q2_0_test_rows(rows, cols, 2710)
+    raw = torch.tensor(data, device="cuda")
+    _TEST_WEIGHT_STORAGE.append(raw)
+    dequant = ops.ggml_dequantize(
+        raw, int(gguf.GGMLQuantizationType.Q2_0), rows, cols, torch.float32
+    ).cpu()
+    torch.testing.assert_close(
+        dequant.double(),
+        _dequantized_reference(data, gguf.GGMLQuantizationType.Q2_0),
+        atol=0.001,
+        rtol=0.001,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("cols", [640, 2560])
+@pytest.mark.parametrize("num_tokens", [1, 7])
+@torch.inference_mode()
+def test_q2_0_moe_vec_paths_match_cpu_reference(num_tokens, cols):
+    """a8/q8 vec and the fused weighted sum must match decoded-weight math."""
+    qtype = gguf.GGMLQuantizationType.Q2_0
+    rows, experts, top_k = 129, 512, 10
+    data = np.tile(_q2_0_test_rows(rows, cols, 73)[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    weight = torch.tensor(data, device="cuda")
+    _TEST_WEIGHT_STORAGE.append(weight)
+    decoded = torch.from_numpy(gguf.dequantize(data, qtype)).double()
+
+    torch.manual_seed(73)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda") * 0.2
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    ids = torch.tensor(
+        [0, 1, 127, 254, 255, 256, 257, 383, 510, 511], device="cuda", dtype=torch.int32
+    ).repeat(num_tokens, 1)
+    weights = torch.rand(num_tokens, top_k, dtype=torch.float32, device="cuda")
+
+    dq_x = _q8_1_dequantized_rows(quant_x, cols)
+    gathered = decoded[ids.cpu().long()]  # (t, k, rows, cols)
+    per_expert = torch.einsum("tc,tkrc->tkr", dq_x, gathered)
+    expected_pure = per_expert.reshape(num_tokens * top_k, rows)
+
+    actual_a8 = ops.ggml_moe_a8_vec(x, weight, ids, top_k, int(qtype), rows, num_tokens)
+    torch.testing.assert_close(
+        actual_a8.cpu().double(), expected_pure, atol=0.02, rtol=0.01
+    )
+
+    actual_q8 = ops.ggml_moe_q8_vec(
+        quant_x, weight, ids, top_k, int(qtype), rows, num_tokens, cols, torch.float16
+    )
+    torch.testing.assert_close(
+        actual_q8.cpu().double(), expected_pure, atol=0.02, rtol=0.01
+    )
+
+    # The weighted sum consumes per-expert activations with tokens*top_k rows
+    # (the silu-quantized W1 output in the fused decode path).
+    act = (
+        torch.randn(num_tokens * top_k, cols, dtype=torch.float16, device="cuda") * 0.2
+    )
+    quant_act = ops.ggml_quantize_row_q8_1(act)
+    dq_act = _q8_1_dequantized_rows(quant_act, cols).reshape(num_tokens, top_k, cols)
+    per_expert_act = torch.einsum("tkc,tkrc->tkr", dq_act, gathered)
+    expected_weighted = torch.einsum(
+        "tk,tkr->tr", weights.cpu().double(), per_expert_act
+    )
+
+    actual_ws = ops.ggml_moe_q8_vec_weighted_sum(
+        quant_act,
+        weight,
+        ids,
+        weights,
+        top_k,
+        int(qtype),
+        rows,
+        num_tokens,
+        cols,
+        torch.float16,
+    )
+    # top_k fp16 partial sums accumulate slightly past the plain dot tolerance
+    torch.testing.assert_close(
+        actual_ws.cpu().double(), expected_weighted, atol=0.03, rtol=0.01
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.timeout(180)
+@torch.inference_mode()
+def test_q2_0_moe_vec_production_shape_matches_reference():
+    """The model's exact ffn_down_exps shape [512, 2560, 640] end to end."""
+    qtype = gguf.GGMLQuantizationType.Q2_0
+    experts, rows, cols, num_tokens, top_k = 512, 2560, 640, 4, 10
+    data = np.tile(_q2_0_test_rows(rows, cols, 2026)[None], (experts, 1, 1))
+    weight = torch.tensor(data, device="cuda")
+    _TEST_WEIGHT_STORAGE.append(weight)
+    decoded = torch.from_numpy(gguf.dequantize(data, qtype)).double()
+
+    torch.manual_seed(2026)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda") * 0.2
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    ids = torch.randint(
+        0, experts, (num_tokens, top_k), device="cuda", dtype=torch.int32
+    )
+    weights = torch.rand(num_tokens, top_k, dtype=torch.float32, device="cuda")
+
+    dq_x = _q8_1_dequantized_rows(quant_x, cols)
+    gathered = decoded[ids.cpu().long()]  # (t, k, rows, cols)
+    per_expert = torch.einsum("tc,tkrc->tkr", dq_x, gathered)
+    expected_pure = per_expert.reshape(num_tokens * top_k, rows)
+
+    actual_q8 = ops.ggml_moe_q8_vec(
+        quant_x, weight, ids, top_k, int(qtype), rows, num_tokens, cols, torch.float16
+    )
+    torch.testing.assert_close(
+        actual_q8.cpu().double(), expected_pure, atol=0.02, rtol=0.01
+    )
+
+    act = (
+        torch.randn(num_tokens * top_k, cols, dtype=torch.float16, device="cuda") * 0.2
+    )
+    quant_act = ops.ggml_quantize_row_q8_1(act)
+    dq_act = _q8_1_dequantized_rows(quant_act, cols).reshape(num_tokens, top_k, cols)
+    per_expert_act = torch.einsum("tkc,tkrc->tkr", dq_act, gathered)
+    expected_weighted = torch.einsum(
+        "tk,tkr->tr", weights.cpu().double(), per_expert_act
+    )
+
+    actual_ws = ops.ggml_moe_q8_vec_weighted_sum(
+        quant_act,
+        weight,
+        ids,
+        weights,
+        top_k,
+        int(qtype),
+        rows,
+        num_tokens,
+        cols,
+        torch.float16,
+    )
+    # top_k fp16 partial sums accumulate slightly past the plain dot tolerance
+    torch.testing.assert_close(
+        actual_ws.cpu().double(), expected_weighted, atol=0.03, rtol=0.01
+    )

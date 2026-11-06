@@ -3304,6 +3304,11 @@ torch::Tensor ggml_moe_a8(torch::Tensor X,  // input
           W_PTR, Q_PTR, Y_PTR, TOPK_PTR, TOP_K, TOKENS, COL, ROW, Q_STRIDE,    \
           STREAM);                                                             \
       break;                                                                   \
+    case 42:                                                                   \
+      moe_vec_q2_0_q8_1_cuda<SCALAR_T>(                                        \
+          W_PTR, Q_PTR, Y_PTR, TOPK_PTR, TOP_K, TOKENS, COL, ROW, Q_STRIDE,    \
+          STREAM);                                                             \
+      break;                                                                   \
     default:                                                                   \
       TORCH_CHECK(false, "Unsupported GGUF MoE MMVQ quantization type: ",      \
                   TYPE);                                                       \
@@ -3600,6 +3605,12 @@ torch::Tensor ggml_moe_q8_vec(torch::Tensor quant_X,  // input
             (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens,
             col, row, quant_X.stride(0), stream);
         break;
+      case 42:
+        moe_vec_q2_0_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens,
+            col, row, quant_X.stride(0), stream);
+        break;
       default:
         TORCH_CHECK(false, "Unsupported GGUF MoE MMVQ quantization type: ",
                     type);
@@ -3804,6 +3815,13 @@ static void ggml_moe_q8_vec_weighted_sum_dispatch(
     case 29:
       moe_vec_q_weighted_sum_cuda<scalar_t, weight_t, QK_K, QI1_M,
                                   block_iq1_m, 1, vec_dot_iq1_m_q8_1>(
+          W, quant_X, weights, dst, topk_ids, top_k, tokens, col, row,
+          token_stride, stream);
+      break;
+    case 42:
+      moe_vec_q_weighted_sum_cuda<scalar_t, weight_t, QK2_0, QI2_0,
+                                  block_q2_0, VDR_Q2_0_Q8_1_MMVQ,
+                                  vec_dot_q2_0_q8_1>(
           W, quant_X, weights, dst, topk_ids, top_k, tokens, col, row,
           token_stride, stream);
       break;
