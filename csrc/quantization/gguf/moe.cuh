@@ -997,21 +997,41 @@ static void ggml_moe_iq3_xxs_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst,
     const int* sorted_token_ids, const int* expert_ids,
     const int* num_tokens_post_padded, const int exp_stride,
-    const int ncols_x, const int nrows_x, const int ncols_y,
-    const int nrows_y, const int nrows_dst, const int top_k,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k,
     const int tokens_post_padded, cudaStream_t stream) {
-  const dim3 block_nums((nrows_x + MOE_Y_IQ - 1) / MOE_Y_IQ,
-                        tokens_post_padded / MOE_X_IQ, 1);
-  const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
-  if (nrows_x % MOE_Y_IQ == 0) {
-    moe_iq3_xxs<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
-  } else {
-    moe_iq3_xxs<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  const char* tile_env = std::getenv("VLLM_GGUF_MOE_IQ3_XXS_TILE_ROWS");
+  int default_tile_rows = MOE_Y_IQ;
+#ifdef USE_ROCM
+  if (std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+          .find("gfx906") == 0) {
+    default_tile_rows = 32;
   }
+#endif
+  const int tile_rows = tile_env == nullptr ? default_tile_rows : std::atoi(tile_env);
+  const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
+#define LAUNCH_IQ_TILE(ROWS_) \
+  do { \
+    const dim3 grid((nrows_x + ROWS_ - 1) / ROWS_, \
+                    tokens_post_padded / MOE_X_IQ, 1); \
+    if (nrows_x % ROWS_ == 0) { \
+      moe_iq3_xxs<scalar_t, false, ROWS_><<<grid, block_dims, 0, stream>>>( \
+          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k); \
+    } else { \
+      moe_iq3_xxs<scalar_t, true, ROWS_><<<grid, block_dims, 0, stream>>>( \
+          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k); \
+    } \
+  } while (0)
+  if (tile_rows == 32) {
+    LAUNCH_IQ_TILE(32);
+  } else if (tile_rows == 64) {
+    LAUNCH_IQ_TILE(64);
+  } else {
+    LAUNCH_IQ_TILE(MOE_Y_IQ);
+  }
+#undef LAUNCH_IQ_TILE
 }
 
 template <typename scalar_t, bool need_check, int TILE_ROWS = MOE_Y_IQ>
@@ -1039,21 +1059,41 @@ static void ggml_moe_iq2_s_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst,
     const int* sorted_token_ids, const int* expert_ids,
     const int* num_tokens_post_padded, const int exp_stride,
-    const int ncols_x, const int nrows_x, const int ncols_y,
-    const int nrows_y, const int nrows_dst, const int top_k,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const int top_k,
     const int tokens_post_padded, cudaStream_t stream) {
-  const dim3 block_nums((nrows_x + MOE_Y_IQ - 1) / MOE_Y_IQ,
-                        tokens_post_padded / MOE_X_IQ, 1);
-  const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
-  if (nrows_x % MOE_Y_IQ == 0) {
-    moe_iq2_s<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
-  } else {
-    moe_iq2_s<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  const char* tile_env = std::getenv("VLLM_GGUF_MOE_IQ2_S_TILE_ROWS");
+  int default_tile_rows = MOE_Y_IQ;
+#ifdef USE_ROCM
+  if (std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+          .find("gfx906") == 0) {
+    default_tile_rows = 32;
   }
+#endif
+  const int tile_rows = tile_env == nullptr ? default_tile_rows : std::atoi(tile_env);
+  const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_IQ, 1);
+#define LAUNCH_IQ_TILE(ROWS_) \
+  do { \
+    const dim3 grid((nrows_x + ROWS_ - 1) / ROWS_, \
+                    tokens_post_padded / MOE_X_IQ, 1); \
+    if (nrows_x % ROWS_ == 0) { \
+      moe_iq2_s<scalar_t, false, ROWS_><<<grid, block_dims, 0, stream>>>( \
+          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k); \
+    } else { \
+      moe_iq2_s<scalar_t, true, ROWS_><<<grid, block_dims, 0, stream>>>( \
+          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k); \
+    } \
+  } while (0)
+  if (tile_rows == 32) {
+    LAUNCH_IQ_TILE(32);
+  } else if (tile_rows == 64) {
+    LAUNCH_IQ_TILE(64);
+  } else {
+    LAUNCH_IQ_TILE(MOE_Y_IQ);
+  }
+#undef LAUNCH_IQ_TILE
 }
 
 template <typename scalar_t, bool need_check, int TILE_ROWS = MOE_Y_IQ>

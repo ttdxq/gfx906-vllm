@@ -2833,10 +2833,14 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         int i = i0 + i_offset;
         if (need_check) i = min(i, i_max);
         const block_iq2_s * bxi = bx0 + i*blocks_per_row;
-        const int idx = bxi->qs[4*g + l] | ((bxi->qh[g] << (8 - 2*l)) & 0x300);
+        // adjacent lanes (l = 2m, 2m+1) need adjacent bytes of qs/signs: fetch
+        // the pair as one 16-bit load instead of two byte loads
+        const uint16_t qpair = *(const uint16_t *)(bxi->qs + 4*g + 2*(l >> 1));
+        const int idx = ((qpair >> (8*(l & 1))) & 0xFF) | ((bxi->qh[g] << (8 - 2*l)) & 0x300);
         const uint32_t grid_lo = ((const uint32_t *)(iq2s_grid + idx))[0];
         const uint32_t grid_hi = ((const uint32_t *)(iq2s_grid + idx))[1];
-        iq_sign_words(grid_lo, grid_hi, bxi->qs[QK_K/8 + 4*g + l],
+        const uint16_t spair = *(const uint16_t *)(bxi->qs + QK_K/8 + 4*g + 2*(l >> 1));
+        iq_sign_words(grid_lo, grid_hi, (uint8_t)(spair >> (8*(l & 1))),
                       x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l)],
                       x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l) + 1]);
         if (k < 8) {
@@ -2862,15 +2866,21 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         int i = i0 + i_offset;
         if (need_check) i = min(i, i_max);
         const block_iq3_xxs * bxi = bx0 + i*blocks_per_row;
-        const uint8_t * q3 = bxi->qs + 8*g;
+        // q3[2*l] and q3[2*l+1] are adjacent bytes: fetch them as one 16-bit
+        // load (qs is 2-byte aligned in every row) instead of two byte loads
+        const uint16_t qpair = *(const uint16_t *)(bxi->qs + 8*g + 2*l);
         const uint16_t * gas = (const uint16_t *)(bxi->qs + QK_K/4) + 2*g;
         const uint32_t aux32 = (uint32_t)gas[0] | ((uint32_t)gas[1] << 16);
-        const uint32_t grid1 = iq3xxs_grid[q3[2*l + 0]];
-        const uint32_t grid2 = iq3xxs_grid[q3[2*l + 1]];
-        const uint32_t * sgn = (const uint32_t *)(ksigns64 + ((aux32 >> (7*l)) & 127));
+        const uint32_t grid1 = iq3xxs_grid[qpair & 0xFF];
+        const uint32_t grid2 = iq3xxs_grid[qpair >> 8];
+        // ksigns64[s7] expands bit b of s7 into 0xFF in byte b (b = 0..6) and
+        // stores popcount(s7) & 1 in byte 7, i.e. exactly the nibble trick of
+        // iq_sign_words with a signs byte of s7 | parity<<7 - this drops the
+        // two 64-bit-table loads per row
+        const uint32_t s7 = (aux32 >> (7*l)) & 0x7F;
+        const uint8_t signs = (uint8_t)(s7 | ((uint32_t)(__popc(s7) & 1) << 7));
         const int base = i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l);
-        x_ql[base]     = (int)__vsub4(grid1 ^ sgn[0], sgn[0]);
-        x_ql[base + 1] = (int)__vsub4(grid2 ^ sgn[1], sgn[1]);
+        iq_sign_words(grid1, grid2, signs, x_ql[base], x_ql[base + 1]);
         if (k < 8) {
             // build the word as uint32_t: an inline (ga[0] | (ga[1] << 16))
             // stays in promoted int and >> 28 becomes an arithmetic shift
