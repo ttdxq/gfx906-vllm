@@ -84,7 +84,11 @@ class GGUFMoEExpertCache:
         )
 
     def observe(
-        self, w1: torch.Tensor, w2: torch.Tensor, ids: torch.Tensor
+        self,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        ids: torch.Tensor,
+        decode_token_limit: int = 1,
     ) -> ExpertCacheEntry | None:
         stream = torch.cuda.current_stream(self.device)
         if self.stream is None:
@@ -109,7 +113,7 @@ class GGUFMoEExpertCache:
                 ),
             )
         entry = self.entries[key]
-        decode = ids.shape[0] == 1
+        decode = 0 < ids.shape[0] <= decode_token_limit
         if not decode:
             if self.phase == "decode":
                 for value in self.entries.values():

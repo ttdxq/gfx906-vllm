@@ -65,9 +65,10 @@ def test_flash_gguf_default_policy_uses_text_config(tmp_path, variant):
 
 
 @pytest.mark.parametrize("top_k", [2, 10])
+@pytest.mark.parametrize("num_tokens", [1, 2, 3])
 @pytest.mark.parametrize("cache_env", [None, "1"])
 @torch.inference_mode()
-def test_cached_fused_moe_matches_original(monkeypatch, top_k, cache_env):
+def test_cached_fused_moe_matches_original(monkeypatch, top_k, num_tokens, cache_env):
     from vllm.model_executor.layers.quantization import gguf as gg
     from vllm.model_executor.layers.quantization import gguf_moe_expert_cache as ec
     from vllm.model_executor.layers.quantization import gguf_moe_staging as gs
@@ -88,9 +89,9 @@ def test_cached_fused_moe_matches_original(monkeypatch, top_k, cache_env):
     monkeypatch.setitem(gs._STAGING, device, pool)
     monkeypatch.setitem(ec._CACHES, device, cache)
     prompt = torch.randint(16, (32, top_k), device=device, dtype=torch.int32)
-    x = torch.randn(1, 256, device=device, dtype=torch.float16)
-    routes = prompt[:1]
-    weights = torch.softmax(torch.randn(1, top_k, device=device), dim=-1)
+    x = torch.randn(num_tokens, 256, device=device, dtype=torch.float16)
+    routes = prompt[:num_tokens]
+    weights = torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=-1)
     args = (x, module.w1, module.w2, weights, routes, 8, 8, "silu", True, True)
     monkeypatch.setenv("VLLM_GGUF_MOE_EXPERT_CACHE", "0")
     expected = gg.fused_moe_gguf(*args, expert_cache_default=True).clone()
@@ -101,7 +102,11 @@ def test_cached_fused_moe_matches_original(monkeypatch, top_k, cache_env):
         monkeypatch.setenv("VLLM_GGUF_MOE_EXPERT_CACHE", cache_env)
     cache.observe(module.w1, module.w2, prompt)
     for _ in range(3):
-        actual = gg.fused_moe_gguf(*args, expert_cache_default=True)
+        actual = gg.fused_moe_gguf(
+            *args,
+            expert_cache_default=True,
+            expert_cache_decode_tokens=num_tokens,
+        )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     cache_supported = False
     if current_platform.is_rocm():

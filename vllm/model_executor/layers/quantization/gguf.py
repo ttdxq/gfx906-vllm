@@ -2004,8 +2004,12 @@ def _fused_moe_gguf(
         from vllm.platforms.rocm import on_gfx906
 
         if on_gfx906():
-            entry = get_gguf_expert_cache(x.device).observe(w1, w2, topk_ids)
+            entry = get_gguf_expert_cache(x.device).observe(
+                w1, w2, topk_ids, expert_cache_decode_tokens
+            )
             if entry is not None:
+                num_tokens = x.shape[0]
+                top_k = topk_ids.shape[1]
                 quant_x = _quantize_row_q8_1_cached(
                     x, None, ("_gguf_expert_cache_x", w1.data_ptr())
                 )
@@ -2417,6 +2421,7 @@ def _fused_moe_gguf_fake(
     w1_offloaded: bool = False,
     w2_offloaded: bool = False,
     expert_cache_default: bool = False,
+    expert_cache_decode_tokens: int = 1,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -3054,9 +3059,14 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     ):
         super().__init__(moe)
         self.quant_config = quant_config
-        self._expert_cache_default = use_gfx906_qwen4exp_decode_defaults(
-            get_current_vllm_config_or_none()
-        )
+        vllm_config = get_current_vllm_config_or_none()
+        self._expert_cache_default = use_gfx906_qwen4exp_decode_defaults(vllm_config)
+        self._expert_cache_decode_tokens = 1
+        if vllm_config is not None:
+            self._expert_cache_decode_tokens = (
+                vllm_config.scheduler_config.max_num_seqs
+                * (1 + vllm_config.num_speculative_tokens)
+            )
 
     def create_weights(
         self,
@@ -3159,6 +3169,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             getattr(layer.w13_qweight, "_vllm_is_uva_offloaded", False),
             getattr(layer.w2_qweight, "_vllm_is_uva_offloaded", False),
             self._expert_cache_default,
+            self._expert_cache_decode_tokens,
         )
 
 
