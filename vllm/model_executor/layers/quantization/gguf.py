@@ -82,9 +82,7 @@ ENABLE_GGUF_SIGMOID_GATED_OUT_PROJ_MMVQ = _env_flag(
 ENABLE_GGUF_Q8_0_FAST_MMVQ = _env_flag("VLLM_GGUF_Q8_0_FAST_MMVQ", False)
 ENABLE_GGUF_SHARED_ACTIVATION = os.getenv("VLLM_GGUF_SHARED_ACTIVATION", "0") == "1"
 ENABLE_GGUF_Q8_1_BUFFER_CACHE = _env_flag("VLLM_GGUF_Q8_1_BUFFER_CACHE", True)
-ENABLE_GGUF_SINGLE_MMVQ_Q8_CACHE = _env_flag(
-    "VLLM_GGUF_SINGLE_MMVQ_Q8_CACHE", False
-)
+ENABLE_GGUF_SINGLE_MMVQ_Q8_CACHE = _env_flag("VLLM_GGUF_SINGLE_MMVQ_Q8_CACHE", False)
 ENABLE_GGUF_GROUPED_MMVQ_OUTPUT_CACHE = _env_flag(
     "VLLM_GGUF_GROUPED_MMVQ_OUTPUT_CACHE", False
 )
@@ -97,31 +95,21 @@ ENABLE_GGUF_COALESCE_SAME_TYPE_SHARDS = _env_flag(
 # Keep the legacy zero-padded concat parameter for mixed-width merged GGUF
 # layers (set VLLM_GGUF_MERGED_PADDED=1 to restore the old memory layout).
 ENABLE_GGUF_MERGED_PADDED_COMPAT = _env_flag("VLLM_GGUF_MERGED_PADDED", False)
-ENABLE_GGUF_SHARDED_MMVQ_Q8_CACHE = _env_flag(
-    "VLLM_GGUF_SHARDED_MMVQ_Q8_CACHE", True
-)
-ENABLE_GGUF_GROUPED_SAME_TYPE_MMVQ = _env_flag(
-    "VLLM_GGUF_GROUPED_SAME_TYPE_MMVQ", True
-)
+ENABLE_GGUF_SHARDED_MMVQ_Q8_CACHE = _env_flag("VLLM_GGUF_SHARDED_MMVQ_Q8_CACHE", True)
+ENABLE_GGUF_GROUPED_SAME_TYPE_MMVQ = _env_flag("VLLM_GGUF_GROUPED_SAME_TYPE_MMVQ", True)
 ENABLE_GGUF_IQ_MOE_MMQ = _env_flag("VLLM_GGUF_IQ_MOE_MMQ", True)
 ENABLE_GGUF_QKV3_MMVQ = _env_flag("VLLM_GGUF_QKV3_MMVQ", False)
-ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2 = _env_flag(
-    "VLLM_GGUF_MOE_HOST_FUSED_ACT_W2", True
-)
+ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2 = _env_flag("VLLM_GGUF_MOE_HOST_FUSED_ACT_W2", True)
 ENABLE_GGUF_GFX906_SMALL_BATCH_MMVQ = _env_flag(
     "VLLM_GGUF_GFX906_SMALL_BATCH_MMVQ", True
 )
 ENABLE_GGUF_LINEAR_PROFILE = _env_flag("VLLM_GGUF_LINEAR_PROFILE", False)
-ENABLE_GGUF_FORCE_DEQUANT_MATMUL = _env_flag(
-    "VLLM_GGUF_FORCE_DEQUANT_MATMUL", False
-)
+ENABLE_GGUF_FORCE_DEQUANT_MATMUL = _env_flag("VLLM_GGUF_FORCE_DEQUANT_MATMUL", False)
 # The repack doubles iq4_xs weight bytes (x2.09 VRAM) and its q8_0 decode
 # speed only reaches ~300-360 GB/s of effective (original-byte) bandwidth on
 # gfx906, below the native iq4_xs paths (~440-600 GB/s). Off by default; set
 # VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0=1 to restore the repacked layout.
-ENABLE_GGUF_REPACK_IQ4_XS_TO_Q8_0 = _env_flag(
-    "VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0", False
-)
+ENABLE_GGUF_REPACK_IQ4_XS_TO_Q8_0 = _env_flag("VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0", False)
 
 _GGUF_Q8_1_BUFFER_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
 _GGUF_TENSOR_BUFFER_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
@@ -204,11 +192,13 @@ _GGUF_PLANAR_K_TYPE_SIZES = {
 
 @lru_cache(maxsize=1)
 def _gguf_planar_k_types() -> frozenset:
-    default = frozenset({
-        int(WeightType.Q4_K),
-        int(WeightType.Q5_K),
-        int(WeightType.Q6_K),
-    })
+    default = frozenset(
+        {
+            int(WeightType.Q4_K),
+            int(WeightType.Q5_K),
+            int(WeightType.Q6_K),
+        }
+    )
     raw = os.getenv("VLLM_GGUF_KQUANT_PLANAR_TYPES")
     if not raw:
         return default
@@ -233,7 +223,6 @@ def _qkv3_mmvq_planar_safe(qweight_types: list[int]) -> bool:
         return True
     packed = _gguf_planar_k_types()
     return qweight_types[0] not in packed and qweight_types[2] not in packed
-
 
 
 @lru_cache(maxsize=1)
@@ -400,7 +389,6 @@ def _gguf_linear_profile_hit(
 
 
 class _GGUFMoeTimer:
-
     def __init__(
         self,
         path: str,
@@ -1016,8 +1004,9 @@ def _gguf_moe_use_mmq(qweight_type: int, num_tokens: int) -> bool:
     )
 
 
-def _iq_mmq_beats_dequant(x: torch.Tensor, qweight: torch.Tensor,
-                          qweight_type: int) -> bool:
+def _iq_mmq_beats_dequant(
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+) -> bool:
     """Shape gate for the i-quant MMQ kernels.
 
     gfx906 measurements at 256/2048-token batches: the dp4a MMQ kernels beat
@@ -1234,10 +1223,7 @@ def _mmvq_safe_batch(qweight: torch.Tensor, qweight_type: int) -> int:
     if qweight_type in IMATRIX_QUANT_TYPES:
         cap = 8 if qweight.shape[0] > 5120 else 16
     elif qweight.shape[0] > 5120:
-        if (
-            qweight_type in MMQ_QUANT_TYPES
-            and _gguf_gfx906_small_batch_mmvq_enabled()
-        ):
+        if qweight_type in MMQ_QUANT_TYPES and _gguf_gfx906_small_batch_mmvq_enabled():
             if qweight_type in {WeightType.Q4_0, WeightType.Q4_1, WeightType.Q4_K}:
                 cap = _gguf_gfx906_q4_mmvq_max_batch()
             elif qweight_type == WeightType.Q6_K:
@@ -1677,9 +1663,7 @@ def try_grouped_gguf_linear_mmvq(
     if x.shape[0] > mmvq_max_batch:
         return None
 
-    quant_x = _quantize_row_q8_1_cached(
-        x, layers[0], "_gguf_grouped_mmvq_quant_x"
-    )
+    quant_x = _quantize_row_q8_1_cached(x, layers[0], "_gguf_grouped_mmvq_quant_x")
     out = _get_grouped_mmvq_output_buffer(
         "_gguf_grouped_mmvq_output",
         qweights,
@@ -1715,9 +1699,7 @@ def try_grouped_gguf_linear_mmvq(
                 qweight_types,
                 grouped_same_type=False,
             )
-        if out is not None and hasattr(
-            torch.ops._C, "ggml_mul_mat_vec_q8_sharded_out"
-        ):
+        if out is not None and hasattr(torch.ops._C, "ggml_mul_mat_vec_q8_sharded_out"):
             ops.ggml_mul_mat_vec_q8_sharded_out(
                 qweights, quant_x, out, qweight_types, x.shape[1]
             )
@@ -1788,7 +1770,9 @@ def try_gguf_silu_and_mul_down_mmvq(
             gate_up.device,
         )
         if out is not None and hasattr(torch.ops._C, "ggml_mul_mat_vec_q8_sharded_out"):
-            ops.ggml_mul_mat_vec_q8_sharded_out(qweights, quant_out, out, qweight_types, col)
+            ops.ggml_mul_mat_vec_q8_sharded_out(
+                qweights, quant_out, out, qweight_types, col
+            )
         else:
             out = _fused_mul_mat_gguf_sharded_mmvq_q8(
                 quant_out, qweights, qweight_types, col, gate_up.dtype
@@ -2795,9 +2779,11 @@ class GGUFLinearMethod(LinearMethodBase):
                 # tensors to the shard cache as the single resident copy.
                 cache = {}
                 for idx in shard_id:
-                    shard = data_container[shard_id_map[idx]].to(
-                        device=qweight.device
-                    ).contiguous()
+                    shard = (
+                        data_container[shard_id_map[idx]]
+                        .to(device=qweight.device)
+                        .contiguous()
+                    )
                     cache[idx] = shard
                 qweight.data_container.clear()
                 layer._gguf_shard_cache = cache
@@ -2872,13 +2858,10 @@ class GGUFLinearMethod(LinearMethodBase):
                     ):
                         type_size = _GGUF_PLANAR_K_TYPE_SIZES[shard_type]
                         col = shard.shape[1] // type_size * 256
-                        if (
-                            col % 256 == 0
-                            and col > 0
-                            and shard.shape[0] > 0
-                        ):
+                        if col % 256 == 0 and col > 0 and shard.shape[0] > 0:
                             cache[idx] = torch.ops._C.ggml_planar_pack(
-                                shard, shard_type, shard.shape[0], col)
+                                shard, shard_type, shard.shape[0], col
+                            )
             return
 
         cache = {}
@@ -2893,9 +2876,11 @@ class GGUFLinearMethod(LinearMethodBase):
         # original block-layout qweight (_get_full_mmvq_shard_weight takes
         # priority over the shard cache), so planar copies of their shards
         # would never be read and would only double the resident memory.
-        if pack_shard and _get_full_mmvq_shard_weight(
-            layer, list(shard_weight_type.values())
-        ) is not None:
+        if (
+            pack_shard
+            and _get_full_mmvq_shard_weight(layer, list(shard_weight_type.values()))
+            is not None
+        ):
             pack_shard = False
         all_packed = True
         for idx, (start, end, offset) in shard_offset_map.items():
@@ -2912,7 +2897,8 @@ class GGUFLinearMethod(LinearMethodBase):
                 col = shard.shape[1] // type_size * 256
                 if col % 256 == 0 and col > 0 and shard.shape[0] > 0:
                     shard = torch.ops._C.ggml_planar_pack(
-                        shard, shard_type, shard.shape[0], col)
+                        shard, shard_type, shard.shape[0], col
+                    )
                     packed_shard = True
             all_packed = all_packed and packed_shard
             cache[idx] = shard
@@ -2951,17 +2937,13 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             return
 
-        coalesced = _coalesce_adjacent_same_type_mmvq_shards(
-            qweights, qweight_types
-        )
+        coalesced = _coalesce_adjacent_same_type_mmvq_shards(qweights, qweight_types)
         if coalesced is not None:
             coalesced_qweights, coalesced_qweight_types = coalesced
             layer._gguf_coalesced_shards = (
                 coalesced_qweights,
                 coalesced_qweight_types,
-                _shared_mmvq_max_batch(
-                    coalesced_qweights, coalesced_qweight_types
-                ),
+                _shared_mmvq_max_batch(coalesced_qweights, coalesced_qweight_types),
             )
 
     def apply(
@@ -3016,9 +2998,7 @@ class GGUFLinearMethod(LinearMethodBase):
                 else:
                     profile_path = "sharded_mmvq"
                 if ENABLE_GGUF_LINEAR_PROFILE:
-                    _gguf_linear_profile_hit(
-                        profile_path, x, qweights, qweight_types
-                    )
+                    _gguf_linear_profile_hit(profile_path, x, qweights, qweight_types)
                 out = _fused_mul_mat_gguf_sharded_cached_mmvq(
                     x,
                     qweights,
