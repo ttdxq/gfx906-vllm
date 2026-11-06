@@ -115,16 +115,106 @@ def test_hc_linear_hook_preserves_projection(
         assert isinstance(layer.quant_method, Qwen4ExpHCGemvMethod)
 
 
-@pytest.mark.parametrize("tokens", [1, 2])
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 5])
 @torch.inference_mode()
 def test_gguf_f16_gdn_out_proj_gemv_matches_mm(tokens: int):
-    """Use the long-K GEMV only for the single-token GDN out projection."""
+    """The long-K GEMV covers the GDN out projection for verify-sized batches."""
     torch.manual_seed(7319)
     x = torch.randn(tokens, 3072, device="cuda", dtype=torch.float16)
     weight = torch.randn(2560, 3072, device="cuda", dtype=torch.float16) * 0.01
-    actual = _fused_mul_mat_gguf(x, weight, WeightType.F16)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profile:
+        actual = _fused_mul_mat_gguf(x, weight, WeightType.F16)
     expected = x @ weight.T
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-3)
+    used_gemv = any(
+        "qwen4_exp_gemv_gfx906" in e.key for e in profile.key_averages()
+    )
+    assert used_gemv == (tokens <= 4)
+
+
+@pytest.mark.parametrize("tokens", [2, 3, 4, 5])
+@pytest.mark.parametrize(
+    "rows,k,gemv_expected",
+    [
+        (512, 2560, True),  # MoE router
+        (16, 2560, True),  # GDN a/b projections
+        (2560, 3072, True),  # GDN out projection shape via the unquantized path
+        (10240, 320, False),  # HC up: small K stays on triton_matmul
+        (19, 257, False),  # odd rows and K tail below the crossover
+        (128, 8192, True),  # K gate boundary
+    ],
+)
+@torch.inference_mode()
+def test_small_m_gemv_matches_fp32(tokens: int, rows: int, k: int, gemv_expected: bool):
+    """Verify-sized 2-4 row batches ride the shared-weight GEMV where the
+    measured crossover says it wins; small-K shapes and 5 rows fall back."""
+    from vllm.model_executor.layers import utils
+
+    torch.manual_seed(7319)
+    x = torch.randn(tokens, k, device="cuda", dtype=torch.float16)
+    weight = torch.randn(rows, k, device="cuda", dtype=torch.float16) * 0.01
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        actual = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    expected = torch.nn.functional.linear(x.float(), weight.float()).half()
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-3)
+    used_gemv = any(
+        "_small_m_gemv_kernel" in e.key for e in profile.key_averages()
+    )
+    assert used_gemv == (gemv_expected and tokens <= 4)
+
+
+@torch.inference_mode()
+def test_small_m_gemv_accepts_row_strided_activation():
+    """A row-strided activation (stride(0) > K, unit inner stride) rides the GEMV."""
+    from vllm.model_executor.layers import utils
+
+    torch.manual_seed(7319)
+    x = torch.randn(2, 2, 2560, device="cuda", dtype=torch.float16)[:, 0, :]
+    assert x.shape == (2, 2560) and x.stride() == (5120, 1)
+    weight = torch.randn(512, 2560, device="cuda", dtype=torch.float16) * 0.01
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        actual = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    expected = torch.nn.functional.linear(x.float(), weight.float()).half()
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-3)
+    assert any(
+        "_small_m_gemv_kernel" in e.key for e in profile.key_averages()
+    )
+
+
+@torch.inference_mode()
+def test_small_m_gemv_opt_out(monkeypatch):
+    """VLLM_QWEN4EXP_SMALL_M_GEMV=0 restores the triton_matmul dispatch."""
+    from vllm import envs
+    from vllm.model_executor.layers import utils
+
+    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_SMALL_M_GEMV", False)
+    torch.manual_seed(7319)
+    x = torch.randn(2, 2560, device="cuda", dtype=torch.float16)
+    weight = torch.randn(512, 2560, device="cuda", dtype=torch.float16) * 0.01
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        actual = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    expected = torch.nn.functional.linear(x.float(), weight.float()).half()
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-3)
+    assert not any(
+        "_small_m_gemv_kernel" in e.key for e in profile.key_averages()
+    )
 
 
 @pytest.mark.parametrize("tokens", [1, 2, 16])

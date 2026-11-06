@@ -129,6 +129,51 @@ def triton_matmul_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@triton.jit
+def _small_m_gemv_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    stride_x_row,
+    stride_w_row,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    NUM_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # One program per output row: the weight row is loaded once and reused by
+    # every token row, so verify-style batches (2-4 rows) don't re-read the
+    # matrix per token. Accumulation is FP32, including the multiplication,
+    # before the final FP16 rounding.
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    k_mask = offsets < K
+    weight = tl.load(weight_ptr + row * stride_w_row + offsets, k_mask, other=0)
+    for m in tl.static_range(NUM_M):
+        x = tl.load(x_ptr + m * stride_x_row + offsets, k_mask, other=0)
+        value = tl.sum(x.to(tl.float32) * weight.to(tl.float32), axis=0)
+        tl.store(out_ptr + m * N + row, value)
+
+
+def _small_m_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty((x.shape[0], weight.shape[0]))
+    _small_m_gemv_kernel[(weight.shape[0],)](
+        x,
+        weight,
+        out,
+        x.stride(0),
+        weight.stride(0),
+        N=weight.shape[0],
+        K=weight.shape[1],
+        NUM_M=x.shape[0],
+        BLOCK_K=triton.next_power_of_2(weight.shape[1]),
+        num_warps=4,
+        num_stages=1,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
 def triton_matmul(a, b):
     # Check constraints.
     assert a.shape[1] == b.shape[1], (
@@ -498,6 +543,26 @@ def rocm_unquantized_gemm_impl(
         and not gfx906_bf16
     ):
         out = ops.LLMM1(weight, x_view, 4)
+        return out.view(*x.shape[:-1], weight.shape[0])
+
+    # gfx906 verify-style batches of 2-4 rows: a per-row GEMV that shares the
+    # weight load across tokens beats the 64-wide tl.dot tiles of
+    # triton_matmul, whose matrix cores idle at these M. Small-K shapes stay
+    # on triton_matmul: gfx906 measurements put the crossover near k=2048
+    # (k>=512 only for many-row weights, >=1024 rows, where the per-row
+    # programs still fill the CUs; e.g. the HC up projection is k=320).
+    if (
+        envs.VLLM_QWEN4EXP_SMALL_M_GEMV
+        and on_gfx906()
+        and 2 <= n <= 4
+        and x.dtype == weight.dtype == torch.float16
+        and bias is None
+        and weight.is_contiguous()
+        and k <= 8192
+        and x_view.stride(1) == 1
+        and (k >= 2048 or (k >= 512 and m >= 1024))
+    ):
+        out = _small_m_gemv(x_view, weight)
         return out.view(*x.shape[:-1], weight.shape[0])
 
     if n <= 16 and not on_gfx9() and not gfx906_bf16:

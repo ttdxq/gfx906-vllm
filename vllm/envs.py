@@ -169,6 +169,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_HC_GEMV: bool = True
     VLLM_QWEN4EXP_SHARED_EXPERT_GATE_GEMV: bool = True
     VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV: bool = True
+    VLLM_QWEN4EXP_SMALL_M_GEMV: bool = True
     VLLM_QWEN4EXP_GDN_KV_STATE: bool = True
 
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1486,6 +1487,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV": lambda: (
         os.getenv("VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV", "1").lower() in ("true", "1")
+    ),
+    # Verify-style 2-4 row batches ride a per-row GEMV instead of the 64-wide
+    # tl.dot tiles of triton_matmul, which idle the matrix cores at these M.
+    "VLLM_QWEN4EXP_SMALL_M_GEMV": lambda: (
+        os.getenv("VLLM_QWEN4EXP_SMALL_M_GEMV", "1").lower() in ("true", "1")
     ),
     # KxV GDN state enables the coalesced gfx906 single-token decode kernel.
     "VLLM_QWEN4EXP_GDN_KV_STATE": lambda: (

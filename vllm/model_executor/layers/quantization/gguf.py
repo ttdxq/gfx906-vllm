@@ -1034,7 +1034,8 @@ def _fused_mul_mat_gguf(
             envs.VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV
             and current_platform.is_rocm()
             and x.ndim == 2
-            and x.shape == (1, 3072)
+            and x.shape[0] <= 4
+            and x.shape[1] == 3072
             and qweight.shape == (2560, 3072)
             and x.dtype == qweight.dtype == torch.float16
             and x.device == qweight.device
