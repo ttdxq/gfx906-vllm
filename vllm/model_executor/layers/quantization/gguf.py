@@ -2015,7 +2015,7 @@ def _fused_moe_gguf(
                     topk_ids,
                     qweight_type,
                     w1.shape[1],
-                    1,
+                    num_tokens,
                     x.shape[1],
                     x.dtype,
                 )
@@ -2029,10 +2029,10 @@ def _fused_moe_gguf(
                     topk_ids.reshape(-1, 1),
                     qweight_type2,
                     w2.shape[1],
-                    top_k,
+                    num_tokens * top_k,
                     out.shape[1] // 2,
                     x.dtype,
-                ).view(1, top_k, w2.shape[1])
+                ).view(num_tokens, top_k, w2.shape[1])
                 output = torch.empty_like(x)
                 ops.moe_weighted_sum(out, topk_weights, output)
                 return output
