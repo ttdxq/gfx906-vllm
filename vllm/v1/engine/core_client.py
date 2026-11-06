@@ -435,6 +435,23 @@ class InprocClient(EngineCoreClient):
             profiler_kwargs=profiler_kwargs,
         )
 
+    async def profile_async(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self.profile,
+            is_start,
+            profile_prefix,
+            delay_iterations,
+            max_iterations,
+            profiler_kwargs,
+        )
+
     def reset_mm_cache(self) -> None:
         self.engine_core.reset_mm_cache()
 
