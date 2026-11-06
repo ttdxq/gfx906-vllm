@@ -25,12 +25,12 @@ if TYPE_CHECKING:
 
 _QWEN4_EXP_MODEL_TYPES = ("qwen4_exp", "qwen4_exp_text")
 
-# Hyper-connection projections are tiny (low-rank 320/10240-wide) plain
-# modules, but the checkpoint quantizes them (Q4_K/Q5_0); they are
-# dequantized on the host instead of building quantized modules.
+# Hyper-connection projections are plain runtime modules, but GGUF may
+# quantize them (including MTP block-inject weights); dequantize on the host.
 _HC_PROJ_SUFFIXES = (
     ".input_mix_weight_down",
     ".input_mix_weight_up",
+    ".block_inject_weight",
 )
 
 
@@ -161,6 +161,7 @@ class Qwen4ExpGGUFAdapter(BaseGGUFWeightsAdapter):
                     )
         return name_map
 
+
     def transform_weights(
         self,
         weights: Generator[tuple[str, torch.Tensor], None, None],
@@ -187,21 +188,22 @@ class Qwen4ExpGGUFAdapter(BaseGGUFWeightsAdapter):
                 .contiguous()
             )
 
-        for layer_id in text_config.ple_layer_ids:
-            ple_prefix = f"model.layers.{int(layer_id) - 1}.ple.ple_embedding"
-            for config_name, buffer_name in {
-                "ple_layer_multipliers": "layer_multipliers",
-                "ple_head_offsets": "ngram_heads_offsets",
-                "ple_head_vocab_sizes": "ngram_heads_vocab_sizes",
-            }.items():
-                values = getattr(text_config, config_name, None)
-                if values:
-                    ple_buffers.append(
-                        (
-                            f"{ple_prefix}.{buffer_name}",
-                            torch.tensor(values, dtype=torch.int64),
+        if getattr(model_config, "architecture", None) != "Qwen4ExpMTP":
+            for layer_id in text_config.ple_layer_ids:
+                ple_prefix = f"model.layers.{int(layer_id) - 1}.ple.ple_embedding"
+                for config_name, buffer_name in {
+                    "ple_layer_multipliers": "layer_multipliers",
+                    "ple_head_offsets": "ngram_heads_offsets",
+                    "ple_head_vocab_sizes": "ngram_heads_vocab_sizes",
+                }.items():
+                    values = getattr(text_config, config_name, None)
+                    if values:
+                        ple_buffers.append(
+                            (
+                                f"{ple_prefix}.{buffer_name}",
+                                torch.tensor(values, dtype=torch.int64),
+                            )
                         )
-                    )
         for name, weight in weights:
             if ple_buffers and not name.endswith("qweight_type"):
                 yield from ple_buffers
@@ -356,3 +358,128 @@ class Qwen4ExpGGUFAdapter(BaseGGUFWeightsAdapter):
                 f"{stem}index_qk_proj{suffix}",
                 torch.cat([q_weight, k_weight], dim=0),
             )
+
+
+class Qwen4ExpMTPGGUFAdapter(Qwen4ExpGGUFAdapter):
+    """Map a standalone Qwen4Exp MTP GGUF checkpoint to the draft model."""
+
+    @classmethod
+    def matches(cls, model_config: ModelConfig) -> bool:
+        return model_config.architecture == "Qwen4ExpMTP"
+
+    def build_name_map(self, model_config: ModelConfig) -> dict[str, str]:
+        return self.build_name_map_for_text_config(
+            model_config.hf_config.get_text_config()
+        )
+
+    @staticmethod
+    def build_name_map_for_text_config(text_config) -> dict[str, str]:
+        num_mtp_layers = getattr(text_config, "mtp_num_hidden_layers", 1)
+        first_mtp_block = text_config.num_hidden_layers
+        name_map = {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output.weight": "lm_head.weight",
+        }
+
+        for mtp_idx in range(num_mtp_layers):
+            gguf_prefix = f"blk.{first_mtp_block + mtp_idx}"
+            hf_prefix = f"mtp.layers.{mtp_idx}"
+            name_map.update(
+                {
+                    f"{gguf_prefix}.nextn.eh_proj.weight": "mtp.eh_proj.weight",
+                    f"{gguf_prefix}.nextn.enorm.weight": (
+                        "mtp.pre_fc_norm_embedding.weight"
+                    ),
+                    f"{gguf_prefix}.nextn.hnorm.weight": (
+                        "mtp.pre_fc_norm_hidden.weight"
+                    ),
+                    f"{gguf_prefix}.nextn.hc_head_down.weight": (
+                        "mtp.hyper_connection_mixer.input_mix_weight_down.weight"
+                    ),
+                    f"{gguf_prefix}.nextn.hc_head_up.weight": (
+                        "mtp.hyper_connection_mixer.input_mix_weight_up.weight"
+                    ),
+                    f"{gguf_prefix}.nextn.hc_head_norm.weight": (
+                        "mtp.hyper_connection_mixer.hc_norm.weight"
+                    ),
+                    f"{gguf_prefix}.attn_q.weight": (
+                        f"{hf_prefix}.self_attn.q_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_k.weight": (
+                        f"{hf_prefix}.self_attn.k_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_v.weight": (
+                        f"{hf_prefix}.self_attn.v_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_output.weight": (
+                        f"{hf_prefix}.self_attn.o_proj.weight"
+                    ),
+                    f"{gguf_prefix}.attn_q_norm.weight": (
+                        f"{hf_prefix}.self_attn.q_norm.weight"
+                    ),
+                    f"{gguf_prefix}.attn_k_norm.weight": (
+                        f"{hf_prefix}.self_attn.k_norm.weight"
+                    ),
+                    f"{gguf_prefix}.indexer.q_proj.weight": (
+                        f"{hf_prefix}.self_attn.indexer.index_qk_proj_q.weight"
+                    ),
+                    f"{gguf_prefix}.indexer.k_proj.weight": (
+                        f"{hf_prefix}.self_attn.indexer.index_qk_proj.weight"
+                    ),
+                    f"{gguf_prefix}.indexer.q_norm.weight": (
+                        f"{hf_prefix}.self_attn.indexer.q_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.indexer.k_norm.weight": (
+                        f"{hf_prefix}.self_attn.indexer.k_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.hc_attn_down.weight": (
+                        f"{hf_prefix}.attn_hyper_connection.input_mix_weight_down.weight"
+                    ),
+                    f"{gguf_prefix}.hc_attn_up.weight": (
+                        f"{hf_prefix}.attn_hyper_connection.input_mix_weight_up.weight"
+                    ),
+                    f"{gguf_prefix}.hc_attn_inject.weight": (
+                        f"{hf_prefix}.attn_hyper_connection.block_inject_weight.weight"
+                    ),
+                    f"{gguf_prefix}.hc_attn_norm.weight": (
+                        f"{hf_prefix}.attn_hyper_connection.hc_norm.weight"
+                    ),
+                    f"{gguf_prefix}.hc_ffn_down.weight": (
+                        f"{hf_prefix}.mlp_hyper_connection.input_mix_weight_down.weight"
+                    ),
+                    f"{gguf_prefix}.hc_ffn_up.weight": (
+                        f"{hf_prefix}.mlp_hyper_connection.input_mix_weight_up.weight"
+                    ),
+                    f"{gguf_prefix}.hc_ffn_inject.weight": (
+                        f"{hf_prefix}.mlp_hyper_connection.block_inject_weight.weight"
+                    ),
+                    f"{gguf_prefix}.hc_ffn_norm.weight": (
+                        f"{hf_prefix}.mlp_hyper_connection.hc_norm.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_gate_inp.weight": (
+                        f"{hf_prefix}.mlp.gate.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_gate_exps.weight": (
+                        f"{hf_prefix}.mlp.experts.0.gate_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_up_exps.weight": (
+                        f"{hf_prefix}.mlp.experts.0.up_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_down_exps.weight": (
+                        f"{hf_prefix}.mlp.experts.0.down_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_gate_shexp.weight": (
+                        f"{hf_prefix}.mlp.shared_expert.gate_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_up_shexp.weight": (
+                        f"{hf_prefix}.mlp.shared_expert.up_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_down_shexp.weight": (
+                        f"{hf_prefix}.mlp.shared_expert.down_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_gate_inp_shexp.weight": (
+                        f"{hf_prefix}.mlp.shared_expert_gate.weight"
+                    ),
+                }
+            )
+        return name_map

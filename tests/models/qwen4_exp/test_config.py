@@ -166,6 +166,42 @@ def test_gguf_adapter_restores_gdn_head_order_and_norm_weights(tmp_path) -> None
     )
 
 
+def test_gguf_mtp_adapter_maps_standalone_checkpoint() -> None:
+    from vllm.model_executor.model_loader.gguf_adapters import (
+        Qwen4ExpMTPGGUFAdapter,
+    )
+
+    text_config = _text_config(
+        num_hidden_layers=48,
+        layer_types=["indexed_attention"] * 48,
+        ple_layer_ids=[],
+    )
+    name_map = Qwen4ExpMTPGGUFAdapter.build_name_map_for_text_config(text_config)
+
+    assert name_map["blk.48.nextn.eh_proj.weight"] == "mtp.eh_proj.weight"
+    assert (
+        name_map["blk.48.nextn.enorm.weight"]
+        == "mtp.pre_fc_norm_embedding.weight"
+    )
+    assert (
+        name_map["blk.48.nextn.hnorm.weight"]
+        == "mtp.pre_fc_norm_hidden.weight"
+    )
+    assert (
+        name_map["blk.48.nextn.hc_head_down.weight"]
+        == "mtp.hyper_connection_mixer.input_mix_weight_down.weight"
+    )
+    assert (
+        name_map["blk.48.attn_q.weight"]
+        == "mtp.layers.0.self_attn.q_proj.weight"
+    )
+    assert (
+        name_map["blk.48.ffn_gate_exps.weight"]
+        == "mtp.layers.0.mlp.experts.0.gate_proj.weight"
+    )
+    assert "blk.49.nextn.eh_proj.weight" not in name_map
+
+
 def test_moe_sp_rejects_pipeline_parallel() -> None:
     """Automatic MoE SP must validate HC topology even without --enable-hc-sp."""
     config = SimpleNamespace(
@@ -205,8 +241,17 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams(
     model.num_mtp_layers = 1
     model.pre_fc_norm_embedding = torch.nn.Identity()
     model.pre_fc_norm_hidden = torch.nn.Identity()
-    model.fc_embedding = torch.nn.Identity()
-    model.fc_hidden = torch.nn.Identity()
+
+    if backend == "amd":
+
+        class SelectHiddenProjection(torch.nn.Module):
+            def forward(self, eh_input):
+                return eh_input[..., model.hidden_size :], None
+
+        model.eh_proj = SelectHiddenProjection()
+    else:
+        model.fc_embedding = torch.nn.Identity()
+        model.fc_hidden = torch.nn.Identity()
 
     def decoder(**kwargs):
         """Check that the embedding residual shares the hidden state's token slice."""

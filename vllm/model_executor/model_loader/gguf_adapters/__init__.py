@@ -21,13 +21,14 @@ from .base import (
 from .generic import GenericGGUFWeightsAdapter
 from .gemma4 import Gemma4GGUFAdapter, Gemma4MtpGGUFAdapter
 from .qwen3_5 import Qwen35GGUFAdapter, Qwen35MtpGGUFAdapter
-from .qwen4_exp import Qwen4ExpGGUFAdapter
+from .qwen4_exp import Qwen4ExpGGUFAdapter, Qwen4ExpMTPGGUFAdapter
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 _ADAPTER_REGISTRY: list[type[BaseGGUFWeightsAdapter]] = [
     Qwen35MtpGGUFAdapter,
+    Qwen4ExpMTPGGUFAdapter,
     Qwen35GGUFAdapter,
     Qwen4ExpGGUFAdapter,
     Gemma4MtpGGUFAdapter,
@@ -60,6 +61,7 @@ __all__ = [
     "Qwen35GGUFAdapter",
     "Qwen35MtpGGUFAdapter",
     "Qwen4ExpGGUFAdapter",
+    "Qwen4ExpMTPGGUFAdapter",
     "build_name_map_via_gguf_py",
     "get_mmproj_file",
     "get_weights_adapter",

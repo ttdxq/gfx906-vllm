@@ -87,6 +87,34 @@ def _remap_quantized_layers(
     }
 
 
+def _inherit_gguf_unquantized_modules(
+    draft_quant_config,
+    source_quant_config,
+    mtp_start_layer_idx: int,
+) -> None:
+    """Keep GGUF loader's per-tensor precision decisions for MTP layers."""
+    if (
+        draft_quant_config is None
+        or source_quant_config is None
+        or draft_quant_config.get_name() != "gguf"
+        or source_quant_config.get_name() != "gguf"
+    ):
+        return
+
+    source_modules = getattr(source_quant_config, "unquantized_modules", None)
+    draft_modules = getattr(draft_quant_config, "unquantized_modules", None)
+    if source_modules is None or draft_modules is None:
+        return
+
+    existing = set(draft_modules)
+    for name in source_modules:
+        if name.startswith("mtp."):
+            remapped = _remap_ignored_layers([name], mtp_start_layer_idx)[0]
+            if remapped not in existing:
+                draft_modules.append(remapped)
+                existing.add(remapped)
+
+
 def _remap_mtp_weight_name(name: str) -> str | None:
     """Map Qwen4Exp checkpoint paths into the standalone draft model."""
     for checkpoint_prefix in (
@@ -130,6 +158,9 @@ def _make_draft_vllm_config(
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
         configure_quant_config(draft_quant_config, Qwen4ExpMTP)
+        _inherit_gguf_unquantized_modules(
+            draft_quant_config, vllm_config.quant_config, mtp_start_layer_idx
+        )
         ignored_layers = getattr(draft_quant_config, "ignored_layers", None)
         if ignored_layers:
             setattr(  # noqa: B010
@@ -191,37 +222,29 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
 
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
-        draft_vllm_config = _make_draft_vllm_config(
+        self.draft_vllm_config = _make_draft_vllm_config(
             vllm_config,
             self.mtp_start_layer_idx,
         )
-        with set_current_vllm_config(draft_vllm_config, prefix=prefix):
-            # residual_linear_shared fusion: fc_embedding projects the token
-            # embedding, fc_hidden (shared across HC branches) projects the
-            # backbone hidden; the embedding is added as a residual to every
-            # branch (see mtp_residual_linear_shared.md).
-            self.fc_embedding = ColumnParallelLinear(
+        with set_current_vllm_config(self.draft_vllm_config, prefix=prefix):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
                 self.hidden_size,
-                self.hidden_size,
-                gather_output=True,
-                bias=False,
-                return_bias=False,
-                quant_config=draft_vllm_config.quant_config,
-                prefix=f"{prefix}.fc_embedding",
+                quant_config=self.draft_vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
             )
-            self.fc_hidden = ColumnParallelLinear(
-                self.hidden_size,
+            self.eh_proj = ColumnParallelLinear(
+                self.hidden_size * 2,
                 self.hidden_size,
                 gather_output=True,
                 bias=False,
-                return_bias=False,
-                quant_config=draft_vllm_config.quant_config,
-                prefix=f"{prefix}.fc_hidden",
+                return_bias=True,
+                quant_config=self.draft_vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "eh_proj"),
             )
             self.layers = nn.ModuleList(
                 Qwen4ExpDecoderLayer(
-                    draft_vllm_config,
+                    self.draft_vllm_config,
                     layer_type="qwen_sparse_attention",
                     prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
                 )
@@ -302,9 +325,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             if inputs_embeds is None:
                 assert input_ids is not None
                 inputs_embeds = self.embed_input_ids(input_ids)
-            # Embedding branch: pre-norm -> fc_embedding -> [T, H].
+            # Normalize the embedding and every HC hidden branch separately.
             inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            inputs_embeds = self.fc_embedding(inputs_embeds)
 
             # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
             # the main model truly emits the pre-final-mixer multi stream
@@ -315,10 +337,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
                 num_tokens, hc_count, hidden_size
             )
-            hidden_states = self.fc_hidden(hidden_states)
-            # Add the embedding residual to every branch, then fold back
-            # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
-            hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+            expanded_embedding = inputs_embeds.unsqueeze(-2).expand(
+                -1, hc_count, -1
+            )
+            eh_input = torch.cat([expanded_embedding, hidden_states], dim=-1)
+            hidden_states, _ = self.eh_proj(eh_input.flatten(0, 1))
+            hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
             hidden_states = hidden_states.flatten(-2)
         else:
             assert intermediate_tensors is not None
@@ -424,11 +448,15 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    prefix=maybe_prefix(prefix, "lm_head"),
-                )
+                with set_current_vllm_config(
+                    self.model.draft_vllm_config, prefix=prefix
+                ):
+                    self.lm_head = ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        quant_config=self.model.draft_vllm_config.quant_config,
+                        prefix=maybe_prefix(prefix, "lm_head"),
+                    )
         else:
             self.lm_head = PPMissingLayer()
 
