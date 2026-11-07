@@ -610,6 +610,95 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1_mul_mat(
          y_ds[j * (WARP_SIZE_GGUF/QI8_1) + (2*k/QI8_1) % (WARP_SIZE_GGUF/QI8_1)]);
 }
 
+// Q2_0 (GGML type 42) grouped MMQ. Four ints per 64-weight block; the 16
+// codes in an int are byte-major (code 4b+s lives in byte b, bit 2s), so the
+// tile keeps raw ints and the dot product transposes each int into four
+// bit-plane ints: plane s, byte b holds code 4s+b, which are exactly the four
+// int8 of y lanes 4*(k%8)+s. One mul_mat call consumes a single source int
+// (16 codes -> 8 dp4a); weights are d*(code-1), so the code dot product also
+// subtracts the raw int8 sums.
+#define VDR_Q2_0_Q8_1_MMQ 1
+#define QI2_0_MMQ 4 // ints per block for the tile geometry (not QI2_0)
+
+template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q2_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+    __shared__ int  tile_x_qs[mmq_y * (WARP_SIZE_GGUF)       + mmq_y];
+    __shared__ float tile_x_d[mmq_y * (WARP_SIZE_GGUF/QI2_0_MMQ) + mmq_y/QI2_0_MMQ];
+    *x_ql = tile_x_qs;
+    *x_dm = (half2 *) tile_x_d;
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q2_0(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & blocks_left) {
+    const int kbx  = k / QI2_0_MMQ;
+    const int kqsx = k % QI2_0_MMQ;
+
+    const block_q2_0 * bx0 = (const block_q2_0 *) vx;
+    float * x_dmf = (float *) x_dm;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        if (kbx < blocks_left) {
+            const block_q2_0 * bxi = bx0 + i*blocks_per_row + kbx;
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8(bxi->qs, kqsx);
+        } else {
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = 0;
+        }
+    }
+
+    const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI2_0_MMQ;
+    const int kbxd = k % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI2_0_MMQ) {
+        int i = i0 + i_offset * QI2_0_MMQ + k / blocks_per_tile_x_row;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        if (kbxd < blocks_left) {
+            const block_q2_0 * bxi = bx0 + i*blocks_per_row + kbxd;
+            x_dmf[i * (WARP_SIZE_GGUF/QI2_0_MMQ) + i / QI2_0_MMQ + kbxd] = __half2float(bxi->d);
+        } else {
+            x_dmf[i * (WARP_SIZE_GGUF/QI2_0_MMQ) + i / QI2_0_MMQ + kbxd] = 0.0f;
+        }
+    }
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+    (void)x_qh; (void)x_sc;
+
+    const float * x_dmf = (const float *) x_dm;
+    const float * y_df  = (const float *) y_ds;
+
+    const int v = x_ql[i * (WARP_SIZE_GGUF + 1) + k];
+    const float d = x_dmf[i * (WARP_SIZE_GGUF/QI2_0_MMQ) + i / QI2_0_MMQ + k / QI2_0_MMQ];
+
+    const int index_y = j * WARP_SIZE_GGUF + (4*k) % WARP_SIZE_GGUF;
+
+    int sumi = 0;
+    int sumq = 0;
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const int vs =
+            (((v >> (8*s +  0)) & 0x03) <<  0) |
+            (((v >> (8*s +  2)) & 0x03) <<  8) |
+            (((v >> (8*s +  4)) & 0x03) << 16) |
+            (((v >> (8*s +  6)) & 0x03) << 24);
+        sumi = __dp4a(vs, y_qs[index_y + s], sumi);
+        sumq = __dp4a(0x01010101, y_qs[index_y + s], sumq);
+    }
+
+    const float d8 = y_df[index_y / QI8_1];
+    return d * d8 * (sumi - sumq);
+}
+
 static __device__ __forceinline__ float vec_dot_q4_1_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 

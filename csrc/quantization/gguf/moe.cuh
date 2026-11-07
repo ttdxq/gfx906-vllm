@@ -517,6 +517,71 @@ static void ggml_moe_q2_K_q8_1_cuda(
   }
 }
 
+// Q2_0 (GGML type 42): 64-weight blocks with one f16 scale. Same tile shape
+// as the other flat quants; the dot product carries the (code-1) offset.
+#if defined(USE_ROCM)
+  #define MOE_X_Q2_0 8
+  #define MOE_Y_Q2_0 128
+  #define NWARPS_Q2_0 8
+#else
+  #define MOE_X_Q2_0 4
+  #define MOE_Y_Q2_0 32
+  #define NWARPS_Q2_0 4
+#endif
+
+template <typename scalar_t, bool need_check>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_0, 2)
+#endif
+    moe_q2_0(const void* __restrict__ vx, const void* __restrict__ vy,
+             scalar_t* __restrict__ dst, const int* __restrict__ sorted_token_ids,
+             const int* __restrict__ expert_ids,
+             const int* __restrict__ num_tokens_post_padded,
+             const int exp_stride, const int ncols_x, const int nrows_x,
+             const int ncols_y, const int nrows_y, const int nrows_dst,
+             const int top_k) {
+  const int mmq_x = MOE_X_Q2_0;
+  const int mmq_y = MOE_Y_Q2_0;
+  const int nwarps = NWARPS_Q2_0;
+
+  moe_q<scalar_t, QK2_0, QR2_0, QI2_0_MMQ, false, block_q2_0, mmq_x, mmq_y,
+        nwarps, allocate_tiles_q2_0<mmq_y>,
+        load_tiles_q2_0<mmq_y, nwarps, need_check>, VDR_Q2_0_Q8_1_MMQ,
+        vec_dot_q2_0_q8_1_mul_mat>(
+      vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+}
+
+template <typename scalar_t>
+static void ggml_moe_q2_0_q8_1_cuda(
+    const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
+    const int* expert_ids, const int* num_tokens_post_padded,
+    const int exp_stride, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
+    const int tokens_post_padded, cudaStream_t stream) {
+  const int mmq_x = MOE_X_Q2_0;
+  const int mmq_y = MOE_Y_Q2_0;
+  const int nwarps = NWARPS_Q2_0;
+
+  const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+  const int block_num_y = (tokens_post_padded) / mmq_x;
+  const dim3 block_nums(block_num_x, block_num_y, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+  if (nrows_x % mmq_y == 0) {
+    constexpr bool need_check = false;
+    moe_q2_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  } else {
+    constexpr bool need_check = true;
+    moe_q2_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  }
+}
+
 #if defined(USE_ROCM)
   #define MOE_X_Q3_K 8
   #define MOE_Y_Q3_K 128

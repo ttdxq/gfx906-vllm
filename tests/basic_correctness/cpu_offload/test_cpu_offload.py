@@ -95,6 +95,35 @@ def test_gguf_prefill_staging_reuses_bounded_storage_across_streams():
         torch.testing.assert_close(output, weight, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("num_tokens", [5, 64, 2050])
+@torch.inference_mode()
+def test_gguf_moe_q2_0_grouped_mmq_matches_vec(num_tokens: int):
+    # The per-token vec (MMVQ) path is already verified; grouped MMQ must
+    # produce the same outputs once batches reach the MMQ token threshold.
+    torch.manual_seed(0)
+    E, N, H = 8, 256, 256
+    q2_0 = int(GGMLQuantizationType.Q2_0)
+    w1 = torch.from_numpy(
+        quantize((torch.randn(E, 2 * N, H) * 0.01).numpy(), GGMLQuantizationType.Q2_0)
+    ).cuda()
+    w2 = torch.from_numpy(
+        quantize((torch.randn(E, N, H) * 0.01).numpy(), GGMLQuantizationType.Q2_0)
+    ).cuda()
+    x = torch.randn((num_tokens, H), device="cuda", dtype=torch.float16)
+    ids = torch.randint(E, (num_tokens, 2), device="cuda", dtype=torch.int32)
+    weights = torch.softmax(torch.randn(num_tokens, 2, device="cuda"), dim=-1)
+
+    mmq = fused_moe_gguf(
+        x, w1, w2, weights, ids, q2_0, q2_0, "silu", w1_offloaded=False
+    )
+    vec = fused_moe_gguf(
+        x[:4], w1, w2, weights[:4], ids[:4], q2_0, q2_0, "silu", w1_offloaded=False
+    )
+    assert torch.isfinite(mmq).all()
+    # Both kernels accumulate in different orders; allow small fp drift.
+    torch.testing.assert_close(mmq[:4], vec, rtol=1e-3, atol=1e-2)
+
+
 def test_gguf_prefill_staging_compacts_routed_experts():
     weight = torch.arange(8 * 4 * 2, device="cuda", dtype=torch.uint8).reshape(
         8, 4, 2
