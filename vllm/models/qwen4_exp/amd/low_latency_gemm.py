@@ -23,21 +23,24 @@ def _hc_gemv_kernel(
     N: tl.constexpr,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NUM_M: tl.constexpr,
 ):
     row = tl.program_id(0)
-    token = tl.program_id(1)
     offsets = tl.arange(0, BLOCK_K)
-    x = tl.load(x_ptr + token * stride_x_row + offsets, offsets < K, other=0)
-    weight = tl.load(weight_ptr + row * stride_w_row + offsets, offsets < K, other=0)
-    # A CTA per output row exposes all HC rows to the GPU. Accumulation is
+    # A CTA per output row exposes all HC rows to the GPU, and the weight row
+    # is loaded once and dotted with every token row, so verify-style batches
+    # (2-4 rows) don't re-read the matrix per token. Accumulation is
     # FP32, including the multiplication, before the final FP16 rounding.
-    value = tl.sum(x.to(tl.float32) * weight.to(tl.float32), axis=0)
-    tl.store(out_ptr + token * N + row, value)
+    weight = tl.load(weight_ptr + row * stride_w_row + offsets, offsets < K, other=0)
+    for token in tl.static_range(NUM_M):
+        x = tl.load(x_ptr + token * stride_x_row + offsets, offsets < K, other=0)
+        value = tl.sum(x.to(tl.float32) * weight.to(tl.float32), axis=0)
+        tl.store(out_ptr + token * N + row, value)
 
 
 def _hc_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     out = x.new_empty((x.shape[0], weight.shape[0]))
-    _hc_gemv_kernel[(weight.shape[0], x.shape[0])](
+    _hc_gemv_kernel[(weight.shape[0],)](
         x,
         weight,
         out,
@@ -45,6 +48,7 @@ def _hc_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         weight.stride(0),
         N=weight.shape[0],
         K=weight.shape[1],
+        NUM_M=x.shape[0],
         BLOCK_K=triton.next_power_of_2(weight.shape[1]),
         num_warps=4,
         num_stages=1,
