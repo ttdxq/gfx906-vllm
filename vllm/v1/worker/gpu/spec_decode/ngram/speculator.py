@@ -94,7 +94,6 @@ def _ngram_finalize_kernel(
     idx_mapping_ptr,  # *int64  [B]
     total_len_ptr,  # *int32  [max_num_reqs]
     num_sampled_ptr,  # *int32  [B]
-    last_sampled_ptr,  # *int64  [max_num_reqs]
     scratch_ptr,  # *int64  [B, scratch_stride]
     scratch_stride,
     drafts_ptr,  # *int64  [B, K]  (output)
@@ -121,7 +120,6 @@ def _ngram_finalize_kernel(
 
     seq_len = tl.load(total_len_ptr + req_state_idx).to(tl.int64)
     num_sampled = tl.load(num_sampled_ptr + b)
-    last_tok = tl.load(last_sampled_ptr + req_state_idx)
 
     has_match = score > 0
     s1 = score - 1
@@ -142,17 +140,12 @@ def _ngram_finalize_kernel(
         mask=slot_valid,
         other=0,
     ).to(tl.int64)
-    # Invalid slots fall back to the last sampled token; they are verified as
-    # ordinary (rejectable) drafts, so the fill value only affects efficiency.
-    out = tl.where(slot_valid, gathered, last_tok)
+    out = tl.where(slot_valid, gathered, -1)
     tl.store(drafts_ptr + b * K + k_iota, out, mask=k_in_range)
 
 
 class NgramGPUSpeculator(BaseSpeculator):
     """V2-compatible GPU n-gram speculator."""
-
-    supports_mm_inputs = False
-    draft_logits = None
 
     def __init__(
         self,
@@ -264,7 +257,6 @@ class NgramGPUSpeculator(BaseSpeculator):
             idx_mapping,
             req_states.total_len.gpu,
             num_sampled,
-            last_sampled.view(-1),
             self.scratch,
             self.scratch.stride(0),
             self.drafts,

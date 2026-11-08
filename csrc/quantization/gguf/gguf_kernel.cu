@@ -3144,6 +3144,14 @@ torch::Tensor ggml_moe_a8(torch::Tensor X,  // input
             (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
             tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
         break;
+      case 42:
+        ggml_moe_q2_0_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
       case 11:
         ggml_moe_q3_K_q8_1_cuda(
             (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
@@ -3170,6 +3178,54 @@ torch::Tensor ggml_moe_a8(torch::Tensor X,  // input
         break;
       case 14:
         ggml_moe_q6_K_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
+      case 17:
+        ggml_moe_iq2_xs_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
+      case 20:
+        ggml_moe_iq4_nl_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
+      case 21:
+        ggml_moe_iq3_s_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
+      case 18:
+        ggml_moe_iq3_xxs_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
+      case 22:
+        ggml_moe_iq2_s_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
+      case 23:
+        ggml_moe_iq4_xs_q8_1_cuda(
             (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
             (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
             (int*)expert_ids.data_ptr(),
@@ -3280,6 +3336,11 @@ torch::Tensor ggml_moe_a8(torch::Tensor X,  // input
           W_PTR, Q_PTR, Y_PTR, TOPK_PTR, TOP_K, TOKENS, COL, ROW, Q_STRIDE,    \
           STREAM);                                                             \
       break;                                                                   \
+    case 42:                                                                   \
+      moe_vec_q2_0_q8_1_cuda<SCALAR_T>(                                        \
+          W_PTR, Q_PTR, Y_PTR, TOPK_PTR, TOP_K, TOKENS, COL, ROW, Q_STRIDE,    \
+          STREAM);                                                             \
+      break;                                                                   \
     default:                                                                   \
       TORCH_CHECK(false, "Unsupported GGUF MoE MMVQ quantization type: ",      \
                   TYPE);                                                       \
@@ -3347,6 +3408,121 @@ void ggml_moe_a8_vec_out(torch::Tensor X, torch::Tensor W,
 }
 
 #undef VLLM_GGUF_MOE_A8_VEC_DISPATCH
+
+// The pointer table chooses the original UVA expert or an identical packed
+// copy in HBM. Arithmetic, routing order and reduction stay in the existing
+// GEMV kernels; no expert is dropped on a cache miss.
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t dot>
+static void moe_vec_indirect_cuda(
+    const void* qx, scalar_t* out, const int* ids, const int64_t* ptrs,
+    int top_k, int tokens, int cols, int rows, int stride, cudaStream_t stream) {
+#ifdef USE_ROCM
+  const char* enabled = std::getenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP");
+  const int active = cols / qk * (qi / vdr);
+  if (qk == 32 && (!enabled || enabled[0] == '1') && active <= 32 &&
+      std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+              .find("gfx906") == 0) {
+    if (active <= 16) {
+      moe_vec_q<scalar_t, qk, qi, block_q_t, vdr, dot, 16, true>
+          <<<dim3((rows + 7) / 8, 1, tokens * top_k), dim3(16, 8), 0, stream>>>(
+              nullptr, qx, out, ids, top_k, cols, rows, stride, ptrs);
+    } else {
+      moe_vec_q<scalar_t, qk, qi, block_q_t, vdr, dot, 32, true>
+          <<<dim3((rows + 3) / 4, 1, tokens * top_k), dim3(32, 4), 0, stream>>>(
+              nullptr, qx, out, ids, top_k, cols, rows, stride, ptrs);
+    }
+    return;
+  }
+#endif
+  moe_vec_q<scalar_t, qk, qi, block_q_t, vdr, dot, 0, true>
+      <<<dim3((rows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y, 1, tokens * top_k),
+         dim3(WARP_SIZE, GGML_CUDA_MMV_Y), 0, stream>>>(
+          nullptr, qx, out, ids, top_k, cols, rows, stride, ptrs);
+}
+
+torch::Tensor ggml_moe_q8_vec_indirect(
+    torch::Tensor quant_X, torch::Tensor expert_ptrs, torch::Tensor topk_ids,
+    int64_t type, int64_t row, int64_t tokens, int64_t col, at::ScalarType dtype) {
+  TORCH_CHECK(quant_X.is_cuda() && quant_X.is_contiguous() &&
+                  quant_X.scalar_type() == at::kInt && quant_X.dim() == 2,
+              "Expected contiguous CUDA int32 quantized activations");
+  TORCH_CHECK(expert_ptrs.device() == quant_X.device() &&
+                  expert_ptrs.scalar_type() == at::kLong &&
+                  expert_ptrs.dim() == 1 && expert_ptrs.is_contiguous(),
+              "Expected contiguous int64 expert addresses on the activation GPU");
+  TORCH_CHECK(topk_ids.device() == quant_X.device() &&
+                  topk_ids.scalar_type() == at::kInt && topk_ids.dim() == 2 &&
+                  topk_ids.is_contiguous() && tokens == topk_ids.size(0) &&
+                  tokens > 0 && topk_ids.size(1) > 0 && expert_ptrs.numel() > 0,
+              "Expected int32 routing indices [tokens, top_k]");
+  TORCH_CHECK(row > 0 && col > 0 &&
+                  col % ((type == 18 || type == 21 || type == 23) ? 256 : 32) == 0 &&
+                  quant_X.size(0) == tokens &&
+                  quant_X.size(1) == ((col + 511) / 512 * 512) / 32 * 9,
+              "Invalid expert dimensions or activation layout");
+  TORCH_CHECK(
+      type == 6 || type == 8 || type == 18 || type == 20 || type == 21 ||
+          type == 23,
+      "Indirect experts support Q5_0, Q8_0, IQ3_XXS, IQ4_NL, IQ3_S and IQ4_XS");
+  const at::cuda::OptionalCUDAGuard guard(device_of(quant_X));
+  const int top_k = topk_ids.size(1);
+  auto out = torch::empty({tokens * top_k, row}, quant_X.options().dtype(dtype));
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  VLLM_DISPATCH_FLOATING_TYPES(dtype, "ggml_moe_q8_vec_indirect", [&] {
+    const void* qx = quant_X.data_ptr();
+    auto* y = static_cast<scalar_t*>(out.data_ptr());
+    auto* ids = topk_ids.data_ptr<int>();
+    auto* ptrs = expert_ptrs.data_ptr<int64_t>();
+    const int stride = quant_X.stride(0);
+    switch (type) {
+      case 8:
+        moe_vec_indirect_cuda<scalar_t, QK8_0, QI8_0, block_q8_0,
+                             VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
+            qx, y, ids, ptrs, top_k, tokens, col, row, stride, stream);
+        break;
+      case 20:
+        moe_vec_indirect_cuda<scalar_t, QK4_NL, QI4_NL, block_iq4_nl,
+                             VDR_Q4_0_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1>(
+            qx, y, ids, ptrs, top_k, tokens, col, row, stride, stream);
+        break;
+      case 21: {
+#ifdef USE_ROCM
+        const char* lut = std::getenv("VLLM_GGUF_MOE_IQ3_S_LUT");
+        if ((!lut || lut[0] == '1') &&
+            std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+                    .find("gfx906") == 0) {
+          mul_mat_vec_iq_lut<scalar_t, 1, 3, true, true, true>
+              <<<dim3((row + 3) / 4, 1, tokens * top_k), 256, 0, stream>>>(
+                  nullptr, static_cast<const block_q8_1*>(qx), y, col, row,
+                  row, ids, top_k, stride, ptrs);
+          break;
+        }
+#endif
+        moe_vec_indirect_cuda<scalar_t, QK_K, QI3_XS, block_iq3_s, 1,
+                             vec_dot_iq3_s_q8_1>(
+            qx, y, ids, ptrs, top_k, tokens, col, row, stride, stream);
+        break;
+      }
+      case 23:
+        moe_vec_indirect_cuda<scalar_t, QK_K, QI4_XS, block_iq4_xs,
+                             VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1>(
+            qx, y, ids, ptrs, top_k, tokens, col, row, stride, stream);
+        break;
+      case 6:
+        moe_vec_indirect_cuda<scalar_t, QK5_0, QI5_0, block_q5_0,
+                             VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
+            qx, y, ids, ptrs, top_k, tokens, col, row, stride, stream);
+        break;
+      case 18:
+        moe_vec_indirect_cuda<scalar_t, QK_K, QI3_XXS, block_iq3_xxs, 1,
+                             vec_dot_iq3_xxs_q8_1>(
+            qx, y, ids, ptrs, top_k, tokens, col, row, stride, stream);
+        break;
+    }
+  });
+  return out;
+}
 
 torch::Tensor ggml_moe_q8_vec(torch::Tensor quant_X,  // input
                               torch::Tensor W,        // expert weights
@@ -3469,6 +3645,12 @@ torch::Tensor ggml_moe_q8_vec(torch::Tensor quant_X,  // input
         break;
       case 29:
         moe_vec_iq1_m_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens,
+            col, row, quant_X.stride(0), stream);
+        break;
+      case 42:
+        moe_vec_q2_0_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
             (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens,
             col, row, quant_X.stride(0), stream);
@@ -3680,6 +3862,13 @@ static void ggml_moe_q8_vec_weighted_sum_dispatch(
           W, quant_X, weights, dst, topk_ids, top_k, tokens, col, row,
           token_stride, stream);
       break;
+    case 42:
+      moe_vec_q_weighted_sum_cuda<scalar_t, weight_t, QK2_0, QI2_0,
+                                  block_q2_0, VDR_Q2_0_Q8_1_MMVQ,
+                                  vec_dot_q2_0_q8_1>(
+          W, quant_X, weights, dst, topk_ids, top_k, tokens, col, row,
+          token_stride, stream);
+      break;
     default:
       TORCH_CHECK(false,
                   "Unsupported GGUF MoE weighted MMVQ quantization type: ",
@@ -3817,6 +4006,8 @@ int64_t ggml_moe_get_block_size(int64_t type) {
       return MOE_X_Q8_0;
     case 10:
       return MOE_X_Q2_K;
+    case 42:
+      return MOE_X_Q2_0;
     case 11:
       return MOE_X_Q3_K;
     case 12:
@@ -3825,6 +4016,13 @@ int64_t ggml_moe_get_block_size(int64_t type) {
       return MOE_X_Q5_K;
     case 14:
       return MOE_X_Q6_K;
+    case 17:
+    case 18:
+    case 20:
+    case 21:
+    case 22:
+    case 23:
+      return MOE_X_IQ;
   }
   return 0;
 }

@@ -9,6 +9,7 @@ Unified Virtual Addressing on any CUDA-alike platform.
 
 import threading
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import ClassVar
 
 import torch
@@ -159,6 +160,10 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
             return embeddings
         return embeddings.narrow(0, slot_offset, local_num_tokens)
 
+    def bind_file_shards(self) -> None:
+        """Bind the checkpoint files of a disk-offloaded table after loading."""
+        return None
+
     @abstractmethod
     def start_prefetch(self, ngram_ids: torch.Tensor) -> None:
         """Start an asynchronous lookup when supported."""
@@ -194,22 +199,33 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             )
         if quant_config is None:
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
-        if isinstance(quant_config, ModelOptMixedPrecisionConfig):
-            quant_algo = quant_config._resolve_quant_algo(prefix)
-            if quant_algo == "FP8":
-                return Qwen4ExpPLEFp8EmbeddingMethod()
-            if quant_algo == "NVFP4":
-                return Qwen4ExpPLENvFp4EmbeddingMethod()
-            if quant_algo is not None:
-                raise ValueError(
-                    f"Unsupported quant_algo {quant_algo!r} for the PLE embedding "
-                    f"{prefix!r}; expected FP8 or NVFP4"
-                )
-            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
-        if isinstance(
-            quant_config, ModelOptQuantConfigBase
-        ) and quant_config.is_layer_excluded(prefix):
-            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if quant_config.get_name() == "gguf":
+            from vllm.model_executor.layers.quantization.gguf import (
+                is_layer_skipped_gguf,
+            )
+
+            if is_layer_skipped_gguf(
+                prefix,
+                quant_config.unquantized_modules,
+                quant_config.packed_modules_mapping,
+            ):
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+            return Qwen4ExpPLEGGUFEmbeddingMethod()
+        if isinstance(quant_config, ModelOptQuantConfigBase):
+            if quant_config.is_layer_excluded(prefix):
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+            if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+                quant_algo = quant_config._resolve_quant_algo(prefix)
+                if quant_algo == "FP8":
+                    return Qwen4ExpPLEFp8EmbeddingMethod()
+                if quant_algo == "NVFP4":
+                    return Qwen4ExpPLENvFp4EmbeddingMethod()
+                if quant_algo is not None:
+                    raise ValueError(
+                        f"Unsupported quant_algo {quant_algo!r} for the PLE embedding "
+                        f"{prefix!r}; expected FP8 or NVFP4"
+                    )
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if (
             isinstance(quant_config, CompressedTensorsConfig)
             and quant_config.get_scheme_dict(None, layer_name=prefix) is None
@@ -223,29 +239,32 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         # Quark quantizes only Linear and MoE layers; PLE tables stay BF16.
         if isinstance(quant_config, QuarkConfig):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
-        if not isinstance(quant_config, Fp8Config):
-            raise NotImplementedError(
-                "Qwen4Exp PLE embedding does not support quantization config "
-                f"{type(quant_config).__name__}"
-            )
-
-        ignored_layers = quant_config.ignored_layers
-        if is_layer_skipped(
-            prefix,
-            ignored_layers,
-            quant_config.packed_modules_mapping,
-            match_mode=quant_config.ignored_layers_match_mode,
-        ):
-            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
-        # PLE checkpoint shards form one runtime embedding parameter.
-        shard_prefix = f"{prefix}.shard_"
-        if any(name.startswith(shard_prefix) for name in ignored_layers):
-            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
-        if not quant_config.is_checkpoint_fp8_serialized:
+        if isinstance(quant_config, Fp8Config):
+            ignored_layers = quant_config.ignored_layers
+            if is_layer_skipped(
+                prefix,
+                ignored_layers,
+                quant_config.packed_modules_mapping,
+                match_mode=quant_config.ignored_layers_match_mode,
+            ):
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+            # PLE checkpoint shards form one runtime embedding parameter.
+            shard_prefix = f"{prefix}.shard_"
+            if any(name.startswith(shard_prefix) for name in ignored_layers):
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+            if quant_config.is_checkpoint_fp8_serialized:
+                return Qwen4ExpPLEFp8EmbeddingMethod()
             raise NotImplementedError(
                 "Qwen4Exp PLE embedding only supports serialized FP8 checkpoints"
             )
-        return Qwen4ExpPLEFp8EmbeddingMethod()
+
+        logger.warning(
+            "Falling back to unquantized PLE embedding for %s "
+            "with quantization config %s.",
+            prefix,
+            type(quant_config).__name__,
+        )
+        return Qwen4ExpPLEUnquantizedEmbeddingMethod()
 
     def apply(
         self,
@@ -279,6 +298,11 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             layer.shard_indices.org_vocab_end_index,
             BLOCK_D=triton.next_power_of_2(row_bytes),
         )
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """Bind disk-offloaded tables once every checkpoint shard is loaded."""
+        if isinstance(layer, Qwen4ExpPLEEmbedding):
+            layer.bind_file_shards()
 
     @abstractmethod
     def dequantize(
@@ -327,6 +351,170 @@ class Qwen4ExpPLEUnquantizedEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         return embeddings
 
 
+class Qwen4ExpPLEGGUFEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
+    """Keep GGUF rows packed and dequantize only the requested embeddings."""
+
+    def create_weights(
+        self,
+        layer: Qwen4ExpPLEEmbedding,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size_per_partition, output_partition_sizes
+        del input_size, output_size, params_dtype
+        weight = nn.Parameter(
+            layer.allocate_embedding_weight(0, 0, torch.uint8),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"weight_loader": partial(self._load_weight, layer)})
+        layer.register_parameter("weight", weight)
+        weight_type = nn.Parameter(
+            torch.zeros(1, dtype=torch.uint8, device="cpu"), requires_grad=False
+        )
+        set_weight_attrs(weight_type, {"is_gguf_weight_type": True})
+        set_weight_attrs(weight_type, extra_weight_attrs)
+        layer.register_parameter("weight_type", weight_type)
+
+    def _load_weight(
+        self,
+        layer: Qwen4ExpPLEEmbedding,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        import gguf
+
+        from vllm.model_executor.layers.quantization.gguf import DEQUANT_TYPES
+
+        qtype = getattr(layer.weight_type, "weight_type", None)
+        if qtype not in DEQUANT_TYPES:
+            raise ValueError(f"Unsupported or missing GGUF PLE weight type: {qtype}")
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
+        if layer.embedding_dim % block_size:
+            raise ValueError("GGUF PLE embedding width must contain whole quant blocks")
+        row_bytes = layer.embedding_dim // block_size * type_size
+        expected_shape = (layer.org_vocab_size, row_bytes)
+        if loaded_weight.dtype != torch.uint8 or loaded_weight.shape != expected_shape:
+            raise ValueError(
+                f"GGUF PLE table must have uint8 shape {expected_shape}, "
+                f"got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
+            )
+        with torch.device(param.device):
+            param.data = layer.allocate_embedding_weight(
+                layer.num_embeddings_per_partition, row_bytes, torch.uint8
+            )
+        layer._copy_embedding_shard_(param, loaded_weight, checkpoint_start=0)
+        param.data[layer.num_org_embeddings_per_partition :].zero_()
+
+    def lookup_dtype(self, layer: nn.Module) -> torch.dtype:
+        return layer.params_dtype
+
+    def _lookup_q4_0(
+        self, layer: nn.Module, ids: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        pinned = isinstance(layer, Qwen4ExpPLEPinnedHostEmbedding)
+        start = layer.shard_indices.org_vocab_start_index if pinned else 0
+        end = (
+            layer.shard_indices.org_vocab_end_index
+            if pinned
+            else layer.num_org_embeddings_per_partition
+        )
+        if ids.numel():
+            _lookup_gguf_q4_0_ple_kernel[(ids.numel(),)](
+                layer._uva_weight if pinned else layer.weight,
+                ids.reshape(-1),
+                output,
+                start,
+                end,
+                EMBEDDING_DIM=layer.embedding_dim,
+                ROW_BYTES=layer.weight.shape[1],
+                BLOCK_D=triton.next_power_of_2(layer.embedding_dim),
+            )
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        from gguf import GGMLQuantizationType
+
+        from vllm.model_executor.layers.quantization.gguf import apply_gguf_embedding
+
+        if layer.weight_type.weight_type == GGMLQuantizationType.Q4_0:
+            output = torch.empty(
+                (*input_.shape, layer.embedding_dim),
+                dtype=layer.params_dtype,
+                device=input_.device,
+            )
+            self._lookup_q4_0(layer, input_, output)
+            return output
+        return apply_gguf_embedding(
+            input_,
+            layer.weight,
+            layer.weight_type.weight_type,
+            layer.embedding_dim,
+            dtype=torch.float32,
+        ).to(layer.params_dtype)
+
+    def lookup_from_pinned(
+        self,
+        layer: "Qwen4ExpPLEPinnedHostEmbedding",
+        ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        from gguf import GGMLQuantizationType
+
+        from vllm import _custom_ops as ops
+
+        if layer.weight_type.weight_type == GGMLQuantizationType.Q4_0:
+            self._lookup_q4_0(layer, ids, output)
+            return
+        row_bytes = layer.weight.shape[1]
+        packed = torch.empty(
+            ids.numel(), row_bytes, dtype=torch.uint8, device=ids.device
+        )
+        _lookup_ple_embedding_from_pinned_kernel[(ids.numel(),)](
+            layer._uva_weight,
+            ids,
+            packed,
+            row_bytes,
+            layer.shard_indices.org_vocab_start_index,
+            layer.shard_indices.org_vocab_end_index,
+            BLOCK_D=triton.next_power_of_2(row_bytes),
+        )
+        dequantized = ops.ggml_dequantize(
+            packed,
+            layer.weight_type.weight_type,
+            layer.embedding_dim,
+            ids.numel(),
+            torch.float32,
+        )
+        output.copy_(dequantized.view_as(output).to(output.dtype))
+
+    def dequantize(
+        self,
+        layer: nn.Module,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return embeddings.to(output_dtype)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        if layer.weight.numel() == 0:
+            raise ValueError("GGUF PLE embedding table was not loaded")
+        if isinstance(layer, Qwen4ExpPLEPinnedHostEmbedding):
+            layer._uva_weight = get_accelerator_view_from_cpu_tensor(layer.weight)
+        logger.info(
+            "Loaded GGUF PLE table: type=%s, local_shape=%s, "
+            "storage=%.2f GiB on %s, lookup_dtype=%s",
+            layer.weight_type.weight_type,
+            tuple(layer.weight.shape),
+            layer.weight.numel() / 2**30,
+            layer.weight.device,
+            layer.params_dtype,
+        )
+        super().process_weights_after_loading(layer)
+
+
 class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
     """FP8 PLE embedding with one global checkpoint scale."""
 
@@ -369,6 +557,7 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         sentinel = torch.finfo(torch.float32).min
         if torch.any(layer.weight_scale == sentinel):
             raise ValueError("FP8 PLE checkpoint is missing its global scale")
+        super().process_weights_after_loading(layer)
 
     def dequantize(
         self,
@@ -452,6 +641,7 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         sentinel = torch.finfo(torch.float32).min
         if torch.any(layer.weight_scale_2 == sentinel):
             raise ValueError("NVFP4 PLE checkpoint is missing its global scale")
+        super().process_weights_after_loading(layer)
 
     def lookup_dtype(self, layer: nn.Module) -> torch.dtype:
         return layer.params_dtype
@@ -472,20 +662,41 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             dtype=layer.params_dtype,
             device=input_.device,
         )
+        # Device rows are already local, so every ID in range is owned.
+        self.decode_rows(
+            layer.weight,
+            layer.weight_scale,
+            layer.weight_scale_2,
+            ids,
+            output,
+            0,
+            layer.weight.shape[0],
+        )
+        return output
+
+    @staticmethod
+    def decode_rows(
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        weight_scale_2: torch.Tensor,
+        ids: torch.Tensor,
+        output: torch.Tensor,
+        vocab_start: int,
+        vocab_end: int,
+    ) -> None:
+        """Decode the rows of `ids` in `[vocab_start, vocab_end)` into `output`."""
         if ids.numel():
-            # Device rows are already local, so every ID in range is owned.
             _lookup_nvfp4_ple_embedding_kernel[(ids.numel(),)](
-                layer.weight,
-                layer.weight_scale.view(torch.uint8),
-                layer.weight_scale_2,
+                weight,
+                weight_scale.view(torch.uint8),
+                weight_scale_2,
                 ids,
                 output,
-                layer.embedding_dim,
-                0,
-                layer.weight.shape[0],
-                BLOCK_D=triton.next_power_of_2(layer.embedding_dim),
+                output.shape[-1],
+                vocab_start,
+                vocab_end,
+                BLOCK_D=triton.next_power_of_2(output.shape[-1]),
             )
-        return output
 
     def lookup_from_pinned(
         self,
@@ -493,16 +704,14 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         ids: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        _lookup_nvfp4_ple_embedding_kernel[(ids.numel(),)](
+        self.decode_rows(
             layer._uva_weight,
-            self._uva_weight_scale.view(torch.uint8),
+            self._uva_weight_scale,
             layer.weight_scale_2,
             ids,
             output,
-            layer.embedding_dim,
             layer.shard_indices.org_vocab_start_index,
             layer.shard_indices.org_vocab_end_index,
-            BLOCK_D=triton.next_power_of_2(layer.embedding_dim),
         )
 
     def dequantize(
@@ -621,6 +830,35 @@ def _lookup_ple_embedding_from_pinned_kernel(
     )
 
 
+@triton.jit
+def _lookup_gguf_q4_0_ple_kernel(
+    weight_ptr,
+    ids_ptr,
+    output_ptr,
+    vocab_start,
+    vocab_end,
+    EMBEDDING_DIM: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Read Q4_0 rows and round FP32 dequantization once to the model dtype."""
+    row = tl.program_id(0).to(tl.int64)
+    idx = tl.load(ids_ptr + row)
+    owned = (idx >= vocab_start) & (idx < vocab_end)
+    local_idx = tl.where(owned, idx - vocab_start, 0)
+    dims = tl.arange(0, BLOCK_D)
+    valid = (dims < EMBEDDING_DIM) & owned
+    block = dims // 32
+    block_ptr = weight_ptr + local_idx * ROW_BYTES + block * 18
+    scale_lo = tl.load(block_ptr, mask=valid, other=0).to(tl.uint16)
+    scale_hi = tl.load(block_ptr + 1, mask=valid, other=0).to(tl.uint16)
+    scale = (scale_lo | (scale_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    packed = tl.load(block_ptr + 2 + dims % 16, mask=valid, other=0)
+    codes = tl.where(dims % 32 < 16, packed & 15, packed >> 4).to(tl.float32)
+    values = (codes - 8.0) * scale
+    tl.store(output_ptr + row * EMBEDDING_DIM + dims, values, mask=dims < EMBEDDING_DIM)
+
+
 class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
     """PLE table loaded into pinned CPU memory and looked up through UVA."""
 
@@ -654,7 +892,11 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             data_parallel_rank=data_parallel_rank,
             reduce_results=reduce_results,
         )
-        self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
+        self._uva_weight = (
+            get_accelerator_view_from_cpu_tensor(self.weight)
+            if self.weight.numel()
+            else None
+        )
         self._prefetch_stream: torch.cuda.Stream | None = None
         self._prefetch_buffer: torch.Tensor | None = None
         self._prefetch_alloc_lock = threading.Lock()
@@ -669,13 +911,20 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """Allocate the complete PLE weight directly in pinned CPU memory."""
-        return torch.empty(
+        host = torch.empty(
             num_embeddings,
             embedding_dim,
             dtype=dtype,
             device="cpu",
             pin_memory=True,
         )
+        # This table stays GPU-registered for the process lifetime while the
+        # rest of the weights stream in; lock it now so kernel reclaim cannot
+        # trigger KFD queue evictions against it during model load.
+        from vllm.utils.host_memory_lock import maybe_mlock_pinned_host_buffer
+
+        maybe_mlock_pinned_host_buffer(host)
+        return host
 
     def _lookup(
         self,
@@ -773,6 +1022,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             )
         active_output = buffer[: gathered_ids.shape[0]]
         prefetch_stream.wait_stream(torch.cuda.current_stream())
+        # Prevent ID storage reuse until the prefetch stream finishes reading it.
         gathered_ids.record_stream(prefetch_stream)
         with torch.cuda.stream(prefetch_stream):
             self._lookup(gathered_ids, output=active_output)

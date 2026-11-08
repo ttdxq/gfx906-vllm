@@ -44,6 +44,31 @@ _NATIVE_WEIGHT_TYPES = [
 _TEST_WEIGHT_STORAGE = []
 
 
+@pytest.mark.parametrize("qtype", _NATIVE_WEIGHT_TYPES[:5])
+@pytest.mark.parametrize("cols", [64, 256, 320])
+@pytest.mark.parametrize("rows", [128, 129])
+@pytest.mark.parametrize("num_tokens", [1, 25])
+@torch.inference_mode()
+def test_mmq_k_tail_ignores_adjacent_storage(qtype, cols, rows, num_tokens):
+    """An incomplete K tile must not read the following weight storage."""
+    rng = np.random.default_rng(42)
+    packed = gguf.quantize(rng.standard_normal((rows, cols)).astype(np.float32), qtype)
+    # Four extra rows cover the largest tile overread for a 64-wide input.
+    storage = torch.zeros(rows + 4, packed.shape[1], dtype=torch.uint8, device="cuda")
+    storage[:rows].copy_(torch.from_numpy(packed))
+    weight = storage[:rows]
+    torch.manual_seed(42)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda")
+
+    expected = ops.ggml_mul_mat_a8(weight, x, qtype, rows)
+    assert torch.isfinite(expected).all()
+    # 0xffff is a NaN FP16 scale in these formats, outside the logical weight.
+    storage[rows:].fill_(255)
+    actual = ops.ggml_mul_mat_a8(weight, x, qtype, rows)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @lru_cache(maxsize=1)
 def _quantized_sample_dir():
     return Path(snapshot_download("Isotr0py/test-gguf-sample"))
@@ -63,6 +88,549 @@ def _quantized_test_rows(qtype, rows, cols):
     return np.tile(source, (1, (width + source.shape[1] - 1) // source.shape[1]))[
         :, :width
     ].copy()
+
+
+@pytest.mark.parametrize(
+    "qtype,cols",
+    [
+        (8, 320),
+        (8, 2560),
+        (20, 320),
+        (21, 256),
+        (21, 2560),
+        (23, 256),
+        (6, 640),
+        (6, 2560),
+        (18, 2560),
+    ],
+)
+@pytest.mark.parametrize("tokens,top_k", [(1, 10), (3, 1)])
+@torch.inference_mode()
+def test_indirect_moe_mixed_residency(monkeypatch, qtype, cols, tokens, top_k):
+    """Mixed HBM/UVA experts preserve exact sums, repeated routes and tail rows."""
+    from vllm.model_executor.offloader import UVAOffloader
+
+    monkeypatch.setenv("VLLM_GGUF_MOE_IQ3_S_LUT", "1")
+    monkeypatch.setenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", "1")
+    qtype = gguf.GGMLQuantizationType(qtype)
+    experts, rows = 512, 129
+    data = np.tile(_quantized_test_rows(qtype, rows, cols)[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    module = torch.nn.Module()
+    module.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.tensor(data, device="cuda"), requires_grad=False),
+    )
+    UVAOffloader(2**30, {"weight"}).wrap_modules(iter([module]))
+    weight = module.weight
+    assert getattr(weight, "_vllm_is_uva_offloaded", False)
+    selected = torch.tensor([0, 257, 511], device="cuda")
+    cached = weight.index_select(0, selected)
+    expert_bytes = weight[0].numel()
+    pointers = torch.arange(experts, device="cuda") * expert_bytes + weight.data_ptr()
+    pointers[selected] = (
+        torch.arange(3, device="cuda") * expert_bytes + cached.data_ptr()
+    )
+    routes = [511, 1, 257, 511, 255, 0, 256, 383, 510, 127]
+    ids = torch.tensor(routes[: tokens * top_k], dtype=torch.int32, device="cuda").view(
+        tokens, top_k
+    )
+    x = torch.randn(tokens, cols, device="cuda", dtype=torch.float16)
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    expected = ops.ggml_moe_q8_vec(
+        quant_x, weight, ids, top_k, qtype, rows, tokens, cols, x.dtype
+    )
+    actual = torch.ops._C.ggml_moe_q8_vec_indirect(
+        quant_x, pointers, ids, qtype, rows, tokens, cols, x.dtype
+    )
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "qtype", [gguf.GGMLQuantizationType.Q8_0, gguf.GGMLQuantizationType.IQ4_NL]
+)
+@pytest.mark.parametrize("cols", [256, 320, 512, 640])
+@pytest.mark.parametrize("top_k", [1, 10])
+@pytest.mark.parametrize("subwarp_env", [None, "1"])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_small_k_subwarp(
+    monkeypatch, qtype, cols, top_k, subwarp_env
+):
+    """Short W2 rows retain exact sums, routing and padded-row coverage."""
+    rows, experts, tokens = 129, 512, 10 // top_k
+    data = np.tile(_quantized_test_rows(qtype, rows, cols)[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    weight = torch.tensor(data, device="cuda")
+    torch.manual_seed(2026)
+    x = torch.randn(tokens, cols, dtype=torch.float16, device="cuda")
+    ids = torch.tensor(
+        [0, 1, 127, 254, 255, 256, 257, 383, 510, 511], device="cuda", dtype=torch.int32
+    ).view(tokens, top_k)
+    monkeypatch.setenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", "0")
+    expected = ops.ggml_moe_a8_vec(x, weight, ids, top_k, qtype, rows, tokens)
+    if subwarp_env is None:
+        monkeypatch.delenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP", subwarp_env)
+    output = torch.full_like(expected, float("nan"))
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    ops.ggml_moe_a8_vec_out(x, weight, ids, output, quant_x, top_k, qtype, rows, tokens)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    if (
+        "gfx906" in getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+        and qtype == gguf.GGMLQuantizationType.IQ4_NL
+        and cols == 320
+        and top_k == 10
+    ):
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profile:
+            ops.ggml_moe_a8_vec_out(
+                x, weight, ids, output, quant_x, top_k, qtype, rows, tokens
+            )
+            torch.cuda.synchronize()
+        kernels = [
+            event.name
+            for event in profile.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        assert any(
+            "moe_vec_q<" in name and ", 32, false>" in name for name in kernels
+        ), kernels
+
+
+@pytest.mark.parametrize("num_tokens", [1, 3])
+@pytest.mark.parametrize("cols", [256, 2560])
+@pytest.mark.parametrize("lut_env", [None, "1"])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_iq3_lut_decode(
+    monkeypatch, num_tokens, cols, lut_env
+):
+    """Routed LUT GEMV keeps the dense LUT math and full expert indices."""
+    rows, experts, top_k = 129, 512, 10
+    qtype = gguf.GGMLQuantizationType.IQ3_S
+    data = np.tile(_quantized_test_rows(qtype, rows, cols)[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    weight = torch.tensor(data, device="cuda")
+    torch.manual_seed(7319)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda")
+    route = [0, 1, 127, 254, 255, 256, 257, 383, 510, 511]
+    ids = torch.tensor(route, device="cuda", dtype=torch.int32).repeat(num_tokens, 1)
+    monkeypatch.setenv("VLLM_GGUF_IQ_WIDE", "1")
+    monkeypatch.setenv("VLLM_GGUF_IQ_LUT", "2")
+    expected = []
+    for token in range(num_tokens):
+        quant_x = ops.ggml_quantize_row_q8_1(x[token : token + 1])
+        for expert in route:
+            expected.append(
+                ops.ggml_mul_mat_vec_q8(
+                    weight[expert], quant_x, qtype, rows, cols, x.dtype
+                )
+            )
+    expected = torch.cat(expected)
+    if lut_env is None:
+        monkeypatch.delenv("VLLM_GGUF_MOE_IQ3_S_LUT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GGUF_MOE_IQ3_S_LUT", lut_env)
+    output = torch.full_like(expected, float("nan"))
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    ops.ggml_moe_a8_vec_out(
+        x, weight, ids, output, quant_x, top_k, qtype, rows, num_tokens
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("qtype,cols", [(21, 2560), (20, 320)])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_prefill_row_tiles(
+    monkeypatch, qtype, cols
+):
+    from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+    qtype = gguf.GGMLQuantizationType(qtype)
+    rows, experts, tokens, top_k = 129, 512, 65, 10
+    weight = torch.tensor(
+        np.tile(_quantized_test_rows(qtype, rows, cols)[None], (experts, 1, 1)),
+        device="cuda",
+    )
+    ids = torch.tensor(
+        [0, 1, 127, 254, 255, 256, 257, 383, 510, 511], device="cuda", dtype=torch.int32
+    ).repeat(tokens, 1)
+    torch.manual_seed(7319)
+    x = torch.randn(tokens, cols, dtype=torch.float16, device="cuda")
+    aligned = moe_align_block_size(ids, ops.ggml_moe_get_block_size(qtype), experts)
+    env_name = f"VLLM_GGUF_MOE_{qtype.name}_TILE_ROWS"
+    monkeypatch.setenv(env_name, "128")
+    expected = ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, tokens)
+    for tile in (None, 32, 64):
+        if tile is None:
+            monkeypatch.delenv(env_name, raising=False)
+            expected_tile = (
+                32
+                if "gfx906"
+                in getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+                else 128
+            )
+        else:
+            monkeypatch.setenv(env_name, str(tile))
+            expected_tile = tile
+        actual = ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, tokens)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profile:
+            ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, tokens)
+            torch.cuda.synchronize()
+        kernels = [
+            e.name
+            for e in profile.events()
+            if e.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        assert any(
+            f"moe_{qtype.name.lower()}<" in name and f", {expected_tile}>" in name
+            for name in kernels
+        ), kernels
+
+
+@pytest.mark.parametrize(
+    "qtype,cols",
+    [
+        pytest.param(gguf.GGMLQuantizationType.IQ3_S, 256, id="iq3_s-256"),
+        pytest.param(gguf.GGMLQuantizationType.IQ3_S, 2560, id="iq3_s-2560"),
+        (gguf.GGMLQuantizationType.IQ2_XS, 256),
+        (gguf.GGMLQuantizationType.IQ2_XS, 2560),
+        (gguf.GGMLQuantizationType.IQ2_S, 256),
+        (gguf.GGMLQuantizationType.IQ2_S, 2560),
+        (gguf.GGMLQuantizationType.IQ3_XXS, 256),
+        (gguf.GGMLQuantizationType.IQ3_XXS, 2560),
+        (gguf.GGMLQuantizationType.IQ4_XS, 2560),
+        (gguf.GGMLQuantizationType.IQ4_NL, 256),
+        (gguf.GGMLQuantizationType.IQ4_NL, 320),
+        (gguf.GGMLQuantizationType.IQ4_NL, 640),
+        (gguf.GGMLQuantizationType.IQ4_NL, 2560),
+        (gguf.GGMLQuantizationType.Q4_0, 256),
+        (gguf.GGMLQuantizationType.Q4_0, 2560),
+        (gguf.GGMLQuantizationType.Q8_0, 256),
+        (gguf.GGMLQuantizationType.Q8_0, 2560),
+    ],
+)
+@pytest.mark.parametrize("num_tokens", [7, 65])
+@pytest.mark.parametrize("top_k", [1, 10])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts(qtype, num_tokens, cols, top_k):
+    """Grouped prefill must compute experts above 255 and padded token tiles."""
+    from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+    rows, experts = 129, 512
+    data = _quantized_test_rows(qtype, rows, cols)
+    data = np.tile(data[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    weight = torch.tensor(data, device="cuda")
+    torch.manual_seed(73)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda")
+    # Include both sides of the old limit and the last expert. Repetition
+    # exercises a full token tile as well as expert padding.
+    ids = torch.tensor(
+        [0, 1, 127, 254, 255, 256, 257, 383, 510, 511], device="cuda", dtype=torch.int32
+    ).repeat(num_tokens, 1)
+    if top_k == 1:
+        ids = ids.flatten()[:num_tokens, None].contiguous()
+    block_size = ops.ggml_moe_get_block_size(qtype)
+    assert block_size > 0, "grouped MoE kernel is unavailable for this format"
+    aligned = moe_align_block_size(ids, block_size, experts)
+    expected = ops.ggml_moe_a8_vec(x, weight, ids, top_k, qtype, rows, num_tokens)
+    actual = ops.ggml_moe_a8(x, weight, *aligned, qtype, rows, top_k, num_tokens)
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "w1_type,w2_type,top_k",
+    [
+        (gguf.GGMLQuantizationType.IQ4_XS, gguf.GGMLQuantizationType.Q8_0, 10),
+        (gguf.GGMLQuantizationType.IQ3_S, gguf.GGMLQuantizationType.Q8_0, 10),
+        (gguf.GGMLQuantizationType.IQ3_S, gguf.GGMLQuantizationType.IQ4_NL, 10),
+        (gguf.GGMLQuantizationType.IQ3_S, gguf.GGMLQuantizationType.IQ4_NL, 2),
+    ],
+)
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_bounds_prefill_cache(
+    workspace_init, w1_type, w2_type, top_k
+):
+    """Layers and tail chunks must share scratch without retaining each shape."""
+    torch.manual_seed(2026)
+    experts, rows, cols = 512, 512, 256
+    w1 = torch.from_numpy(
+        np.tile(_quantized_test_rows(w1_type, rows, cols)[None], (experts, 1, 1))
+    )
+    w1 = w1.reshape(experts, rows, -1).cuda()
+    w2 = torch.from_numpy(
+        np.tile(_quantized_test_rows(w2_type, cols, rows // 2)[None], (experts, 1, 1))
+    )
+    w2 = w2.reshape(experts, cols, -1).cuda()
+    layers = [(w1, w2), (w1.clone(), w2.clone())]
+    x = torch.randn(513, cols, dtype=torch.float16, device="cuda")
+    ids = torch.randint(experts, (513, top_k), dtype=torch.int32, device="cuda")
+    weights = torch.softmax(torch.randn(513, top_k, device="cuda"), dim=-1)
+    tensor_cache = set(gguf_layer._GGUF_TENSOR_BUFFER_CACHE)
+    q8_cache = set(gguf_layer._GGUF_Q8_1_BUFFER_CACHE)
+    initial = gguf_layer.fused_moe_gguf(
+        x[:257], w1, w2, weights[:257], ids[:257], int(w1_type), int(w2_type), "silu"
+    )
+    assert torch.isfinite(initial).all()
+    expected = initial.clone()
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    current_workspace_manager().lock()
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    for w1, w2 in layers:
+        for tokens in [143, 32, 257, 97, 513]:
+            output = gguf_layer.fused_moe_gguf(
+                x[:tokens],
+                w1,
+                w2,
+                weights[:tokens],
+                ids[:tokens],
+                int(w1_type),
+                int(w2_type),
+                "silu",
+            )
+            assert torch.isfinite(output).all()
+            if tokens == 257 and w1 is layers[0][0]:
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            del output
+    torch.cuda.synchronize()
+    torch.testing.assert_close(initial, expected, rtol=0, atol=0)
+    assert torch.cuda.memory_allocated() == allocated
+    assert set(gguf_layer._GGUF_TENSOR_BUFFER_CACHE) == tensor_cache
+    assert set(gguf_layer._GGUF_Q8_1_BUFFER_CACHE) == q8_cache
+
+
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_prefill_streams(workspace_init):
+    """The scratch lease must cover activation and all consumers on each stream."""
+    torch.manual_seed(2027)
+    experts, rows, cols, tokens, top_k = 512, 512, 256, 257, 10
+    w1_type = gguf.GGMLQuantizationType.IQ4_XS
+    w2_type = gguf.GGMLQuantizationType.Q8_0
+    w1 = torch.from_numpy(
+        np.tile(_quantized_test_rows(w1_type, rows, cols)[None], (experts, 1, 1))
+    )
+    w1 = w1.reshape(experts, rows, -1).cuda()
+    w2 = torch.from_numpy(
+        np.tile(_quantized_test_rows(w2_type, cols, rows // 2)[None], (experts, 1, 1))
+    )
+    w2 = w2.reshape(experts, cols, -1).cuda()
+    inputs = [
+        torch.randn(tokens, cols, dtype=torch.float16, device="cuda") for _ in range(4)
+    ]
+    ids = torch.randint(experts, (tokens, top_k), dtype=torch.int32, device="cuda")
+    weights = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
+
+    def forward(x):
+        return gguf_layer.fused_moe_gguf(
+            x, w1, w2, weights, ids, int(w1_type), int(w2_type), "silu"
+        )
+
+    expected = [forward(x).clone() for x in inputs]
+    assert all(torch.isfinite(output).all() for output in expected)
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    current_workspace_manager().lock()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    actual = []
+    for index in range(12):
+        with torch.cuda.stream(streams[index % 2]):
+            actual.append(forward(inputs[index % len(inputs)]))
+    for stream in streams:
+        torch.cuda.current_stream().wait_stream(stream)
+    for index, output in enumerate(actual):
+        torch.testing.assert_close(
+            output, expected[index % len(inputs)], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("tokens", [1, 32])
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_workspace_graph(
+    workspace_init, tokens
+):
+    """Decode and capture retain stable, independent storage for graph replay."""
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    torch.manual_seed(2028)
+    experts, rows, cols, top_k = 512, 512, 256, 10
+    w1_type = gguf.GGMLQuantizationType.IQ4_XS
+    w2_type = gguf.GGMLQuantizationType.Q8_0
+    w1 = torch.tensor(
+        np.tile(_quantized_test_rows(w1_type, rows, cols)[None], (experts, 1, 1)),
+        device="cuda",
+    )
+    w2 = torch.tensor(
+        np.tile(_quantized_test_rows(w2_type, cols, rows // 2)[None], (experts, 1, 1)),
+        device="cuda",
+    )
+    x = torch.randn(tokens, cols, dtype=torch.float16, device="cuda") * 0.1
+    ids = torch.randint(experts, (tokens, top_k), dtype=torch.int32, device="cuda")
+    weights = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
+
+    def forward():
+        return gguf_layer.fused_moe_gguf(
+            x, w1, w2, weights, ids, int(w1_type), int(w2_type), "silu"
+        )
+
+    expected = forward().clone()
+    assert torch.isfinite(expected).all()
+    current_workspace_manager().lock()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = forward()
+    for scale in [1.0, 0.5, 0.0]:
+        x.mul_(scale)
+        expected = forward().clone()
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [191, 192, 217])
+@torch.inference_mode()
+def test_iq_moe_prefill_crossover_matches_vector(num_tokens):
+    """The full IQ2/IQ4 pipeline preserves outputs across the prefill crossover."""
+    experts, hidden, intermediate, top_k = 512, 256, 128, 10
+    w1 = torch.tensor(
+        np.tile(
+            _quantized_test_rows(gguf.GGMLQuantizationType.IQ2_XS, 256, hidden)[None],
+            (experts, 1, 1),
+        ),
+        device="cuda",
+    )
+    w2 = torch.tensor(
+        np.tile(
+            _quantized_test_rows(
+                gguf.GGMLQuantizationType.IQ4_NL, hidden, intermediate
+            )[None],
+            (experts, 1, 1),
+        ),
+        device="cuda",
+    )
+    torch.manual_seed(7319)
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.float16) * 0.1
+    ids = torch.topk(torch.randn(num_tokens, experts, device="cuda"), top_k).indices
+    ids = ids.to(torch.int32)
+    weights = torch.softmax(torch.randn(num_tokens, top_k, device="cuda"), dim=-1)
+    first = ops.ggml_moe_a8_vec(x, w1, ids, top_k, 17, 256, num_tokens)
+    activated = torch.empty(
+        num_tokens * top_k, intermediate, device=x.device, dtype=x.dtype
+    )
+    torch.ops._C.silu_and_mul(activated, first)
+    second = ops.ggml_moe_a8_vec(
+        activated, w2, ids, 1, 20, hidden, num_tokens * top_k
+    ).reshape(num_tokens, top_k, hidden)
+    expected = torch.empty_like(x)
+    ops.moe_weighted_sum(second, weights, expected)
+    actual = gguf_layer._fused_moe_gguf(x, w1, w2, weights, ids, 17, 20, "silu")
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "w1_type,w2_type,grouped_w1,grouped_w2",
+    [
+        (
+            gguf.GGMLQuantizationType.IQ3_S,
+            gguf.GGMLQuantizationType.IQ4_NL,
+            True,
+            True,
+        ),
+        (
+            gguf.GGMLQuantizationType.IQ2_XS,
+            gguf.GGMLQuantizationType.IQ4_XS,
+            True,
+            True,
+        ),
+        (gguf.GGMLQuantizationType.IQ4_NL, gguf.GGMLQuantizationType.Q8_0, True, True),
+    ],
+)
+@torch.inference_mode()
+def test_grouped_moe_matches_mmvq_with_512_experts_mixed_formats(
+    w1_type, w2_type, grouped_w1, grouped_w2
+):
+    """Each supported projection uses MMQ even if its partner needs MMVQ."""
+    from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+    experts, hidden, intermediate, top_k, tokens = 512, 256, 256, 10, 257
+    w1 = torch.tensor(
+        np.tile(
+            _quantized_test_rows(w1_type, 2 * intermediate, hidden)[None],
+            (experts, 1, 1),
+        ),
+        device="cuda",
+    )
+    w2 = torch.tensor(
+        np.tile(
+            _quantized_test_rows(w2_type, hidden, intermediate)[None], (experts, 1, 1)
+        ),
+        device="cuda",
+    )
+    torch.manual_seed(7319)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.float16) * 0.1
+    ids = torch.topk(torch.randn(tokens, experts, device="cuda"), top_k).indices.int()
+    weights = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
+    if grouped_w1:
+        aligned = moe_align_block_size(
+            ids, ops.ggml_moe_get_block_size(w1_type), experts
+        )
+        first = ops.ggml_moe_a8(
+            x, w1, *aligned, w1_type, 2 * intermediate, top_k, tokens
+        )
+    else:
+        first = ops.ggml_moe_a8_vec(
+            x, w1, ids, top_k, w1_type, 2 * intermediate, tokens
+        )
+    activated = torch.empty(
+        tokens * top_k, intermediate, device=x.device, dtype=x.dtype
+    )
+    torch.ops._C.silu_and_mul(activated, first)
+    if grouped_w2:
+        aligned = moe_align_block_size(
+            ids, ops.ggml_moe_get_block_size(w2_type), experts
+        )
+        second = ops.ggml_moe_a8(
+            activated, w2, *aligned, w2_type, hidden, 1, tokens * top_k
+        )
+    else:
+        second = ops.ggml_moe_a8_vec(
+            activated, w2, ids, 1, w2_type, hidden, tokens * top_k
+        )
+    second = second.reshape(tokens, top_k, hidden)
+    expected = torch.empty_like(x)
+    ops.moe_weighted_sum(second, weights, expected)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:
+        actual = gguf_layer.fused_moe_gguf(
+            x, w1, w2, weights, ids, w1_type, w2_type, "silu"
+        )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert sum(e.count for e in p.key_averages() if e.key == "_C::ggml_moe_a8") == (
+        int(grouped_w1) + int(grouped_w2)
+    )
+
 
 
 def _dequantized_reference(data, qtype):
@@ -671,9 +1239,12 @@ def test_prepared_k45_preserves_math_graph_replay_and_fallback(
 def test_q8_1_weight_type_is_rejected():
     """Q8_1 activation records do not implement the GGUF weight format."""
     qtype = gguf.GGMLQuantizationType.Q8_1
-    assert set(_NATIVE_WEIGHT_TYPES) == gguf_layer.MMVQ_QUANT_TYPES
+    # Q2_0 ships the dequant and MoE vec kernels only; the other native
+    # formats cover MMVQ, MMQ and dequant alike.
+    vec_only = {gguf.GGMLQuantizationType.Q2_0}
+    assert set(_NATIVE_WEIGHT_TYPES) | vec_only == gguf_layer.MMVQ_QUANT_TYPES
     assert set(_NATIVE_WEIGHT_TYPES) == gguf_layer.MMQ_QUANT_TYPES
-    assert set(_NATIVE_WEIGHT_TYPES) == gguf_layer.DEQUANT_TYPES
+    assert set(_NATIVE_WEIGHT_TYPES) | vec_only == gguf_layer.DEQUANT_TYPES
     assert qtype not in gguf_layer.MMVQ_QUANT_TYPES
     assert qtype not in gguf_layer.MMQ_QUANT_TYPES
     assert qtype not in gguf_layer.DEQUANT_TYPES
@@ -1051,3 +1622,170 @@ def test_q8_m1_preserves_math_graph_and_multivec_fallback(monkeypatch, dtype):
         if e.device_type == torch.autograd.DeviceType.CUDA
     ]
     assert any("q8_0_q8_1_row_tile<" in n and ", true>" in n for n in names), names
+
+
+def _q2_0_test_rows(rows, cols, seed):
+    rng = np.random.default_rng(seed)
+    return gguf.quantize(
+        rng.standard_normal((rows, cols)).astype(np.float32),
+        gguf.GGMLQuantizationType.Q2_0,
+    )
+
+
+def _q8_1_dequantized_rows(quant_x, cols):
+    batch = quant_x.shape[0]
+    blocks = quant_x.cpu().view(torch.uint8).reshape(batch, -1, 36)
+    ds = blocks[..., :4].contiguous().view(torch.float16).double()
+    qs = blocks[..., 4:].contiguous().view(torch.int8).double()
+    return (ds[..., :1] * qs).reshape(batch, -1)[:, :cols]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("cols", [640, 2560])
+@pytest.mark.parametrize("rows", [3, 129])
+@torch.inference_mode()
+def test_q2_0_dequant_matches_cpu_reference(rows, cols):
+    """The Q2_0 dequant kernel must reproduce d*(code-1) exactly."""
+    data = _q2_0_test_rows(rows, cols, 2710)
+    raw = torch.tensor(data, device="cuda")
+    _TEST_WEIGHT_STORAGE.append(raw)
+    dequant = ops.ggml_dequantize(
+        raw, int(gguf.GGMLQuantizationType.Q2_0), rows, cols, torch.float32
+    ).cpu()
+    torch.testing.assert_close(
+        dequant.double(),
+        _dequantized_reference(data, gguf.GGMLQuantizationType.Q2_0),
+        atol=0.001,
+        rtol=0.001,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("cols", [640, 2560])
+@pytest.mark.parametrize("num_tokens", [1, 7])
+@torch.inference_mode()
+def test_q2_0_moe_vec_paths_match_cpu_reference(num_tokens, cols):
+    """a8/q8 vec and the fused weighted sum must match decoded-weight math."""
+    qtype = gguf.GGMLQuantizationType.Q2_0
+    rows, experts, top_k = 129, 512, 10
+    data = np.tile(_q2_0_test_rows(rows, cols, 73)[None], (experts, 1, 1))
+    _, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
+    scales = data.reshape(experts, rows, -1, block_bytes)[..., :2].view(np.float16)
+    scales *= np.linspace(0.5, 1.5, experts).reshape(experts, 1, 1, 1)
+    weight = torch.tensor(data, device="cuda")
+    _TEST_WEIGHT_STORAGE.append(weight)
+    decoded = torch.from_numpy(gguf.dequantize(data, qtype)).double()
+
+    torch.manual_seed(73)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda") * 0.2
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    ids = torch.tensor(
+        [0, 1, 127, 254, 255, 256, 257, 383, 510, 511], device="cuda", dtype=torch.int32
+    ).repeat(num_tokens, 1)
+    weights = torch.rand(num_tokens, top_k, dtype=torch.float32, device="cuda")
+
+    dq_x = _q8_1_dequantized_rows(quant_x, cols)
+    gathered = decoded[ids.cpu().long()]  # (t, k, rows, cols)
+    per_expert = torch.einsum("tc,tkrc->tkr", dq_x, gathered)
+    expected_pure = per_expert.reshape(num_tokens * top_k, rows)
+
+    actual_a8 = ops.ggml_moe_a8_vec(x, weight, ids, top_k, int(qtype), rows, num_tokens)
+    torch.testing.assert_close(
+        actual_a8.cpu().double(), expected_pure, atol=0.02, rtol=0.01
+    )
+
+    actual_q8 = ops.ggml_moe_q8_vec(
+        quant_x, weight, ids, top_k, int(qtype), rows, num_tokens, cols, torch.float16
+    )
+    torch.testing.assert_close(
+        actual_q8.cpu().double(), expected_pure, atol=0.02, rtol=0.01
+    )
+
+    # The weighted sum consumes per-expert activations with tokens*top_k rows
+    # (the silu-quantized W1 output in the fused decode path).
+    act = (
+        torch.randn(num_tokens * top_k, cols, dtype=torch.float16, device="cuda") * 0.2
+    )
+    quant_act = ops.ggml_quantize_row_q8_1(act)
+    dq_act = _q8_1_dequantized_rows(quant_act, cols).reshape(num_tokens, top_k, cols)
+    per_expert_act = torch.einsum("tkc,tkrc->tkr", dq_act, gathered)
+    expected_weighted = torch.einsum(
+        "tk,tkr->tr", weights.cpu().double(), per_expert_act
+    )
+
+    actual_ws = ops.ggml_moe_q8_vec_weighted_sum(
+        quant_act,
+        weight,
+        ids,
+        weights,
+        top_k,
+        int(qtype),
+        rows,
+        num_tokens,
+        cols,
+        torch.float16,
+    )
+    # top_k fp16 partial sums accumulate slightly past the plain dot tolerance
+    torch.testing.assert_close(
+        actual_ws.cpu().double(), expected_weighted, atol=0.03, rtol=0.01
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.timeout(180)
+@torch.inference_mode()
+def test_q2_0_moe_vec_production_shape_matches_reference():
+    """The model's exact ffn_down_exps shape [512, 2560, 640] end to end."""
+    qtype = gguf.GGMLQuantizationType.Q2_0
+    experts, rows, cols, num_tokens, top_k = 512, 2560, 640, 4, 10
+    data = np.tile(_q2_0_test_rows(rows, cols, 2026)[None], (experts, 1, 1))
+    weight = torch.tensor(data, device="cuda")
+    _TEST_WEIGHT_STORAGE.append(weight)
+    decoded = torch.from_numpy(gguf.dequantize(data, qtype)).double()
+
+    torch.manual_seed(2026)
+    x = torch.randn(num_tokens, cols, dtype=torch.float16, device="cuda") * 0.2
+    quant_x = ops.ggml_quantize_row_q8_1(x)
+    ids = torch.randint(
+        0, experts, (num_tokens, top_k), device="cuda", dtype=torch.int32
+    )
+    weights = torch.rand(num_tokens, top_k, dtype=torch.float32, device="cuda")
+
+    dq_x = _q8_1_dequantized_rows(quant_x, cols)
+    gathered = decoded[ids.cpu().long()]  # (t, k, rows, cols)
+    per_expert = torch.einsum("tc,tkrc->tkr", dq_x, gathered)
+    expected_pure = per_expert.reshape(num_tokens * top_k, rows)
+
+    actual_q8 = ops.ggml_moe_q8_vec(
+        quant_x, weight, ids, top_k, int(qtype), rows, num_tokens, cols, torch.float16
+    )
+    torch.testing.assert_close(
+        actual_q8.cpu().double(), expected_pure, atol=0.02, rtol=0.01
+    )
+
+    act = (
+        torch.randn(num_tokens * top_k, cols, dtype=torch.float16, device="cuda") * 0.2
+    )
+    quant_act = ops.ggml_quantize_row_q8_1(act)
+    dq_act = _q8_1_dequantized_rows(quant_act, cols).reshape(num_tokens, top_k, cols)
+    per_expert_act = torch.einsum("tkc,tkrc->tkr", dq_act, gathered)
+    expected_weighted = torch.einsum(
+        "tk,tkr->tr", weights.cpu().double(), per_expert_act
+    )
+
+    actual_ws = ops.ggml_moe_q8_vec_weighted_sum(
+        quant_act,
+        weight,
+        ids,
+        weights,
+        top_k,
+        int(qtype),
+        rows,
+        num_tokens,
+        cols,
+        torch.float16,
+    )
+    # top_k fp16 partial sums accumulate slightly past the plain dot tolerance
+    torch.testing.assert_close(
+        actual_ws.cpu().double(), expected_weighted, atol=0.03, rtol=0.01
+    )

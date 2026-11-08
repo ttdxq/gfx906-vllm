@@ -3,6 +3,7 @@
 """GGUF utility functions."""
 
 import hashlib
+import json
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -16,6 +17,7 @@ from transformers import (
     PreTrainedTokenizerFast,
     SiglipVisionConfig,
 )
+
 try:  # transformers >= 5.20 moved the GGUF converters to a package
     from transformers.integrations.gguf import convert_gguf_tokenizer
 except ImportError:
@@ -54,6 +56,32 @@ def _gguf_special_token_kwargs(
     return additional_kwargs
 
 
+_GGUF_SHARD_SUFFIX_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def get_gguf_shard_files(path: str | Path) -> list[str]:
+    """Return every file of a GGUF split, ordered by shard number.
+
+    Plain (non-split) GGUF files yield themselves.  Split files follow the
+    ``<name>-NNNNN-of-NNNNN.gguf`` convention; tensor data is striped
+    across shards while only the first shard carries the full KV metadata.
+    """
+    model_path = Path(path)
+    match = _GGUF_SHARD_SUFFIX_RE.search(model_path.name)
+    if match is None:
+        return [str(model_path)]
+    shard_glob = _GGUF_SHARD_SUFFIX_RE.sub("-*-of-*.gguf", model_path.name)
+    siblings = [
+        f
+        for f in model_path.parent.glob(shard_glob)
+        if _GGUF_SHARD_SUFFIX_RE.search(f.name)
+    ]
+    siblings.sort(key=lambda f: int(_GGUF_SHARD_SUFFIX_RE.search(f.name).group(1)))
+    if not siblings or str(model_path) not in {str(f) for f in siblings}:
+        return [str(model_path)]
+    return [str(f) for f in siblings]
+
+
 def _gguf_model_family(path: Path) -> str:
     tokens = re.split(r"[-_.]+", path.stem.lower())
     if tokens and tokens[0] == "mmproj":
@@ -81,6 +109,7 @@ def detect_gguf_multimodal(model: str) -> Path | None:
 
     Returns:
         Path to mmproj file if found, None otherwise
+
     """
     if not model.endswith(".gguf"):
         return None
@@ -132,6 +161,7 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
     Raises:
         Exception: Exceptions from GGUF reading (file not found, corrupted
             file, etc.) propagate directly from gguf.GGUFReader
+
     """
     reader = gguf.GGUFReader(str(mmproj_path))
 
@@ -411,6 +441,172 @@ def qwen35_gguf_config_dict(model: str) -> dict | None:
             }
         )
     logger.info("Built Qwen3.5 config from %s GGUF metadata: %s", arch, model)
+    return config_dict
+
+
+def qwen4exp_gguf_config_dict(model: str) -> dict | None:
+    """Build a Qwen4Exp config dict from qwen4exp GGUF metadata.
+
+    Hybrid SSM/full-attention checkpoints ("Qwen3.8 Flash Next"): every
+    4th layer is full attention with an indexer (QSA); the rest are gated
+    delta net. Hyper-connections replace the per-layer RMS norms. PLE
+    n-gram tables retain their quantized storage and use the host backend
+    by default.
+    """
+    try:
+        reader = gguf.GGUFReader(str(model))
+    except Exception:
+        return None
+
+    arch = _read_gguf_scalar(reader, "general.architecture")
+    if arch != "qwen4exp":
+        return None
+    prefix = "qwen4exp"
+
+    tokens = _read_gguf_scalar(reader, "tokenizer.ggml.tokens", [])
+    num_hidden_layers = int(_read_gguf_scalar(reader, f"{prefix}.block_count"))
+    # Splits stripe blocks across files: layer typing and lm-head presence
+    # must see every shard's tensors.
+    tensor_names = {tensor.name for tensor in reader.tensors}
+    for shard in get_gguf_shard_files(model)[1:]:
+        tensor_names |= {tensor.name for tensor in gguf.GGUFReader(shard).tensors}
+    # Full-attention blocks carry attn_q; the GDN blocks use the fused
+    # attn_qkv projection instead.
+    layer_types = [
+        "indexed_attention"
+        if f"blk.{idx}.attn_q.weight" in tensor_names
+        else "linear_attention"
+        for idx in range(num_hidden_layers)
+    ]
+    if "indexed_attention" not in layer_types:
+        return None
+
+    state_size = int(_read_gguf_scalar(reader, f"{prefix}.ssm.state_size", 128))
+    group_count = int(_read_gguf_scalar(reader, f"{prefix}.ssm.group_count"))
+    inner_size = int(_read_gguf_scalar(reader, f"{prefix}.ssm.inner_size"))
+    linear_num_value_heads = inner_size // state_size
+    head_dim = int(_read_gguf_scalar(reader, f"{prefix}.attention.key_length"))
+    rope_dim = int(
+        _read_gguf_scalar(reader, f"{prefix}.rope.dimension_count", head_dim)
+    )
+    # QSA validation requires the rotary dim to fit the indexer head; the
+    # checkpoint uses partial rope (64 of 256 here).
+    partial_rotary_factor = rope_dim / head_dim
+
+    indexer_n_heads = _read_gguf_scalar(
+        reader, f"{prefix}.attention.indexer.head_count"
+    )
+    indexer_head_dim = _read_gguf_scalar(
+        reader, f"{prefix}.attention.indexer.key_length"
+    )
+    indexer_budget = _read_gguf_scalar(reader, f"{prefix}.attention.indexer.top_k")
+    if indexer_n_heads is None or indexer_head_dim is None or indexer_budget is None:
+        raise RuntimeError(
+            f"qwen4exp GGUF {model} lacks indexer metadata required by QSA"
+        )
+    # Per-layer compress ratios repeat the 8-layer pattern; full-attention
+    # layers carry the non-zero value.
+    compress_ratios = _read_gguf_scalar(
+        reader, f"{prefix}.attention.compress_ratios", []
+    )
+    indexer_compress_ratio = max(
+        (int(r) for r in compress_ratios if int(r) > 0), default=1
+    )
+    if indexer_budget % indexer_compress_ratio != 0:
+        indexer_compress_ratio = 1
+
+    ple_layers = _read_gguf_scalar(reader, f"{prefix}.ple.layers", [])
+    if isinstance(ple_layers, int):
+        ple_layers = [ple_layers]
+    ngram_size = int(_read_gguf_scalar(reader, f"{prefix}.ple.ngram_size", 3))
+    heads_per_ngram = int(_read_gguf_scalar(reader, f"{prefix}.ple.heads_per_ngram", 8))
+    ple_head_dim = int(
+        _read_gguf_scalar(reader, f"{prefix}.embedding_length_per_layer_input", 0)
+    )
+
+    text_config = {
+        "model_type": "qwen4_exp_text",
+        "vocab_size": len(tokens),
+        "hidden_size": int(_read_gguf_scalar(reader, f"{prefix}.embedding_length")),
+        "hidden_act": "silu",
+        "num_hidden_layers": num_hidden_layers,
+        "num_attention_heads": int(
+            _read_gguf_scalar(reader, f"{prefix}.attention.head_count")
+        ),
+        "num_key_value_heads": int(
+            _read_gguf_scalar(reader, f"{prefix}.attention.head_count_kv")
+        ),
+        "head_dim": head_dim,
+        "max_position_embeddings": int(
+            _read_gguf_scalar(reader, f"{prefix}.context_length")
+        ),
+        "rms_norm_eps": float(
+            _read_gguf_scalar(reader, f"{prefix}.attention.layer_norm_rms_epsilon")
+        ),
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": float(_read_gguf_scalar(reader, f"{prefix}.rope.freq_base")),
+            "partial_rotary_factor": partial_rotary_factor,
+        },
+        "layer_types": layer_types,
+        "output_gate_type": "sigmoid",
+        "linear_conv_kernel_dim": int(
+            _read_gguf_scalar(reader, f"{prefix}.ssm.conv_kernel", 4)
+        ),
+        "linear_num_key_heads": group_count,
+        "linear_key_head_dim": state_size,
+        "linear_num_value_heads": linear_num_value_heads,
+        "linear_value_head_dim": state_size,
+        "num_experts": int(_read_gguf_scalar(reader, f"{prefix}.expert_count")),
+        "num_experts_per_tok": int(
+            _read_gguf_scalar(reader, f"{prefix}.expert_used_count")
+        ),
+        "moe_intermediate_size": int(
+            _read_gguf_scalar(reader, f"{prefix}.expert_feed_forward_length")
+        ),
+        "shared_expert_intermediate_size": int(
+            _read_gguf_scalar(reader, f"{prefix}.expert_shared_feed_forward_length", 0)
+        ),
+        "norm_topk_prob": True,
+        "hc_count": int(
+            _read_gguf_scalar(reader, f"{prefix}.hyper_connection.count", 4)
+        ),
+        "hc_lowrank": int(
+            _read_gguf_scalar(reader, f"{prefix}.hyper_connection.low_rank", 0)
+        ),
+        "indexer_n_heads": int(indexer_n_heads),
+        "indexer_head_dim": int(indexer_head_dim),
+        "indexer_kv_heads": 1,
+        "indexer_budget": int(indexer_budget),
+        "indexer_compress_ratio": indexer_compress_ratio,
+        # GGUF layer indices are zero-based, and the exported width is per
+        # n-gram head rather than the concatenated projection input.
+        "ple_layer_ids": [int(layer) + 1 for layer in ple_layers],
+        "ngram_size": ngram_size,
+        "heads_per_ngram": heads_per_ngram,
+        "ple_embed_dim": ple_head_dim * (ngram_size - 1) * heads_per_ngram,
+        "ple_layer_multipliers": _read_gguf_scalar(
+            reader, f"{prefix}.ple.layer_multipliers", []
+        ),
+        "ple_head_offsets": _read_gguf_scalar(reader, f"{prefix}.ple.head_offsets", []),
+        "ple_head_vocab_sizes": _read_gguf_scalar(
+            reader, f"{prefix}.ple.head_vocab_sizes", []
+        ),
+        "ple_conv_kernel_size": int(
+            _read_gguf_scalar(reader, f"{prefix}.ple.conv_kernel", 4)
+        ),
+        "eos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.eos_token_id"),
+        "bos_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.bos_token_id"),
+        "pad_token_id": _read_gguf_scalar(reader, "tokenizer.ggml.padding_token_id"),
+        "tie_word_embeddings": "output.weight" not in tensor_names,
+    }
+
+    config_dict = {
+        "architectures": ["Qwen4ExpForCausalLM"],
+        "model_type": "qwen4_exp",
+        "text_config": text_config,
+    }
+    logger.info("Built Qwen4Exp config from %s GGUF metadata: %s", arch, model)
     return config_dict
 
 
@@ -700,13 +896,11 @@ def gemma4_gguf_tokenizer_path(model: str) -> str | None:
     return str(tokenizer_dir)
 
 
-def _qwen35_gguf_tokenizer_config(
+def _gguf_tokenizer_config(
     reader: gguf.GGUFReader,
+    archs: tuple[str, ...],
 ) -> tuple[dict, dict] | None:
-    if _read_gguf_scalar(reader, "general.architecture") not in (
-        "qwen35",
-        "qwen35moe",
-    ):
+    if _read_gguf_scalar(reader, "general.architecture") not in archs:
         return None
 
     parsed = {k: {} for k in GGUF_TO_TRANSFORMERS_MAPPING}
@@ -746,15 +940,19 @@ def _qwen35_gguf_tokenizer_config(
     return tokenizer_dict, tokenizer_config
 
 
-def qwen35_gguf_tokenizer_path(model: str) -> str | None:
-    """Materialize a HF tokenizer directory from qwen35 GGUF metadata."""
+def _materialize_gguf_tokenizer(
+    model: str,
+    archs: tuple[str, ...],
+    family: str,
+) -> str | None:
+    """Materialize a HF tokenizer directory from GGUF metadata."""
     try:
         model_path = Path(model)
         reader = gguf.GGUFReader(str(model_path))
     except Exception:
         return None
 
-    tokenizer_parts = _qwen35_gguf_tokenizer_config(reader)
+    tokenizer_parts = _gguf_tokenizer_config(reader, archs)
     if tokenizer_parts is None:
         return None
 
@@ -762,11 +960,24 @@ def qwen35_gguf_tokenizer_path(model: str) -> str | None:
     digest = hashlib.sha256(
         f"{model_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()
     ).hexdigest()[:16]
-    tokenizer_dir = Path.home() / ".cache" / "vllm" / "qwen35_gguf_tokenizers" / digest
+    tokenizer_dir = (
+        Path.home() / ".cache" / "vllm" / f"{family}_gguf_tokenizers" / digest
+    )
+    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+    config_path = tokenizer_dir / "config.json"
+    config_dict = (
+        qwen4exp_gguf_config_dict(model)
+        if family == "qwen4exp"
+        else qwen35_gguf_config_dict(model)
+    )
+    if config_dict is None:
+        return None
+    config_json = json.dumps(config_dict, indent=2) + "\n"
+    if not config_path.is_file() or config_path.read_text() != config_json:
+        config_path.write_text(config_json, encoding="utf-8")
     if (tokenizer_dir / "tokenizer.json").is_file():
         return str(tokenizer_dir)
 
-    tokenizer_dir.mkdir(parents=True, exist_ok=True)
     tokenizer_dict, tokenizer_config = tokenizer_parts
     tokenizer_object, additional_kwargs = convert_gguf_tokenizer(
         "qwen3",
@@ -781,8 +992,22 @@ def qwen35_gguf_tokenizer_path(model: str) -> str | None:
         **tokenizer_config,
     )
     fast_tokenizer.save_pretrained(tokenizer_dir)
-    logger.info("Built Qwen3.5 tokenizer from qwen35 GGUF metadata: %s", model)
+    logger.info("Built %s tokenizer from GGUF metadata: %s", family, model)
     return str(tokenizer_dir)
+
+
+def qwen35_gguf_tokenizer_path(model: str) -> str | None:
+    """Materialize a HF tokenizer directory from qwen35 GGUF metadata."""
+    return _materialize_gguf_tokenizer(model, ("qwen35", "qwen35moe"), "qwen35")
+
+
+def qwen4exp_gguf_tokenizer_path(model: str) -> str | None:
+    """Materialize a HF tokenizer directory from qwen4exp GGUF metadata.
+
+    qwen4exp ships the same gpt2 BPE vocabulary family as qwen3.5
+    (tokenizer.ggml.pre = qwen35), so the converter is shared.
+    """
+    return _materialize_gguf_tokenizer(model, ("qwen4exp",), "qwen4exp")
 
 
 @lru_cache
@@ -832,13 +1057,12 @@ def maybe_patch_hf_config_from_gguf(
 
     Returns:
         Updated HuggingFace config
+
     """
     # Patch multimodal config if mmproj.gguf exists
     mmproj_path = detect_gguf_multimodal(model)
     if mmproj_path is not None:
-        gemma4_vision_config = extract_gemma4_vision_config_from_gguf(
-            str(mmproj_path)
-        )
+        gemma4_vision_config = extract_gemma4_vision_config_from_gguf(str(mmproj_path))
         vision_config = extract_vision_config_from_gguf(str(mmproj_path))
 
         if gemma4_vision_config is not None and hf_config.model_type == "gemma4":
@@ -883,7 +1107,8 @@ def maybe_patch_hf_config_from_gguf(
                 "patch_size": vision_config.patch_size,
                 "num_position_embeddings": (
                     vision_config.image_size // vision_config.patch_size
-                ) ** 2,
+                )
+                ** 2,
                 "spatial_merge_size": getattr(vision_config, "spatial_merge_size", 2),
                 "out_hidden_size": getattr(vision_config, "projection_dim", None),
                 # the mmproj declares no rope metadata; pin the axial
@@ -922,6 +1147,7 @@ def get_gguf_file_path_from_hf(
 
     Returns:
         The path to the GGUF file on HuggingFace Hub (e.g., "filename.gguf"),
+
     """
     repo_id = str(repo_id)
     gguf_patterns = [

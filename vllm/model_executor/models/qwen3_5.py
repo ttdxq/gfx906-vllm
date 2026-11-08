@@ -124,6 +124,7 @@ from .utils import (
     _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
+    get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -544,7 +545,7 @@ class Qwen3_5GatedDeltaNet(GatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None = None,
     ):
         num_tokens = hidden_states.size(0)
         profile_linear_attn = self._use_qwen35_linear_attn_profile(hidden_states)
@@ -693,6 +694,9 @@ class Qwen3_5GatedDeltaNet(GatedDeltaNetAttention):
             return projected_out
 
         projected_out = timed("out", run_out_proj)
+        if output is None:
+            # Buffer-less callers (upstream DecoderLayer contract).
+            return projected_out
         output[:num_tokens] = projected_out
         if profile_linear_attn:
             self._record_qwen35_linear_attn_profile(hidden_states, profile_events)
@@ -789,6 +793,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
+
+        # The upstream Qwen3NextDecoderLayer.forward (reached via super()
+        # when layer profiling is off) reads this flag set by its own
+        # __init__, which this subclass intentionally skips.
+        self.use_attn_reduce_scatter_for_moe = False
 
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
@@ -927,9 +936,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     output=self_attention_output,
                 )
             elif self.layer_type == "full_attention":
-                self.self_attn(
+                # Qwen3NextAttention moved to the upstream return-value
+                # contract (no output buffer argument).
+                self_attention_output[:] = self.self_attn(
                     hidden_states=hidden_states,
-                    output=self_attention_output,
                     positions=positions,
                 )
             else:
@@ -1025,6 +1035,11 @@ class Qwen3_5Model(Qwen3NextModel):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
+            Qwen3NextSparseMoeBlock,
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -1061,6 +1076,17 @@ class Qwen3_5Model(Qwen3NextModel):
         return loaded_local_expert
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
+        # shared expert into the extra fused slot only when AITER FSE is both
+        # requested and compatible with the quant spec.
+        if "moe" in self.config.model_type:
+            weights = maybe_fuse_shared_experts(
+                weights,
+                fused_shared_expert_layers=self.fused_shared_expert_layers,
+                n_routed_experts=self.config.num_experts,
+                n_shared_experts=1,
+                ckpt_prefix="mlp.shared_expert",
+            )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # self attention

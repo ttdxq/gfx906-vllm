@@ -1,13 +1,14 @@
 // copied and adapted from
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_cuda_t vec_dot_q_cuda>
+          vec_dot_q_cuda_t vec_dot_q_cuda, int LANES = 0, bool INDIRECT = false>
 static __global__ void moe_vec_q(const void* __restrict__ vx,
                                  const void* __restrict__ vy,
                                  scalar_t* __restrict__ dst,
                                  const int* topk_ids, const int topk,
                                  const int ncols, const int nrows,
-                                 const int token_stride) {
+                                 const int token_stride,
+                                 const int64_t* expert_ptrs = nullptr) {
   const auto row = blockIdx.x * blockDim.y + threadIdx.y;
 
   const auto token = blockIdx.z / topk;
@@ -18,12 +19,18 @@ static __global__ void moe_vec_q(const void* __restrict__ vx,
   }
 
   const int blocks_per_row = ncols / qk;
-  const int blocks_per_warp = vdr * WARP_SIZE / qi;
+  const int row_lanes = LANES > 0 ? LANES : WARP_SIZE;
+  const int blocks_per_warp = vdr * row_lanes / qi;
 
   // partial sum for each thread
   float tmp = 0.0f;
 
-  const block_q_t* x = ((const block_q_t*)vx) + expert * nrows * blocks_per_row;
+  const block_q_t* x;
+  if constexpr (INDIRECT) {
+    x = reinterpret_cast<const block_q_t*>(expert_ptrs[expert]);
+  } else {
+    x = ((const block_q_t*)vx) + expert * nrows * blocks_per_row;
+  }
   const block_q8_1* y =
       (const block_q8_1*)(((const int*)vy) + token * token_stride);
 
@@ -43,13 +50,50 @@ static __global__ void moe_vec_q(const void* __restrict__ vx,
 
   // sum up partial sums and write back result
 #pragma unroll
-  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+  for (int mask = row_lanes / 2; mask > 0; mask >>= 1) {
     tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
   }
 
   if (threadIdx.x == 0) {
     dst[blockIdx.z * nrows + row] = tmp;
   }
+}
+
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda>
+static bool try_moe_vec_small_k(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    int top_k, int tokens, int ncols, int nrows, int token_stride,
+    cudaStream_t stream) {
+#ifdef USE_ROCM
+  const char* enabled = std::getenv("VLLM_GGUF_MOE_SMALL_K_SUBWARP");
+  const int active_lanes = (ncols / qk) * (qi / vdr);
+  if ((enabled != nullptr && enabled[0] != '1') || qk != 32 || ncols <= 0 ||
+      ncols % qk != 0 || active_lanes > 32 ||
+      std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+              .find("gfx906") != 0) {
+    return false;
+  }
+  // Keep 128 threads per CTA while packing independent short rows into
+  // subwarps. Each row fits in one iteration, so the discarded lanes in
+  // the 64-lane reference contributed only zeros to its reduction.
+  const int lanes = active_lanes <= 16 ? 16 : 32;
+  const int rows = 128 / lanes;
+  const dim3 grid((nrows + rows - 1) / rows, 1, tokens * top_k);
+  const dim3 block(lanes, rows, 1);
+  if (lanes == 16) {
+    moe_vec_q<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 16>
+        <<<grid, block, 0, stream>>>(
+            vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+  } else {
+    moe_vec_q<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 32>
+        <<<grid, block, 0, stream>>>(
+            vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+  }
+  return true;
+#else
+  return false;
+#endif
 }
 
 template <typename scalar_t>
@@ -119,11 +163,32 @@ static void moe_vec_q8_0_q8_1_cuda(const void* vx, const void* vy,
                                    const int ncols, const int nrows,
                                    const int token_stride,
                                    cudaStream_t stream) {
+  if (try_moe_vec_small_k<scalar_t, QK8_0, QI8_0, block_q8_0,
+                          VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
+          vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride,
+          stream)) {
+    return;
+  }
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
   moe_vec_q<scalar_t, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ,
             vec_dot_q8_0_q8_1><<<block_nums, block_dims, 0, stream>>>(
+      vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+}
+
+template <typename scalar_t>
+static void moe_vec_q2_0_q8_1_cuda(const void* vx, const void* vy,
+                                   scalar_t* dst, const int* topk_ids,
+                                   const int top_k, const int tokens,
+                                   const int ncols, const int nrows,
+                                   const int token_stride,
+                                   cudaStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, 1, tokens * top_k);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  moe_vec_q<scalar_t, QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ,
+            vec_dot_q2_0_q8_1><<<block_nums, block_dims, 0, stream>>>(
       vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
 }
 
@@ -299,6 +364,12 @@ static void moe_vec_iq4_nl_q8_1_cuda(const void* vx, const void* vy,
                                      const int ncols, const int nrows,
                                      const int token_stride,
                                      cudaStream_t stream) {
+  if (try_moe_vec_small_k<scalar_t, QK4_NL, QI4_NL, block_iq4_nl,
+                          VDR_Q4_0_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1>(
+          vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride,
+          stream)) {
+    return;
+  }
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
@@ -330,6 +401,19 @@ static void moe_vec_iq3_s_q8_1_cuda(const void* vx, const void* vy,
                                     const int ncols, const int nrows,
                                     const int token_stride,
                                     cudaStream_t stream) {
+#ifdef USE_ROCM
+  const char* lut_env = std::getenv("VLLM_GGUF_MOE_IQ3_S_LUT");
+  if ((lut_env == nullptr || lut_env[0] == '1') &&
+      std::string(at::cuda::getCurrentDeviceProperties()->gcnArchName)
+              .find("gfx906") == 0) {
+    const dim3 grid((nrows + 3) / 4, 1, tokens * top_k);
+    mul_mat_vec_iq_lut<scalar_t, 1, 3, true, true>
+        <<<grid, 256, 0, stream>>>(
+            (const uint8_t*)vx, (const block_q8_1*)vy, dst, ncols,
+            nrows, nrows, topk_ids, top_k, token_stride);
+    return;
+  }
+#endif
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);

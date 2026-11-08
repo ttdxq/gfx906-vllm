@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from functools import lru_cache
+from threading import Lock
 from types import MappingProxyType
 from typing import Any, Optional
 
@@ -13,16 +15,18 @@ import torch.nn as nn
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
-)
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoEMethodBase,
-    RoutedExperts,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -33,6 +37,11 @@ from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from vllm.model_executor.layers.quantization.gguf_moe_staging import (
+    GGUFMoEStaging,
+    get_gguf_moe_staging,
+    use_gfx906_qwen4exp_decode_defaults,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -73,9 +82,7 @@ ENABLE_GGUF_SIGMOID_GATED_OUT_PROJ_MMVQ = _env_flag(
 ENABLE_GGUF_Q8_0_FAST_MMVQ = _env_flag("VLLM_GGUF_Q8_0_FAST_MMVQ", False)
 ENABLE_GGUF_SHARED_ACTIVATION = os.getenv("VLLM_GGUF_SHARED_ACTIVATION", "0") == "1"
 ENABLE_GGUF_Q8_1_BUFFER_CACHE = _env_flag("VLLM_GGUF_Q8_1_BUFFER_CACHE", True)
-ENABLE_GGUF_SINGLE_MMVQ_Q8_CACHE = _env_flag(
-    "VLLM_GGUF_SINGLE_MMVQ_Q8_CACHE", False
-)
+ENABLE_GGUF_SINGLE_MMVQ_Q8_CACHE = _env_flag("VLLM_GGUF_SINGLE_MMVQ_Q8_CACHE", False)
 ENABLE_GGUF_GROUPED_MMVQ_OUTPUT_CACHE = _env_flag(
     "VLLM_GGUF_GROUPED_MMVQ_OUTPUT_CACHE", False
 )
@@ -88,30 +95,21 @@ ENABLE_GGUF_COALESCE_SAME_TYPE_SHARDS = _env_flag(
 # Keep the legacy zero-padded concat parameter for mixed-width merged GGUF
 # layers (set VLLM_GGUF_MERGED_PADDED=1 to restore the old memory layout).
 ENABLE_GGUF_MERGED_PADDED_COMPAT = _env_flag("VLLM_GGUF_MERGED_PADDED", False)
-ENABLE_GGUF_SHARDED_MMVQ_Q8_CACHE = _env_flag(
-    "VLLM_GGUF_SHARDED_MMVQ_Q8_CACHE", True
-)
-ENABLE_GGUF_GROUPED_SAME_TYPE_MMVQ = _env_flag(
-    "VLLM_GGUF_GROUPED_SAME_TYPE_MMVQ", True
-)
+ENABLE_GGUF_SHARDED_MMVQ_Q8_CACHE = _env_flag("VLLM_GGUF_SHARDED_MMVQ_Q8_CACHE", True)
+ENABLE_GGUF_GROUPED_SAME_TYPE_MMVQ = _env_flag("VLLM_GGUF_GROUPED_SAME_TYPE_MMVQ", True)
+ENABLE_GGUF_IQ_MOE_MMQ = _env_flag("VLLM_GGUF_IQ_MOE_MMQ", True)
 ENABLE_GGUF_QKV3_MMVQ = _env_flag("VLLM_GGUF_QKV3_MMVQ", False)
-ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2 = _env_flag(
-    "VLLM_GGUF_MOE_HOST_FUSED_ACT_W2", True
-)
+ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2 = _env_flag("VLLM_GGUF_MOE_HOST_FUSED_ACT_W2", True)
 ENABLE_GGUF_GFX906_SMALL_BATCH_MMVQ = _env_flag(
     "VLLM_GGUF_GFX906_SMALL_BATCH_MMVQ", True
 )
 ENABLE_GGUF_LINEAR_PROFILE = _env_flag("VLLM_GGUF_LINEAR_PROFILE", False)
-ENABLE_GGUF_FORCE_DEQUANT_MATMUL = _env_flag(
-    "VLLM_GGUF_FORCE_DEQUANT_MATMUL", False
-)
+ENABLE_GGUF_FORCE_DEQUANT_MATMUL = _env_flag("VLLM_GGUF_FORCE_DEQUANT_MATMUL", False)
 # The repack doubles iq4_xs weight bytes (x2.09 VRAM) and its q8_0 decode
 # speed only reaches ~300-360 GB/s of effective (original-byte) bandwidth on
 # gfx906, below the native iq4_xs paths (~440-600 GB/s). Off by default; set
 # VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0=1 to restore the repacked layout.
-ENABLE_GGUF_REPACK_IQ4_XS_TO_Q8_0 = _env_flag(
-    "VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0", False
-)
+ENABLE_GGUF_REPACK_IQ4_XS_TO_Q8_0 = _env_flag("VLLM_GGUF_REPACK_IQ4_XS_TO_Q8_0", False)
 
 _GGUF_Q8_1_BUFFER_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
 _GGUF_TENSOR_BUFFER_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
@@ -194,11 +192,13 @@ _GGUF_PLANAR_K_TYPE_SIZES = {
 
 @lru_cache(maxsize=1)
 def _gguf_planar_k_types() -> frozenset:
-    default = frozenset({
-        int(WeightType.Q4_K),
-        int(WeightType.Q5_K),
-        int(WeightType.Q6_K),
-    })
+    default = frozenset(
+        {
+            int(WeightType.Q4_K),
+            int(WeightType.Q5_K),
+            int(WeightType.Q6_K),
+        }
+    )
     raw = os.getenv("VLLM_GGUF_KQUANT_PLANAR_TYPES")
     if not raw:
         return default
@@ -225,7 +225,6 @@ def _qkv3_mmvq_planar_safe(qweight_types: list[int]) -> bool:
     return qweight_types[0] not in packed and qweight_types[2] not in packed
 
 
-
 @lru_cache(maxsize=1)
 def _gguf_repack_iq4_xs_to_q8_0_enabled() -> bool:
     if not ENABLE_GGUF_REPACK_IQ4_XS_TO_Q8_0:
@@ -243,6 +242,17 @@ def _gguf_repack_iq4_xs_to_q8_0_enabled() -> bool:
 @lru_cache(maxsize=1)
 def _gguf_moe_mmq_min_tokens() -> int:
     return max(1, _env_int("VLLM_GGUF_MOE_MMQ_MIN_TOKENS", 5))
+
+
+@lru_cache(maxsize=1)
+def _gguf_iq_moe_mmq_min_tokens() -> int:
+    default = 256
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx906
+
+        if on_gfx906():
+            default = 192
+    return max(1, _env_int("VLLM_GGUF_IQ_MOE_MMQ_MIN_TOKENS", default))
 
 
 @lru_cache(maxsize=1)
@@ -379,7 +389,6 @@ def _gguf_linear_profile_hit(
 
 
 class _GGUFMoeTimer:
-
     def __init__(
         self,
         path: str,
@@ -455,6 +464,84 @@ class _GGUFMoeTimer:
 
 def _gguf_q8_1_packed_cols(cols: int) -> int:
     return ((cols + 511) // 512 * 512) // 32 * 9
+
+
+class _GGUFMoEWorkspace:
+    """One prefill scratch allocation per execution slot, shared across layers."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.buffer: torch.Tensor | None = None
+        self.done: torch.cuda.Event | None = None
+        self.lock = Lock()
+
+    @contextmanager
+    def lease(
+        self, x: torch.Tensor, rows: int, top_k: int, allow_growth: bool
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor] | None]:
+        tokens, cols = x.shape
+        output_bytes = tokens * top_k * rows * x.element_size()
+        quant_offset = (output_bytes + 255) // 256 * 256
+        quant_cols = _gguf_q8_1_packed_cols(cols)
+        size = quant_offset + tokens * quant_cols * 4
+        with self.lock:
+            if self.buffer is None or self.buffer.numel() < size:
+                if not allow_growth:
+                    yield None
+                    return
+                self.buffer = torch.empty(size, dtype=torch.uint8, device=self.device)
+            stream = torch.cuda.current_stream(self.device)
+            if self.done is not None:
+                stream.wait_event(self.done)
+            self.buffer.record_stream(stream)
+            output = self.buffer[:output_bytes].view(x.dtype).view(tokens * top_k, rows)
+            quant_x = self.buffer[quant_offset:size].view(torch.int32).view(
+                tokens, quant_cols
+            )
+            try:
+                yield output, quant_x
+            finally:
+                if self.done is None:
+                    self.done = torch.cuda.Event()
+                self.done.record(stream)
+
+
+@contextmanager
+def _gguf_moe_prefill_workspace(
+    x: torch.Tensor, w1: torch.Tensor, top_k: int, qweight_type: int
+) -> Iterator[tuple[torch.Tensor, torch.Tensor] | None]:
+    if (
+        x.shape[0] <= 4
+        or not ENABLE_GGUF_Q8_1_BUFFER_CACHE
+        or not x.is_cuda
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        yield None
+        return
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    if not is_workspace_manager_initialized():
+        yield None
+        return
+    manager = current_workspace_manager()
+    # Register during warmup even when W1 uses MMQ; runtime tails may use MMVQ.
+    try:
+        workspace = manager.get_persistent_resource(
+            _GGUFMoEWorkspace, lambda: _GGUFMoEWorkspace(x.device)
+        )
+    except AssertionError:
+        if not manager.is_locked():
+            raise
+        yield None
+        return
+    if _gguf_moe_use_mmq(qweight_type, x.shape[0]):
+        yield None
+        return
+    with workspace.lease(x, w1.shape[1], top_k, not manager.is_locked()) as buffers:
+        yield buffers
 
 
 def _get_gguf_q8_1_buffer(
@@ -583,10 +670,12 @@ def _gguf_moe_q8_vec_weighted_sum_cached(
     num_tokens: int,
     col: int,
     dtype: torch.dtype,
+    cache_owner: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if hasattr(torch.ops._C, "ggml_moe_q8_vec_weighted_sum_out"):
+        owner_ptr = w2.data_ptr() if cache_owner is None else cache_owner.data_ptr()
         output = _get_gguf_tensor_buffer(
-            ("_gguf_moe_w2_weighted_sum", w2.data_ptr(), row, num_tokens),
+            ("_gguf_moe_w2_weighted_sum", owner_ptr, row, num_tokens),
             (num_tokens, row),
             dtype,
             w2.device,
@@ -627,21 +716,31 @@ def _gguf_moe_a8_vec_cached(
     qweight_type: int,
     row: int,
     num_tokens: int,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if hasattr(torch.ops._C, "ggml_moe_a8_vec_out"):
-        output = _get_gguf_tensor_buffer(
-            ("_gguf_moe_w1_out", w1.data_ptr(), row, num_tokens, top_k),
-            (num_tokens * top_k, row),
-            x.dtype,
-            x.device,
-        )
-        quant_x = _get_gguf_q8_1_buffer(
-            None,
-            ("_gguf_moe_w1_quant_x", w1.data_ptr(), num_tokens, x.shape[1]),
-            num_tokens,
-            x.shape[1],
-            x.device,
-        )
+        if workspace is not None:
+            output, quant_x = workspace
+        elif num_tokens > 4 and not torch.cuda.is_current_stream_capturing():
+            # Unwarmed shapes use temporary storage rather than retaining a
+            # buffer for every layer and tail size. Decode/capture keep theirs.
+            return ops.ggml_moe_a8_vec(
+                x, w1, topk_ids, top_k, qweight_type, row, num_tokens
+            )
+        else:
+            output = _get_gguf_tensor_buffer(
+                ("_gguf_moe_w1_out", w1.data_ptr(), row, num_tokens, top_k),
+                (num_tokens * top_k, row),
+                x.dtype,
+                x.device,
+            )
+            quant_x = _get_gguf_q8_1_buffer(
+                None,
+                ("_gguf_moe_w1_quant_x", w1.data_ptr(), num_tokens, x.shape[1]),
+                num_tokens,
+                x.shape[1],
+                x.device,
+            )
         if output is not None and quant_x is not None:
             ops.ggml_moe_a8_vec_out(
                 x,
@@ -869,16 +968,51 @@ IQ_MMQ_QUANT_TYPES = {
     WeightType.IQ3_S,
     WeightType.IQ4_NL,
 }
-DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
+# Q2_0 (GGML type 42): 2-bit single-scale blocks. The dequant, MoE vec
+# (MMVQ) and grouped MoE MMQ kernels all exist; dense MMQ does not, so Q2_0
+# stays out of MMQ_QUANT_TYPES but MoE layers take the grouped MMQ path for
+# prefill batches.
+Q2_0_QUANT_TYPES = {WeightType.Q2_0}
+DEQUANT_TYPES = (
+    STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | Q2_0_QUANT_TYPES
+)
+MMVQ_QUANT_TYPES = (
+    STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | Q2_0_QUANT_TYPES
+)
 # Q8_1 is an activation format here; native weight kernels do not support it.
 MMQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | {WeightType.IQ4_XS} | IQ_MMQ_QUANT_TYPES
 )
+# These formats share the normalized IQ tile loaders with dense MMQ.
+IQ_MOE_MMQ_QUANT_TYPES = {
+    WeightType.IQ2_XS,
+    WeightType.IQ2_S,
+    WeightType.IQ3_XXS,
+    WeightType.IQ3_S,
+    WeightType.IQ4_XS,
+    WeightType.IQ4_NL,
+}
+MOE_MMQ_QUANT_TYPES = (
+    STANDARD_QUANT_TYPES
+    | KQUANT_TYPES
+    | IQ_MOE_MMQ_QUANT_TYPES
+    | Q2_0_QUANT_TYPES
+)
 
 
-def _iq_mmq_beats_dequant(x: torch.Tensor, qweight: torch.Tensor,
-                          qweight_type: int) -> bool:
+def _gguf_moe_use_mmq(qweight_type: int, num_tokens: int) -> bool:
+    if qweight_type not in MOE_MMQ_QUANT_TYPES:
+        return False
+    if num_tokens < _gguf_moe_mmq_min_tokens():
+        return False
+    return qweight_type not in IQ_MOE_MMQ_QUANT_TYPES or (
+        ENABLE_GGUF_IQ_MOE_MMQ and num_tokens >= _gguf_iq_moe_mmq_min_tokens()
+    )
+
+
+def _iq_mmq_beats_dequant(
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+) -> bool:
     """Shape gate for the i-quant MMQ kernels.
 
     gfx906 measurements at 256/2048-token batches: the dp4a MMQ kernels beat
@@ -906,10 +1040,24 @@ def _fused_mul_mat_gguf(
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
+        if (
+            envs.VLLM_QWEN4EXP_GDN_OUT_PROJ_GEMV
+            and current_platform.is_rocm()
+            and x.ndim == 2
+            and x.shape[0] <= 4
+            and x.shape[1] == 3072
+            and qweight.shape == (2560, 3072)
+            and x.dtype == qweight.dtype == torch.float16
+            and x.device == qweight.device
+            and x.stride(1) == qweight.stride(1) == 1
+            and hasattr(torch.ops.vllm, "qwen4_exp_gemv_gfx906")
+        ):
+            from vllm.platforms.rocm import on_gfx906
+
+            if on_gfx906():
+                return torch.ops.vllm.qwen4_exp_gemv_gfx906(x, qweight)
         if ENABLE_GGUF_LINEAR_PROFILE:
-            _gguf_linear_profile_hit(
-                "single_unquantized", x, [qweight], [qweight_type]
-            )
+            _gguf_linear_profile_hit("single_unquantized", x, [qweight], [qweight_type])
         return x @ qweight.T
     if ENABLE_GGUF_FORCE_DEQUANT_MATMUL:
         if ENABLE_GGUF_LINEAR_PROFILE:
@@ -1081,10 +1229,7 @@ def _mmvq_safe_batch(qweight: torch.Tensor, qweight_type: int) -> int:
     if qweight_type in IMATRIX_QUANT_TYPES:
         cap = 8 if qweight.shape[0] > 5120 else 16
     elif qweight.shape[0] > 5120:
-        if (
-            qweight_type in MMQ_QUANT_TYPES
-            and _gguf_gfx906_small_batch_mmvq_enabled()
-        ):
+        if qweight_type in MMQ_QUANT_TYPES and _gguf_gfx906_small_batch_mmvq_enabled():
             if qweight_type in {WeightType.Q4_0, WeightType.Q4_1, WeightType.Q4_K}:
                 cap = _gguf_gfx906_q4_mmvq_max_batch()
             elif qweight_type == WeightType.Q6_K:
@@ -1524,9 +1669,7 @@ def try_grouped_gguf_linear_mmvq(
     if x.shape[0] > mmvq_max_batch:
         return None
 
-    quant_x = _quantize_row_q8_1_cached(
-        x, layers[0], "_gguf_grouped_mmvq_quant_x"
-    )
+    quant_x = _quantize_row_q8_1_cached(x, layers[0], "_gguf_grouped_mmvq_quant_x")
     out = _get_grouped_mmvq_output_buffer(
         "_gguf_grouped_mmvq_output",
         qweights,
@@ -1562,9 +1705,7 @@ def try_grouped_gguf_linear_mmvq(
                 qweight_types,
                 grouped_same_type=False,
             )
-        if out is not None and hasattr(
-            torch.ops._C, "ggml_mul_mat_vec_q8_sharded_out"
-        ):
+        if out is not None and hasattr(torch.ops._C, "ggml_mul_mat_vec_q8_sharded_out"):
             ops.ggml_mul_mat_vec_q8_sharded_out(
                 qweights, quant_x, out, qweight_types, x.shape[1]
             )
@@ -1635,7 +1776,9 @@ def try_gguf_silu_and_mul_down_mmvq(
             gate_up.device,
         )
         if out is not None and hasattr(torch.ops._C, "ggml_mul_mat_vec_q8_sharded_out"):
-            ops.ggml_mul_mat_vec_q8_sharded_out(qweights, quant_out, out, qweight_types, col)
+            ops.ggml_mul_mat_vec_q8_sharded_out(
+                qweights, quant_out, out, qweight_types, col
+            )
         else:
             out = _fused_mul_mat_gguf_sharded_mmvq_q8(
                 quant_out, qweights, qweight_types, col, gate_up.dtype
@@ -1843,6 +1986,110 @@ def _fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    w1_offloaded: bool = False,
+    w2_offloaded: bool = False,
+    expert_cache_default: bool = False,
+    expert_cache_decode_tokens: int = 1,
+) -> torch.Tensor:
+    if (
+        os.getenv("VLLM_GGUF_MOE_EXPERT_CACHE", str(int(expert_cache_default))) == "1"
+        and w1_offloaded
+        and w2_offloaded
+        and qweight_type in (6, 8, 18, 20, 21, 23)
+        and qweight_type2 in (6, 8, 18, 20, 21, 23)
+        and activation == "silu"
+        and w1.is_contiguous()
+        and w2.is_contiguous()
+        and topk_ids.dtype == torch.int32
+        and current_platform.is_rocm()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        from vllm.model_executor.layers.quantization.gguf_moe_expert_cache import (
+            get_gguf_expert_cache,
+        )
+        from vllm.platforms.rocm import on_gfx906
+
+        if on_gfx906():
+            entry = get_gguf_expert_cache(x.device).observe(
+                w1, w2, topk_ids, expert_cache_decode_tokens
+            )
+            if entry is not None:
+                num_tokens = x.shape[0]
+                top_k = topk_ids.shape[1]
+                quant_x = _quantize_row_q8_1_cached(
+                    x, None, ("_gguf_expert_cache_x", w1.data_ptr())
+                )
+                out = torch.ops._C.ggml_moe_q8_vec_indirect(
+                    quant_x,
+                    entry.pointers[0],
+                    topk_ids,
+                    qweight_type,
+                    w1.shape[1],
+                    num_tokens,
+                    x.shape[1],
+                    x.dtype,
+                )
+                quant_out = _silu_and_mul_quantize_row_q8_1_cached(
+                    out, None, ("_gguf_expert_cache_act", w2.data_ptr())
+                )
+                top_k = topk_ids.shape[1]
+                out = torch.ops._C.ggml_moe_q8_vec_indirect(
+                    quant_out,
+                    entry.pointers[1],
+                    topk_ids.reshape(-1, 1),
+                    qweight_type2,
+                    w2.shape[1],
+                    num_tokens * top_k,
+                    out.shape[1] // 2,
+                    x.dtype,
+                ).view(num_tokens, top_k, w2.shape[1])
+                output = torch.empty_like(x)
+                ops.moe_weighted_sum(out, topk_weights, output)
+                return output
+    staging = get_gguf_moe_staging(x, w1, w2, topk_ids, w1_offloaded, w2_offloaded)
+    with ExitStack() as stack:
+        workspace = stack.enter_context(
+            _gguf_moe_prefill_workspace(x, w1, topk_ids.shape[1], qweight_type)
+        )
+        if staging is not None:
+            stack.enter_context(
+                staging.lease(
+                    topk_ids,
+                    w1.shape[0],
+                    compact=staging.can_compact(
+                        w1, w2, w1_offloaded, w2_offloaded
+                    ),
+                )
+            )
+        return _fused_moe_gguf_impl(
+            x,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            qweight_type,
+            qweight_type2,
+            activation,
+            staging,
+            w1_offloaded,
+            w2_offloaded,
+            workspace,
+        )
+
+
+def _fused_moe_gguf_impl(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    qweight_type: int,
+    qweight_type2: int,
+    activation: str,
+    staging: GGUFMoEStaging | None = None,
+    w1_offloaded: bool = False,
+    w2_offloaded: bool = False,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     (
         use_weighted_sum,
@@ -1851,6 +2098,9 @@ def _fused_moe_gguf(
         use_fused_w2_weighted_sum,
         fused_w2_weighted_sum_max_topk,
     ) = _gguf_moe_runtime_config()
+
+    if staging is not None:
+        topk_ids = staging.remap_topk_ids(topk_ids)
 
     def reduce_expert_outputs(out: torch.Tensor, output: torch.Tensor) -> None:
         if use_weighted_sum:
@@ -1873,17 +2123,20 @@ def _fused_moe_gguf(
             raise ValueError(f"Unsupported activation: {activation}")
         return out
 
-    # unless we decent expert reuse we are better off running moe_vec kernel
+    w1_mmq = _gguf_moe_use_mmq(qweight_type, x.shape[0])
+    w2_mmq = _gguf_moe_use_mmq(qweight_type2, x.shape[0])
     if (
-        qweight_type2 in MMQ_QUANT_TYPES
-        and qweight_type in MMQ_QUANT_TYPES
-        and x.shape[0] >= _gguf_moe_mmq_min_tokens()
+        (w1_mmq or w2_mmq)
+        and qweight_type in MMVQ_QUANT_TYPES
+        and qweight_type2 in MMVQ_QUANT_TYPES
     ):
         # lazy import to avoid triggering triton import in CPU/backend decode paths
         from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
+        if staging is not None:
+            E = staging.effective_expert_count(E)
         top_k = topk_ids.shape[1]
         _gguf_moe_profile_hit(
             "mmq_prefill",
@@ -1899,39 +2152,56 @@ def _fused_moe_gguf(
             qweight_type,
             qweight_type2,
         )
-        BLOCK_SIZE = ops.ggml_moe_get_block_size(qweight_type)
+        alignments: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = timer.record(
-            "align",
-            lambda: moe_align_block_size(topk_ids, BLOCK_SIZE, E),
-        )
+        def mmq(inp, weight, weight_type, offloaded, product_top_k, tokens):
+            block_size = ops.ggml_moe_get_block_size(weight_type)
+            if block_size not in alignments:
+                alignments[block_size] = timer.record(
+                    "align", lambda: moe_align_block_size(topk_ids, block_size, E)
+                )
+            return ops.ggml_moe_a8(
+                inp,
+                staging.stage(weight, offloaded) if staging is not None else weight,
+                *alignments[block_size],
+                weight_type,
+                weight.shape[1],
+                product_top_k,
+                tokens,
+            )
+
         out = timer.record(
             "w1",
-            lambda: ops.ggml_moe_a8(
-                x,
-                w1,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                qweight_type,
-                N,
-                top_k,
-                num_tokens,
+            lambda: (
+                mmq(x, w1, qweight_type, w1_offloaded, top_k, num_tokens)
+                if w1_mmq
+                else _gguf_moe_a8_vec_cached(
+                    x,
+                    staging.stage(w1, w1_offloaded) if staging is not None else w1,
+                    topk_ids,
+                    top_k,
+                    qweight_type,
+                    N,
+                    num_tokens,
+                    workspace,
+                )
             ),
         )
         out = timer.record("act", lambda: act(out))
         out = timer.record(
             "w2",
-            lambda: ops.ggml_moe_a8(
-                out,
-                w2,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                qweight_type2,
-                w2.shape[1],
-                1,
-                num_tokens * top_k,
+            lambda: (
+                mmq(out, w2, qweight_type2, w2_offloaded, 1, num_tokens * top_k)
+                if w2_mmq
+                else ops.ggml_moe_a8_vec(
+                    out,
+                    staging.stage(w2, w2_offloaded) if staging is not None else w2,
+                    topk_ids,
+                    1,
+                    qweight_type2,
+                    w2.shape[1],
+                    num_tokens * top_k,
+                )
             ),
         )
         out = out.reshape(num_tokens, top_k, w2.shape[1])
@@ -1949,7 +2219,9 @@ def _fused_moe_gguf(
         ) = _gguf_moe_ops_available()
 
         if (
-            ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2
+            staging is None
+            and (num_tokens <= 4 or torch.cuda.is_current_stream_capturing())
+            and ENABLE_GGUF_MOE_HOST_FUSED_ACT_W2
             and use_fused_act_quant
             and use_fused_w2_weighted_sum
             and activation == "silu"
@@ -2000,7 +2272,14 @@ def _fused_moe_gguf(
         out = timer.record(
             "w1",
             lambda: _gguf_moe_a8_vec_cached(
-                x, w1, topk_ids, top_k, qweight_type, N, num_tokens
+                x,
+                staging.stage(w1, w1_offloaded) if staging is not None else w1,
+                topk_ids,
+                top_k,
+                qweight_type,
+                N,
+                num_tokens,
+                workspace,
             ),
         )
         if (
@@ -2040,7 +2319,7 @@ def _fused_moe_gguf(
                     "w2_weighted_sum",
                     lambda: _gguf_moe_q8_vec_weighted_sum_cached(
                         quant_out,
-                        w2,
+                        staging.stage(w2, w2_offloaded) if staging is not None else w2,
                         topk_ids,
                         topk_weights,
                         top_k,
@@ -2049,6 +2328,7 @@ def _fused_moe_gguf(
                         num_tokens,
                         out.shape[-1] // 2,
                         x.dtype,
+                        cache_owner=w2,
                     ),
                 )
                 timer.report()
@@ -2065,7 +2345,7 @@ def _fused_moe_gguf(
                     "w2_vec",
                     lambda: ops.ggml_moe_q8_vec(
                         quant_out,
-                        w2,
+                        staging.stage(w2, w2_offloaded) if staging is not None else w2,
                         topk_ids,
                         1,
                         qweight_type2,
@@ -2088,7 +2368,7 @@ def _fused_moe_gguf(
                 "w2",
                 lambda: ops.ggml_moe_a8_vec(
                     out,
-                    w2,
+                    staging.stage(w2, w2_offloaded) if staging is not None else w2,
                     topk_ids,
                     1,
                     qweight_type2,
@@ -2144,6 +2424,10 @@ def _fused_moe_gguf_fake(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    w1_offloaded: bool = False,
+    w2_offloaded: bool = False,
+    expert_cache_default: bool = False,
+    expert_cache_decode_tokens: int = 1,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -2519,9 +2803,11 @@ class GGUFLinearMethod(LinearMethodBase):
                 # tensors to the shard cache as the single resident copy.
                 cache = {}
                 for idx in shard_id:
-                    shard = data_container[shard_id_map[idx]].to(
-                        device=qweight.device
-                    ).contiguous()
+                    shard = (
+                        data_container[shard_id_map[idx]]
+                        .to(device=qweight.device)
+                        .contiguous()
+                    )
                     cache[idx] = shard
                 qweight.data_container.clear()
                 layer._gguf_shard_cache = cache
@@ -2596,13 +2882,10 @@ class GGUFLinearMethod(LinearMethodBase):
                     ):
                         type_size = _GGUF_PLANAR_K_TYPE_SIZES[shard_type]
                         col = shard.shape[1] // type_size * 256
-                        if (
-                            col % 256 == 0
-                            and col > 0
-                            and shard.shape[0] > 0
-                        ):
+                        if col % 256 == 0 and col > 0 and shard.shape[0] > 0:
                             cache[idx] = torch.ops._C.ggml_planar_pack(
-                                shard, shard_type, shard.shape[0], col)
+                                shard, shard_type, shard.shape[0], col
+                            )
             return
 
         cache = {}
@@ -2617,9 +2900,11 @@ class GGUFLinearMethod(LinearMethodBase):
         # original block-layout qweight (_get_full_mmvq_shard_weight takes
         # priority over the shard cache), so planar copies of their shards
         # would never be read and would only double the resident memory.
-        if pack_shard and _get_full_mmvq_shard_weight(
-            layer, list(shard_weight_type.values())
-        ) is not None:
+        if (
+            pack_shard
+            and _get_full_mmvq_shard_weight(layer, list(shard_weight_type.values()))
+            is not None
+        ):
             pack_shard = False
         all_packed = True
         for idx, (start, end, offset) in shard_offset_map.items():
@@ -2636,7 +2921,8 @@ class GGUFLinearMethod(LinearMethodBase):
                 col = shard.shape[1] // type_size * 256
                 if col % 256 == 0 and col > 0 and shard.shape[0] > 0:
                     shard = torch.ops._C.ggml_planar_pack(
-                        shard, shard_type, shard.shape[0], col)
+                        shard, shard_type, shard.shape[0], col
+                    )
                     packed_shard = True
             all_packed = all_packed and packed_shard
             cache[idx] = shard
@@ -2675,17 +2961,13 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             return
 
-        coalesced = _coalesce_adjacent_same_type_mmvq_shards(
-            qweights, qweight_types
-        )
+        coalesced = _coalesce_adjacent_same_type_mmvq_shards(qweights, qweight_types)
         if coalesced is not None:
             coalesced_qweights, coalesced_qweight_types = coalesced
             layer._gguf_coalesced_shards = (
                 coalesced_qweights,
                 coalesced_qweight_types,
-                _shared_mmvq_max_batch(
-                    coalesced_qweights, coalesced_qweight_types
-                ),
+                _shared_mmvq_max_batch(coalesced_qweights, coalesced_qweight_types),
             )
 
     def apply(
@@ -2740,9 +3022,7 @@ class GGUFLinearMethod(LinearMethodBase):
                 else:
                     profile_path = "sharded_mmvq"
                 if ENABLE_GGUF_LINEAR_PROFILE:
-                    _gguf_linear_profile_hit(
-                        profile_path, x, qweights, qweight_types
-                    )
+                    _gguf_linear_profile_hit(profile_path, x, qweights, qweight_types)
                 out = _fused_mul_mat_gguf_sharded_cached_mmvq(
                     x,
                     qweights,
@@ -2785,6 +3065,14 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     ):
         super().__init__(moe)
         self.quant_config = quant_config
+        vllm_config = get_current_vllm_config_or_none()
+        self._expert_cache_default = use_gfx906_qwen4exp_decode_defaults(vllm_config)
+        self._expert_cache_decode_tokens = 1
+        if vllm_config is not None:
+            self._expert_cache_decode_tokens = (
+                vllm_config.scheduler_config.max_num_seqs
+                * (1 + vllm_config.num_speculative_tokens)
+            )
 
     def create_weights(
         self,
@@ -2884,6 +3172,10 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             layer.w13_qweight_type.weight_type,
             layer.w2_qweight_type.weight_type,
             activation,
+            getattr(layer.w13_qweight, "_vllm_is_uva_offloaded", False),
+            getattr(layer.w2_qweight, "_vllm_is_uva_offloaded", False),
+            self._expert_cache_default,
+            self._expert_cache_decode_tokens,
         )
 
 
@@ -2907,3 +3199,12 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
 class GGUFUninitializedParameter(UninitializedParameter):
     cls_to_become = Parameter
     data_container: list[torch.Tensor]
+
+    def defer_cpu_offload(self, callback: Callable[[Parameter], bool]) -> None:
+        self._cpu_offload_callback = callback
+
+    def materialize(self, shape, device=None, dtype=None) -> None:
+        callback = self.__dict__.pop("_cpu_offload_callback", None)
+        super().materialize(shape, device=device, dtype=dtype)
+        if callback is not None:
+            callback(self)

@@ -144,7 +144,7 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
-@CustomOp.register("chunk_gated_delta_rule")
+@CustomOp.register("chunk_gated_delta_rule_gfx906")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
         super().__init__()
@@ -269,6 +269,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         create_in_proj_qkvz: bool = True,
         create_in_proj_ba: bool = True,
         gqa_interleaved_layout=False,
+        use_chunk_prefill_on_gfx906: bool = False,
     ) -> None:
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -298,6 +299,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             else 0
         )
         self.gqa_interleaved_layout = gqa_interleaved_layout
+        self.use_chunk_prefill_on_gfx906 = use_chunk_prefill_on_gfx906
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = ColumnParallelLinear(
@@ -382,6 +384,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             group_size=None,
             norm_before_gate=True,
             device=current_platform.current_device(),
+            activation=getattr(config, "output_gate_type", None) or "silu",
         )
 
         self.out_proj = RowParallelLinear(
@@ -544,6 +547,48 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
     def _uses_transposed_temporal_state(self) -> bool:
         return self.use_transposed_state_for_packed_decode
 
+    def _forward_chunk_prefill_gfx906(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        cached_state: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The FLA chunk kernels require one Q/K head per value head. The
+        # checkpoint and packed decode instead keep adjacent GQA groups.
+        head_ratio = value.shape[2] // query.shape[2]
+        if head_ratio > 1:
+            query = query.repeat_interleave(head_ratio, dim=2)
+            key = key.repeat_interleave(head_ratio, dim=2)
+
+        # Chunk state is KxV; the shared core's persistent cache is VxK.
+        # Explicit conversion also handles unequal K/V dimensions and keeps
+        # prefill -> packed decode and cached-prefix continuation consistent.
+        initial_state = cached_state
+        if not self._uses_transposed_temporal_state():
+            initial_state = initial_state.transpose(-1, -2)
+        initial_state = initial_state.contiguous()
+        initial_state.masked_fill_(~has_initial_state[:, None, None, None], 0)
+        output, final_state = self.chunk_gated_delta_rule(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            head_first=False,
+            use_qk_l2norm_in_kernel=False,
+        )
+        if not self._uses_transposed_temporal_state():
+            final_state = final_state.transpose(-1, -2)
+        return output, final_state
+
     def _can_use_empty_core_attn_out(self, num_tokens: int) -> bool:
         if not ENABLE_QWEN35_EMPTY_CORE_ATTN_OUT:
             return False
@@ -561,14 +606,24 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None = None,
     ):
         num_tokens = hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
+            if hasattr(self, "in_proj_ba"):
+                ba, _ = self.in_proj_ba(hidden_states)
+            else:
+                # Split projection construction: b and a come from their
+                # own linears (same [b; a] layout the merged ba projection
+                # produces).
+                b, _ = self.in_proj_b(hidden_states)
+                a, _ = self.in_proj_a(hidden_states)
+                ba = None
             if self.gqa_interleaved_layout:
+                if ba is None:
+                    ba = torch.cat([b, a], dim=-1)
                 mixed_qkv_grouped = mixed_qkv.view(
                     mixed_qkv.size(0),
                     self.num_k_heads // self.tp_size,
@@ -597,7 +652,8 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 mixed_qkv = torch.cat((query, key, value), dim=-1)
             else:
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
-                b, a = ba.chunk(2, dim=-1)
+                if ba is not None:
+                    b, a = ba.chunk(2, dim=-1)
                 b = b.contiguous()
                 a = a.contiguous()
         else:
@@ -652,7 +708,13 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens], _ = self.out_proj(core_attn_out)
+        projected, _ = self.out_proj(core_attn_out)
+        if output is None:
+            # Buffer-less callers (upstream DecoderLayer contract) receive
+            # the projection as the return value.
+            return projected
+        output[:num_tokens] = projected
+        return output
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
         if hasattr(self, "_prefill_kernels_warmed_up"):
@@ -961,6 +1023,9 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
+        recurrent_decode_state = ssm_state
+        if self._uses_transposed_temporal_state():
+            recurrent_decode_state = ssm_state.transpose(-1, -2)
         if split_non_spec:
             assert query_decode is not None
             assert key_decode is not None
@@ -973,7 +1038,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                 q=query_decode,
                 k=key_decode,
                 v=value_decode,
-                initial_state=ssm_state,
+                initial_state=recurrent_decode_state,
                 inplace_final_state=True,
                 cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
                 ssm_state_indices=non_spec_state_indices_tensor[
@@ -991,7 +1056,26 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
             assert prefill_query_start_loc is not None
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            if _is_gfx906_rocm():
+            if _is_gfx906_rocm() and getattr(
+                self, "use_chunk_prefill_on_gfx906", False
+            ):
+                assert g_non_spec is not None and beta_non_spec is not None
+                core_attn_out_non_spec, last_recurrent_state = (
+                    self._forward_chunk_prefill_gfx906(
+                        query_non_spec,
+                        key_non_spec,
+                        value_non_spec,
+                        g_non_spec,
+                        beta_non_spec,
+                        ssm_state[prefill_state_indices],
+                        prefill_has_initial_state,
+                        prefill_query_start_loc,
+                    )
+                )
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
+            elif _is_gfx906_rocm():
                 if spec_sequence_masks is not None:
                     a_non_spec = a.index_select(0, non_spec_token_indx)
                     b_non_spec = b.index_select(0, non_spec_token_indx)
@@ -1072,7 +1156,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    initial_state=ssm_state,
+                    initial_state=recurrent_decode_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor,
@@ -1087,7 +1171,7 @@ class GatedDeltaNetAttention(nn.Module, MambaBase):
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    initial_state=ssm_state,
+                    initial_state=recurrent_decode_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor,

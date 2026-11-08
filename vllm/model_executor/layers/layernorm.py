@@ -13,6 +13,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
 from vllm.platforms import current_platform
+from vllm.model_executor.utils import set_weight_attrs
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -383,6 +385,7 @@ class RMSNormGated(CustomOp):
     ) -> torch.Tensor:
         if (
             self._use_native_rocm_gfx90
+            and self.activation in ("silu", "swish")
             and z is not None
             and self.group_size is None
             and x.dim() == 2
@@ -405,28 +408,103 @@ class RMSNormGated(CustomOp):
                 self.norm_before_gate,
             )
 
-        if torch.compiler.is_compiling() or self._use_native_rocm_gfx90:
+        use_native = self._use_native_rocm_gfx90
+        if (
+            use_native
+            and self.activation == "sigmoid"
+            and self.group_size is None
+            and z is not None
+            and x.dim() >= 2
+            and x.numel() > 0
+            and x.shape == z.shape
+            and x.is_cuda
+            and z.is_cuda
+            and x.dtype == z.dtype == self.weight.dtype == torch.float16
+        ):
+            from vllm.platforms.rocm import on_gfx906
+
+            # Flash GDN uses [tokens, heads, head_dim] with a sigmoid gate.
+            use_native = not on_gfx906()
+            # Up to 16 TP2 GDN tokens; larger prefill uses the tiled FLA kernel.
+            if (
+                not use_native
+                and not torch.compiler.is_compiling()
+                and x.shape[-1] == 128
+                and x.numel() <= 384 * 128
+                and x.stride(-1) == z.stride(-1) == 1
+            ):
+                from vllm import _custom_ops as ops
+
+                return ops.rms_norm_gated_gfx906(
+                    x.reshape(-1, 128),
+                    self.weight,
+                    z.reshape(-1, 128),
+                    self.eps,
+                    self.norm_before_gate,
+                    sigmoid_gate=True,
+                ).reshape(x.shape)
+
+        if torch.compiler.is_compiling() or use_native:
             return self.forward_native(x, z)
 
-        from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
-            rmsnorm_fn,
-        )
-
-        return rmsnorm_fn(
+        return torch.ops.vllm.fla_rms_norm_gated(
             x,
+            z,
             self.weight,
-            self.bias,
-            z=z,
-            eps=self.eps,
-            group_size=self.group_size,
-            norm_before_gate=self.norm_before_gate,
-            activation=self.activation,
+            self.eps,
+            self.group_size,
+            self.norm_before_gate,
+            self.activation,
         )
 
     def forward_xpu(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         return self.forward_cuda(x, z)
+
+
+def _fla_rms_norm_gated(
+    x: torch.Tensor,
+    z: torch.Tensor | None,
+    weight: torch.Tensor,
+    eps: float,
+    group_size: int | None,
+    norm_before_gate: bool,
+    activation: str,
+) -> torch.Tensor:
+    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+        rmsnorm_fn,
+    )
+
+    return rmsnorm_fn(
+        x,
+        weight,
+        None,
+        z=z,
+        eps=eps,
+        group_size=group_size,
+        norm_before_gate=norm_before_gate,
+        activation=activation,
+    )
+
+
+def _fla_rms_norm_gated_fake(
+    x: torch.Tensor,
+    z: torch.Tensor | None,
+    weight: torch.Tensor,
+    eps: float,
+    group_size: int | None,
+    norm_before_gate: bool,
+    activation: str,
+) -> torch.Tensor:
+    return x.new_empty(x.shape)
+
+
+direct_register_custom_op(
+    op_name="fla_rms_norm_gated",
+    op_func=_fla_rms_norm_gated,
+    fake_impl=_fla_rms_norm_gated_fake,
+)
 
 
 class LayerNorm(nn.Module):

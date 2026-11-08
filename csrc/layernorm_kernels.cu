@@ -184,7 +184,8 @@ __global__ void rms_norm_gated_gfx906_kernel(
     scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
     const scalar_t* __restrict__ weight, const scalar_t* __restrict__ gate,
     const float epsilon, const int hidden_size, const int64_t input_stride,
-    const int64_t gate_stride, const bool norm_before_gate) {
+    const int64_t gate_stride, const bool norm_before_gate,
+    const bool sigmoid_gate) {
   __shared__ float s_variance;
   float variance = 0.0f;
 
@@ -196,7 +197,7 @@ __global__ void rms_norm_gated_gfx906_kernel(
     float x = static_cast<float>(input_row[idx]);
     if (!norm_before_gate) {
       float z = static_cast<float>(gate_row[idx]);
-      x *= z / (1.0f + expf(-z));
+      x *= (sigmoid_gate ? 1.0f : z) / (1.0f + expf(-z));
     }
     variance += x * x;
   }
@@ -214,7 +215,7 @@ __global__ void rms_norm_gated_gfx906_kernel(
   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
     float x = static_cast<float>(input_row[idx]);
     float z = static_cast<float>(gate_row[idx]);
-    const float gate_val = z / (1.0f + expf(-z));
+    const float gate_val = (sigmoid_gate ? 1.0f : z) / (1.0f + expf(-z));
     float val = norm_before_gate ? x * s_variance * gate_val
                                  : x * gate_val * s_variance;
     val *= static_cast<float>(weight[idx]);
@@ -405,7 +406,7 @@ torch::Tensor rms_norm_gated_gfx906(torch::Tensor input,    // [..., hidden_size
                                     torch::Tensor weight,   // [hidden_size]
                                     torch::Tensor gate,     // [..., hidden_size]
                                     double epsilon,
-                                    bool norm_before_gate) {
+                                    bool norm_before_gate, bool sigmoid_gate) {
   TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
   TORCH_CHECK(gate.is_cuda(), "gate must be a CUDA tensor");
   TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
@@ -442,7 +443,7 @@ torch::Tensor rms_norm_gated_gfx906(torch::Tensor input,    // [..., hidden_size
                                          weight.data_ptr<scalar_t>(),
                                          gate.data_ptr<scalar_t>(), epsilon,
                                          hidden_size, input_stride, gate_stride,
-                                         norm_before_gate);
+                                         norm_before_gate, sigmoid_gate);
                                });
   return out;
 }

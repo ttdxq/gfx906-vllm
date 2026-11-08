@@ -10,6 +10,7 @@ import gguf
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -45,7 +46,9 @@ from vllm.model_executor.model_loader.ep_weight_filter import (
 )
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
+from vllm.transformers_utils.gguf_utils import get_gguf_shard_files
 from vllm.transformers_utils.repo_utils import hf_api, hf_fs
+from vllm.utils.cpu_resource_utils import get_available_memory
 from vllm.utils.import_utils import PlaceholderModule
 
 try:
@@ -874,38 +877,69 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+def _local_snapshot_dirs(model_name_or_path: str, cache_dir: str | None) -> list[Path]:
+    """Snapshot directories of a cached repo, found from the cache layout alone.
+
+    Offline, snapshot_download() resolves a revision only through refs/<revision>,
+    which a cache seeded at a pinned commit does not have.
+    """
+    snapshots = (
+        Path(cache_dir or huggingface_hub.constants.HF_HUB_CACHE)
+        / f"models--{model_name_or_path.replace('/', '--')}"
+        / "snapshots"
+    )
+    if not snapshots.is_dir():
+        return []
+    return [path for path in snapshots.iterdir() if path.is_dir()]
+
+
 def drop_checkpoint_cache(
     model_name_or_path: str,
     revision: str | None = None,
     cache_dir: str | None = None,
 ) -> None:
-    checkpoint_dir: Path | None = None
+    if sys.platform != "linux":
+        return
+    checkpoint_dirs: list[Path] = []
     if os.path.isdir(model_name_or_path):
-        checkpoint_dir = Path(model_name_or_path)
+        checkpoint_dirs = [Path(model_name_or_path)]
     else:
         with suppress(OSError, ValueError):
-            checkpoint_dir = Path(
-                hf_api().snapshot_download(
-                    model_name_or_path,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    local_files_only=True,
+            checkpoint_dirs = [
+                Path(
+                    hf_api().snapshot_download(
+                        model_name_or_path,
+                        revision=revision,
+                        cache_dir=cache_dir,
+                        local_files_only=True,
+                    )
                 )
-            )
-    if checkpoint_dir is None:
+            ]
+        if not checkpoint_dirs:
+            checkpoint_dirs = _local_snapshot_dirs(model_name_or_path, cache_dir)
+    if not checkpoint_dirs:
         logger.info_once(
             "No local checkpoint found for %s; skipping page-cache eviction",
             model_name_or_path,
         )
         return
-    for path in checkpoint_dir.glob("*.safetensors"):
-        try:
-            with path.open("rb") as file:
-                os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-        except OSError as exc:
-            logger.warning(
-                "Could not release checkpoint page cache for %s: %s", path, exc
-            )
+    for checkpoint_dir in checkpoint_dirs:
+        dropped_bytes = 0
+        for path in checkpoint_dir.glob("*.safetensors"):
+            try:
+                with path.open("rb") as file:
+                    os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError as exc:
+                logger.warning(
+                    "Could not release checkpoint page cache for %s: %s", path, exc
+                )
+            else:
+                dropped_bytes += path.stat().st_size
+        logger.info(
+            "Released %.2f GiB of checkpoint page cache in %s",
+            dropped_bytes / 1024**3,
+            checkpoint_dir,
+        )
 
 
 def _get_checkpoints_size_bytes(files: list[str]) -> int:
@@ -913,27 +947,6 @@ def _get_checkpoints_size_bytes(files: list[str]) -> int:
     if not files:
         return 0
     return sum(os.path.getsize(f) for f in files)
-
-
-def _get_available_ram_bytes() -> int:
-    """Return available RAM, honoring cgroup limits."""
-    import psutil
-
-    host_available = psutil.virtual_memory().available
-
-    from vllm.utils.cpu_resource_utils import (
-        get_cgroup_memory_limit,
-        get_cgroup_memory_usage,
-    )
-
-    cgroup_limit = get_cgroup_memory_limit()
-    if cgroup_limit is None:
-        return host_available
-    cgroup_usage = get_cgroup_memory_usage()
-    cgroup_available = (
-        cgroup_limit if cgroup_usage is None else max(0, cgroup_limit - cgroup_usage)
-    )
-    return min(host_available, cgroup_available)
 
 
 def _get_fs_type(files: list[str]) -> str:
@@ -1085,7 +1098,7 @@ def safetensors_weights_iterator(
     fs_type = _get_fs_type(sorted_files)
     is_net_fs = fs_type in ("nfs", "nfs4", "lustre")
     total_bytes = _get_checkpoints_size_bytes(sorted_files)
-    avail_bytes = _get_available_ram_bytes()
+    avail_bytes = get_available_memory()
     ram_threshold_pct = 90
     fits_in_ram = total_bytes <= (ram_threshold_pct / 100.0) * avail_bytes
     fs_name = fs_type.upper() if fs_type else "unknown"
@@ -1334,12 +1347,20 @@ def fastsafetensors_weights_iterator(
             pl.close()
 
 
+_ENGRAM_WEIGHT_RE = re.compile(
+    r"(?:^|\.)(?:engram\.embed\.(?:weight|scale)|"
+    r"ple\.ple_embedding\.ngram_embedding\.shard_[0-9]+\.weight)$"
+)
+
+
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
+    local_expert_ids: set[int] | None = None,
+    *,
+    load_engram_on_cpu: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files
-    using instanttensor library."""
+    """Load with InstantTensor, optionally mapping Engram tables on CPU."""
     try:
         import instanttensor
     except ImportError as e:
@@ -1358,35 +1379,63 @@ def instanttensor_weights_iterator(
     else:
         process_group = world_group.device_group if world_group.world_size > 1 else None
 
-    device = current_platform.current_device()
+    gpu_weight_names: list[str] = []
+    cpu_weights: dict[str, list[str]] = {}
+    for path in hf_weights_files:
+        with safe_open(path, framework="pt") as metadata:
+            for name in metadata.keys():  # noqa: SIM118
+                # Engram tables can exceed device memory before TP sharding.
+                if load_engram_on_cpu and _ENGRAM_WEIGHT_RE.search(name) is not None:
+                    cpu_weights.setdefault(path, []).append(name)
+                else:
+                    gpu_weight_names.append(name)
 
-    # copy=True yields tensors that own their memory, staying valid after the
-    # context exits or InstantTensor reuses its buffer.
-    with instanttensor.safe_open(
-        hf_weights_files,
-        framework="pt",
-        device=device,
-        process_group=process_group,
-        copy=True,
-    ) as f:
-        # Track bytes so the bar reports load throughput (GB/s).
-        pbar = tqdm(
-            total=f.total_tensor_size,
-            desc="Loading safetensors using InstantTensor loader",
-            disable=not enable_tqdm(use_tqdm_on_load),
-            bar_format=_BAR_FORMAT,
-            position=tqdm._get_free_pos(),
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            mininterval=1.0,
-        )
-        try:
+    # Every rank must make the same decision about collective loading.
+    empty_expert_ids: set[int] = set()
+    filter_experts = local_expert_ids is not None and any(
+        should_skip_weight(name, empty_expert_ids) for name in gpu_weight_names
+    )
+    tensor_filter: list[str] | None = None
+    if cpu_weights or filter_experts:
+        process_group = None
+        tensor_filter = [
+            name
+            for name in gpu_weight_names
+            if not should_skip_weight(name, local_expert_ids)
+        ]
+
+    if gpu_weight_names:
+        # copy=True keeps tensors valid after InstantTensor reuses its buffer.
+        with (
+            instanttensor.safe_open(
+                hf_weights_files,
+                framework="pt",
+                device=current_platform.current_device(),
+                process_group=process_group,
+                copy=True,
+                tensor_filter=tensor_filter,
+                tensor_name_match_mode="exact",
+            ) as f,
+            tqdm(
+                total=f.total_tensor_size,
+                desc="Loading safetensors using InstantTensor loader",
+                disable=not enable_tqdm(use_tqdm_on_load),
+                bar_format=_BAR_FORMAT,
+                position=tqdm._get_free_pos(),
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                mininterval=1.0,
+            ) as pbar,
+        ):
             for name, tensor in f.tensors():
                 pbar.update(tensor.numel() * tensor.element_size())
                 yield name, tensor
-        finally:
-            pbar.close()
+
+    for path, names in cpu_weights.items():
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for name in names:
+                yield name, f.get_tensor(name)
 
 
 def pt_weights_iterator(
@@ -1437,6 +1486,12 @@ def multi_thread_pt_weights_iterator(
             state = future.result()
             yield from state.items()
             del state
+
+
+def finalize_model_weights(model: torch.nn.Module) -> None:
+    """Run once after a full load or reload: the model-level post-load hook."""
+    if hasattr(model, "process_weights_after_loading"):
+        model.process_weights_after_loading()
 
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -1908,9 +1963,11 @@ def _init_loader(
 def get_gguf_extra_tensor_names(
     gguf_file: str, gguf_to_hf_name_map: dict[str, str]
 ) -> list[str]:
-    reader = gguf.GGUFReader(gguf_file)
+    exact_gguf_keys = set()
+    for shard in get_gguf_shard_files(gguf_file):
+        reader = gguf.GGUFReader(shard)
+        exact_gguf_keys |= {tensor.name for tensor in reader.tensors}
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
-    exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
     extra_keys = expected_gguf_keys - exact_gguf_keys
     return [gguf_to_hf_name_map[key] for key in extra_keys]
 
@@ -1920,12 +1977,17 @@ def get_gguf_weight_type_map(
     """
     Return GGUF mapped weight's name and its quant type
     """
-    reader = gguf.GGUFReader(gguf_file)
-    return {
-        gguf_to_hf_name_map[tensor.name]: tensor.tensor_type.name
-        for tensor in reader.tensors
-        if tensor.name in gguf_to_hf_name_map
-    }
+    weight_type_map: dict[str, str] = {}
+    for shard in get_gguf_shard_files(gguf_file):
+        reader = gguf.GGUFReader(shard)
+        weight_type_map.update(
+            {
+                gguf_to_hf_name_map[tensor.name]: tensor.tensor_type.name
+                for tensor in reader.tensors
+                if tensor.name in gguf_to_hf_name_map
+            }
+        )
+    return weight_type_map
 
 def gguf_quant_weights_iterator(
     gguf_file: str, gguf_to_hf_name_map: dict[str, str]
@@ -1939,32 +2001,50 @@ def gguf_quant_weights_iterator(
     layer with different quant types.
     """
 
-    reader = gguf.GGUFReader(gguf_file)
+    # Copy-on-write mappings keep loader transforms safe while avoiding a
+    # full host copy of large tensors such as the Qwen4Exp PLE table.
+    readers = [
+        gguf.GGUFReader(shard, mode="c")
+        for shard in get_gguf_shard_files(gguf_file)
+    ]
 
-    for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+    for reader in readers:
+        for tensor in reader.tensors:
+            if tensor.name in gguf_to_hf_name_map:
+                weight_type = tensor.tensor_type
+                name = gguf_to_hf_name_map[tensor.name]
 
-            if weight_type.name not in ("F32", "BF16", "F16"):
-                weight_type_name = name.replace("weight", "qweight_type")
-                weight_type = torch.tensor(weight_type)
-                yield weight_type_name, weight_type
+                if weight_type.name not in ("F32", "BF16", "F16"):
+                    # Only the trailing ".weight" becomes ".qweight_type":
+                    # parameter names like "input_mix_weight_down" embed the
+                    # substring and must not be rewritten.
+                    weight_type_name = (
+                        name[: -len(".weight")] + ".qweight_type"
+                        if name.endswith(".weight")
+                        else name + "_qweight_type"
+                    )
+                    weight_type = torch.tensor(weight_type)
+                    yield weight_type_name, weight_type
 
-    for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight = tensor.data
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
-            if weight_type.name not in ("F32", "BF16", "F16"):
-                name = name.replace("weight", "qweight")
-            param = torch.tensor(weight)
-            if weight_type.name == "BF16" and param.dtype == torch.uint8:
-                # numpy has no bfloat16, so the gguf reader exposes BF16
-                # tensors as raw uint8 bytes (last dim doubled); reinterpret
-                # them back to the logical bfloat16 shape.
-                param = param.view(torch.uint16).view(torch.bfloat16)
-            yield name, param
+    for reader in readers:
+        for tensor in reader.tensors:
+            if tensor.name in gguf_to_hf_name_map:
+                weight = tensor.data
+                weight_type = tensor.tensor_type
+                name = gguf_to_hf_name_map[tensor.name]
+                if weight_type.name not in ("F32", "BF16", "F16"):
+                    name = (
+                        name[: -len(".weight")] + ".qweight"
+                        if name.endswith(".weight")
+                        else name + "_qweight"
+                    )
+                param = torch.from_numpy(weight)
+                if weight_type.name == "BF16" and param.dtype == torch.uint8:
+                    # numpy has no bfloat16, so the gguf reader exposes BF16
+                    # tensors as raw uint8 bytes (last dim doubled); reinterpret
+                    # them back to the logical bfloat16 shape.
+                    param = param.view(torch.uint16).view(torch.bfloat16)
+                yield name, param
 
 def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     """convert PySafeSlice object from safetensors to torch.Tensor

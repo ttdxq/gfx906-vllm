@@ -323,6 +323,12 @@ class LLMEngine:
         # 1) Get EngineCoreOutput from the EngineCore.
         with record_function_or_nullcontext("llm_engine step: get_output"):
             outputs = self.engine_core.get_output()
+            if self.dp_group is not None and not getattr(
+                self.engine_core, "last_step_model_executed", True
+            ):
+                # Each DP rank joins one forward's DP sync per step; a step that
+                # ran no forward joins with a dummy batch, as DPEngineCoreProc.
+                self.engine_core.execute_dummy_batch()
 
         # 2) Process EngineCoreOutputs.
         with record_function_or_nullcontext("llm_engine step: process_outputs"):
@@ -354,8 +360,31 @@ class LLMEngine:
 
         return processed_outputs.request_outputs
 
-    def start_profile(self, profile_prefix: str | None = None):
-        self.engine_core.profile(True, profile_prefix)
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
+    ):
+        if self._profile_session_active:
+            raise ProfilerAlreadyActiveError()
+        validate_profile_prefix(profile_prefix)
+        validate_profile_iteration_bounds(delay_iterations, max_iterations)
+
+        self._profile_session_active = True
+        try:
+            self.engine_core.profile(
+                True,
+                profile_prefix,
+                delay_iterations,
+                max_iterations,
+                profiler_kwargs=profiler_kwargs,
+            )
+        except BaseException:
+            self._profile_session_active = False
+            raise
 
     def stop_profile(self):
         self.engine_core.profile(False)

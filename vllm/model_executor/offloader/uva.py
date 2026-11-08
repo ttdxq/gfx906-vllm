@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from torch.func import functional_call
+from torch.nn.parameter import UninitializedParameter
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -111,18 +112,14 @@ class UVAOffloader(BaseOffloader):
                 if not should_offload:
                     continue
 
-            cpu_data = p.data.to(device="cpu")
-            if self.pin_memory:
-                cpu_data = cpu_data.pin_memory()
+            if isinstance(p, UninitializedParameter):
+                defer = getattr(p, "defer_cpu_offload", None)
+                if defer is not None:
+                    defer(self._offload_parameter)
+                    offloaded_parameters = True
+                continue
 
-            if not self.uva_offloading:
-                p.data = cpu_data
-            else:
-                p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
-                p._vllm_is_uva_offloaded = True
-
-            self.cpu_offload_bytes += p.data.numel() * p.data.element_size()
-            offloaded_parameters = True
+            offloaded_parameters |= self._offload_parameter(p)
 
         if offloaded_parameters and not self.uva_offloading:
             original_forward = module.forward
@@ -153,3 +150,17 @@ class UVAOffloader(BaseOffloader):
             module.forward = forward
 
         return module
+
+    def _offload_parameter(self, p: nn.Parameter) -> bool:
+        if self.cpu_offload_bytes >= self.cpu_offload_max_bytes or p.numel() == 0:
+            return False
+        cpu_data = p.data.to(device="cpu")
+        if self.pin_memory:
+            cpu_data = cpu_data.pin_memory()
+        if self.uva_offloading:
+            p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
+            p._vllm_is_uva_offloaded = True
+        else:
+            p.data = cpu_data
+        self.cpu_offload_bytes += p.numel() * p.element_size()
+        return True

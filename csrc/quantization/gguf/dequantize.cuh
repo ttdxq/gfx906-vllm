@@ -98,6 +98,25 @@ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __
     y[iybs + iqs + y_offset] = convert_from_half<dst_t>(v.y);
 }
 
+// Q2_0 (group 64): one f16 scale per block, four 2-bit codes per payload
+// byte, w = d*(code-1). The generic qr<=2 template cannot walk 2-bit codes,
+// so this kernel keeps one weight per lane.
+template<typename dst_t>
+static __global__ void dequantize_block_q2_0(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const int i = blockIdx.x;
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+
+    const int tid = threadIdx.x; // 0..63, one weight per lane
+
+    dst_t * y = yy + (int64_t)i*QK2_0;
+    const float d = __half2float(x[i].d);
+    const uint8_t q = x[i].qs[tid >> 2];
+    const float v = d * (((q >> (2*(tid & 3))) & 3) - 1);
+
+    y[tid] = convert_from_half<dst_t>(__float2half(v));
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
 
@@ -441,6 +460,12 @@ static void dequantize_block_cuda(const void * __restrict__ vx, dst_t * __restri
 }
 
 template<typename dst_t>
+static void dequantize_row_q2_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK2_0;
+    dequantize_block_q2_0<<<nb, QK2_0, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
 static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
@@ -537,6 +562,8 @@ static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case 8:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case 42:
+            return dequantize_row_q2_0_cuda;
         case 10:
             return dequantize_row_q2_K_cuda;
         case 11:

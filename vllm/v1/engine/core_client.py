@@ -40,6 +40,7 @@ from vllm.utils.network_utils import (
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     FT_STATUS_CALL_ID,
+    CheckpointState,
     EEPNotificationType,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
@@ -179,7 +180,14 @@ class EngineCoreClient(ABC):
     def add_request(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
+    ) -> None:
         raise NotImplementedError
 
     def reset_mm_cache(self) -> None:
@@ -273,7 +281,12 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def profile_async(
-        self, is_start: bool = True, profile_prefix: str | None = None
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -298,6 +311,15 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def is_sleeping_async(self) -> bool:
+        raise NotImplementedError
+
+    async def checkpoint_prepare_async(self, mode: PauseMode) -> str | None:
+        raise NotImplementedError
+
+    async def checkpoint_restore_async(self) -> None:
+        raise NotImplementedError
+
+    async def checkpoint_state_async(self) -> tuple[CheckpointState, str | None]:
         raise NotImplementedError
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -355,6 +377,8 @@ class InprocClient(EngineCoreClient):
     def get_output(self) -> EngineCoreOutputs:
         outputs, model_executed = self.engine_core.step_fn()
         self.engine_core.post_step(model_executed=model_executed)
+        # Read by LLMEngine.step() to keep the DP ranks' collectives aligned.
+        self.last_step_model_executed = model_executed
         return outputs and outputs.get(0) or EngineCoreOutputs()
 
     async def get_output_async(self) -> EngineCoreOutputs:
@@ -395,13 +419,38 @@ class InprocClient(EngineCoreClient):
     def shutdown(self, timeout: float | None = None) -> None:
         self.engine_core.shutdown()
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
-        self.engine_core.profile(is_start, profile_prefix)
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
+    ) -> None:
+        self.engine_core.profile(
+            is_start,
+            profile_prefix,
+            delay_iterations=delay_iterations,
+            max_iterations=max_iterations,
+            profiler_kwargs=profiler_kwargs,
+        )
 
     async def profile_async(
-        self, is_start: bool = True, profile_prefix: str | None = None
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ) -> None:
-        self.profile(is_start, profile_prefix)
+        await asyncio.to_thread(
+            self.profile,
+            is_start,
+            profile_prefix,
+            delay_iterations,
+            max_iterations,
+            profiler_kwargs,
+        )
 
     def reset_mm_cache(self) -> None:
         self.engine_core.reset_mm_cache()
@@ -1082,8 +1131,22 @@ class SyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
-        self.call_utility("profile", is_start, profile_prefix)
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
+    ) -> None:
+        self.call_utility(
+            "profile",
+            is_start,
+            profile_prefix,
+            delay_iterations,
+            max_iterations,
+            profiler_kwargs,
+        )
 
     def reset_mm_cache(self) -> None:
         self.call_utility("reset_mm_cache")
@@ -1333,6 +1396,11 @@ class AsyncMPClient(MPClient):
     ) -> None:
         await self.call_utility_async("pause_scheduler", mode, clear_cache)
 
+    async def pause_generation_async(
+        self, mode: PauseMode = "abort", clear_cache: bool = True
+    ) -> None:
+        await self.call_utility_async("pause_generation", mode, clear_cache)
+
     async def resume_scheduler_async(self) -> None:
         await self.call_utility_async("resume_scheduler")
 
@@ -1340,9 +1408,21 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async("is_scheduler_paused")
 
     async def profile_async(
-        self, is_start: bool = True, profile_prefix: str | None = None
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ) -> None:
-        await self.call_utility_async("profile", is_start, profile_prefix)
+        await self.call_utility_async(
+            "profile",
+            is_start,
+            profile_prefix,
+            delay_iterations,
+            max_iterations,
+            profiler_kwargs,
+        )
 
     async def reset_mm_cache_async(self) -> None:
         await self.call_utility_async("reset_mm_cache")
@@ -1368,6 +1448,16 @@ class AsyncMPClient(MPClient):
 
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")
+
+    async def checkpoint_prepare_async(self, mode: PauseMode) -> str | None:
+        return await self.call_utility_async("checkpoint_prepare", mode)
+
+    async def checkpoint_restore_async(self) -> None:
+        await self.call_utility_async("checkpoint_restore")
+
+    async def checkpoint_state_async(self) -> tuple[CheckpointState, str | None]:
+        state, error = await self.call_utility_async("checkpoint_state")
+        return CheckpointState(state), error
 
     async def execute_dummy_batch_async(self) -> None:
         await self.call_utility_async("execute_dummy_batch")
@@ -1409,14 +1499,39 @@ class AsyncMPClient(MPClient):
     async def handle_fault(
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
-        res = await self.call_utility_async(FT_UTILITY_METHOD, ft_request)
-        result = msgspec.convert(res, FaultToleranceResult)
+        status = self._engine_status[self.engine_ranks_managed[0]]
+
+        # Reject a second recovery while one is in flight
+        if status.get("ft_state") == "recovering":
+            return FaultToleranceResult(
+                request_id=ft_request.request_id,
+                success=False,
+                reason="another recovery is in progress",
+            )
+
+        status["ft_state"] = "recovering"
+        status["last_ft_request_id"] = ft_request.request_id
+        status.pop("ft_error", None)
+
+        try:
+            res = await self.call_utility_async(FT_UTILITY_METHOD, ft_request)
+            result = msgspec.convert(res, FaultToleranceResult)
+        except Exception as e:
+            result = FaultToleranceResult(ft_request.request_id, False, str(e))
+
         if not result.success:
-            status = self._engine_status.get(self.engine_ranks_managed[0])
-            if status is not None:
-                status["last_ft_request_id"] = result.request_id
-                status["ft_error"] = result.reason
+            # Status pushes replace the cached entry; re-read before recording.
+            status = self._engine_status[self.engine_ranks_managed[0]]
+            status["ft_state"] = "failed"
+            status["last_ft_request_id"] = result.request_id
+            status["ft_error"] = result.reason
+
         return result
+
+    @property
+    def engine_status(self) -> dict:
+        """Cached FT status entry of the managed engine."""
+        return self._engine_status.get(self.engine_ranks_managed[0], {})
 
     async def get_status(self):
         return {
@@ -1712,6 +1827,21 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 ]
             )
         )[0]
+
+    async def checkpoint_state_async(self) -> tuple[CheckpointState, str | None]:
+        # Engines move independently: failed if any failed, otherwise a state
+        # all share or the transition in progress. A failure reports the first
+        # failed engine's error.
+        states: dict[CheckpointState, str | None] = {}
+        for state, error in await self.call_utility_all_async("checkpoint_state"):
+            states.setdefault(CheckpointState(state), error)
+        if CheckpointState.FAILED in states:
+            return CheckpointState.FAILED, states[CheckpointState.FAILED]
+        if len(states) == 1:
+            return next(iter(states)), None
+        if CheckpointState.PREPARING in states:
+            return CheckpointState.PREPARING, None
+        return CheckpointState.RESTORING, None
 
     @staticmethod
     async def process_engine_outputs(

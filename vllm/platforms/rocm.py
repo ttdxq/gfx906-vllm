@@ -238,9 +238,11 @@ def _rocm_supported_dtypes() -> list[torch.dtype]:
     """Supported dtypes for the current ROCm device.
 
     gfx906 lacks native bfloat16, so returns fp16/fp32 there; other
-    GFX9 (gfx90a+) additionally include bfloat16.
+    GFX9 (gfx90a+) additionally include bfloat16. BF16 remains usable on
+    gfx906 through rocBLAS conversion paths, which models can opt into
+    with VLLM_ROCM_GFX906_ALLOW_BF16=1.
     """
-    if _ON_GFX906:
+    if _ON_GFX906 and not envs.VLLM_ROCM_GFX906_ALLOW_BF16:
         return [torch.float16, torch.float32]
     return [torch.float16, torch.bfloat16, torch.float32]
 
@@ -403,6 +405,48 @@ def get_cdna_version() -> int:
     return 0
 
 
+def get_rdna_version() -> int:
+    if on_rdna4():
+        return 4
+    if on_gfx11():
+        return 3
+    return 0
+
+
+def _maybe_default_dsv4_mxfp4_indexer(vllm_config: "VllmConfig") -> None:
+    """Default DeepSeek-V4's sparse indexer K cache to MXFP4 on CDNA4.
+
+    aiter's paged MXFP4 indexer is faster than FP8 on MI350/MI355 (lower
+    TTFT/TPOT, ~9% more KV cache) with near-lossless accuracy. Only rewrite
+    "auto" and fall back to FP8 silently when the MXFP4 path can't run, so
+    configs that worked before never start failing.
+    """
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) != "deepseek_v4":
+        return
+    attention_config = vllm_config.attention_config
+    parallel_config = vllm_config.parallel_config
+    if (
+        attention_config.indexer_kv_dtype != "auto"
+        or attention_config.indexer_sparse_logits
+        or get_cdna_version() != 4
+        # The MXFP4 indexer metadata builder rejects DCP/PCP.
+        or parallel_config.decode_context_parallel_size > 1
+        or parallel_config.prefill_context_parallel_size > 1
+    ):
+        return
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if not rocm_aiter_ops.is_enabled():
+        return
+    attention_config.indexer_kv_dtype = "mxfp4"
+    logger.info_once(
+        "DeepSeek-V4 on ROCm CDNA4: using aiter's paged MXFP4 sparse indexer "
+        "K cache by default. Pass --attention-config "
+        '\'{"indexer_kv_dtype": "fp8"}\' to use the FP8 indexer cache.'
+    )
+
+
 @cache
 def get_rocm_version() -> tuple[int, ...] | None:
     """Return the installed ROCm release as (major, minor, patch), or None."""
@@ -541,10 +585,16 @@ def _get_backend_priorities(
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)
     if is_aiter_found_and_supported():
         backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
-    elif rocm_aiter_ops.is_rdna_aiter_enabled():
-        backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
+    if rocm_aiter_ops.is_rdna_aiter_enabled():
+        if on_rdna4():
+            backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
+        else:
+            backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
+    if not on_gfx906():
+        backends.append(AttentionBackendEnum.ROCM_OCTAVE)
+        backends.append(AttentionBackendEnum.ULTRAQUANT)
 
     # gfx906 has no MFMA/wave64, so ROCM_ATTN serves GQA decode with the
     # generic 2D paged kernel, ~24x slower than the unified 3D Triton kernel
@@ -1065,6 +1115,17 @@ class RocmPlatform(Platform):
         # Default dispatch to rocm's sparse_attn_indexer implementation
         compilation_config.custom_ops.append("+sparse_attn_indexer")
 
+        # Default the gated RMSNorm custom op on for unquantized models. Quantized
+        # is untested in serving.
+        model_config = vllm_config.model_config
+        if (
+            model_config is not None
+            and model_config.quantization is None
+            and "+rms_norm_gated" not in compilation_config.custom_ops
+            and "-rms_norm_gated" not in compilation_config.custom_ops
+        ):
+            compilation_config.custom_ops.append("+rms_norm_gated")
+
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         from vllm.config.compilation import CUDAGraphMode
@@ -1101,6 +1162,8 @@ class RocmPlatform(Platform):
                 "with multimodal-bidirectional attention."
             )
             scheduler_config.disable_chunked_mm_input = True
+
+        _maybe_default_dsv4_mxfp4_indexer(vllm_config)
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
@@ -1167,8 +1230,11 @@ class RocmPlatform(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        # Custom allreduce runs on the MI300 series and on gfx906 (MI50):
+        # PCIe gfx906 pairs report working P2P access, and the IPC one-shot
+        # kernel beats RCCL's small-message path there. CustomAllreduce
+        # itself still self-disables for topologies it cannot serve.
+        return any(gfx in _GCN_ARCH for gfx in ["gfx906", "gfx94", "gfx95"])
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
@@ -1334,7 +1400,6 @@ class RocmPlatform(Platform):
             cc.cudagraph_mode != CUDAGraphMode.NONE
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_RMSNORM
-            and not on_rdna4()
             and not on_gfx90a()  # AITER not built for gfx90a, rmsnorm -> SEGV.
         ):
             rms_norm = ["aiter"] + default

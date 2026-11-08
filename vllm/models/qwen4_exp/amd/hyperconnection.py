@@ -22,9 +22,12 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+import os
+
 import torch
 from torch import nn
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -70,7 +73,7 @@ class GatedResidual(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.lora_rank = config.hc_lowrank
+        self.hc_lowrank = config.hc_lowrank
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.use_combine = use_combine
@@ -91,11 +94,11 @@ class GatedResidual(nn.Module):
         # -- vLLM Linear weights --------------------------------------------
         # The merged skinny-GEMM shape is physically padded to 16 rows for
         # alignment and efficient backend dispatch.
-        self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
+        self.pad_size = (-(self.hc_lowrank + self.hc_count)) % 16 if use_combine else 0
         if use_combine:
             self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
                 self.hyper_hidden_size,
-                [self.lora_rank, self.hc_count]
+                [self.hc_lowrank, self.hc_count]
                 + ([self.pad_size] if self.pad_size else []),
                 bias=False,
                 params_dtype=config.params_dtype,
@@ -107,19 +110,28 @@ class GatedResidual(nn.Module):
         else:
             self.input_mix_weight_down = ReplicatedLinear(
                 self.hyper_hidden_size,
-                self.lora_rank,
+                self.hc_lowrank,
                 bias=False,
                 params_dtype=config.params_dtype,
                 quant_config=None,
                 prefix=maybe_prefix(prefix, "input_mix_weight_down"),
                 return_bias=False,
             )
+        vllm_config = get_current_vllm_config_or_none()
+        up_quant_config = None
+        if (
+            os.getenv("VLLM_QWEN4EXP_GGUF_HC_UP_QUANT", "0") == "1"
+            and vllm_config is not None
+            and vllm_config.quant_config is not None
+            and vllm_config.quant_config.get_name() == "gguf"
+        ):
+            up_quant_config = vllm_config.quant_config
         self.input_mix_weight_up = ReplicatedLinear(
-            self.lora_rank,
+            self.hc_lowrank,
             self.hyper_hidden_size,
             bias=False,
             params_dtype=config.params_dtype,
-            quant_config=None,
+            quant_config=up_quant_config,
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
@@ -127,6 +139,16 @@ class GatedResidual(nn.Module):
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self._use_native_decode_mix(hidden_states):
+            return torch.ops._rocm_C.qwen4exp_hc_mix(
+                hidden_states,
+                None,
+                None,
+                self.hc_norm.weight,
+                self.input_mix_weight_down_block_inject.weight,
+                self.input_mix_weight_up.weight,
+                self.config.rms_norm_eps,
+            )
         xn = grouped_gemma_rmsnorm(
             hidden_states,
             self.hc_norm.weight,
@@ -136,15 +158,15 @@ class GatedResidual(nn.Module):
 
         if self.use_combine:
             # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+            split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]
             down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+            lowrank, injection, _ = down_and_injection.split(split_sizes, dim=-1)
         else:
-            lora = self.input_mix_weight_down(xn)
+            lowrank = self.input_mix_weight_down(xn)
             injection = None
 
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
+        lowrank = hc_silu(lowrank, self.hc_count)
+        gate = self.input_mix_weight_up(lowrank)  # [M, D]
         block_input = hc_gate_mix(xn, gate, self.hc_count)
 
         return hidden_states, block_input, injection
@@ -161,6 +183,16 @@ class GatedResidual(nn.Module):
         block's mix. Its combine with ``block_output`` is fused with this
         module's input RMSNorm.
         """
+        if self._use_native_decode_mix(hidden_states):
+            return torch.ops._rocm_C.qwen4exp_hc_mix(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.input_mix_weight_down_block_inject.weight,
+                self.input_mix_weight_up.weight,
+                self.config.rms_norm_eps,
+            )
         hidden_states, xn = hc_combine_norm(
             hidden_states,
             prev_block_output,
@@ -172,15 +204,15 @@ class GatedResidual(nn.Module):
 
         if self.use_combine:
             # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+            split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]
             down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+            lowrank, injection, _ = down_and_injection.split(split_sizes, dim=-1)
         else:
-            lora = self.input_mix_weight_down(xn)
+            lowrank = self.input_mix_weight_down(xn)
             injection = None
 
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
+        lowrank = hc_silu(lowrank, self.hc_count)
+        gate = self.input_mix_weight_up(lowrank)  # [M, D]
         block_input = hc_gate_mix(xn, gate, self.hc_count)
 
         return hidden_states, block_input, injection
@@ -192,6 +224,25 @@ class GatedResidual(nn.Module):
         injection: torch.Tensor,
     ) -> torch.Tensor:
         return hc_combine(hidden_states, block_output, injection, self.hc_count)
+
+    def _use_native_decode_mix(self, hidden_states: torch.Tensor) -> bool:
+        if (
+            os.getenv("VLLM_QWEN4EXP_NATIVE_HC_MIX", "1") != "1"
+            or not self.use_combine
+            or self.hc_count != 4
+            or self.hc_lowrank != 320
+            or hidden_states.shape != (1, 10240)
+            or hidden_states.dtype != torch.float16
+            or not hidden_states.is_cuda
+            or not hidden_states.is_contiguous()
+            or torch.cuda.is_current_stream_capturing()
+            or not hasattr(self.input_mix_weight_up, "weight")
+            or not hasattr(torch.ops._rocm_C, "qwen4exp_hc_mix")
+        ):
+            return False
+        from vllm.platforms.rocm import on_gfx906
+
+        return on_gfx906()
 
     @property
     def hyper_hidden_size(self) -> int:

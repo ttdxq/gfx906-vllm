@@ -25,6 +25,10 @@ See [NOTICE](NOTICE) for the complete attribution statement.
 
 ## Latest Updates
 
+### ✅ November 2026 Update
+
+- **Experimental Qwen4Exp architecture GGUF support** - Adds GGUF loading for the qwen4exp architecture (Hyper-Connections, gated DeltaNet, QSA; sharded checkpoints and quantized PLE included), grouped-quantized MoE kernels (IQ2_XS / IQ3_XXS / IQ3_S / IQ4_XS / Q2_0 / Q5_0), and the expert cache with offload staging, plus a push-based custom all-reduce kernel for two-GPU PCIe TP2. Verified models are listed below.
+
 ### ✅ October 2026 Update
 
 - **Upstream vLLM synced to 08a65e287e (two merge rounds, 1382 upstream commits)** - Measured on Qwen3.8-27B GGUF: real prefill of a 9.2k-token prompt improves from 134.8 to ≥213 tok/s, decode stays at parity, and prefix caching is now on by default (warm prefill 3537 tok/s).
@@ -55,6 +59,8 @@ Many new model implementations (49+) have been synchronized from upstream vLLM, 
 - ✅ unsloth/Qwen3.6-27B-GGUF
 - ✅ unsloth/Qwen3.8-27B-GGUF
 - ✅ unsloth/Qwen3.6-35B-A3B-GGUF
+- ✅ unsloth/Qwen3.8-Flash-Next-GGUF (UD-IQ4_XS)
+- ✅ ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF (IQ2_XS)
 
 **Known not to work:**
 

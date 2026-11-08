@@ -332,6 +332,60 @@ def test_layer_norm_rows_per_block(
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="Requires ROCm")
+@pytest.mark.parametrize("num_tokens", [1, 16, 17, 32, 512, 2048])
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("norm_before_gate", [True, False])
+@torch.inference_mode()
+def test_rmsnorm_gated_gfx906_sigmoid_is_fused(
+    default_vllm_config, num_tokens, contiguous, norm_before_gate
+) -> None:
+    """Flash's per-head sigmoid norm must avoid native pointwise dispatches."""
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        pytest.skip("Requires gfx906")
+    default_vllm_config.compilation_config.custom_ops.append("+rms_norm_gated")
+    set_random_seed(42)
+    layer = RMSNormGated(
+        128,
+        eps=1e-6,
+        norm_before_gate=norm_before_gate,
+        activation="sigmoid",
+        device=DEVICE,
+        dtype=torch.float16,
+    )
+    packed = torch.randn(num_tokens, 24, 2, 128, device=DEVICE, dtype=torch.float16)
+    x, z = packed[:, :, 0, :], packed[:, :, 1, :]
+    if contiguous:
+        x, z = x.contiguous(), z.contiguous()
+    expected = layer.forward_native(x, z)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
+        actual = layer(x, z)
+    fused_op = (
+        "_C::rms_norm_gated_gfx906"
+        if num_tokens <= 16
+        else "vllm::fla_rms_norm_gated"
+    )
+    assert fused_op in {event.key for event in prof.key_averages()}
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+    assert actual.dtype == x.dtype
+    assert actual.shape == x.shape
+    if num_tokens == 1 and contiguous and norm_before_gate:
+        empty = x[:0]
+        torch.testing.assert_close(
+            layer(empty, empty), layer.forward_native(empty, empty), atol=0, rtol=0
+        )
+        torch.library.opcheck(
+            torch.ops._C.rms_norm_gated_gfx906.default,
+            (x.reshape(-1, 128), layer.weight, z.reshape(-1, 128), 1e-6, True, True),
+            test_utils=("test_schema", "test_faketensor"),
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.inference_mode()
 def test_strided_input(dtype: torch.dtype) -> None:
@@ -501,6 +555,42 @@ def test_rmsnorm_gated_forward_native_dtype(
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize("norm_before_gate", [True, False])
+@pytest.mark.parametrize("num_tokens", [1, 5])
+@torch.inference_mode()
+def test_rmsnorm_gated_forward_respects_activation(
+    default_vllm_config,
+    dtype: torch.dtype,
+    activation: str,
+    norm_before_gate: bool,
+    num_tokens: int,
+) -> None:
+    """GDN output gates must retain their activation on the dispatched path."""
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+
+    default_vllm_config.compilation_config.custom_ops.append("+rms_norm_gated")
+    set_random_seed(42)
+    layer = RMSNormGated(
+        128,
+        eps=1e-6,
+        norm_before_gate=norm_before_gate,
+        activation=activation,
+        device=DEVICE,
+        dtype=dtype,
+    )
+    x = torch.randn(num_tokens, 128, dtype=dtype, device=DEVICE) * 0.01
+    z = torch.linspace(-4, 4, 128, dtype=dtype, device=DEVICE)
+    z = z.expand_as(x).contiguous()
+
+    actual = layer(x, z)
+    expected = layer.forward_native(x, z)
+    tolerance = 1e-3 if dtype == torch.float16 else 1e-2
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    assert actual.dtype == dtype
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.inference_mode()
 def test_rmsnorm_gated_3d_matches_flattened_2d(
@@ -543,6 +633,39 @@ def test_rmsnorm_gated_3d_matches_flattened_2d(
     torch.testing.assert_close(cuda_3d, cuda_2d, atol=1e-3, rtol=1e-2)
     torch.testing.assert_close(cuda_3d, native_3d, atol=1e-2, rtol=1e-2)
     assert cuda_3d.shape == (num_tokens, num_heads, head_dim)
+
+
+@torch.inference_mode()
+def test_rmsnorm_gated_int64_row_offset() -> None:
+    """Rows past 2^31 // row stride need int64 offsets.
+
+    Mirrors RMSNormGated on the GDN output: [num_tokens, num_heads, 128]
+    flattened to rows of 128, so tokens from 2^31 // (num_heads * 128) on
+    (262,144 for 64 heads) wrap in int32.
+    """
+    num_heads, head_dim = 64, 128
+    num_tokens = 2**31 // (num_heads * head_dim) + 4
+    # x, z and the output, all bf16.
+    need = num_tokens * num_heads * head_dim * 2 * 3
+    free, _ = current_platform.mem_get_info()
+    if free < need + (1 << 30):
+        pytest.skip("not enough free device memory")
+
+    set_random_seed(0)
+    device = torch.device(DEVICE)
+    shape = (num_tokens, num_heads, head_dim)
+    x = torch.randn(shape, dtype=torch.bfloat16, device=device)
+    z = torch.randn(shape, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+
+    out = layernorm_fn(
+        x, weight, None, z=z, eps=1e-6, norm_before_gate=True, is_rms_norm=True
+    )
+
+    # Reference on the first token and the last tokens, past the int32 boundary.
+    rows = torch.tensor([0, *range(num_tokens - 4, num_tokens)], device=device)
+    ref = rms_norm_ref(x[rows], weight, None, z=z[rows], eps=1e-6)
+    torch.testing.assert_close(out[rows], ref, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

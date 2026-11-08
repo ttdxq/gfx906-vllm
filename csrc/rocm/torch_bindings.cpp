@@ -18,6 +18,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 // (gfx9/gfx11 ISA, unsupported there); skip these registrations to avoid
 // undefined symbols. vLLM uses default/Triton GEMM for these ops on gfx1250.
 #ifndef VLLM_SKIP_SKINNY_GEMMS
+  rocm_ops.def("qwen4exp_hc_mix(Tensor residual, Tensor? block, Tensor? injection, "
+               "Tensor norm, Tensor down, Tensor up, float eps) -> (Tensor, Tensor, Tensor)");
+  rocm_ops.impl("qwen4exp_hc_mix", torch::kCUDA, &qwen4exp_hc_mix);
   // Custom gemm op for matrix-vector multiplication
   rocm_ops.def(
       "LLMM1(Tensor in_a, Tensor in_b, int rows_per_block) -> "
@@ -54,6 +57,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 #endif  // VLLM_SKIP_SKINNY_GEMMS
 
 #ifdef VLLM_ROCM_GFX1100
+  // MXFP4 weights x int8 activations GEMV for RDNA3/RDNA3.5 (gfx11) decode,
+  // 1 <= M <= 8. Weights [N, K/2] uint8 E2M1, scales [N, K/32] uint8 E8M0.
+  rocm_ops.def(
+      "mxfp4_w4a8_gemv_rdna3(Tensor a, Tensor b_q, Tensor b_scale) -> Tensor");
+  rocm_ops.impl("mxfp4_w4a8_gemv_rdna3", torch::kCUDA, &mxfp4_w4a8_gemv_rdna3);
+
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(
       "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
@@ -92,7 +101,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                str kv_cache_dtype,"
       "                Tensor k_scale, Tensor v_scale,"
       "                Tensor? fp8_out_scale,"
-      "                str mfma_type) -> ()");
+      "                str mfma_type,"
+      "                bool use_interleaved_v_cache=False) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
 }
 

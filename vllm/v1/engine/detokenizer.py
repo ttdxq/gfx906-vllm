@@ -28,6 +28,42 @@ def uses_fast_detokenizer(tokenizer: TokenizerLike) -> bool:
     return isinstance(tokenizer, TokenizersBackend)
 
 
+def warm_detokenizer_vocab(tokenizer: TokenizerLike | None) -> None:
+    """Step every vocabulary id once through a DecodeStream.
+
+    The frontend detokenizes on the output handler thread. Under host memory
+    pressure the fast tokenizer's vocabulary and decoder tables age into
+    swap while the engine loads, and the first long generation then stalls
+    for hundreds of milliseconds per major fault behind that thread while
+    the engine pipeline backpressures. Stepping the whole vocabulary once
+    faults the working set up front; pair it with mlocking the frontend's
+    private mappings to keep the pages resident.
+    """
+    if tokenizer is None or not uses_fast_detokenizer(tokenizer):
+        return
+    inner: Tokenizer = tokenizer._tokenizer
+    vocab_size = inner.get_vocab_size(with_added_tokens=True)
+    stepped = 0
+    for skip_special_tokens in (True, False):
+        stream = tokenizers.decoders.DecodeStream(
+            ids=[inner.token_to_id("!") or 0],
+            skip_special_tokens=skip_special_tokens,
+        )
+        for token_id in range(vocab_size):
+            try:
+                stream.step(inner, token_id)
+                stepped += 1
+            except Exception:  # noqa: S110
+                # Mirrors _protected_step: odd ids can raise overflow or
+                # invalid-prefix errors; the point here is only to touch pages.
+                pass
+    logger.info(
+        "Detokenizer vocabulary warmup: stepped %d/%d ids x2 skip modes",
+        stepped,
+        vocab_size,
+    )
+
+
 class IncrementalDetokenizer:
     def __init__(self):
         self.token_ids: list[int] = []

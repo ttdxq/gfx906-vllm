@@ -18,6 +18,15 @@
 // QR = QK / number of values before dequantization
 // QI = number of 32 bit integers before dequantization
 
+#define QK2_0 64
+#define QR2_0 4
+#define QI2_0 (QK2_0 / (4 * QR2_0))
+typedef struct {
+    half    d;              // delta
+    uint8_t qs[QK2_0 / 4];  // 2-bit codes, 4 elements per byte, LSB first
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
 #define QK4_0 32
 #define QR4_0 2
 #define QI4_0 (QK4_0 / (4 * QR4_0))
@@ -1073,7 +1082,8 @@ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_
 typedef void (*allocate_tiles_cuda_t)(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc);
 typedef void (*load_tiles_cuda_t)(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row);
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & blocks_left);
 // planar-repack loader: the original convention shifts the weight pointer by
 // (row_x_0*blocks_per_row + ib0), which cannot express the global plane bases
 typedef void (*load_tiles_planar_cuda_t)(

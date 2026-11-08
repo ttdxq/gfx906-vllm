@@ -9,17 +9,13 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
-from vllm.model_executor.layers.fused_moe.utils import (
-    is_model_fused_shared_expert_compatible,
-)
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    QwenGatedDeltaNetAttention,
-)
+from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -59,18 +55,22 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     StageMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
+    get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.model_executor.offloader import get_offloader
 from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.platforms.rocm import on_gfx906
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -219,13 +219,22 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         if layer_type == "linear_attention":
-            self.linear_attn = QwenGatedDeltaNetAttention(
-                config,
+            self.linear_attn = GatedDeltaNetAttention(
+                config=config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                reduce_results=not self.use_hc_sequence_parallel,
+                create_in_proj_qkvz=False,
+                create_in_proj_ba=False,
+                use_chunk_prefill_on_gfx906=envs.VLLM_QWEN4EXP_GDN_CHUNK_PREFILL,
             )
+            if (
+                on_gfx906()
+                and envs.VLLM_QWEN4EXP_GDN_KV_STATE
+                and config.linear_key_head_dim == config.linear_value_head_dim == 128
+            ):
+                # Match chunk state to the existing coalesced packed decode.
+                self.linear_attn.use_transposed_state_for_packed_decode = True
         elif layer_type in _QSA_LAYER_TYPES:
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
             if not use_qsa:
@@ -258,7 +267,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
             hidden_size=config.hidden_size,
-            params_dtype=torch.bfloat16,
+            params_dtype=vllm_config.model_config.dtype,
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
@@ -426,7 +435,30 @@ class Qwen4ExpModel(nn.Module):
             if layer_type in _QSA_LAYER_TYPES
             and getattr(config, "indexer_n_heads", None) is not None
         )
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        self.embed_tokens: VocabParallelEmbedding | PPMissingLayer
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                # GGUF checkpoints ship a quantized token_embd; the quant
+                # method must own the parameter.
+                self.vocab_size,
+                config.hidden_size,
+                quant_config=vllm_config.quant_config,
+            )
+            offloader = get_offloader()
+            if (
+                vllm_config.quant_config is not None
+                and vllm_config.quant_config.get_name() == "gguf"
+                and offloader.supports_tower_offload
+                and "embed_tokens" in getattr(offloader, "cpu_offload_params", set())
+            ):
+                # Embedding queries read selected rows, so allow the existing
+                # parameter filter to offload this table independently of MoE.
+                self.embed_tokens = offloader.wrap_modules(
+                    (module for module in (self.embed_tokens,)),
+                    prefix=maybe_prefix(prefix, "embed_tokens"),
+                )[0]
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
@@ -439,10 +471,10 @@ class Qwen4ExpModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
-        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
-            self.layers,
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
             Qwen4ExpSparseMoeBlock,
-            "mlp",
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
         )
         intermediate_size = config.hidden_size * config.hc_count
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -454,7 +486,7 @@ class Qwen4ExpModel(nn.Module):
             hc_config = HyperConnectionConfig(
                 hc_count=config.hc_count,
                 hidden_size=config.hidden_size,
-                params_dtype=torch.bfloat16,
+                params_dtype=vllm_config.model_config.dtype,
                 hc_lowrank=config.hc_lowrank,
                 rms_norm_eps=config.rms_norm_eps,
                 hc_per_branch_norm=True,
@@ -613,7 +645,7 @@ class Qwen4ExpModel(nn.Module):
         )
         weights = maybe_fuse_shared_experts(
             weights,
-            enabled=self.is_fused_shared_expert_enabled,
+            fused_shared_expert_layers=self.fused_shared_expert_layers,
             n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
@@ -685,11 +717,18 @@ class Qwen4ExpForCausalLM(
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        self.lm_head: ParallelLMHead | PPMissingLayer
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                # GGUF checkpoints ship a quantized lm_head (output.weight);
+                # the quant method must own the parameter.
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -973,7 +1012,9 @@ class Qwen4ExpForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
-        if not get_pp_group().is_first_rank and self.use_deepstack:
+        if not get_pp_group().is_first_rank and hasattr(
+            config.vision_config, "deepstack_visual_indexes"
+        ):
             assert self.language_model.model.start_layer >= len(
                 config.vision_config.deepstack_visual_indexes
             ), (

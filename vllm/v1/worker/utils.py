@@ -36,7 +36,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
-    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
@@ -636,25 +635,12 @@ def prepare_kernel_block_sizes(
             # This is an attention backend that supports virtual block splitting.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
-            storage_block_size = (
-                kv_cache_spec.storage_block_size
-                if isinstance(kv_cache_spec, MLAAttentionSpec)
-                else None
+            # MLAAttentionSpec lost storage_block_size in the packed-KV-layout
+            # rework (the GLM-5.3-Flash kpool cache it served is gone with the
+            # model); the backend vote below is the only selector now.
+            kernel_block_sizes.append(
+                select_common_block_size(kv_manager_block_size, group_backends)
             )
-            if storage_block_size is not None and _block_size_is_supported(
-                group_backends, storage_block_size
-            ):
-                # Storage-block specs (e.g. the GLM-5.3-Flash kpool indexer
-                # cache) address the cache in pool pages, and every other
-                # consumer (cache views, metadata builders, hisparse) already
-                # uses storage_block_size as the kernel block. Fall back to the
-                # backend vote when the group's backends do not accept it.
-                selected_kernel_size = storage_block_size
-            else:
-                selected_kernel_size = select_common_block_size(
-                    kv_manager_block_size, group_backends
-                )
-            kernel_block_sizes.append(selected_kernel_size)
         elif isinstance(kv_cache_spec, MambaSpec):
             # This is likely Mamba or other non-attention cache, no splitting.
             kernel_block_sizes.append(kv_cache_spec.block_size)
@@ -855,12 +841,22 @@ def copy_kv_cache_blocks_inplace(
 
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
     indices: torch.Tensor | None = None
-    seen: set[tuple[torch.device, int]] = set()
+    seen: set[tuple[Any, ...]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
     for cache in kv_caches:
         # Layers sharing KV (cross-layer sharing) alias the same view; copy it
-        # once. data_ptr distinguishes per-layer views of a shared allocation.
-        key = (cache.device, cache.data_ptr())
+        # once. Hybrid models overlay layers of different kinds on one tensor,
+        # so views at the same address can differ in geometry (a Mamba state
+        # view spans only the leading bytes of a block that an attention view
+        # spans in full); each geometry must be copied, so the key covers the
+        # view's shape and strides and not just its address.
+        key = (
+            cache.device,
+            cache.data_ptr(),
+            tuple(cache.shape),
+            tuple(cache.stride()),
+            cache.element_size(),
+        )
         if key in seen:
             continue
         seen.add(key)

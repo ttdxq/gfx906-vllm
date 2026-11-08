@@ -13,6 +13,10 @@ import vllm.envs as envs
 from vllm import TokensPrompt
 from vllm.config import VllmConfig
 from vllm.config.kv_events import KVEventsConfig
+from vllm.config.profiler import (
+    validate_profile_iteration_bounds,
+    validate_profile_prefix,
+)
 from vllm.distributed.weight_transfer.base import (
     WeightTransferInitRequest,
     WeightTransferUpdateRequest,
@@ -21,8 +25,11 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.entrypoints.serve.elastic_ep.middleware import set_scaling_elastic_ep
 from vllm.exceptions import (
+    EngineFaultedError,
+    GenerationError,
     GracefulHTTPError,
     MaxQueuedTokensError,
+    ProfilerAlreadyActiveError,
     QueueOverflowError,
     VLLMClientError,
     VLLMValidationError,
@@ -31,13 +38,14 @@ from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
 from vllm.platforms import current_platform
 from vllm.plugins.io_processors import get_io_processor
-
-from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
-from vllm.profiler.wrapper import TorchProfilerWrapper
+from vllm.profiler.wrapper import (
+    TorchProfilerWrapper,
+    create_frontend_profiler,
+)
 from vllm.renderers import renderer_from_config
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -48,7 +56,7 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
-from vllm.v1.engine import EngineCoreRequest, PauseMode
+from vllm.v1.engine import CheckpointState, EngineCoreRequest, PauseMode
 from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -134,6 +142,9 @@ class AsyncLLM(EngineClient):
 
         self.vllm_config = vllm_config
         self._elastic_ep_lock = asyncio.Lock()
+        self._profile_lock = asyncio.Lock()
+        self._profile_session_guard_enabled = client_count == 1
+        self._profile_session_active = False
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
         self.observability_config = vllm_config.observability_config
@@ -176,6 +187,18 @@ class AsyncLLM(EngineClient):
             tracing_enabled=tracing_endpoint is not None,
             admission_stats=self.admission_stats,
         )
+
+        # The engine load streams tens of GiB through the page cache while
+        # this process idles, which pushes the tokenizer vocabulary into
+        # swap; the first long generation would then stall behind major
+        # faults on the output handler thread. Keep the frontend's private
+        # memory resident and fault the whole vocabulary up front.
+        if envs.VLLM_WARM_LOCK_DETOKENIZER and renderer.tokenizer is not None:
+            from vllm.utils.host_memory_lock import mlock_private_mappings
+            from vllm.v1.engine.detokenizer import warm_detokenizer_vocab
+
+            mlock_private_mappings()
+            warm_detokenizer_vocab(renderer.tokenizer)
 
         # EngineCore (starts the engine in background process).
         if _use_v1_async_multiprocessing():
@@ -225,23 +248,18 @@ class AsyncLLM(EngineClient):
             pass
 
         self.profiler = profiler
-        configured_activities = vllm_config.profiler_config.torch_profiler_activities
+        self._frontend_profiler_injected = profiler is not None
+        self._frontend_profiler_worker_name = (
+            f"{socket.gethostname()}_{os.getpid()}.async_llm"
+        )
         if (
-            vllm_config.profiler_config.profiler == "torch"
-            and not vllm_config.profiler_config.ignore_frontend
-            and (configured_activities is None or "CPU" in configured_activities)
+            not self._frontend_profiler_injected
+            and client_count == 1
+            and vllm_config.profiler_config.should_profile_frontend
         ):
-            profiler_dir = vllm_config.profiler_config.torch_profiler_dir
-            logger.info(
-                "Torch profiler enabled. AsyncLLM CPU traces will be collected under %s",  # noqa: E501
-                profiler_dir,
-            )
-            worker_name = f"{socket.gethostname()}_{os.getpid()}.async_llm"
-            self.profiler = TorchProfilerWrapper(
+            self.profiler = create_frontend_profiler(
                 vllm_config.profiler_config,
-                worker_name=worker_name,
-                local_rank=0,
-                activities=["CPU"],
+                worker_name=self._frontend_profiler_worker_name,
             )
 
     @classmethod
@@ -343,10 +361,23 @@ class AsyncLLM(EngineClient):
             request_id: Request id, used for logging only.
 
         Raises:
+            EngineFaultedError: If the engine has faulted and is awaiting
+                FT recovery.
             QueueOverflowError: If ``max_num_queued_reqs`` would be exceeded.
             MaxQueuedTokensError: If ``max_num_queued_tokens`` would be exceeded.
 
         """
+        if (
+            self.vllm_config.parallel_config.enable_fault_tolerance
+            and self.engine_core.engine_status.get("status") != "healthy"
+        ):
+            logger.info(
+                "Engine %s - rejecting request %s.",
+                self.engine_core.engine_status.get("status"),
+                request_id,
+            )
+            raise EngineFaultedError()
+
         max_num_reqs = self.scheduler_config.max_num_queued_reqs
         if max_num_reqs is not None:
             current_requests = (
@@ -580,6 +611,7 @@ class AsyncLLM(EngineClient):
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> RequestOutputCollector:
+        self._validate_resumable_request()
         self._validate_streaming_input_sampling_params(sampling_params)
 
         inputs = dict(
@@ -662,6 +694,13 @@ class AsyncLLM(EngineClient):
 
         queue._input_stream_task = asyncio.create_task(handle_inputs())
         return queue
+
+    def _validate_resumable_request(self) -> None:
+        if self.vllm_config.is_mm_encoder_only or self.model_config.is_diffusion:
+            raise VLLMValidationError(
+                "Resumable requests are not supported for encoder-only or "
+                "diffusion models."
+            )
 
     @staticmethod
     def _validate_streaming_input_sampling_params(
@@ -779,7 +818,10 @@ class AsyncLLM(EngineClient):
             raise
 
         # Request validation error or admission control rejection.
-        except (VLLMClientError, GracefulHTTPError) as e:
+        except (VLLMClientError, GracefulHTTPError, GenerationError) as e:
+            if q is not None:
+                # E.g. a paused engine rejected one child: reclaim its n>1 siblings.
+                await self.abort(q.request_id, internal=True)
             if self.log_requests:
                 logger.info("Request %s failed (bad request): %s.", request_id, e)
             raise
@@ -849,22 +891,22 @@ class AsyncLLM(EngineClient):
                     for start in range(0, num_outputs, chunk_size):
                         end = start + chunk_size
                         outputs_slice = engine_core_outputs[start:end]
+                        if mm_processor_cache is not None:
+                            missing_hashes = [
+                                mm_hash
+                                for eco in outputs_slice
+                                for mm_hash in eco.mm_cache_miss_hashes or ()
+                            ]
+                            # Mark before publishing errors so even queued
+                            # renders invalidate before their next cache lookup.
+                            renderer.queue_mm_cache_invalidations(missing_hashes)
+
                         # 2) Process EngineCoreOutputs.
                         processed_outputs = output_processor.process_outputs(
                             outputs_slice, outputs.timestamp, iteration_stats
                         )
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
-
-                        # 2b) Recover from P0/P1 cache drift: the engine flags hashes
-                        # it couldn't find (mm_cache_miss_hashes); drop them from the
-                        # P0 shadow so the client's retry resends the data and
-                        # repopulates P1. Hot-path no-op (field is None otherwise).
-                        if mm_processor_cache is not None:
-                            for eco in outputs_slice:
-                                if eco.mm_cache_miss_hashes:
-                                    for mm_hash in eco.mm_cache_miss_hashes:
-                                        mm_processor_cache.invalidate(mm_hash)
 
                         # Allow other asyncio tasks to run between chunks
                         if end < num_outputs:
@@ -946,8 +988,9 @@ class AsyncLLM(EngineClient):
         """Pause generation to allow model weight updates.
 
         All mode handling (abort / wait / keep) and cache clearing is done
-        in the engine. New generation/encoding requests will not be scheduled
-        until resume is called.
+        in the engine. In ``abort`` and ``wait`` mode, new requests are rejected
+        with ``RetryableRequestError`` from when the pause starts until
+        :meth:`resume_generation`; ``keep`` accepts and queues them.
 
         Args:
             mode: How to handle in-flight requests:
@@ -972,7 +1015,9 @@ class AsyncLLM(EngineClient):
             mode = "wait"
         if clear_cache:
             await self.renderer.clear_mm_cache_async()
-        await self.engine_core.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
+        await self.engine_core.pause_generation_async(
+            mode=mode, clear_cache=clear_cache
+        )
         # Small sleep to help ensure that final outputs from any in-flight requests are
         # returned prior to this method returning. These outputs come out of the engine
         # prior to the wait-for-idle completion event, but involve additional async
@@ -1054,7 +1099,7 @@ class AsyncLLM(EngineClient):
             raise
 
         # Request validation error or admission control rejection.
-        except (VLLMClientError, GracefulHTTPError):
+        except (VLLMClientError, GracefulHTTPError, GenerationError):
             if self.log_requests:
                 logger.info("Request %s failed (bad request).", request_id)
             raise
@@ -1089,17 +1134,50 @@ class AsyncLLM(EngineClient):
         if self.errored:
             raise self.dead_error
 
-    async def start_profile(self, profile_prefix: str | None = None) -> None:
-        coros = [self.engine_core.profile_async(True, profile_prefix)]
-        if self.profiler is not None:
-            coros.append(asyncio.to_thread(self.profiler.start))
-        await asyncio.gather(*coros)
+    async def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        async with self._profile_lock:
+            if self._profile_session_guard_enabled and self._profile_session_active:
+                raise ProfilerAlreadyActiveError()
+            validate_profile_prefix(profile_prefix)
+            validate_profile_iteration_bounds(delay_iterations, max_iterations)
+
+            if self._profile_session_guard_enabled:
+                self._profile_session_active = True
+            # A cancelled start may still take effect, so only a reported
+            # engine failure clears the session; otherwise /stop_profile is needed.
+            try:
+                await self.engine_core.profile_async(
+                    True,
+                    profile_prefix,
+                    delay_iterations,
+                    max_iterations,
+                    profiler_kwargs=profiler_kwargs,
+                )
+            except Exception:
+                self._profile_session_active = False
+                raise
+            if self.profiler is not None:
+                if not self._frontend_profiler_injected:
+                    worker_name = self._frontend_profiler_worker_name
+                    if profile_prefix is not None:
+                        worker_name = f"{profile_prefix}_{worker_name}"
+                    self.profiler.set_output_name(worker_name)
+                await asyncio.to_thread(self.profiler.start)
 
     async def stop_profile(self) -> None:
-        coros = [self.engine_core.profile_async(False)]
-        if self.profiler is not None:
-            coros.append(asyncio.to_thread(self.profiler.stop))
-        await asyncio.gather(*coros)
+        async with self._profile_lock:
+            coros = [self.engine_core.profile_async(False)]
+            if self.profiler is not None:
+                coros.append(asyncio.to_thread(self.profiler.stop))
+            await asyncio.gather(*coros)
+            self._profile_session_active = False
 
     async def reset_mm_cache(self) -> None:
         # Join the background MM warmup first: the mm_processor_cache is not
@@ -1139,11 +1217,20 @@ class AsyncLLM(EngineClient):
         if self.logger_manager is not None and fully_awake:
             self.logger_manager.record_sleep_state(0, 0)
 
-    async def checkpoint_prepare(self) -> None:
-        await self.collective_rpc("checkpoint_prepare")
+        return fully_awake
+
+    async def checkpoint_prepare(self, mode: PauseMode = "wait") -> str | None:
+        refusal = await self.engine_core.checkpoint_prepare_async(mode)
+        if refusal is None:
+            # Preparing resets the engine's multimodal cache.
+            await self.renderer.clear_mm_cache_async()
+        return refusal
 
     async def checkpoint_restore(self) -> None:
-        await self.collective_rpc("checkpoint_restore")
+        await self.engine_core.checkpoint_restore_async()
+
+    async def checkpoint_state(self) -> tuple[CheckpointState, str | None]:
+        return await self.engine_core.checkpoint_state_async()
 
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()

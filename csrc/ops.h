@@ -93,7 +93,7 @@ void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
 
 torch::Tensor rms_norm_gated_gfx906(torch::Tensor input, torch::Tensor weight,
                                     torch::Tensor gate, double epsilon,
-                                    bool norm_before_gate);
+                                    bool norm_before_gate, bool sigmoid_gate);
 
 torch::Tensor gemma_rms_norm_gfx906(torch::Tensor input, torch::Tensor weight,
                                     double epsilon);
@@ -319,6 +319,10 @@ void ggml_moe_a8_vec_out(torch::Tensor X, torch::Tensor W,
                          torch::Tensor topk_ids, torch::Tensor output,
                          torch::Tensor quant_X, int64_t top_k, int64_t type,
                          int64_t row, int64_t tokens);
+
+torch::Tensor ggml_moe_q8_vec_indirect(
+    torch::Tensor quant_X, torch::Tensor expert_ptrs, torch::Tensor topk_ids,
+    int64_t type, int64_t row, int64_t tokens, int64_t col, at::ScalarType dtype);
 
 torch::Tensor ggml_moe_q8_vec(torch::Tensor quant_X, torch::Tensor W,
                               torch::Tensor topk_ids, int64_t top_k,

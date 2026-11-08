@@ -383,7 +383,29 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     const std::string& kv_cache_dtype, bool skip_index_branch,
     std::optional<torch::stable::Tensor> q_fp8_out, double q_fp8_scale,
     std::optional<torch::stable::Tensor> kv_k_scale,
-    std::optional<torch::stable::Tensor> kv_v_scale);
+    std::optional<torch::stable::Tensor> kv_v_scale, bool write_qkv);
+void fused_minimax_m3_dspark_context_kv(
+    torch::stable::Tensor const& all_kv,
+    torch::stable::Tensor const& k_norm_weight,
+    torch::stable::Tensor const& cos_sin_cache,
+    torch::stable::Tensor const& positions,
+    torch::stable::Tensor const& slot_mapping, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor const& cache_offsets,
+    torch::stable::Tensor const& k_scale,
+    torch::stable::Tensor const& scale_offsets, int64_t rotary_dim, double eps,
+    const std::string& kv_cache_dtype);
+
+void fused_muse_spark_qknorm_rope_kv_insert(
+    torch::stable::Tensor& qkv, torch::stable::Tensor const& positions,
+    int64_t num_heads, int64_t num_kv_heads, int64_t head_dim, double eps,
+    std::optional<torch::stable::Tensor> cos_sin_cache, int64_t rotary_dim,
+    std::optional<torch::stable::Tensor> slot_mapping,
+    std::optional<torch::stable::Tensor> kv_cache, int64_t block_size,
+    const std::string& kv_cache_dtype,
+    std::optional<torch::stable::Tensor> k_scale,
+    std::optional<torch::stable::Tensor> v_scale,
+    std::optional<torch::stable::Tensor> q_fp8_out,
+    std::optional<torch::stable::Tensor> q_scale);
 
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
 void fused_kda_decode(
@@ -547,6 +569,10 @@ int64_t open_mem_handle(torch::stable::Tensor& mem_handle);
 void free_shared_buffer(int64_t buffer);
 
 // Activation kernels (shared CUDA/ROCm)
+void muse_spark_mul_tanh_soft_cap(torch::stable::Tensor& out,
+                                  torch::stable::Tensor& input,
+                                  double multiplier, double soft_cap_temp);
+
 void silu_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input);
 void silu_and_mul_clamp(torch::stable::Tensor& out,
                         torch::stable::Tensor& input, double limit,
@@ -650,8 +676,7 @@ void reshape_and_cache(torch::stable::Tensor& key, torch::stable::Tensor& value,
                        torch::stable::Tensor& slot_mapping,
                        const std::string& kv_cache_dtype,
                        torch::stable::Tensor& k_scale,
-                       torch::stable::Tensor& v_scale,
-                       bool interleaved_v = false);
+                       torch::stable::Tensor& v_scale, bool interleaved_v);
 
 void reshape_and_cache_flash(
     torch::stable::Tensor& key, torch::stable::Tensor& value,
@@ -664,7 +689,7 @@ void concat_and_cache_mla(torch::stable::Tensor& kv_c,
                           torch::stable::Tensor& kv_cache,
                           torch::stable::Tensor& slot_mapping,
                           const std::string& kv_cache_dtype,
-                          torch::stable::Tensor& scale);
+                          torch::stable::Tensor& scale, bool skip_scale);
 
 void concat_and_cache_mla_grouped(
     torch::stable::Tensor& kv_c, torch::stable::Tensor& k_pe,
@@ -777,7 +802,8 @@ void cp_gather_and_upconvert_nvfp4_kv_cache(
     torch::stable::Tensor const& dst,               // [TOT_TOKENS, 576]
     torch::stable::Tensor const& block_table,       // [BATCH, BLOCK_INDICES]
     torch::stable::Tensor const& workspace_starts,  // [BATCH]
-    int64_t batch_size);
+    int64_t batch_size,
+    std::optional<torch::stable::Tensor> seq_starts = std::nullopt);
 
 // Indexer K quantization and cache function
 void indexer_k_quant_and_cache(

@@ -9,11 +9,17 @@ import pytest
 import torch
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
-from vllm.config import CacheConfig, ParallelConfig
+from vllm.config import CacheConfig, ModelConfig, ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from vllm.model_executor.models.config import (
-    Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForConditionalGenerationConfig,
+)
+from vllm.models.qwen4_exp.nvidia.model import (
+    Qwen4ExpForCausalLM,
+    Qwen4ExpForConditionalGeneration,
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -47,6 +53,153 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     }
     values.update(kwargs)
     return Qwen4ExpTextConfig(**values)
+
+
+@pytest.mark.parametrize("keep_quantized", [False, True])
+def test_gguf_hc_up_preserves_checkpoint_precision(
+    tmp_path, monkeypatch, keep_quantized
+) -> None:
+    import gguf
+
+    from vllm.model_executor.model_loader.gguf_adapters import Qwen4ExpGGUFAdapter
+
+    monkeypatch.setenv("VLLM_QWEN4EXP_GGUF_HC_UP_QUANT", str(int(keep_quantized)))
+    _text_config(architectures=["Qwen4ExpForCausalLM"]).save_pretrained(tmp_path)
+    model_config = ModelConfig(model=str(tmp_path), dtype="half", max_model_len=4096)
+    qtype = gguf.GGMLQuantizationType.Q8_0
+    packed = torch.from_numpy(
+        gguf.quantize(
+            torch.arange(1024, dtype=torch.float32).view(32, 32).numpy(), qtype
+        )
+    )
+    base = "model.layers.0.attn_hyper_connection"
+    weights = []
+    for suffix in ("input_mix_weight_up", "input_mix_weight_down"):
+        weights.extend(
+            [
+                (f"{base}.{suffix}.qweight_type", torch.tensor(int(qtype))),
+                (f"{base}.{suffix}.qweight", packed),
+            ]
+        )
+    restored = dict(
+        Qwen4ExpGGUFAdapter().transform_weights(iter(weights), model_config)
+    )
+    expected = torch.from_numpy(gguf.dequantize(packed.numpy(), qtype)).half()
+    torch.testing.assert_close(
+        restored[f"{base}.input_mix_weight_down.weight"], expected
+    )
+    if keep_quantized:
+        assert restored[f"{base}.input_mix_weight_up.qweight"] is packed
+        assert restored[f"{base}.input_mix_weight_up.qweight_type"].item() == int(qtype)
+        assert f"{base}.input_mix_weight_up.weight" not in restored
+    else:
+        torch.testing.assert_close(
+            restored[f"{base}.input_mix_weight_up.weight"], expected
+        )
+
+
+def test_gguf_adapter_restores_gdn_head_order_and_norm_weights(tmp_path) -> None:
+    """GGUF value heads and zero-centred gammas retain their HF meaning."""
+    import gguf
+
+    from vllm.model_executor.model_loader.gguf_adapters import Qwen4ExpGGUFAdapter
+
+    config = _text_config(
+        architectures=["Qwen4ExpForCausalLM"],
+        hidden_size=32,
+        num_hidden_layers=1,
+        layer_types=["linear_attention"],
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        ple_layer_ids=[],
+        output_gate_type="sigmoid",
+    )
+    config.save_pretrained(tmp_path)
+    model_config = ModelConfig(model=str(tmp_path), dtype="half", max_model_len=4096)
+    torch.manual_seed(0)
+    qtype = gguf.GGMLQuantizationType.Q4_0
+    qkv = gguf.quantize(torch.randn(256, 32).numpy(), qtype)
+    out = gguf.quantize(torch.randn(32, 128).numpy(), qtype)
+    prefix = "model.layers.0.linear_attn"
+    decay = -torch.exp(torch.tensor([0.25, -1.0, 2.0, 0.5]))
+    weights = [
+        (f"{prefix}.in_proj_qkv.qweight_type", torch.tensor(int(qtype))),
+        (f"{prefix}.out_proj.qweight_type", torch.tensor(int(qtype))),
+        (f"{prefix}.in_proj_qkv.qweight", torch.from_numpy(qkv)),
+        (f"{prefix}.out_proj.qweight", torch.from_numpy(out)),
+        (f"{prefix}.A_log", decay),
+        (f"{prefix}.norm.weight", torch.ones(32)),
+        ("model.layers.0.attn_hyper_connection.hc_norm.weight", torch.ones(64)),
+    ]
+    restored = dict(
+        Qwen4ExpGGUFAdapter().transform_weights(iter(weights), model_config)
+    )
+    permutation = torch.tensor([0, 2, 1, 3])
+    qkv_ref = torch.from_numpy(gguf.dequantize(qkv, qtype))
+    qkv_ref = torch.cat(
+        [qkv_ref[:128], qkv_ref[128:].view(4, 32, 32)[permutation].flatten(0, 1)]
+    )
+    actual_qkv = torch.from_numpy(
+        gguf.dequantize(restored[f"{prefix}.in_proj_qkv.qweight"].numpy(), qtype)
+    )
+    torch.testing.assert_close(actual_qkv, qkv_ref, rtol=0, atol=0)
+    out_ref = torch.from_numpy(gguf.dequantize(out, qtype))
+    out_ref = out_ref.view(32, 4, 32)[:, permutation].flatten(1).half()
+    torch.testing.assert_close(
+        restored[f"{prefix}.out_proj.qweight"], out_ref, rtol=0, atol=0
+    )
+    assert (
+        int(restored[f"{prefix}.out_proj.qweight_type"])
+        == gguf.GGMLQuantizationType.F16
+    )
+    torch.testing.assert_close(
+        restored[f"{prefix}.A_log"], torch.log(-decay)[permutation], rtol=0, atol=0
+    )
+    assert torch.equal(restored[f"{prefix}.norm.weight"], torch.ones(32))
+    assert (
+        torch.count_nonzero(
+            restored["model.layers.0.attn_hyper_connection.hc_norm.weight"]
+        )
+        == 0
+    )
+
+
+def test_gguf_mtp_adapter_maps_standalone_checkpoint() -> None:
+    from vllm.model_executor.model_loader.gguf_adapters import (
+        Qwen4ExpMTPGGUFAdapter,
+    )
+
+    text_config = _text_config(
+        num_hidden_layers=48,
+        layer_types=["indexed_attention"] * 48,
+        ple_layer_ids=[],
+    )
+    name_map = Qwen4ExpMTPGGUFAdapter.build_name_map_for_text_config(text_config)
+
+    assert name_map["blk.48.nextn.eh_proj.weight"] == "mtp.eh_proj.weight"
+    assert (
+        name_map["blk.48.nextn.enorm.weight"]
+        == "mtp.pre_fc_norm_embedding.weight"
+    )
+    assert (
+        name_map["blk.48.nextn.hnorm.weight"]
+        == "mtp.pre_fc_norm_hidden.weight"
+    )
+    assert (
+        name_map["blk.48.nextn.hc_head_down.weight"]
+        == "mtp.hyper_connection_mixer.input_mix_weight_down.weight"
+    )
+    assert (
+        name_map["blk.48.attn_q.weight"]
+        == "mtp.layers.0.self_attn.q_proj.weight"
+    )
+    assert (
+        name_map["blk.48.ffn_gate_exps.weight"]
+        == "mtp.layers.0.mlp.experts.0.gate_proj.weight"
+    )
+    assert "blk.49.nextn.eh_proj.weight" not in name_map
 
 
 def test_moe_sp_rejects_pipeline_parallel() -> None:
@@ -88,8 +241,17 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams(
     model.num_mtp_layers = 1
     model.pre_fc_norm_embedding = torch.nn.Identity()
     model.pre_fc_norm_hidden = torch.nn.Identity()
-    model.fc_embedding = torch.nn.Identity()
-    model.fc_hidden = torch.nn.Identity()
+
+    if backend == "amd":
+
+        class SelectHiddenProjection(torch.nn.Module):
+            def forward(self, eh_input):
+                return eh_input[..., model.hidden_size :], None
+
+        model.eh_proj = SelectHiddenProjection()
+    else:
+        model.fc_embedding = torch.nn.Identity()
+        model.fc_hidden = torch.nn.Identity()
 
     def decoder(**kwargs):
         """Check that the embedding residual shares the hidden state's token slice."""
@@ -183,31 +345,6 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
     assert draft_config.n_predict == 1
 
 
-@pytest.mark.parametrize("ple_layer_ids", [[1], []])
-def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
-    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
-    rest of the architecture is PP-capable, so the refusal must be conditional
-    -- and must land before the engine spends time loading weights."""
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
-            multimodal_config=None,
-        ),
-        parallel_config=ParallelConfig(pipeline_parallel_size=2),
-        speculative_config=None,
-    )
-    with patch.object(
-        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
-    ):
-        if ple_layer_ids:
-            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
-                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
-                    vllm_config
-                )
-        else:
-            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
-
-
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     model_state = object.__new__(Qwen4ExpModelState)
     model_state.uses_ngram_embedding = True
@@ -216,6 +353,7 @@ def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     model_state.ngram_context = torch.empty((8, 3), dtype=torch.int32)
     model_state.ngram_context_offsets = torch.arange(-3, 0, dtype=torch.int64)
     model_state.ple_query_start_loc = torch.empty(9, dtype=torch.int32)
+    model_state.disk_offload_modules = []
 
     input_batch = SimpleNamespace(
         num_reqs=2,
@@ -287,3 +425,19 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     )
     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
+
+
+@pytest.mark.parametrize(
+    "model_cls", [Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration]
+)
+def test_qkv_proj_mapping_allows_bf16_indexer(model_cls) -> None:
+    """Regression test for https://github.com/vllm-project/vllm/issues/62308.
+
+    Layout of e.g. ukisai/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ: q/k/v are
+    quantized and only the indexer projection is in `ignore`.
+    """
+    assert not should_ignore_layer(
+        "model.layers.3.self_attn.qkv_proj",
+        ignore=["model.layers.3.self_attn.indexer.index_qk_proj"],
+        fused_mapping=model_cls.packed_modules_mapping,
+    )

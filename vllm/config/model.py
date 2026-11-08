@@ -60,6 +60,7 @@ from vllm.transformers_utils.gguf_utils import (
     maybe_patch_hf_config_from_gguf,
     qwen35_gguf_config_dict,
     qwen35_gguf_tokenizer_path,
+    qwen4exp_gguf_tokenizer_path,
 )
 from vllm.tasks import PoolingTask, ScoreType, SupportedTask
 from vllm.transformers_utils.config import (
@@ -187,6 +188,8 @@ TokenizerMode = Literal[
     "auto",
     "hf",
     "slow",
+    "glm5_next",
+    "alpamayo2_super",
     "mistral",
     "deepseek_v32",
     "deepseek_v4",
@@ -246,12 +249,19 @@ class ModelConfig:
       if available, otherwise it will use the "hf" tokenizer.
     - "hf" will use the fast tokenizer if available.
     - "slow" will always use the slow tokenizer.
+    - "alpamayo2_super" uses the "hf" tokenizer with Alpamayo 2 Super's
+      trajectory and special tokens added; selected automatically for
+      `nvidia/Alpamayo2-Super`.
     - "mistral" will always use the tokenizer from `mistral_common`.
     - "deepseek_v32" will always use the tokenizer from `deepseek_v32`.
     - "deepseek_v4" will always use the tokenizer from `deepseek_v4`.
     - "deepseek_v41" will use the DeepSeek V4.1 prompt encoder.
     - "kimi_k3" will always use the "hf" tokenizer but render chat prompts
       with Kimi K3's Python XTML encoding instead of a Jinja template.
+    - "glm5_next" uses the "hf" tokenizer and renderer on the Python frontend;
+      the Rust frontend renders GLM-5.3 and GLM-5.3-Flash prompts natively,
+      and selects this under "auto" for the `glm5_next` model type
+      (GLM-5.3-Flash).
     - "cohere" uses the standard HF tokenizer but renders the chat template
       via the `cohere_melody` library (cmd3 / cmd4 templates) instead of
       Jinja, and surfaces grounded-citation metadata on responses.
@@ -445,10 +455,17 @@ class ModelConfig:
     (default) uses the built-in ``CuMemAllocator`` and is behavior-compatible
     with prior releases. Additional backends (CUDA checkpoint, CRIU, durable
     snapshot) may be registered in-tree or by plugins (RFC #34303)."""
+    sleep_mode_offload_cudagraph: bool = False
+    """Back up CUDA graph memory to CPU during sleep, restored in place on wake.
+    Takes effect with enable_sleep_mode, the cumem backend and CUDA graphs."""
     enable_nccl_comm_suspend: bool = False
     """Enable releasing NCCL communicator memory during sleep mode
     (``ncclCommSuspend``/``ncclCommResume``). Experimental; when disabled
     (the default) sleep still releases weights/KV-cache memory as before."""
+    checkpoint_prepare_on_startup: bool = False
+    """Prepare each engine for a process checkpoint once it starts, as
+    `/checkpoint/prepare` does. It serves only after `/checkpoint/restore`.
+    Requires sleep mode."""
     enable_cumem_allocator: bool = False
     """Enable the custom cumem allocator to leverage advanced GPU memory
     allocation features such as multi-node NVLink support.
@@ -561,6 +578,7 @@ class ModelConfig:
             "interleave_mm_strings",
             "skip_mm_profiling",
             "mm_ipc_gpu_memory_gb",
+            "checkpoint_prepare_on_startup",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -576,6 +594,13 @@ class ModelConfig:
             factors["video_pruning"] = (
                 self.multimodal_config.is_multimodal_pruning_enabled()
             )
+            # Adding modality into the hashing method to take multimodal
+            # cache into consideration.
+            factors["mm_limit_per_prompt"] = {
+                modality: (opts if isinstance(opts, int) else opts.count)
+                for modality, opts in self.multimodal_config.limit_per_prompt.items()
+            }
+            factors["mm_enable_mm_embeds"] = self.multimodal_config.enable_mm_embeds
         return hash_factors(factors)
 
     def _update_nested(
@@ -700,6 +725,15 @@ class ModelConfig:
             self.tokenizer = tokenizer_path
             logger.info("Using Gemma4 GGUF metadata tokenizer: %s", self.tokenizer)
 
+    def _maybe_use_qwen4exp_gguf_tokenizer(self) -> None:
+        if self.tokenizer is None or self.tokenizer != self.model:
+            return
+
+        tokenizer_path = qwen4exp_gguf_tokenizer_path(self.model)
+        if tokenizer_path is not None:
+            self.tokenizer = tokenizer_path
+            logger.info("Using qwen4exp GGUF metadata tokenizer: %s", self.tokenizer)
+
     def __post_init__(
         self,
         # Multimodal config init vars
@@ -741,6 +775,7 @@ class ModelConfig:
             self.tokenizer = self.model
         self._maybe_use_local_gguf_companion_tokenizer()
         self._maybe_use_qwen35_gguf_tokenizer()
+        self._maybe_use_qwen4exp_gguf_tokenizer()
         self._maybe_use_gemma4_gguf_tokenizer()
         if self.tokenizer_revision is None:
             self.tokenizer_revision = self.revision
@@ -795,6 +830,8 @@ class ModelConfig:
                 self.hf_token,
             )
 
+        if self.checkpoint_prepare_on_startup and not self.enable_sleep_mode:
+            raise ValueError("checkpoint_prepare_on_startup requires enable_sleep_mode")
         if self.enable_sleep_mode:
             if not current_platform.is_sleep_mode_available():
                 raise ValueError("Sleep mode is not supported on current platform.")
@@ -902,6 +939,8 @@ class ModelConfig:
         if self.tokenizer_mode == "auto":
             if self.model_impl == "terratorch":
                 self.tokenizer_mode = "terratorch"
+            elif arch == "Alpamayo2Super":
+                self.tokenizer_mode = "alpamayo2_super"
             elif arch == "MoonshotKimiaForCausalLM":
                 self.tokenizer_mode = "kimi_audio"
             elif arch == "KimiK3ForConditionalGeneration":
@@ -2062,6 +2101,7 @@ class ModelConfig:
             "top_p",
             "min_p",
             "max_new_tokens",
+            "skip_special_tokens",
         ]
         if any(p in config for p in available_params):
             diff_sampling_param = {
@@ -2248,6 +2288,10 @@ class ModelConfig:
         return self._model_info.supports_pp
 
     @property
+    def is_lora_supported(self) -> bool:
+        return self._model_info.supports_lora
+
+    @property
     def is_attention_free(self) -> bool:
         return self._model_info.is_attention_free
 
@@ -2277,6 +2321,18 @@ class ModelConfig:
     @property
     def supports_mamba_prefix_caching(self) -> bool:
         return self._model_info.supports_mamba_prefix_caching
+
+    @property
+    def speculator_config_class(self) -> str | None:
+        """For a speculative decoding draft model, the config class of the
+        speculator it's for, if it declares one (see `SpeculativeDraftModel`)."""
+        return self._model_info.speculator_config_class
+
+    @property
+    def may_use_target_embed(self) -> bool:
+        """For a speculative decoding draft model, whether it may reuse the
+        target's input embedding under pipeline parallelism."""
+        return self._model_info.may_use_target_embed
 
     @property
     def supports_replayssm(self) -> bool:
@@ -2514,7 +2570,7 @@ class ModelConfig:
 
     @property
     def is_quantized(self) -> bool:
-        return getattr(self.hf_config, "quantization_config", None) is not None
+        return self.model_arch_config.quantization_config is not None
 
     def is_nvfp4_quantized(self) -> bool:
         # ModelOpt NVFP4 checkpoints resolve to modelopt_fp4 quantization method

@@ -41,11 +41,13 @@ from .pooling.protocol import (
 )
 from .scoring.protocol import ScoringRequest, ScoringResponse
 from .scoring.typing import ScoreData, ScoringData
+from .token_embed.protocol import TokenEmbeddingRequest, TokenEmbeddingResponse
 
 PoolingCompletionLikeRequest: TypeAlias = (
     EmbeddingCompletionRequest
     | ClassificationCompletionRequest
     | PoolingCompletionRequest
+    | TokenEmbeddingRequest
 )
 
 PoolingChatLikeRequest: TypeAlias = (
@@ -71,6 +73,7 @@ AnyPoolingResponse: TypeAlias = (
     | PoolingResponse
     | PoolingBytesResponse
     | ScoringResponse
+    | TokenEmbeddingResponse
 )
 
 PoolingRequestT = TypeVar("PoolingRequestT", bound=AnyPoolingRequest)
@@ -110,6 +113,7 @@ class PoolingServeContext(Generic[PoolingRequestT]):
         None
     )
     final_res_batch: list[PoolingRequestOutput] = field(default_factory=list)
+    late_chunking: list[LateChunkingSlot] = field(default_factory=list)
 
     ## for Long Text Embedding with Chunked Processing
     original_engine_inputs: Sequence["PoolingEngineInput"] | None = None

@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.gguf_utils import (
     gemma4_gguf_config_dict,
     gemma4_mtp_gguf_config_dict,
+    qwen4exp_gguf_config_dict,
     qwen35_gguf_config_dict,
 )
 from vllm.transformers_utils.repo_utils import is_mistral_model_repo
@@ -65,6 +66,46 @@ MISTRAL_CONFIG_NAME = "params.json"
 
 logger = init_logger(__name__)
 
+CONFIG_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "total_num_kv_heads": (
+        "n_head_kv",  # Falcon
+        "num_kv_heads",
+        "num_key_value_heads",  # LLaMA-2
+        "multi_query_group_num",  # ChatGLM
+        "num_attention_groups",  # Step3p5
+    ),
+    "num_experts": (
+        "num_experts",  # Jamba
+        "moe_num_experts",  # Dbrx
+        "n_routed_experts",  # DeepSeek
+        "num_local_experts",  # Mixtral
+    ),
+    "num_experts_per_token": (
+        "num_experts_per_tok",
+        "num_experts_per_token",
+        "top_k_experts",
+        "moe_topk",  # Hunyuan
+        "moe_top_k",
+        "top_k",
+    ),
+    "moe_intermediate_size": (
+        "moe_intermediate_size",
+        "intermediate_size",
+    ),
+    "num_shared_experts": (
+        "n_shared_experts",  # DeepSeek, Docs, GLM
+        "moe_num_shared_experts",  # Aria, Ernie
+    ),
+}
+"""HF config fields that models spell differently, keyed by the name vLLM uses.
+
+`ModelArchConfigConvertorBase` reads a scalar from these; a caller that needs the
+raw value (a per-layer `list`, say) passes the aliases to `getattr_iter` itself."""
+
+_ST_TRANSFORMER_MODULE_TYPES = {
+    "sentence_transformers.models.Transformer",
+    "sentence_transformers.base.modules.transformer.Transformer",
+}
 _ST_POOLING_MODULE_TYPES = {
     "sentence_transformers.models.Pooling",
     "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
@@ -100,27 +141,28 @@ class LazyConfigDict(dict):
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     afmoe="AfmoeConfig",
     axk1="AXK1Config",
+    alpamayo2_super="Alpamayo2SuperConfig",
     bagel="BagelConfig",
     bailing_moe_v3_vl="BailingMoeV3VLConfig",
+    beam="BeamConfig",
     chatglm="ChatGLMConfig",
     modernvbert="ColModernVBertConfig",
     colpali="ColPaliConfig",
-    colqwen3="ColQwen3Config",
-    ops_colqwen3="OpsColQwen3Config",
-    qwen3_vl_nemotron_embed="Qwen3VLNemotronEmbedConfig",
     cosmos3_omni="Cosmos3Config",
     cosmos3_edge="Cosmos3EdgeConfig",
     diffusion_gemma="DiffusionGemmaConfig",
+    deepseek_v4="DeepseekV4Config",
+    ultravbert="ColUltraVBertConfig",
+    colqwen3="ColQwen3Config",
+    ops_colqwen3="OpsColQwen3Config",
+    qwen3_vl_nemotron_embed="Qwen3VLNemotronEmbedConfig",
     deepseek_vl_v2="DeepseekVLV2Config",
     deepseek_v32="DeepseekV3Config",
-    deepseek_v4="DeepseekV4Config",
+    dory="DoryConfig",
     dots3_note="Dots3NoteConfig",
     k3_dspark="K3DSparkConfig",
     funaudiochat="FunAudioChatConfig",
     granite4_vision="Granite4VisionConfig",
-    glm5_next="Glm5NextConfig",
-    glm5_next_text="Glm5NextTextConfig",
-    glm5_next_vision="Glm5NextVisionConfig",
     hyperclovax="HyperCLOVAXConfig",
     hy_v3="HYV3Config",
     hy_v4="HYV4Config",
@@ -128,19 +170,27 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     kimi_k2="DeepseekV3Config",  # Kimi K2 uses same architecture as DeepSeek V3
     kimi_linear="KimiLinearConfig",
     kimi_vl="KimiVLConfig",
-    kimi_k25="KimiK25Config",
     muse_glimmer="MuseGlimmerConfig",
     muse_glimmer_text="MuseGlimmerTextConfig",
     muse_glimmer_vision="MuseGlimmerVisionConfig",
     muse_glimmer_assistant="MuseGlimmerAssistantConfig",
+    kimi_k25="Kimi_K25Config",  # Upstream class, hub remote code uses old schema
+    muse_spark_dspark="MuseSparkDSparkConfig",
+    musespark1x_text="MuseSpark1xTextConfig",
+    muse_spark_text="MuseSparkTextConfig",
+    muse_spark_vision="MuseSparkVisionConfig",
+    muse_spark_audio="MuseSparkAudioConfig",
+    muse_spark="MuseSparkConfig",
     kimi_k3="KimiK3Config",
     RefinedWeb="RWConfig",  # For tiiuae/falcon-40b(-instruct)
     RefinedWebModel="RWConfig",  # For tiiuae/falcon-7b(-instruct)
     midashenglm="MiDashengLMConfig",
     minimax_m3_vl="MiniMaxM3Config",
     minimax_m3_mtp="MiniMaxM3MTPConfig",
+    ming_v3_asr="MingV3ASRConfig",
     moondream3="Moondream3Config",
     moss_transcribe_diarize="MossTranscribeDiarizeConfig",
+    nemo_speechlm="Nemotron3_5TranscribeConfig",
     eagle="EAGLEConfig",
     speculators="SpeculatorsConfig",
     nemotron="NemotronConfig",
@@ -150,12 +200,11 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     ultravox="UltravoxConfig",
     step3_vl="Step3VLConfig",
     step3_text="Step3TextConfig",
-    step3p5="Step3p5Config",
-    qianfan_ocr="QianfanOCRConfig",
+    step3p5="Step3p7TextConfig",  # Upstream class, hub remote code fails validation
+    step5="Step5Config",
+    step5_vl="Step5VLConfig",
     qwen3_asr="Qwen3ASRConfig",
     qwen3_next="Qwen3NextConfig",
-    qwen4_exp="Qwen4ExpConfig",
-    qwen4_exp_text="Qwen4ExpTextConfig",
     qwen3_5="Qwen3_5Config",
     qwen3_5_text="Qwen3_5TextConfig",
     qwen3_5_moe="Qwen3_5MoeConfig",
@@ -163,6 +212,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     lfm2_moe="Lfm2MoeConfig",
     **{"unlimited-ocr": "UnlimitedOCRConfig"},
     **{"deepseek_v41": "DeepseekV41Config"},
+    flint="FlintConfig",
     inkling_mm_model="InklingMMConfig",
     inkling_model="InklingModelConfig",
 )
@@ -364,8 +414,11 @@ class HFConfigParser(ConfigParserBase):
         if gguf_file is not None:
             gguf_path = Path(model) / gguf_file
             config_dict = qwen35_gguf_config_dict(str(gguf_path)) or (
-                gemma4_gguf_config_dict(str(gguf_path))
-                or gemma4_mtp_gguf_config_dict(str(gguf_path))
+                qwen4exp_gguf_config_dict(str(gguf_path))
+                or (
+                    gemma4_gguf_config_dict(str(gguf_path))
+                    or gemma4_mtp_gguf_config_dict(str(gguf_path))
+                )
             )
             if config_dict is not None:
                 model_type = config_dict["model_type"]
@@ -387,8 +440,11 @@ class HFConfigParser(ConfigParserBase):
             # metadata builders first; the transformers attempt below stays
             # as the fallback for architectures they do not cover.
             config_dict = qwen35_gguf_config_dict(str(model)) or (
-                gemma4_gguf_config_dict(str(model))
-                or gemma4_mtp_gguf_config_dict(str(model))
+                qwen4exp_gguf_config_dict(str(model))
+                or (
+                    gemma4_gguf_config_dict(str(model))
+                    or gemma4_mtp_gguf_config_dict(str(model))
+                )
             )
             if config_dict is not None:
                 model_type = config_dict["model_type"]
@@ -425,6 +481,7 @@ class HFConfigParser(ConfigParserBase):
                 )
                 if config_dict := (
                     qwen35_gguf_config_dict(str(gguf_path))
+                    or qwen4exp_gguf_config_dict(str(gguf_path))
                     or gemma4_gguf_config_dict(str(gguf_path))
                     or gemma4_mtp_gguf_config_dict(str(gguf_path))
                 ):
@@ -589,37 +646,6 @@ _CONFIG_FORMAT_TO_CONFIG_PARSER: dict[str, type[ConfigParserBase]] = {
     "mistral": MistralConfigParser,
 }
 
-CONFIG_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
-    "total_num_kv_heads": (
-        "n_head_kv",  # Falcon
-        "num_kv_heads",
-        "num_key_value_heads",  # LLaMA-2
-        "multi_query_group_num",  # ChatGLM
-        "num_attention_groups",  # Step3p5
-    ),
-    "num_experts": (
-        "num_experts",  # Jamba
-        "moe_num_experts",  # Dbrx
-        "n_routed_experts",  # DeepSeek
-        "num_local_experts",  # Mixtral
-    ),
-    "num_experts_per_token": (
-        "num_experts_per_tok",
-        "num_experts_per_token",
-        "top_k_experts",
-        "moe_topk",  # Hunyuan
-        "moe_top_k",
-        "top_k",
-    ),
-    "moe_intermediate_size": (
-        "moe_intermediate_size",
-        "intermediate_size",
-    ),
-    "num_shared_experts": (
-        "n_shared_experts",  # DeepSeek, Docs, GLM
-        "moe_num_shared_experts",  # Aria, Ernie
-    ),
-}
 """HF config fields that models spell differently, keyed by the name vLLM uses.
 
 `ModelArchConfigConvertorBase` reads a scalar from these; a caller that needs the
@@ -926,12 +952,11 @@ def maybe_override_with_speculators(
         Tuple of (resolved_model, resolved_tokenizer, speculative_config)
 
     """
-    # Skip speculator detection for GGUF models. Their config is parsed from
-    # GGUF metadata by the GGUF loader, and reading it via
+    # A single local file (e.g. a .gguf checkpoint) has no speculators config;
+    # GGUF checkpoints (local or remote) are parsed from GGUF metadata by
+    # the GGUF loader, and reading a speculators config via
     # PretrainedConfig.get_config_dict would fail on the .gguf binary.
-    # GGUF models can still use speculators with explicit
-    # --speculative-config, mirroring the cloud storage exemption.
-    if is_gguf(model):
+    if is_gguf(model) or os.path.isfile(model):
         return model, tokenizer, vllm_speculative_config
 
     kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
@@ -949,6 +974,9 @@ def maybe_override_with_speculators(
 
     # Speculators format detected - process overrides
     from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
+    from vllm.v1.worker.gpu.spec_decode.speculator_config import (
+        get_custom_speculator_config_class,
+    )
 
     speculative_config = SpeculatorsConfig.extract_vllm_speculative_config(
         config_dict=config_dict
@@ -959,8 +987,17 @@ def maybe_override_with_speculators(
     if isinstance(vllm_speculative_config, dict):
         speculative_config.update(vllm_speculative_config)
 
-    # Lock fields dictated by the speculators format
-    speculative_config["method"] = speculators_method
+    # Lock fields dictated by the speculators format, except for a custom
+    # method based on the checkpoint's.
+    custom_config_cls = get_custom_speculator_config_class(speculative_config["method"])
+    if custom_config_cls is None:
+        speculative_config["method"] = speculators_method
+    elif custom_config_cls.base_method != speculators_method:
+        raise ValueError(
+            f"Speculative method '{speculative_config['method']}' is based on "
+            f"'{custom_config_cls.base_method}', but the speculators "
+            f"checkpoint {model} is for '{speculators_method}'."
+        )
     speculative_config["model"] = model
 
     # Override model and tokenizer with the verifier model from config
@@ -1519,6 +1556,88 @@ def try_get_dense_modules(
         return layer_configs
     except Exception:
         return None
+
+
+@cache
+def get_sentence_transformers_chat_template_kwargs(
+    model: str | Path,
+    revision: str | None = None,
+) -> dict[str, Any] | None:
+    """Get the saved chat template settings of a Sentence Transformers
+    CrossEncoder whose single Transformer module declares the `message`
+    modality.
+
+    Sentence Transformers formats the pairs of such checkpoints as
+    `query`/`document` messages with the saved chat template.
+
+    Args:
+        model: Local checkpoint path or Hugging Face model ID.
+        revision: Model revision to inspect.
+
+    Returns:
+        The saved `processing_kwargs.chat_template` (possibly empty), or
+        `None` if the checkpoint does not declare the `message` modality.
+
+    Raises:
+        ValueError: If the saved chat template settings are unsupported.
+
+    """
+    try:
+        st_config = get_hf_file_to_dict(
+            "config_sentence_transformers.json", model, revision
+        )
+        if not isinstance(st_config, dict) or (
+            st_config.get("model_type") != "CrossEncoder"
+        ):
+            return None
+        modules = get_hf_file_to_dict("modules.json", model, revision)
+        transformer_config = get_hf_file_to_dict(
+            "sentence_bert_config.json", model, revision
+        )
+    except Exception:
+        logger.debug("Failed to read the Sentence Transformers config", exc_info=True)
+        return None
+
+    if isinstance(modules, dict):
+        modules = modules.get("modules")
+    if not (
+        isinstance(modules, list)
+        and len(modules) == 1
+        and isinstance(modules[0], dict)
+        and modules[0].get("type") in _ST_TRANSFORMER_MODULE_TYPES
+        and not modules[0].get("path")
+        and isinstance(transformer_config, dict)
+        and transformer_config.get("transformer_task") == "sequence-classification"
+        and isinstance(
+            modality_config := transformer_config.get("modality_config"), dict
+        )
+        and "message" in modality_config
+    ):
+        return None
+
+    processing_kwargs = transformer_config.get("processing_kwargs") or {}
+    chat_template_kwargs = (
+        processing_kwargs.get("chat_template") or {}
+        if isinstance(processing_kwargs, dict)
+        else None
+    )
+    if not isinstance(chat_template_kwargs, dict):
+        raise ValueError(
+            "The Sentence Transformers processing_kwargs.chat_template must be "
+            "a JSON object."
+        )
+    chat_template_kwargs = dict(chat_template_kwargs)
+    # vLLM does not restore the template suffix after truncation.
+    chat_template_kwargs.pop("restore_suffix", None)
+    if not isinstance(chat_template_kwargs.get("chat_template", ""), str):
+        raise ValueError(
+            "The Sentence Transformers chat template name must be a string."
+        )
+    if reserved := {"tokenize", "tools"} & chat_template_kwargs.keys():
+        raise ValueError(
+            f"Unsupported Sentence Transformers chat template settings: {reserved}"
+        )
+    return chat_template_kwargs
 
 
 def _read_safetensors_metadata_in_dir(local_dir: Path) -> dict[str, Any]:

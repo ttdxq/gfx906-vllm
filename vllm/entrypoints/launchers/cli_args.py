@@ -190,9 +190,10 @@ class BaseFrontendArgs:
     explicit request-level ``chat_template_kwargs.cohere_format`` takes
     priority."""
     anthropic_disabled_thinking_effort: AnthropicDisabledThinkingEffortOption = "auto"
-    """Anthropic ``/v1/messages`` only. The ``reasoning_effort`` used for
-    requests with ``thinking: {"type": "disabled"}``. ``none`` turns thinking
-    off for models that support it; ``low`` suits models that always think
+    """The ``reasoning_effort`` used for Anthropic Messages, token counting,
+    and render requests with ``thinking: {"type": "disabled"}``.
+    ``none`` turns thinking off for models that support it; ``low`` suits
+    models that always think
     (e.g. GLM-5.3) or reject ``none`` (e.g. gpt-oss). ``auto`` (default) uses
     ``low`` when the renderer rejects ``none`` or renders it the same as a
     thinking effort, and ``none`` otherwise."""
@@ -431,6 +432,14 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         default=False,
         help="Run in headless mode. See multi-node data parallel "
         "documentation for more details.",
+    )
+    # Internal: the Rust frontend's managed `serve` passes its local handshake
+    # endpoint so that headless engines also handshake with it.
+    parser.add_argument(
+        "--headless-client-handshake-address",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--api-server-count",

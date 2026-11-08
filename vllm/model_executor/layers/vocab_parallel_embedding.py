@@ -242,6 +242,7 @@ class VocabParallelEmbedding(PluggableLayer):
         disable_tp: If true, tensor parallelism will be disabled for this layer.
         quant_method: Preselected quantization method for model-specific layers.
         parallel_group: Process group used to shard and reduce the embedding.
+        reduce_results: If false, return the local vocabulary contribution.
 
     """  # noqa: E501
 
@@ -260,12 +261,14 @@ class VocabParallelEmbedding(PluggableLayer):
         disable_tp: bool = False,
         quant_method: QuantizeMethodBase | None = None,
         parallel_group: GroupCoordinator | None = None,
+        reduce_results: bool = True,
     ):
         super().__init__()
 
         # Keep the input dimensions.
         self.disable_tp = disable_tp
         self.parallel_group = parallel_group
+        self.reduce_results = reduce_results
         if disable_tp:
             tp_rank, self.tp_size = 0, 1
         elif parallel_group is not None:
@@ -554,6 +557,8 @@ class VocabParallelEmbedding(PluggableLayer):
                 # Each vocab token has one owner, so FP8 bytes can use int8 SUM.
                 comm_output = output_parallel.view(torch.int8)
                 comm_output.masked_fill_(input_mask.unsqueeze(-1), 0)
+                if not self.reduce_results:
+                    return output_parallel
                 output = (
                     self.parallel_group.all_reduce(comm_output)
                     if self.parallel_group is not None
@@ -561,6 +566,8 @@ class VocabParallelEmbedding(PluggableLayer):
                 )
                 return output.view(output_parallel.dtype)
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        if not self.reduce_results:
+            return output_parallel
         # Reduce across all the model parallel GPUs.
         if self.parallel_group is not None:
             return self.parallel_group.all_reduce(output_parallel)

@@ -490,6 +490,38 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
 #endif
 }
 
+// Q2_0 (group 64): one f16 scale per 64-weight block and four 2-bit codes per
+// payload byte (w = d*(code-1)); each iqs chunk of 16 weights covers half of a
+// 32-value q8_1 block. VDR 1 keeps four lanes per weight block.
+#define VDR_Q2_0_Q8_1_MMVQ 1
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq;
+
+    const int v = get_int_from_uint8(bq2_0->qs, iqs);
+
+    const block_q8_1 * bq8 = bq8_1 + (iqs >> 1);
+    const int u[4] = {
+        get_int_from_int8_aligned(bq8->qs, (iqs & 1)*4 + 0),
+        get_int_from_int8_aligned(bq8->qs, (iqs & 1)*4 + 1),
+        get_int_from_int8_aligned(bq8->qs, (iqs & 1)*4 + 2),
+        get_int_from_int8_aligned(bq8->qs, (iqs & 1)*4 + 3),
+    };
+
+    int sumi = 0;
+#pragma unroll
+    for (int w = 0; w < 16; ++w) {
+        const int code = (v >> (2*w)) & 3;
+        const int q8 = (int8_t)((u[w >> 2] >> (8*(w & 3))) & 0xFF);
+        sumi += (code - 1) * q8;
+    }
+
+    const float d8 = __half2float(__low2half(bq8->ds));
+    return __half2float(bq2_0->d) * d8 * sumi;
+}
+
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 
@@ -517,7 +549,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q4_0(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q4_0(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & blocks_left) {
     const int kbx  = k / QI4_0;
     const int kqsx = k % QI4_0;
 
@@ -530,9 +563,12 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         if (need_check) {
             i = min(i, i_max);
         }
-        const block_q4_0 * bxi = bx0 + i*blocks_per_row + kbx;
-        x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8(bxi->qs, kqsx);
-        // x_dmf[i * (WARP_SIZE_GGUF/QI4_0) + i / QI4_0 + kbx] = bxi->d;
+        if (kbx < blocks_left) {
+            const block_q4_0 * bxi = bx0 + i*blocks_per_row + kbx;
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8(bxi->qs, kqsx);
+        } else {
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = 0;
+        }
     }
 
     const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI4_0;
@@ -544,8 +580,12 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         if (need_check) {
             i = min(i, i_max);
         }
-        const block_q4_0 * bxi = bx0 + i*blocks_per_row + kbxd;
-        x_dmf[i * (WARP_SIZE_GGUF/QI4_0) + i / QI4_0 + kbxd] = __half2float(bxi->d);
+        if (kbxd < blocks_left) {
+            const block_q4_0 * bxi = bx0 + i*blocks_per_row + kbxd;
+            x_dmf[i * (WARP_SIZE_GGUF/QI4_0) + i / QI4_0 + kbxd] = __half2float(bxi->d);
+        } else {
+            x_dmf[i * (WARP_SIZE_GGUF/QI4_0) + i / QI4_0 + kbxd] = 0.0f;
+        }
     }
 }
 
@@ -568,6 +608,95 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1_mul_mat(
     return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMQ>
         (&x_ql[i * (WARP_SIZE_GGUF + 1) + k], u, x_dmf[i * (WARP_SIZE_GGUF/QI4_0) + i/QI4_0 + k/QI4_0],
          y_ds[j * (WARP_SIZE_GGUF/QI8_1) + (2*k/QI8_1) % (WARP_SIZE_GGUF/QI8_1)]);
+}
+
+// Q2_0 (GGML type 42) grouped MMQ. Four ints per 64-weight block; the 16
+// codes in an int are byte-major (code 4b+s lives in byte b, bit 2s), so the
+// tile keeps raw ints and the dot product transposes each int into four
+// bit-plane ints: plane s, byte b holds code 4s+b, which are exactly the four
+// int8 of y lanes 4*(k%8)+s. One mul_mat call consumes a single source int
+// (16 codes -> 8 dp4a); weights are d*(code-1), so the code dot product also
+// subtracts the raw int8 sums.
+#define VDR_Q2_0_Q8_1_MMQ 1
+#define QI2_0_MMQ 4 // ints per block for the tile geometry (not QI2_0)
+
+template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q2_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+    __shared__ int  tile_x_qs[mmq_y * (WARP_SIZE_GGUF)       + mmq_y];
+    __shared__ float tile_x_d[mmq_y * (WARP_SIZE_GGUF/QI2_0_MMQ) + mmq_y/QI2_0_MMQ];
+    *x_ql = tile_x_qs;
+    *x_dm = (half2 *) tile_x_d;
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q2_0(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & blocks_left) {
+    const int kbx  = k / QI2_0_MMQ;
+    const int kqsx = k % QI2_0_MMQ;
+
+    const block_q2_0 * bx0 = (const block_q2_0 *) vx;
+    float * x_dmf = (float *) x_dm;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        if (kbx < blocks_left) {
+            const block_q2_0 * bxi = bx0 + i*blocks_per_row + kbx;
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8(bxi->qs, kqsx);
+        } else {
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = 0;
+        }
+    }
+
+    const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI2_0_MMQ;
+    const int kbxd = k % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI2_0_MMQ) {
+        int i = i0 + i_offset * QI2_0_MMQ + k / blocks_per_tile_x_row;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        if (kbxd < blocks_left) {
+            const block_q2_0 * bxi = bx0 + i*blocks_per_row + kbxd;
+            x_dmf[i * (WARP_SIZE_GGUF/QI2_0_MMQ) + i / QI2_0_MMQ + kbxd] = __half2float(bxi->d);
+        } else {
+            x_dmf[i * (WARP_SIZE_GGUF/QI2_0_MMQ) + i / QI2_0_MMQ + kbxd] = 0.0f;
+        }
+    }
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+    (void)x_qh; (void)x_sc;
+
+    const float * x_dmf = (const float *) x_dm;
+    const float * y_df  = (const float *) y_ds;
+
+    const int v = x_ql[i * (WARP_SIZE_GGUF + 1) + k];
+    const float d = x_dmf[i * (WARP_SIZE_GGUF/QI2_0_MMQ) + i / QI2_0_MMQ + k / QI2_0_MMQ];
+
+    const int index_y = j * WARP_SIZE_GGUF + (4*k) % WARP_SIZE_GGUF;
+
+    int sumi = 0;
+    int sumq = 0;
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const int vs =
+            (((v >> (8*s +  0)) & 0x03) <<  0) |
+            (((v >> (8*s +  2)) & 0x03) <<  8) |
+            (((v >> (8*s +  4)) & 0x03) << 16) |
+            (((v >> (8*s +  6)) & 0x03) << 24);
+        sumi = __dp4a(vs, y_qs[index_y + s], sumi);
+        sumq = __dp4a(0x01010101, y_qs[index_y + s], sumq);
+    }
+
+    const float d8 = y_df[index_y / QI8_1];
+    return d * d8 * (sumi - sumq);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_1_q8_1(
@@ -597,7 +726,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q4_1(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q4_1(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & blocks_left) {
     const int kbx  = k / QI4_1;
     const int kqsx = k % QI4_1;
 
@@ -609,8 +739,12 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         if (need_check) {
             i = min(i, i_max);
         }
-        const block_q4_1 * bxi = bx0 + i*blocks_per_row + kbx;
-        x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8_aligned(bxi->qs, kqsx);
+        if (kbx < blocks_left) {
+            const block_q4_1 * bxi = bx0 + i*blocks_per_row + kbx;
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8_aligned(bxi->qs, kqsx);
+        } else {
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = 0;
+        }
     }
 
     const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI4_1;
@@ -622,8 +756,12 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         if (need_check) {
             i = min(i, i_max);
         }
-        const block_q4_1 * bxi = bx0 + i*blocks_per_row + kbxd;
-        x_dm[i * (WARP_SIZE_GGUF/QI4_1) + i / QI4_1 + kbxd] = bxi->dm;
+        if (kbxd < blocks_left) {
+            const block_q4_1 * bxi = bx0 + i*blocks_per_row + kbxd;
+            x_dm[i * (WARP_SIZE_GGUF/QI4_1) + i / QI4_1 + kbxd] = bxi->dm;
+        } else {
+            x_dm[i * (WARP_SIZE_GGUF/QI4_1) + i / QI4_1 + kbxd] = __floats2half2_rn(0.0f, 0.0f);
+        }
     }
 }
 
@@ -675,7 +813,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q5_0(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q5_0(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & blocks_left) {
     const int kbx  = k / QI5_0;
     const int kqsx = k % QI5_0;
 
@@ -688,27 +827,32 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         if (need_check) {
             i = min(i, i_max);
         }
-        const block_q5_0 * bxi = bx0 + i*blocks_per_row + kbx;
-        const int ql = get_int_from_uint8(bxi->qs, kqsx);
-        const int qh = get_int_from_uint8(bxi->qh, 0) >> (4 * (k % QI5_0));
+        if (kbx < blocks_left) {
+            const block_q5_0 * bxi = bx0 + i*blocks_per_row + kbx;
+            const int ql = get_int_from_uint8(bxi->qs, kqsx);
+            const int qh = get_int_from_uint8(bxi->qh, 0) >> (4 * (k % QI5_0));
 
-        int qs0 = (ql >>  0)   & 0x0F0F0F0F;
-        qs0    |= (qh <<  4)   & 0x00000010;  // 0 ->  4
-        qs0    |= (qh << 11)   & 0x00001000;  // 1 -> 12
-        qs0    |= (qh << 18)   & 0x00100000;  // 2 -> 20
-        qs0    |= (qh << 25)   & 0x10000000;  // 3 -> 28
-        qs0     = __vsubss4(qs0, 0x10101010); // subtract 16
+            int qs0 = (ql >>  0)   & 0x0F0F0F0F;
+            qs0    |= (qh <<  4)   & 0x00000010;  // 0 ->  4
+            qs0    |= (qh << 11)   & 0x00001000;  // 1 -> 12
+            qs0    |= (qh << 18)   & 0x00100000;  // 2 -> 20
+            qs0    |= (qh << 25)   & 0x10000000;  // 3 -> 28
+            qs0     = __vsubss4(qs0, 0x10101010); // subtract 16
 
-        x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+0] = qs0;
+            x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+0] = qs0;
 
-        int qs1 = (ql >>  4)   & 0x0F0F0F0F;
-        qs1    |= (qh >> 12)   & 0x00000010;  // 16 ->  4
-        qs1    |= (qh >>  5)   & 0x00001000;  // 17 -> 12
-        qs1    |= (qh <<  2)   & 0x00100000;  // 18 -> 20
-        qs1    |= (qh <<  9)   & 0x10000000;  // 19 -> 28
-        qs1     = __vsubss4(qs1, 0x10101010); // subtract 16
+            int qs1 = (ql >>  4)   & 0x0F0F0F0F;
+            qs1    |= (qh >> 12)   & 0x00000010;  // 16 ->  4
+            qs1    |= (qh >>  5)   & 0x00001000;  // 17 -> 12
+            qs1    |= (qh <<  2)   & 0x00100000;  // 18 -> 20
+            qs1    |= (qh <<  9)   & 0x10000000;  // 19 -> 28
+            qs1     = __vsubss4(qs1, 0x10101010); // subtract 16
 
-        x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+1] = qs1;
+            x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+1] = qs1;
+        } else {
+            x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+0] = 0;
+            x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+1] = 0;
+        }
     }
 
     const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI5_0;
@@ -723,8 +867,12 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
             i = min(i, i_max);
         }
 
-        const block_q5_0 * bxi = bx0 + i*blocks_per_row + kbxd;
-        x_dmf[i * (WARP_SIZE_GGUF/QI5_0) + i / QI5_0 + kbxd] = __half2float(bxi->d);
+        if (kbxd < blocks_left) {
+            const block_q5_0 * bxi = bx0 + i*blocks_per_row + kbxd;
+            x_dmf[i * (WARP_SIZE_GGUF/QI5_0) + i / QI5_0 + kbxd] = __half2float(bxi->d);
+        } else {
+            x_dmf[i * (WARP_SIZE_GGUF/QI5_0) + i / QI5_0 + kbxd] = 0.0f;
+        }
     }
 }
 
@@ -778,7 +926,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q5_1(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q5_1(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & blocks_left) {
     const int kbx  = k / QI5_1;
     const int kqsx = k % QI5_1;
 
@@ -792,26 +941,31 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
             i = min(i, i_max);
         }
 
-        const block_q5_1 * bxi = bx0 + i*blocks_per_row + kbx;
+        if (kbx < blocks_left) {
+            const block_q5_1 * bxi = bx0 + i*blocks_per_row + kbx;
 
-        const int ql = get_int_from_uint8_aligned(bxi->qs, kqsx);
-        const int qh = get_int_from_uint8_aligned(bxi->qh, 0) >> (4 * (k % QI5_1));
+            const int ql = get_int_from_uint8_aligned(bxi->qs, kqsx);
+            const int qh = get_int_from_uint8_aligned(bxi->qh, 0) >> (4 * (k % QI5_1));
 
-        int qs0 = (ql >>  0) & 0x0F0F0F0F;
-        qs0    |= (qh <<  4) & 0x00000010; // 0 ->  4
-        qs0    |= (qh << 11) & 0x00001000; // 1 -> 12
-        qs0    |= (qh << 18) & 0x00100000; // 2 -> 20
-        qs0    |= (qh << 25) & 0x10000000; // 3 -> 28
+            int qs0 = (ql >>  0) & 0x0F0F0F0F;
+            qs0    |= (qh <<  4) & 0x00000010; // 0 ->  4
+            qs0    |= (qh << 11) & 0x00001000; // 1 -> 12
+            qs0    |= (qh << 18) & 0x00100000; // 2 -> 20
+            qs0    |= (qh << 25) & 0x10000000; // 3 -> 28
 
-        x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+0] = qs0;
+            x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+0] = qs0;
 
-        int qs1 = (ql >>  4) & 0x0F0F0F0F;
-        qs1    |= (qh >> 12) & 0x00000010; // 16 ->  4
-        qs1    |= (qh >>  5) & 0x00001000; // 17 -> 12
-        qs1    |= (qh <<  2) & 0x00100000; // 18 -> 20
-        qs1    |= (qh <<  9) & 0x10000000; // 19 -> 28
+            int qs1 = (ql >>  4) & 0x0F0F0F0F;
+            qs1    |= (qh >> 12) & 0x00000010; // 16 ->  4
+            qs1    |= (qh >>  5) & 0x00001000; // 17 -> 12
+            qs1    |= (qh <<  2) & 0x00100000; // 18 -> 20
+            qs1    |= (qh <<  9) & 0x10000000; // 19 -> 28
 
-        x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+1] = qs1;
+            x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+1] = qs1;
+        } else {
+            x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+0] = 0;
+            x_ql[i * (2*WARP_SIZE_GGUF + 1) + 2*k+1] = 0;
+        }
     }
 
     const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI5_1;
@@ -825,9 +979,13 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
             i = min(i, i_max);
         }
 
-        const block_q5_1 * bxi = bx0 + i*blocks_per_row + kbxd;
+        if (kbxd < blocks_left) {
+            const block_q5_1 * bxi = bx0 + i*blocks_per_row + kbxd;
 
-        x_dm[i * (WARP_SIZE_GGUF/QI5_1) + i / QI5_1 + kbxd] = bxi->dm;
+            x_dm[i * (WARP_SIZE_GGUF/QI5_1) + i / QI5_1 + kbxd] = bxi->dm;
+        } else {
+            x_dm[i * (WARP_SIZE_GGUF/QI5_1) + i / QI5_1 + kbxd] = __floats2half2_rn(0.0f, 0.0f);
+        }
     }
 }
 
@@ -876,7 +1034,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q8_0(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & blocks_left) {
     const int kbx  = k / QI8_0;
     const int kqsx = k % QI8_0;
     float * x_dmf = (float *) x_dm;
@@ -890,8 +1049,12 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         if (need_check) {
             i = min(i, i_max);
         }
-        const block_q8_0 * bxi = bx0 + i*blocks_per_row + kbx;
-        x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_int8(bxi->qs, kqsx);
+        if (kbx < blocks_left) {
+            const block_q8_0 * bxi = bx0 + i*blocks_per_row + kbx;
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_int8(bxi->qs, kqsx);
+        } else {
+            x_ql[i * (WARP_SIZE_GGUF + 1) + k] = 0;
+        }
     }
 
     const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI8_0;
@@ -904,8 +1067,12 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         if (need_check) {
             i = min(i, i_max);
         }
-        const block_q8_0 * bxi = bx0 + i*blocks_per_row + kbxd;
-        x_dmf[i * (WARP_SIZE_GGUF/QI8_0) + i / QI8_0 + kbxd] = __half2float(bxi->d);
+        if (kbxd < blocks_left) {
+            const block_q8_0 * bxi = bx0 + i*blocks_per_row + kbxd;
+            x_dmf[i * (WARP_SIZE_GGUF/QI8_0) + i / QI8_0 + kbxd] = __half2float(bxi->d);
+        } else {
+            x_dmf[i * (WARP_SIZE_GGUF/QI8_0) + i / QI8_0 + kbxd] = 0.0f;
+        }
     }
 }
 
@@ -955,7 +1122,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q2_K(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q2_K(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     const int kbx  = k / QI2_K;
     const int kqsx = k % QI2_K;
 
@@ -1062,7 +1230,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q3_K(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q3_K(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     const int kbx  = k / QI3_K;
     const int kqsx = k % QI3_K;
 
@@ -1213,7 +1382,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q4_K(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q4_K(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     const int kbx  = k / QI4_K; // == 0 if QK_K == 256
     const int kqsx = k % QI4_K; // == k if QK_K == 256
 
@@ -1296,7 +1466,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q4_K_
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q4_K_split(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     const int kbx  = k / QI4_K; // == 0 if QK_K == 256
     const int kqsx = k % QI4_K; // == k if QK_K == 256
 
@@ -1456,7 +1627,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q5_K(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q5_K(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     const int kbx  = k / QI5_K; // == 0 if QK_K == 256
     const int kqsx = k % QI5_K; // == k if QK_K == 256
 
@@ -1766,7 +1938,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q6_K(
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q6_K(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     const int kbx  = k / QI6_K; // == 0 if QK_K == 256
     const int kqsx = k % QI6_K; // == k if QK_K == 256
 
@@ -2411,7 +2584,8 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_iq4_x
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq4_xs(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     (void)x_dm;
     (void)x_qh;
 
@@ -2652,7 +2826,8 @@ static __device__ __forceinline__ void iq_sign_words(const uint32_t & grid_lo, c
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq4_nl(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     (void)x_dm; (void)x_qh;
 
     const block_iq4_nl_x8 * bx0 = (const block_iq4_nl_x8 *) vx;
@@ -2678,7 +2853,8 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xxs(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     (void)x_dm; (void)x_qh;
 
     const block_iq2_xxs * bx0 = (const block_iq2_xxs *) vx;
@@ -2704,7 +2880,8 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xs(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     (void)x_dm; (void)x_qh;
 
     const block_iq2_xs * bx0 = (const block_iq2_xs *) vx;
@@ -2732,7 +2909,8 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_s(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     (void)x_dm; (void)x_qh;
 
     const block_iq2_s * bx0 = (const block_iq2_s *) vx;
@@ -2744,10 +2922,14 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         int i = i0 + i_offset;
         if (need_check) i = min(i, i_max);
         const block_iq2_s * bxi = bx0 + i*blocks_per_row;
-        const int idx = bxi->qs[4*g + l] | ((bxi->qh[g] << (8 - 2*l)) & 0x300);
+        // adjacent lanes (l = 2m, 2m+1) need adjacent bytes of qs/signs: fetch
+        // the pair as one 16-bit load instead of two byte loads
+        const uint16_t qpair = *(const uint16_t *)(bxi->qs + 4*g + 2*(l >> 1));
+        const int idx = ((qpair >> (8*(l & 1))) & 0xFF) | ((bxi->qh[g] << (8 - 2*l)) & 0x300);
         const uint32_t grid_lo = ((const uint32_t *)(iq2s_grid + idx))[0];
         const uint32_t grid_hi = ((const uint32_t *)(iq2s_grid + idx))[1];
-        iq_sign_words(grid_lo, grid_hi, bxi->qs[QK_K/8 + 4*g + l],
+        const uint16_t spair = *(const uint16_t *)(bxi->qs + QK_K/8 + 4*g + 2*(l >> 1));
+        iq_sign_words(grid_lo, grid_hi, (uint8_t)(spair >> (8*(l & 1))),
                       x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l)],
                       x_ql[i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l) + 1]);
         if (k < 8) {
@@ -2760,7 +2942,8 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq3_xxs(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     (void)x_dm; (void)x_qh;
 
     const block_iq3_xxs * bx0 = (const block_iq3_xxs *) vx;
@@ -2772,15 +2955,21 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         int i = i0 + i_offset;
         if (need_check) i = min(i, i_max);
         const block_iq3_xxs * bxi = bx0 + i*blocks_per_row;
-        const uint8_t * q3 = bxi->qs + 8*g;
+        // q3[2*l] and q3[2*l+1] are adjacent bytes: fetch them as one 16-bit
+        // load (qs is 2-byte aligned in every row) instead of two byte loads
+        const uint16_t qpair = *(const uint16_t *)(bxi->qs + 8*g + 2*l);
         const uint16_t * gas = (const uint16_t *)(bxi->qs + QK_K/4) + 2*g;
         const uint32_t aux32 = (uint32_t)gas[0] | ((uint32_t)gas[1] << 16);
-        const uint32_t grid1 = iq3xxs_grid[q3[2*l + 0]];
-        const uint32_t grid2 = iq3xxs_grid[q3[2*l + 1]];
-        const uint32_t * sgn = (const uint32_t *)(ksigns64 + ((aux32 >> (7*l)) & 127));
+        const uint32_t grid1 = iq3xxs_grid[qpair & 0xFF];
+        const uint32_t grid2 = iq3xxs_grid[qpair >> 8];
+        // ksigns64[s7] expands bit b of s7 into 0xFF in byte b (b = 0..6) and
+        // stores popcount(s7) & 1 in byte 7, i.e. exactly the nibble trick of
+        // iq_sign_words with a signs byte of s7 | parity<<7 - this drops the
+        // two 64-bit-table loads per row
+        const uint32_t s7 = (aux32 >> (7*l)) & 0x7F;
+        const uint8_t signs = (uint8_t)(s7 | ((uint32_t)(__popc(s7) & 1) << 7));
         const int base = i * (2*WARP_SIZE_GGUF + 1) + IQ_VAL_BASE(g, l);
-        x_ql[base]     = (int)__vsub4(grid1 ^ sgn[0], sgn[0]);
-        x_ql[base + 1] = (int)__vsub4(grid2 ^ sgn[1], sgn[1]);
+        iq_sign_words(grid1, grid2, signs, x_ql[base], x_ql[base + 1]);
         if (k < 8) {
             // build the word as uint32_t: an inline (ga[0] | (ga[1] << 16))
             // stays in promoted int and >> 28 becomes an arithmetic shift
@@ -2793,7 +2982,8 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq3_s(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     (void)x_dm; (void)x_qh;
 
     const block_iq3_s * bx0 = (const block_iq3_s *) vx;
@@ -2820,7 +3010,8 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq1_s(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     (void)x_dm; (void)x_qh;
 
     const block_iq1_s * bx0 = (const block_iq1_s *) vx;
@@ -2849,7 +3040,8 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq1_m(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int & /*blocks_left*/) {
     (void)x_dm; (void)x_qh;
 
     const block_iq1_m * bx0 = (const block_iq1_m *) vx;

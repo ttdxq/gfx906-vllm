@@ -3,6 +3,7 @@
 """Utility methods for model layers."""
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -15,7 +16,7 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.rocm import on_gfx9
+from vllm.platforms.rocm import on_gfx9, on_gfx906
 from vllm.utils.flashinfer import (
     flashinfer_bf16_mm,
     is_flashinfer_cutedsl_bf16_gemm_supported,
@@ -24,6 +25,7 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+_ROCM_GEMM_TRACE_COUNTS: dict[tuple[str, tuple[int, ...], tuple[int, ...], str], int] = {}
 
 
 def get_autotune_config():
@@ -127,6 +129,51 @@ def triton_matmul_kernel(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.jit
+def _small_m_gemv_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    stride_x_row,
+    stride_w_row,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    NUM_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # One program per output row: the weight row is loaded once and reused by
+    # every token row, so verify-style batches (2-4 rows) don't re-read the
+    # matrix per token. Accumulation is FP32, including the multiplication,
+    # before the final FP16 rounding.
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    k_mask = offsets < K
+    weight = tl.load(weight_ptr + row * stride_w_row + offsets, k_mask, other=0)
+    for m in tl.static_range(NUM_M):
+        x = tl.load(x_ptr + m * stride_x_row + offsets, k_mask, other=0)
+        value = tl.sum(x.to(tl.float32) * weight.to(tl.float32), axis=0)
+        tl.store(out_ptr + m * N + row, value)
+
+
+def _small_m_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty((x.shape[0], weight.shape[0]))
+    _small_m_gemv_kernel[(weight.shape[0],)](
+        x,
+        weight,
+        out,
+        x.stride(0),
+        weight.stride(0),
+        N=weight.shape[0],
+        K=weight.shape[1],
+        NUM_M=x.shape[0],
+        BLOCK_K=triton.next_power_of_2(weight.shape[1]),
+        num_warps=4,
+        num_stages=1,
+        enable_fp_fusion=False,
+    )
+    return out
 
 
 def triton_matmul(a, b):
@@ -481,6 +528,11 @@ def rocm_unquantized_gemm_impl(
     m = weight.shape[0]
     k = weight.shape[1]
 
+    # gfx906 has no native bf16 MFMA: Triton cannot lower tl.dot with bf16
+    # operands and the skinny GEMV kernel rejects the dtype, so bf16 falls
+    # back to rocBLAS, which covers it through conversion paths.
+    gfx906_bf16 = x.dtype == torch.bfloat16 and on_gfx906()
+
     # For FP16/BF16 without bias and k % 8 == 0, prefer skinny GEMV kernel
     if (
         x.dtype in [torch.float16, torch.bfloat16]
@@ -490,11 +542,32 @@ def rocm_unquantized_gemm_impl(
         and n == 1
         and k <= 8192
         and k % 8 == 0
+        and not gfx906_bf16
     ):
         out = ops.LLMM1(weight, x_view, 4)
         return out.view(*x.shape[:-1], weight.shape[0])
 
-    if n <= 16 and not on_gfx9():
+    # gfx906 verify-style batches of 2-4 rows: a per-row GEMV that shares the
+    # weight load across tokens beats the 64-wide tl.dot tiles of
+    # triton_matmul, whose matrix cores idle at these M. Small-K shapes stay
+    # on triton_matmul: gfx906 measurements put the crossover near k=2048
+    # (k>=512 only for many-row weights, >=1024 rows, where the per-row
+    # programs still fill the CUs; e.g. the HC up projection is k=320).
+    if (
+        envs.VLLM_QWEN4EXP_SMALL_M_GEMV
+        and on_gfx906()
+        and 2 <= n <= 4
+        and x.dtype == weight.dtype == torch.float16
+        and bias is None
+        and weight.is_contiguous()
+        and k <= 8192
+        and x_view.stride(1) == 1
+        and (k >= 2048 or (k >= 512 and m >= 1024))
+    ):
+        out = _small_m_gemv(x_view, weight)
+        return out.view(*x.shape[:-1], weight.shape[0])
+
+    if n <= 16 and not on_gfx9() and not gfx906_bf16:
         out = triton_matmul(x_view, weight).view(*x.shape[:-1], weight.shape[0])
         if bias is not None:
             out = out + bias
@@ -523,6 +596,35 @@ def rocm_unquantized_gemm(
     # through the device-agnostic fallback instead of hard-crashing.
     if not x.is_cuda:
         return default_unquantized_gemm(layer, x, weight, bias)
+    if os.getenv("VLLM_ROCM_GEMM_TRACE") == "1":
+        x_view = x.reshape(-1, x.size(-1))
+        if x_view.shape[0] <= 16:
+            m, k = weight.shape
+            n = x_view.shape[0]
+            gfx906_bf16 = x.dtype == torch.bfloat16 and on_gfx906()
+            if (
+                x.dtype in [torch.float16, torch.bfloat16]
+                and bias is None
+                and weight.is_contiguous()
+                and m % 4 == 0
+                and n == 1
+                and k <= 8192
+                and k % 8 == 0
+                and not gfx906_bf16
+            ):
+                path = "LLMM1"
+            elif n <= 16 and not on_gfx9() and not gfx906_bf16:
+                path = "triton"
+            else:
+                path = "torch"
+            key = (getattr(layer, "prefix", ""), tuple(x.shape), tuple(weight.shape), path)
+            count = _ROCM_GEMM_TRACE_COUNTS.get(key, 0) + 1
+            _ROCM_GEMM_TRACE_COUNTS[key] = count
+            if count == 1 or count % 256 == 0:
+                logger.warning(
+                    "ROCM_GEMM_TRACE prefix=%s x=%s weight=%s dtype=%s path=%s count=%d",
+                    key[0], key[1], key[2], x.dtype, path, count,
+                )
     return torch.ops.vllm.rocm_unquantized_gemm(x, weight, bias)
 
 

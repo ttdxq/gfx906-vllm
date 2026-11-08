@@ -2,6 +2,11 @@
 
 #include <torch/all.h>
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> qwen4exp_hc_mix(
+    torch::Tensor residual, std::optional<torch::Tensor> block,
+    std::optional<torch::Tensor> injection, torch::Tensor norm,
+    torch::Tensor down, torch::Tensor up, double eps);
+
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
                     const int64_t rows_per_block);
 
@@ -23,6 +28,9 @@ void wvSplitKQ(const at::Tensor& in_a, const at::Tensor& in_b,
                const std::optional<at::Tensor>& in_bias, at::Tensor& out_c,
                const at::Tensor& scale_a, const at::Tensor& scale_b,
                const int64_t CuCount);
+
+torch::Tensor mxfp4_w4a8_gemv_rdna3(const at::Tensor& a, const at::Tensor& b_q,
+                                    const at::Tensor& b_scale);
 
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
@@ -50,4 +58,4 @@ void paged_attention(
     int64_t max_seq_len, const std::optional<torch::Tensor>& alibi_slopes,
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
-    const std::string& mfma_type);
+    const std::string& mfma_type, bool use_interleaved_v_cache);

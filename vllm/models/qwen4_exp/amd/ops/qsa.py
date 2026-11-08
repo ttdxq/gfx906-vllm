@@ -10,7 +10,10 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import HAS_TRITON, tl, triton
+
+from .qsa_decode import launch_qsa, qsa_topk
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -220,6 +223,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -292,6 +296,14 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if IS_FP8:
+            # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (an fp8
+            # QK dot measured slower and less accurate on the NVIDIA port).
+            keys = keys.to(query.dtype)
+            # Dequant V to fp16 for the PV dot: P <= 1 (online softmax) so
+            # fp16 has the range, its wider mantissa is more accurate, and
+            # the fp8->fp16 upcast with an fp16 PV dot is faster.
+            values = values.to(tl.float16)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -632,7 +644,9 @@ def qsa_mqa_paged(
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     block_n = 32
-    _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
+    launch_qsa(
+        _qsa_mqa_paged_kernel,
+        (q.shape[0], triton.cdiv(columns, block_n)),
         q,
         k_cache,
         page_table,
@@ -700,9 +714,9 @@ def expand_qsa_block_indices_cuda(
     if not block_indices.shape[0]:
         return out
     column_block = 256
-    _expand_qsa_indices_kernel[
-        (block_indices.shape[0], triton.cdiv(output_width, column_block))
-    ](
+    launch_qsa(
+        _expand_qsa_indices_kernel,
+        (block_indices.shape[0], triton.cdiv(output_width, column_block)),
         block_indices,
         query_positions,
         sequence_lengths,
@@ -794,7 +808,8 @@ def qsa_select_paged_tokens(
                 columns,
             )
         else:
-            ops.top_k_per_row_decode(
+            qsa_topk(
+                ops.top_k_per_row_decode,
                 logits,
                 1,
                 visible_blocks,
@@ -825,7 +840,7 @@ def qsa_sparse_paged_attention(
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA over paged FP16, BF16, or FP8 K/V caches."""
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -842,7 +857,12 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    is_fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    assert q.dtype in (torch.float16, torch.bfloat16)
+    assert k_cache.dtype == v_cache.dtype
+    assert is_fp8 or k_cache.dtype == q.dtype, (
+        "QSA sparse attention requires matching 16-bit or FP8-e4m3 K/V"
+    )
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -877,6 +897,24 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+    if (
+        on_gfx906()
+        and q.dtype == torch.float16
+        and not is_fp8
+        and head_dim == 256
+        and group_size == 12
+        and base_programs >= 32
+    ):
+        # Narrow tiles avoid the wide dot's register pressure on gfx906.
+        block_n, partial_warps = 16, 4
+        if base_programs <= 64:
+            target_splits = 16
+        elif base_programs <= 256:
+            target_splits = 8
+        elif base_programs <= 512:
+            target_splits = 4
+        else:
+            target_splits = 1
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
     partial_stages = 1 if current_platform.is_rocm() else 2
@@ -903,7 +941,9 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
-    _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
+    launch_qsa(
+        _qsa_sparse_paged_gqa_splitk_kernel,
+        partial_grid,
         q,
         k_cache,
         v_cache,
@@ -938,13 +978,16 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        IS_FP8=is_fp8,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )
     if num_splits == 1:
         return out
 
-    _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
+    launch_qsa(
+        _qsa_merge_splitk_kernel,
+        (q.shape[0], q.shape[1]),
         partial_output,
         partial_lse,
         out,

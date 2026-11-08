@@ -5,6 +5,9 @@
 
 #include <torch/library.h>
 #include <torch/version.h>
+#ifdef USE_ROCM
+#include "rocm/qsa_decode_plan.h"
+#endif
 
 // Note on op signatures:
 // The X_meta signatures are for the meta functions corresponding to op X.
@@ -17,6 +20,13 @@
 // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+#ifdef USE_ROCM
+  ops.class_<Qwen4ExpQSADecodePlan>("Qwen4ExpQSADecodePlan")
+      .def(torch::init<int64_t>())
+      .def("add_kernel", &Qwen4ExpQSADecodePlan::add_kernel)
+      .def("add_topk", &Qwen4ExpQSADecodePlan::add_topk)
+      .def("run", &Qwen4ExpQSADecodePlan::run);
+#endif
   // vLLM custom ops
   //
 
@@ -89,7 +99,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def(
       "rms_norm_gated_gfx906(Tensor input, Tensor weight, Tensor gate, "
-      "float epsilon, bool norm_before_gate) -> Tensor");
+      "float epsilon, bool norm_before_gate, bool sigmoid_gate=False) -> Tensor");
   ops.impl("rms_norm_gated_gfx906", torch::kCUDA, &rms_norm_gated_gfx906);
 
   ops.def(
@@ -272,6 +282,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor! output, Tensor! quant_X, int top_k, int type, SymInt row, "
       "SymInt tokens) -> ()");
   ops.impl("ggml_moe_a8_vec_out", torch::kCUDA, &ggml_moe_a8_vec_out);
+
+  ops.def(
+      "ggml_moe_q8_vec_indirect(Tensor quant_X, Tensor expert_ptrs, "
+      "Tensor topk_ids, int type, SymInt row, SymInt tokens, SymInt col, "
+      "ScalarType dtype) -> Tensor");
+  ops.impl("ggml_moe_q8_vec_indirect", torch::kCUDA, &ggml_moe_q8_vec_indirect);
 
   ops.def(
       "ggml_moe_q8_vec(Tensor quant_X, Tensor W, "

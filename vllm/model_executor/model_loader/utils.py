@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.weight_cache.utils import (
     is_draft_model_cacheable,
 )
 from vllm.model_executor.model_loader.weight_tying import maybe_retie_word_embeddings
+from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 from vllm.model_executor.models.interfaces import SupportsQuant
 from vllm.model_executor.utils import is_weights_pre_processed
 from vllm.tracing import instrument
@@ -152,8 +153,15 @@ def process_weights_after_loading(
     from vllm.model_executor.layers.quantization.online.moe_base import (
         OnlineMoEMethodBase,
     )
+    from vllm.model_executor.model_loader.reload.direct import (
+        direct_reload_enabled,
+        record_checkpoint_layout,
+    )
 
     maybe_retie_word_embeddings(model, model_config)
+
+    if direct_reload_enabled():
+        record_checkpoint_layout(model)  # cold start only; reloads reuse it
 
     for name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
@@ -184,6 +192,12 @@ def process_weights_after_loading(
                 else nullcontext()
             )
             with loading_context, timing_context:
+                # Quantize the staged fused shared experts into their slots.
+                shared_expert_loader = getattr(
+                    module, "shared_expert_online_loader", None
+                )
+                if shared_expert_loader is not None:
+                    shared_expert_loader.finalize(module)
                 quant_method.process_weights_after_loading(module)
             # process_weights_after_loading may swap in freshly-created
             # Parameters (e.g. FP8 requantization), which are stamped with the
@@ -207,8 +221,7 @@ def process_weights_after_loading(
                 module.process_weights_after_loading(model_config.dtype)
 
     # Model-level post-load hook, after the per-layer quant finalize.
-    if hasattr(model, "process_weights_after_loading"):
-        model.process_weights_after_loading()
+    finalize_model_weights(model)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
@@ -224,7 +237,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         return
 
     cpu_params: set[str] = set()
-    uva_offloaded_parameters: list[str] = []
+    uva_offloaded_parameters: dict[str, int] = {}
 
     # Store which parameters are on CPU and move them to the GPU
     for name, p in module.named_parameters():
@@ -232,7 +245,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             cpu_params.add(name)
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):
-            uva_offloaded_parameters.append(name)
+            uva_offloaded_parameters[name] = p.data.data_ptr()
         # Parameters already on target device are not touched
 
     try:
@@ -252,8 +265,9 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
             # parameter is UVA offloaded, but was replaced with a new device tensor
             # re-offload it to CPU using UVA
-            if name in uva_offloaded_parameters and not getattr(
-                p, "_vllm_is_uva_offloaded", False
+            if name in uva_offloaded_parameters and (
+                not getattr(p, "_vllm_is_uva_offloaded", False)
+                or p.data.data_ptr() != uva_offloaded_parameters[name]
             ):
                 cpu_data = torch.empty_like(
                     p.data, device="cpu", pin_memory=use_pin_memory
