@@ -198,8 +198,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Quick reduce is designed as a complement to custom allreduce
             # (vLLM's or AITER's), so it is initialized for either backend.
             # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-            # On ROCm, 'use_custom_allreduce==True' means it must currently be
-            # an MI300 series.
+            # QuickAllReduce self-disables outside its own supported archs
+            # (the MI300 series), regardless of this flag.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
         if self.world_size > 1:

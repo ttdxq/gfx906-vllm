@@ -260,6 +260,12 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
 
 #else
 
+// The flag loads below read memory written by a peer GPU, so every load is
+// __MEMORY_SCOPE_SYSTEM: a DEVICE-scope acquire does not pair with the peer's
+// SYSTEM-scope release over PCIe (observed on gfx906: the barrier can pass
+// before the peer's reads complete, and the next call's copy-in corrupts the
+// buffer that the peer is still reading).
+
 template <int ngpus>
 DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
                               int rank) {
@@ -272,7 +278,7 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
     // wait until we got true from all ranks
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                   __ATOMIC_RELAXED,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
+                                  __MEMORY_SCOPE_SYSTEM) < flag);
   }
   __syncthreads();
   // use one thread to update flag
@@ -289,7 +295,7 @@ DINLINE void barrier_at_start_release(const RankSignals& sg, Signal* self_sg,
                             flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                   __ATOMIC_ACQUIRE,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
+                                  __MEMORY_SCOPE_SYSTEM) < flag);
   }
   __syncthreads();
   if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
@@ -302,15 +308,19 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
+    //
+    // The store is RELEASE even for the final barrier: the peer gates its
+    // next call's copy-in on this flag, and the copy-in overwrites the very
+    // buffer this rank is reading. A RELAXED flag can reach the peer while
+    // its reads of that buffer are still in flight over PCIe (seen on
+    // gfx906), so the release/acquire pair is what makes the buffer reuse
+    // safe, not just the result visibility.
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
-                            flag,
-                            final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
-                            __MEMORY_SCOPE_SYSTEM);
+                            flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
     while (
         __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                               final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                               __MEMORY_SCOPE_DEVICE) < flag);
+                               __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) < flag);
   }
   if constexpr (!final_sync) __syncthreads();
   // use one thread to update flag

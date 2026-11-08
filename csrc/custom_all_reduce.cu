@@ -25,9 +25,17 @@ fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
   for (int i = 0; i < world_size; i++) {
     ipc_ptrs[i] = reinterpret_cast<vllm::Signal*>(fake_ipc_ptrs[i]);
   }
-  return (fptr_t) new vllm::CustomAllreduce(ipc_ptrs, rank_data.data_ptr(),
-                                            rank_data.numel(), rank, world_size,
-                                            fully_connected);
+  // The push-based one-shot below is the default on ROCm TP2: PCIe peer
+  // links have no hardware cache coherence for peer reads (see the kernel
+  // comment in custom_all_reduce.cuh). VLLM_CAR_PUSH=0 restores the original
+  // pull-based kernel for debugging.
+  const char* env_push = std::getenv("VLLM_CAR_PUSH");
+  int pushmode = env_push ? std::atoi(env_push) : 1;
+  auto* car = new vllm::CustomAllreduce(ipc_ptrs, rank_data.data_ptr(),
+                                        rank_data.numel(), rank, world_size,
+                                        fully_connected);
+  car->pushmode_ = pushmode;
+  return (fptr_t)car;
 }
 
 /**

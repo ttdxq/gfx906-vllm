@@ -1230,8 +1230,11 @@ class RocmPlatform(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        # Custom allreduce runs on the MI300 series and on gfx906 (MI50):
+        # PCIe gfx906 pairs report working P2P access, and the IPC one-shot
+        # kernel beats RCCL's small-message path there. CustomAllreduce
+        # itself still self-disables for topologies it cannot serve.
+        return any(gfx in _GCN_ARCH for gfx in ["gfx906", "gfx94", "gfx95"])
 
     @classmethod
     def opaque_attention_op(cls) -> bool:

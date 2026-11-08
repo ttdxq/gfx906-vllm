@@ -27,6 +27,49 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
+#if defined(USE_ROCM)
+// Push-based one-shot allreduce for 2 GPUs on PCIe peer links (gfx906 and
+// similar). On links without hardware cache coherence the reader GPU's L2
+// caches the peer window and never sees the owner's later writes: normal,
+// volatile and even SYSTEM-scope atomic loads all return data frozen at an
+// old call. Writes INTO a peer stay coherent with the peer's caches (the
+// barrier flags rely on exactly that). So instead of every rank reading the
+// peer's registered buffer (the pull-based kernels below), each rank WRITES
+// its data into the peer's meta tmp region and then reduces locally. With
+// two operands the fp16 sum commutes, so both ranks stay bitwise identical.
+// The pull-based kernels remain for VLLM_CAR_PUSH=0 debugging and for the
+// forced-stage env paths; on coherent fabrics (XGMI/NVLink) the pull one-shot
+// is cheaper (no data round trip before the final barrier).
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_1stage_push(RankData* _dp, RankSignals sg,
+                                    Signal* self_sg, T* __restrict__ result,
+                                    int rank, int size) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  auto dp = *_dp;
+  // instantiated for all ngpus by the dispatch macro, only launched at
+  // world_size_ == 2 (runtime gate in allreduce()).
+  const P* mine = reinterpret_cast<const P*>(dp.ptrs[rank]);  // local, fresh
+  P* peer_tmp = get_tmp_buf<P>(sg.signals[rank ^ 1]);
+  P* my_tmp = get_tmp_buf<P>(self_sg);
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    peer_tmp[idx] = mine[idx];
+  }
+  // non-final end barrier: release/acquire guarantees the peer's push into
+  // MY tmp is visible before the local reduce below.
+  barrier_at_end<ngpus>(sg, self_sg, rank);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    A acc = upcast(mine[idx]);
+    packed_assign_add(acc, upcast(my_tmp[idx]));
+    ((P*)result)[idx] = downcast<P>(acc);
+  }
+}
+#endif
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -81,6 +124,11 @@ static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
 class CustomAllreduce {
  public:
   int rank_;
+  // Selects the push-based one-shot allreduce at TP2 on ROCm (default 1;
+  // VLLM_CAR_PUSH=0 restores the pull-based kernel). Host-side decision:
+  // must be read from this member, not a __constant__ (whose host shadow is
+  // never updated by hipMemcpyToSymbol).
+  int pushmode_ = 0;
   int world_size_;
   // Full NVLink or xGMI connection between GPUs.
   bool fully_connected_;
@@ -296,7 +344,11 @@ class CustomAllreduce {
       KL(ngpus, cross_device_reduce_2stage);            \
     } else {                                            \
       if (world_size_ == 2) {                           \
-        KL(ngpus, cross_device_reduce_1stage);          \
+        if (this->pushmode_ == 1) {                     \
+          KL(ngpus, cross_device_reduce_1stage_push);   \
+        } else {                                        \
+          KL(ngpus, cross_device_reduce_1stage);        \
+        }                                               \
       } else if (fully_connected_) {                    \
         if ((world_size_ <= 4 && bytes < 512 * 1024) || \
             (world_size_ <= 8 && bytes < 256 * 1024)) { \

@@ -346,9 +346,11 @@ def test_custom_allreduce_filters_dtype(
     communicator.disabled = False
     communicator._ptr = 0
     communicator.world_size = 2
-    communicator.max_size = 1024
+    communicator.max_size = 128 * 1024
 
-    assert communicator.should_custom_ar(torch.empty(16, dtype=dtype)) is expected
+    # A comfortably mid-range size so the assert exercises the dtype filter
+    # (and nothing else).
+    assert communicator.should_custom_ar(torch.empty(16384, dtype=dtype)) is expected
 
 
 @pytest.mark.parametrize("batch_invariant", [False, True])
