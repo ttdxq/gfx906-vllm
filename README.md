@@ -25,6 +25,10 @@
 
 ## 最新更新
 
+### ✅ 2026年11月更新
+
+- **Qwen4Exp 架构 GGUF 实验性支持** - 补齐 qwen4exp（Hyper-Connections、门控 DeltaNet、QSA）架构的 GGUF 加载（含分片 checkpoint 与量化 PLE）、分组量化 MoE 内核（IQ2_XS / IQ3_XXS / IQ3_S / IQ4_XS / Q2_0 / Q5_0）、专家缓存与 offload staging；双卡 PCIe TP2 下新增推送式 custom all-reduce 内核。已实测模型见下方列表。
+
 ### ✅ 2026年10月更新
 
 - **上游 vLLM 同步至 08a65e287e（两轮合并，共 1382 个上游提交）** - 集成后 Qwen3.8-27B GGUF 实测：9.2k-token 长上下文真实 prefill 从 134.8 提升至 ≥213 tok/s，decode 持平，前缀缓存默认开启（热请求 prefill 3537 tok/s）。
@@ -55,6 +59,8 @@
 - ✅ unsloth/Qwen3.6-27B-GGUF
 - ✅ unsloth/Qwen3.8-27B-GGUF
 - ✅ unsloth/Qwen3.6-35B-A3B-GGUF
+- ✅ unsloth/Qwen3.8-Flash-Next-GGUF（UD-IQ4_XS）
+- ✅ ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF（IQ2_XS）
 
 **已知无法运行：**
 - ❌ **Qwen/Qwen3.5-35B-A3B-GPTQ-Int4** - MoE + GPTQ Int4 量化组合存在兼容性问题，导致服务无法正常启动或推理失败
