@@ -124,6 +124,7 @@ from .utils import (
     _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
+    get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -1025,6 +1026,11 @@ class Qwen3_5Model(Qwen3NextModel):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
+            Qwen3NextSparseMoeBlock,
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -1061,6 +1067,17 @@ class Qwen3_5Model(Qwen3NextModel):
         return loaded_local_expert
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
+        # shared expert into the extra fused slot only when AITER FSE is both
+        # requested and compatible with the quant spec.
+        if "moe" in self.config.model_type:
+            weights = maybe_fuse_shared_experts(
+                weights,
+                fused_shared_expert_layers=self.fused_shared_expert_layers,
+                n_routed_experts=self.config.num_experts,
+                n_shared_experts=1,
+                ckpt_prefix="mlp.shared_expert",
+            )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # self attention

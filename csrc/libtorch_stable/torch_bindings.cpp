@@ -517,7 +517,27 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor!? kv_cache, Tensor!? index_cache, "
       "int block_size, Tensor!? q_out, Tensor!? index_q_out, "
       "str kv_cache_dtype, bool skip_index_branch=False, "
-      "Tensor!? q_fp8_out=None, float q_fp8_scale=1.0) -> ()");
+      "Tensor!? q_fp8_out=None, float q_fp8_scale=1.0, "
+      "Tensor? kv_k_scale=None, Tensor? kv_v_scale=None, "
+      "bool write_qkv=True) -> ()");
+
+  // MiniMax-M3 DSpark: shared K/V insertion + Q/K-norm + RoPE for draft
+  // context K/V, in one launch.
+  ops.def(
+      "fused_minimax_m3_dspark_context_kv("
+      "Tensor all_kv, Tensor k_norm_weight, Tensor cos_sin_cache, "
+      "Tensor positions, Tensor slot_mapping, Tensor! kv_cache, "
+      "Tensor cache_offsets, Tensor k_scale, Tensor scale_offsets, "
+      "int rotary_dim, float eps, str kv_cache_dtype) -> ()");
+
+  ops.def(
+      "fused_muse_spark_qknorm_rope_kv_insert("
+      "Tensor! qkv, Tensor positions, int num_heads, int num_kv_heads, "
+      "int head_dim, float eps, Tensor? cos_sin_cache, int rotary_dim, "
+      "Tensor? slot_mapping, Tensor!? kv_cache, int block_size, "
+      "str kv_cache_dtype, Tensor? k_scale=None, Tensor? v_scale=None, "
+      "Tensor!? q_fp8_out=None, Tensor? q_scale=None) "
+      "-> ()");
 
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
   ops.def(
@@ -602,6 +622,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
 
   // Activation function used in SwiGLU.
+  ops.def(
+      "muse_spark_mul_tanh_soft_cap(Tensor! out, Tensor input, "
+      "float multiplier, float soft_cap_temp) -> ()");
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
 
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
@@ -840,6 +863,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 #endif
   ops.impl("fused_minimax_m3_qknorm_rope_kv_insert",
            TORCH_BOX(&fused_minimax_m3_qknorm_rope_kv_insert));
+  ops.impl("fused_minimax_m3_dspark_context_kv",
+           TORCH_BOX(&fused_minimax_m3_dspark_context_kv));
+  ops.impl("fused_muse_spark_qknorm_rope_kv_insert",
+           TORCH_BOX(&fused_muse_spark_qknorm_rope_kv_insert));
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
   ops.impl("fused_kda_decode", TORCH_BOX(&fused_kda_decode));
 #endif
@@ -873,6 +900,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
            TORCH_BOX(&persistent_masked_m_silu_mul_quant));
   ops.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
   ops.impl("silu_and_mul_quant", TORCH_BOX(&silu_and_mul_quant));
+  ops.impl("muse_spark_mul_tanh_soft_cap",
+           TORCH_BOX(&muse_spark_mul_tanh_soft_cap));
   ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
   ops.impl("mul_and_silu", TORCH_BOX(&mul_and_silu));
   ops.impl("gelu_and_mul", TORCH_BOX(&gelu_and_mul));
@@ -984,7 +1013,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                     Tensor! kv_cache,"
       "                     Tensor slot_mapping,"
       "                     str kv_cache_dtype,"
-      "                     Tensor scale) -> ()");
+      "                     Tensor scale,"
+      "                     bool skip_scale=False) -> ()");
 
   // Grouped concat_and_cache_mla across all layers. Each layer's cache base
   // pointer and optional plain-FP8 scale are read from device tensors.
@@ -1090,7 +1120,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
 
   ops.def(
       "cp_gather_and_upconvert_nvfp4_kv_cache(Tensor src_cache, Tensor! dst, "
-      "Tensor block_table, Tensor workspace_starts, int batch_size) -> ()");
+      "Tensor block_table, Tensor workspace_starts, int batch_size, Tensor? "
+      "seq_starts=None) -> ()");
 
   ops.def(
       "indexer_k_quant_and_cache(Tensor k, Tensor! kv_cache, Tensor "

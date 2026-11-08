@@ -41,6 +41,7 @@ from vllm.model_executor.layers.fla.ops import (
     fused_sigmoid_gating_delta_rule_update,
     fused_sigmoid_gating_delta_rule_update_kv_cache_gfx906,
 )
+from vllm.kernels.triton.fused_sigmoid_gate_mul import fused_sigmoid_gate_mul
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, RoutedExperts
 from vllm.model_executor.layers.fused_moe.utils import (
     resolve_layer_fused_shared_expert,
@@ -82,7 +83,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
-from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.models.utils import WeightsMapper, sequence_parallel_chunk
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -103,6 +104,7 @@ from .utils import (
     PPMissingLayer,
     extract_layer_index,
     is_pp_missing_parameter,
+    get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -1408,6 +1410,10 @@ class Qwen3NextAttention(nn.Module):
             and text_only
         )
 
+        # Off by default; Qwen3.5 enables the fused sigmoid-gate-mul Triton
+        # kernel post-construction (see Qwen3_5DecoderLayer).
+        self.use_fused_output_gate = False
+
     def _project_qkv_gate(
         self,
         qkv: torch.Tensor,
@@ -1474,11 +1480,14 @@ class Qwen3NextAttention(nn.Module):
             )
             if projected_out is not None:
                 output[:] = projected_out
-                return
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
-
-        output[:], _ = self.o_proj(attn_output)
+                return output
+            if self.use_fused_output_gate:
+                attn_output = fused_sigmoid_gate_mul(attn_output, gate)
+            else:
+                attn_output = attn_output * torch.sigmoid(gate)
+        out, _ = self.o_proj(attn_output)
+        output[:] = out
+        return output
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -1626,6 +1635,19 @@ class Qwen3NextDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Qwen3NextModel(nn.Module):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            # weight_name: (param_name, shard_id)
+            ".q_proj": (".qkv_proj", "q"),
+            ".k_proj": (".qkv_proj", "k"),
+            ".v_proj": (".qkv_proj", "v"),
+            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
+            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
+            ".shared_expert.gate_proj": (".shared_expert.gate_up_proj", 0),
+            ".shared_expert.up_proj": (".shared_expert.gate_up_proj", 1),
+        }
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1653,6 +1675,11 @@ class Qwen3NextModel(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
+        )
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
+            Qwen3NextSparseMoeBlock,
+            enable_eplb=parallel_config.enable_eplb,
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -1717,6 +1744,13 @@ class Qwen3NextModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = maybe_fuse_shared_experts(
+            weights,
+            fused_shared_expert_layers=self.fused_shared_expert_layers,
+            n_routed_experts=getattr(self.config, "num_experts", 0),
+            n_shared_experts=1,
+            ckpt_prefix="mlp.shared_expert",
+        )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

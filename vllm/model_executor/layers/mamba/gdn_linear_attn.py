@@ -144,7 +144,7 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
-@CustomOp.register("chunk_gated_delta_rule")
+@CustomOp.register("chunk_gated_delta_rule_gfx906")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
         super().__init__()

@@ -29,7 +29,14 @@ from vllm.model_executor.models.qwen3_5 import (
     _make_qwen35_fused_expert_params_mapping,
     _maybe_unsqueeze_shared_expert_gate,
 )
-from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
+from vllm.model_executor.models.qwen3_next import (
+    Qwen3NextSparseMoeBlock,
+    QwenNextMixtureOfExperts,
+)
+from vllm.model_executor.models.qwen3_next_mtp import (
+    should_torch_compile_mtp_drafter,
+)
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
 from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
@@ -44,6 +51,7 @@ from .utils import (
     PPMissingLayer,
     _merge_multimodal_embeddings,
     is_pp_missing_parameter,
+    get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
@@ -77,7 +85,8 @@ def _maybe_convert_gguf_rms_norm_weight(
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
         "hidden_states": 0,
-    }
+    },
+    enable_if=should_torch_compile_mtp_drafter,
 )
 class Qwen3_5MultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -135,7 +144,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             for idx in range(self.num_mtp_layers)
         )
         vllm_config.quant_config = original_quant
-
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
+            Qwen3NextSparseMoeBlock,
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -216,6 +229,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         return loaded_local_expert
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = maybe_fuse_shared_experts(
+            weights,
+            fused_shared_expert_layers=self.fused_shared_expert_layers,
+            n_routed_experts=getattr(self.config, "num_experts", 0),
+            n_shared_experts=1,
+            ckpt_prefix="mlp.shared_expert",
+        )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -381,7 +401,8 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
         "hidden_states": 0,
-    }
+    },
+    enable_if=should_torch_compile_mtp_drafter,
 )
 class Qwen3_5MTP(nn.Module, SupportsMultiModal):
     packed_modules_mapping = {
@@ -458,7 +479,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         hidden_states: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        **kwargs: object,
+        spec_step_idx: int = 0,
     ):
         hidden_states = self.model(
             input_ids,
@@ -466,7 +487,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             hidden_states,
             intermediate_tensors,
             inputs_embeds,
-            kwargs.get("spec_step_idx", 0),
+            spec_step_idx,
         )
         return hidden_states
 
@@ -476,6 +497,19 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        # One lm_head is shared by all MTP modules, as in compute_logits.
+        return super().get_top_tokens(hidden_states)
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return not name.startswith("mtp.") and not any(
+            key in name for key in ["embed_tokens", "lm_head"]
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         modules = dict(self.named_modules())

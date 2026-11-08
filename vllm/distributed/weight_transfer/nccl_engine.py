@@ -26,7 +26,8 @@ from vllm.distributed.weight_transfer.base import (
 )
 from vllm.distributed.weight_transfer.nccl_common import (
     NCCLWeightTransferInitInfo,
-    worker_init_payload,
+    build_worker_init_payload,
+    run_trainer_rendezvous,
     worker_init_process_group,
 )
 from vllm.distributed.weight_transfer.nccl_common import (
@@ -172,6 +173,9 @@ class NCCLWeightTransferEngine(
         )
 
         finalize_layerwise_reload(self.model, self.model_config)
+        # Release the cached receive buffers and post-load temporaries so memory
+        # allocated outside torch (NCCL, other processes on the GPU) can use it.
+        torch.accelerator.empty_cache()
 
     def receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
         """Receive weights from trainer via NCCL broadcast.
@@ -269,6 +273,18 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         self.model_update_group: PyNcclCommunicator | None = None
 
     @classmethod
+    def _build_worker_init_payload(cls, init_info: NCCLTrainerInitInfo) -> dict:
+        return build_worker_init_payload(
+            init_info,
+            packed=init_info.packed,
+            packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,
+            packed_num_buffers=init_info.packed_num_buffers,
+        )
+
+    def _open_trainer_endpoint(self, init_info: NCCLTrainerInitInfo) -> None:
+        self.model_update_group = open_trainer_endpoint(init_info)
+
+    @classmethod
     def trainer_init(
         cls,
         init_info: NCCLTrainerInitInfo,
@@ -292,27 +308,11 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             # trainer-side gather during send_weights.
             return engine
 
-        # Workers sit at rank_offset 1, after the single trainer sender rank 0.
-        worker_init_info = NCCLWeightTransferInitInfo(
-            master_address=init_info.master_address,
-            master_port=init_info.master_port,
-            rank_offset=1,
-            world_size=init_info.world_size,
-            packed=init_info.packed,
-            packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,
-            packed_num_buffers=init_info.packed_num_buffers,
+        payload = cls._build_worker_init_payload(init_info)
+        run_trainer_rendezvous(
+            init_worker=lambda: engine.client.init_weight_transfer_engine(payload),
+            init_trainer=lambda: engine._open_trainer_endpoint(init_info),
         )
-
-        # The inference workers block inside init_weight_transfer_engine waiting
-        # for the NCCL rendezvous, so we kick that off on a side thread while we
-        # open the trainer endpoint (rank 0); both sides must rendezvous together.
-        with ThreadPoolExecutor(max_workers=1) as exe:
-            future = exe.submit(
-                engine.client.init_weight_transfer_engine,
-                worker_init_payload(worker_init_info),
-            )
-            engine.model_update_group = open_trainer_endpoint(init_info)
-            future.result()  # surface any inference-side init error
 
         return engine
 
@@ -453,8 +453,8 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         only add a dependency on the default process group that this backend
         otherwise does not have.
         """
-        if torch.cuda.is_available():
-            torch.cuda.current_stream().synchronize()
+        if torch.accelerator.is_available():
+            torch.accelerator.current_stream().synchronize()
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:

@@ -3869,6 +3869,9 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     skip_index_branch: bool = False,
     q_fp8_out: torch.Tensor | None = None,
     q_fp8_scale: float = 1.0,
+    kv_k_scale: torch.Tensor | None = None,
+    kv_v_scale: torch.Tensor | None = None,
+    write_qkv: bool = True,
 ) -> None:
     """Fused MiniMax-M3 attention pre-processing (in-place).
 
@@ -3923,6 +3926,9 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
         skip_index_branch,
         q_fp8_out,
         q_fp8_scale,
+        kv_k_scale,
+        kv_v_scale,
+        write_qkv,
     )
 
 
@@ -4018,10 +4024,18 @@ def concat_and_cache_mla(
     slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
     scale: torch.Tensor,
+    skip_scale: bool = False,
 ) -> None:
-    torch.ops._C_cache_ops.concat_and_cache_mla(
-        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-    )
+    if current_platform.is_xpu():
+        if skip_scale:
+            raise NotImplementedError("skip_scale is not supported on XPU")
+        torch.ops._C_cache_ops.concat_and_cache_mla(
+            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+        )
+    else:
+        torch.ops._C_cache_ops.concat_and_cache_mla(
+            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale, skip_scale
+        )
 
 
 def concat_and_cache_mla_grouped(
@@ -4592,6 +4606,13 @@ def weight_packed_linear_cpu(
     return output
 
 
+class CPUActMethod(IntEnum):
+    SILU_AND_MUL = 0
+    SWIGLU = 1
+    GELU_AND_MUL = 2
+    GELU_TANH_AND_MUL = 3
+
+
 class CPUQuantMethod(IntEnum):
     UNQUANT = 0
     INT8_W8A8 = 1
@@ -4638,6 +4659,7 @@ def fused_experts_cpu(
     limit: float | None = None,
     is_vnni: bool = True,
     a1_scale: torch.Tensor | None = None,
+    act_method: CPUActMethod = CPUActMethod.SILU_AND_MUL,
 ) -> None:
     torch.ops._C.fused_experts_cpu(
         out,
@@ -4658,6 +4680,7 @@ def fused_experts_cpu(
         alpha,
         limit,
         is_vnni,
+        act_method,
     )
 
 
@@ -5989,3 +6012,186 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
             torch.empty([token_num, q_size], dtype=qkv.dtype, device=qkv.device),
             torch.empty([token_num, kv_size], dtype=qkv.dtype, device=qkv.device),
         )
+
+
+def muse_spark_mul_tanh_soft_cap(
+    x: torch.Tensor,
+    multiplier: float,
+    soft_cap_temp: float,
+) -> torch.Tensor:
+    """Cast to FP32 and apply ``temp * tanh(x * multiplier / temp)`` in one pass."""
+    out = torch.empty_like(x, dtype=torch.float32)
+    torch.ops._C.muse_spark_mul_tanh_soft_cap(out, x, multiplier, soft_cap_temp)
+    return out
+
+
+def fused_muse_spark_qknorm_rope_kv_insert(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    eps: float,
+    cos_sin_cache: torch.Tensor | None = None,
+    rotary_dim: int = 0,
+    slot_mapping: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    block_size: int = 0,
+    kv_cache_dtype: str = "auto",
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    q_fp8_out: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+) -> None:
+    """In-place weightless QK RMSNorm + GPT-J RoPE, optionally writing k/v to cache.
+
+    When ``kv_cache`` is given, the caller must skip the attention layer's own KV write.
+    With ``q_fp8_out``, write scaled E4M3 Q there instead of rewriting Q in ``qkv``.
+    """
+    torch.ops._C.fused_muse_spark_qknorm_rope_kv_insert(
+        qkv,
+        positions,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        eps,
+        cos_sin_cache,
+        rotary_dim,
+        slot_mapping,
+        kv_cache,
+        block_size,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        q_fp8_out,
+        q_scale,
+    )
+
+
+def fused_minimax_m3_dspark_context_kv(
+    all_kv: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cache_offsets: torch.Tensor,
+    k_scale: torch.Tensor,
+    scale_offsets: torch.Tensor,
+    rotary_dim: int,
+    eps: float,
+    kv_cache_dtype: str,
+) -> None:
+    """Store the MiniMax-M3 DSpark draft's context K/V for every layer.
+
+    ``all_kv`` ``[N, L, 2, nkv, 128]`` holds each layer's K and V. K gets the
+    layer's Gemma RMSNorm (``k_norm_weight[L, 128]``) and partial NeoX RoPE;
+    both are stored like ``reshape_and_cache_flash`` into the layers' caches.
+    Layer ``l``'s cache is ``kv_cache`` (layer 0, ``[nb, nkv, bs, 2 * 128]``)
+    shifted by ``cache_offsets[l]`` elements; its fp8 k/v scales are
+    ``k_scale`` (layer 0's) shifted by ``scale_offsets[0, l]`` /
+    ``scale_offsets[1, l]`` floats. Slots < 0 are skipped.
+    """
+    torch.ops._C.fused_minimax_m3_dspark_context_kv(
+        all_kv,
+        k_norm_weight,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        kv_cache,
+        cache_offsets,
+        k_scale,
+        scale_offsets,
+        rotary_dim,
+        eps,
+        kv_cache_dtype,
+    )
+
+
+def mxfp4_w4a8_gemv_rdna3(
+    a: torch.Tensor,
+    b_q: torch.Tensor,
+    b_scale: torch.Tensor,
+) -> torch.Tensor:
+    # a: [M, K] fp16/bf16 with 1 <= M <= 8; b_q: [N, K/2] uint8 E2M1;
+    # b_scale: [N, K/32] uint8 E8M0. Returns [M, N] in a.dtype.
+    return torch.ops._rocm_C.mxfp4_w4a8_gemv_rdna3(a, b_q, b_scale)
+
+
+def muse_spark_routing(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    multiplier: float,
+    route_scale: float,
+    division_eps: float,
+    is_padding: torch.Tensor | None = None,
+) -> None:
+    torch.ops._moe_C.muse_spark_routing(
+        topk_weights,
+        topk_ids,
+        logits,
+        bias,
+        multiplier,
+        route_scale,
+        division_eps,
+        is_padding,
+    )
+
+
+def fused_qknorm_rope_cache(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    norm_weight_bias: float = 0.0,
+    kv_cache_dtype: str = "auto",
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse per-head RMSNorm, partial NeoX RoPE and KV insertion.
+
+    Norm weights may be FP32 independently of QKV. A zero rotary dimension
+    skips RoPE; norm outputs are rounded to QKV dtype before rotation.
+    """
+    if rotary_dim < 0 or rotary_dim > head_dim or rotary_dim % 8:
+        raise ValueError("rotary_dim must be a multiple of 8 in [0, head_dim]")
+    q = qkv.new_empty((qkv.shape[0], num_q_heads * head_dim))
+    k = qkv.new_empty((qkv.shape[0], num_kv_heads * head_dim))
+    v = torch.empty_like(k)
+    cos, sin = cos_sin_cache.chunk(2, dim=-1)
+    torch.ops._C.fused_qknorm_rope_cache(
+        q,
+        k,
+        v,
+        qkv,
+        q_weight,
+        k_weight,
+        cos,
+        sin,
+        positions,
+        slot_mapping,
+        key_cache,
+        value_cache,
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        rotary_dim // 2,
+        eps,
+        norm_weight_bias,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+    return q, k, v
+

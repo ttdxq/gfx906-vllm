@@ -1,18 +1,36 @@
 // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmq.cu
 
+// gfx906 grid-order swap for the MMQ tiles: dispatch token-tile blocks on
+// blockIdx.x (fastest) so the waves sharing one weight row-tile run together
+// and the weight tile stays L2-resident across them (the 47MB weight matrices
+// otherwise get re-fetched per token-tile wave). No cross-block data flow
+// exists in these kernels, so block order cannot change any output.
+// Standalone bit-exact A/B (iq4_xs, c10::Half-equivalent output):
+// +0.6-1.9% on all model shapes at m=1024/2048. Read per call for A/B.
+static inline bool gguf_mmq_gridswap_enabled() {
+#if defined(USE_ROCM)
+    const char * env = getenv("VLLM_GGUF_MMQ_GRIDSWAP");
+    return env && env[0] == '1';
+#else
+    return false;
+#endif
+}
+
 // defined in gguf_kernel.cu; reports whether the buffer was produced by
 // ggml_planar_pack (plane layout for q4_K/q5_K/q6_K)
 bool gguf_planar_is_planar(const void* w);
 // forward declaration: the q4_K/q5_K planar kernels below are defined before
 // mul_mat_q_planar's definition
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum, int mmq_x, int mmq_y, int nwarps,
-              allocate_tiles_cuda_t allocate_tiles, load_tiles_planar_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot, bool need_check>
+              allocate_tiles_cuda_t allocate_tiles, load_tiles_planar_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot, bool need_check,
+bool grid_swap = false>
 static __device__ __forceinline__ void mul_mat_q_planar(
     const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst);
 
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
-              allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
+              allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot,
+              bool grid_swap = false>
 static __device__ __forceinline__ void mul_mat_q(
     const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -26,10 +44,10 @@ static __device__ __forceinline__ void mul_mat_q(
 
     const int & ncols_dst = ncols_y;
 
-    const auto row_dst_0 = blockIdx.x*mmq_y;
+    const auto row_dst_0 = grid_swap ? blockIdx.y*mmq_y : blockIdx.x*mmq_y;
     const int & row_x_0 = row_dst_0;
 
-    const auto col_dst_0 = blockIdx.y*mmq_x;
+    const auto col_dst_0 = grid_swap ? blockIdx.x*mmq_x : blockIdx.y*mmq_x;
     const int & col_y_0 = col_dst_0;
 
     int   * tile_x_ql = nullptr;
@@ -647,6 +665,32 @@ mul_mat_q5_K_planar(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// gfx906 opt-in grid-swap twins (VLLM_GGUF_MMQ_GRIDSWAP=1), see
+// mul_mat_iq4_xs_gs.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*NWARPS_Q5_K, 2)
+#endif
+mul_mat_q5_K_gs(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q<scalar_t, QK_K, QR5_K, QI5_K, true, block_q5_K, MMQ_X_Q5_K, MMQ_Y_Q5_K, NWARPS_Q5_K, allocate_tiles_q5_K<MMQ_Y_Q5_K>,
+        load_tiles_q5_K<MMQ_Y_Q5_K, NWARPS_Q5_K, need_check>, VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat, true>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*NWARPS_Q5_K, 2)
+#endif
+mul_mat_q5_K_planar_gs(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q_planar<scalar_t, QK_K, QR5_K, QI5_K, true, MMQ_X_Q5_K, MMQ_Y_Q5_K, NWARPS_Q5_K, allocate_tiles_q5_K<MMQ_Y_Q5_K>,
+        load_tiles_q5_K_planar<MMQ_Y_Q5_K, NWARPS_Q5_K, need_check>, VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat, need_check, true>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q5_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
@@ -658,27 +702,48 @@ static void ggml_mul_mat_q5_K_q8_1_cuda(
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
-    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const bool gs = gguf_mmq_gridswap_enabled();
+    const dim3 block_nums(gs ? dim3(block_num_y, block_num_x, 1) : dim3(block_num_x, block_num_y, 1));
     const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
 
     const bool planar = gguf_planar_is_planar(vx);
     if (nrows_x % mmq_y == 0) {
         const bool need_check = false;
         if (planar) {
-            mul_mat_q5_K_planar<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
-                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            if (gs) {
+                mul_mat_q5_K_planar_gs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                mul_mat_q5_K_planar<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
         } else {
-            mul_mat_q5_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
-                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            if (gs) {
+                mul_mat_q5_K_gs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                mul_mat_q5_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
         }
     } else {
         const bool need_check = true;
         if (planar) {
-            mul_mat_q5_K_planar<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
-                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            if (gs) {
+                mul_mat_q5_K_planar_gs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                mul_mat_q5_K_planar<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
         } else {
-            mul_mat_q5_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
-                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            if (gs) {
+                mul_mat_q5_K_gs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                mul_mat_q5_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
         }
     }
 }
@@ -687,7 +752,8 @@ static void ggml_mul_mat_q5_K_q8_1_cuda(
 // are loaded from the plane layouts via an extended-signature loader (the
 // original load_tiles pointer convention cannot carry the plane bases).
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum, int mmq_x, int mmq_y, int nwarps,
-              allocate_tiles_cuda_t allocate_tiles, load_tiles_planar_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot, bool need_check>
+              allocate_tiles_cuda_t allocate_tiles, load_tiles_planar_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot, bool need_check,
+              bool grid_swap>
 static __device__ __forceinline__ void mul_mat_q_planar(
     const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -833,6 +899,32 @@ mul_mat_q6_K_planar(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// gfx906 opt-in grid-swap twins (VLLM_GGUF_MMQ_GRIDSWAP=1), see
+// mul_mat_iq4_xs_gs.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*NWARPS_Q6_K, 2)
+#endif
+mul_mat_q6_K_gs(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q<scalar_t, QK_K, QR6_K, QI6_K, false, block_q6_K, MMQ_X_Q6_K, MMQ_Y_Q6_K, NWARPS_Q6_K, allocate_tiles_q6_K<MMQ_Y_Q6_K>,
+        load_tiles_q6_K<MMQ_Y_Q6_K, NWARPS_Q6_K, need_check>, VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat, true>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*NWARPS_Q6_K, 2)
+#endif
+mul_mat_q6_K_planar_gs(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q_planar<scalar_t, QK_K, QR6_K, QI6_K, false, MMQ_X_Q6_K, MMQ_Y_Q6_K, NWARPS_Q6_K, allocate_tiles_q6_K<MMQ_Y_Q6_K>,
+        load_tiles_q6_K_planar<MMQ_Y_Q6_K, NWARPS_Q6_K, need_check>, VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat, need_check, true>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q6_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
@@ -843,27 +935,48 @@ static void ggml_mul_mat_q6_K_q8_1_cuda(
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
-    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const bool gs = gguf_mmq_gridswap_enabled();
+    const dim3 block_nums(gs ? dim3(block_num_y, block_num_x, 1) : dim3(block_num_x, block_num_y, 1));
     const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
 
     const bool planar = gguf_planar_is_planar(vx);
     if (nrows_x % mmq_y == 0) {
         const bool need_check = false;
         if (planar) {
-            mul_mat_q6_K_planar<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
-                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            if (gs) {
+                mul_mat_q6_K_planar_gs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                mul_mat_q6_K_planar<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
         } else {
-            mul_mat_q6_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
-                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            if (gs) {
+                mul_mat_q6_K_gs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                mul_mat_q6_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
         }
     } else {
         const bool need_check = true;
         if (planar) {
-            mul_mat_q6_K_planar<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
-                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            if (gs) {
+                mul_mat_q6_K_planar_gs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                mul_mat_q6_K_planar<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
         } else {
-            mul_mat_q6_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
-                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            if (gs) {
+                mul_mat_q6_K_gs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                mul_mat_q6_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>
+                    (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
         }
     }
 }
@@ -899,6 +1012,20 @@ mul_mat_iq4_xs(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// gfx906 opt-in grid-swap twin (VLLM_GGUF_MMQ_GRIDSWAP=1): token-tile blocks
+// on blockIdx.x so waves share one weight row-tile and keep it L2-resident.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*NWARPS_IQ4_XS, 2)
+#endif
+mul_mat_iq4_xs_gs(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q<scalar_t, QK_K, QR4_XS, QI4_XS, false, block_iq4_xs, MMQ_X_IQ4_XS, MMQ_Y_IQ4_XS, NWARPS_IQ4_XS, allocate_tiles_iq4_xs<MMQ_Y_IQ4_XS>,
+        load_tiles_iq4_xs<MMQ_Y_IQ4_XS, NWARPS_IQ4_XS, need_check>, VDR_IQ4_XS_Q8_1_MMQ, vec_dot_iq4_xs_q8_1_mul_mat, true>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_iq4_xs_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
@@ -909,15 +1036,26 @@ static void ggml_mul_mat_iq4_xs_q8_1_cuda(
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
-    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const bool gs = gguf_mmq_gridswap_enabled();
+    const dim3 block_nums(gs ? dim3(block_num_y, block_num_x, 1) : dim3(block_num_x, block_num_y, 1));
     const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
 
     if (nrows_x % mmq_y == 0) {
-        mul_mat_iq4_xs<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
-            (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        if (gs) {
+            mul_mat_iq4_xs_gs<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_iq4_xs<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
     } else {
-        mul_mat_iq4_xs<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
-            (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        if (gs) {
+            mul_mat_iq4_xs_gs<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_iq4_xs<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
     }
 }
 

@@ -125,6 +125,11 @@ ignore_missing_imports = true
 check_untyped_defs = true
 follow_imports = "silent"
 
+[[tool.mypy.overrides]]
+module = "tests.*"
+disable_error_code = ["arg-type", "assignment"]
+enable_error_code = ["method-assign"]
+
 [tool.pytest.ini_options]
 markers = [
     "slow_test",
@@ -154,6 +159,7 @@ extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizer
     "tests/entrypoints/speech_to_text/transcription/test_transcription_validation.py",
     "docs/governance/process.md", "docs/assets/contributing/vllm_bench_serve_timeline.html", 
     "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*", "csrc/cpu/sgl-kernels/*",
+    "tests/entrypoints/scale_out/token_in_token_out/test_protocol.py",
     "rust/src/chat/src/renderer/deepseek_v32/fixtures/*", "rust/src/parser/**",
     "rust/src/text/src/output/decoded.rs",
     "rust/src/tokenizer/src/incremental.rs"]
@@ -204,6 +210,7 @@ pard = "pard"
 AKS = "AKS"
 ba = "ba"
 fo = "fo"
+ot = "ot"
 nd = "nd"
 eles = "eles"
 datas = "datas"
